@@ -69,20 +69,16 @@ pub struct BoolDecoder<'a> {
 }
 
 impl<'a> BoolDecoder<'a> {
-    /// `init_bool( sz )` from VP9 §9.2.1.
+    /// `init_bool( sz )` from VP9 §9.2.1. Loads the first byte of the
+    /// payload into `BoolValue` and sets `BoolRange` to 255. The §9.2.1
+    /// pseudocode does not consume a marker bit here — the VP8-era
+    /// marker bit check was dropped in VP9.
     pub fn new(data: &'a [u8]) -> Result<Self> {
         if data.is_empty() {
             return Err(Error::invalid("vp9 bool decoder: empty payload"));
         }
         let mut pump = BitPump::new(data);
         let value = pump.read_bits(8)?;
-        // marker bit f(1) must be 0
-        let marker = pump.read_bit()?;
-        if marker != 0 {
-            return Err(Error::invalid(
-                "vp9 bool decoder: §9.2.1 marker bit must be zero",
-            ));
-        }
         Ok(Self {
             pump,
             range: 255,
@@ -155,13 +151,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn init_marker_must_be_zero() {
-        // Init reads f(8) into BoolValue, then f(1) marker. With our pump
-        // (byte-granular MSB-first), the first 8 bits are byte 0 and the
-        // 9th bit is the MSB of byte 1. So marker=0 requires byte 1's
-        // MSB to be 0, e.g. 0x00..0x7F.
+    fn init_accepts_any_payload() {
+        // Init only reads f(8) into BoolValue. Unlike VP8, VP9 §9.2.1
+        // does not consume a marker bit, so any non-empty payload is
+        // valid — including ones whose 9th bit is 1.
         assert!(BoolDecoder::new(&[0xAB, 0x00, 0xCD]).is_ok());
-        assert!(BoolDecoder::new(&[0xAB, 0xFF, 0xCD]).is_err());
+        assert!(BoolDecoder::new(&[0xAB, 0xFF, 0xCD]).is_ok());
+        assert!(BoolDecoder::new(&[]).is_err());
     }
 
     /// Read several bits at p=128. Should not panic / EOF.

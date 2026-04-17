@@ -29,10 +29,9 @@ fn bool_decoder_initialises_on_known_buffer() {
 }
 
 #[test]
-fn bool_decoder_rejects_non_zero_marker() {
-    // 2nd byte MSB=1 — marker bit violates §9.2.1.
-    let buf = [0x00u8, 0xFF];
-    assert!(BoolDecoder::new(&buf).is_err());
+fn bool_decoder_rejects_empty_buffer() {
+    // §9.2.1 requires at least one byte to load into BoolValue.
+    assert!(BoolDecoder::new(&[]).is_err());
 }
 
 #[test]
@@ -68,6 +67,7 @@ fn dc_pred_solid_patch_matches_spec_average() {
     let n = Neighbours {
         above: Some(&above),
         left: Some(&left),
+        above_left: None,
     };
     let mut dst = [0u8; 16];
     predict(IntraMode::Dc, n, 4, 4, &mut dst, 4).unwrap();
@@ -85,6 +85,7 @@ fn dc_pred_asymmetric_neighbours_round_to_spec() {
     let n = Neighbours {
         above: Some(&above),
         left: Some(&left),
+        above_left: None,
     };
     let mut dst = [0u8; 16];
     predict(IntraMode::Dc, n, 4, 4, &mut dst, 4).unwrap();
@@ -99,6 +100,7 @@ fn v_pred_produces_vertical_stripes() {
     let n = Neighbours {
         above: Some(&above),
         left: None,
+        above_left: None,
     };
     let mut dst = [0u8; 16];
     predict(IntraMode::V, n, 4, 4, &mut dst, 4).unwrap();
@@ -115,6 +117,7 @@ fn h_pred_produces_horizontal_stripes() {
     let n = Neighbours {
         above: None,
         left: Some(&left),
+        above_left: None,
     };
     let mut dst = [0u8; 16];
     predict(IntraMode::H, n, 4, 4, &mut dst, 4).unwrap();
@@ -135,6 +138,7 @@ fn inverse_dct_zero_residual_preserves_predictor() {
     let n = Neighbours {
         above: Some(&above),
         left: Some(&left),
+        above_left: None,
     };
     let mut dst = [0u8; 16];
     predict(IntraMode::Dc, n, 4, 4, &mut dst, 4).unwrap();
@@ -155,6 +159,7 @@ fn inverse_dct_8x8_zero_residual_preserves_predictor() {
     let n = Neighbours {
         above: Some(&above),
         left: Some(&left),
+        above_left: None,
     };
     let mut dst = [0u8; 64];
     predict(IntraMode::Dc, n, 8, 8, &mut dst, 8).unwrap();
@@ -177,6 +182,7 @@ fn full_solid_colour_path_yields_uniform_block() {
     let n = Neighbours {
         above: Some(&above),
         left: Some(&left),
+        above_left: None,
     };
     let mut block = [0u8; 16];
     predict(IntraMode::Dc, n, 4, 4, &mut block, 4).unwrap();
@@ -195,10 +201,10 @@ fn unsupported_intra_modes_have_precise_error_text() {
     let n = Neighbours {
         above: None,
         left: None,
+        above_left: None,
     };
     let mut dst = [0u8; 16];
     for m in [
-        IntraMode::Tm,
         IntraMode::D45,
         IntraMode::D135,
         IntraMode::D117,

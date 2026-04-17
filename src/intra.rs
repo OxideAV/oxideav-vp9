@@ -2,10 +2,12 @@
 //!
 //! VP9 defines 10 intra luma modes (`DC_PRED`, `V_PRED`, `H_PRED`, six
 //! directional `D*_PRED` variants, and `TM_PRED`). This module implements
-//! the simplest three — `DC_PRED`, `V_PRED`, `H_PRED` — which are enough to
-//! reconstruct "flat" or "edge-gradient" blocks in a minimal I-frame. The
-//! remaining seven modes return `Error::Unsupported` with a precise §ref so
-//! higher layers can report exactly where the decoder gave up.
+//! the four non-directional ones — `DC_PRED`, `V_PRED`, `H_PRED`, and
+//! `TM_PRED` — which is enough to reconstruct "flat" or "edge-gradient"
+//! blocks plus Paeth-style surfaces in a minimal I-frame. The six
+//! directional modes (`D45`, `D135`, `D117`, `D153`, `D207`, `D63`)
+//! return `Error::Unsupported` with a precise §ref so higher layers
+//! can report exactly where the decoder gave up.
 //!
 //! All predictors operate on `u8` samples (8-bit decode only). Higher
 //! bit-depths (VP9 profiles 2 & 3) are out of scope for this first
@@ -87,6 +89,10 @@ pub struct Neighbours<'a> {
     /// `left[0..h]` — column of samples immediately left of the block,
     /// ordered top-to-bottom.
     pub left: Option<&'a [u8]>,
+    /// Single sample at the `above-left` corner, used by `TM_PRED`
+    /// (§8.5.1). When unavailable (frame corner), `TM_PRED` falls back
+    /// to `1 << (bitdepth-1)`.
+    pub above_left: Option<u8>,
 }
 
 /// Run `mode` over a `w × h` block. The predictor writes row-major into
@@ -105,6 +111,7 @@ pub fn predict(
         IntraMode::Dc => dc_pred(n, w, h, dst, dst_stride),
         IntraMode::V => v_pred(n, w, h, dst, dst_stride),
         IntraMode::H => h_pred(n, w, h, dst, dst_stride),
+        IntraMode::Tm => tm_pred(n, w, h, dst, dst_stride),
         _ => Err(Error::unsupported(format!(
             "vp9 intra {}: §8.5.1 {} not implemented in parse-only crate",
             mode.name(),
@@ -190,6 +197,31 @@ fn h_pred(n: Neighbours<'_>, w: usize, h: usize, dst: &mut [u8], dst_stride: usi
     Ok(())
 }
 
+/// `TM_PRED` — "true motion" (Paeth-like). For every sample at (r, c):
+/// `pred = clip(above[c] + left[r] - above_left, 0, 255)`. When either
+/// neighbour or the corner is missing, VP9 substitutes `1 << (bitdepth-1)`
+/// = 128 for 8-bit (§8.5.1).
+fn tm_pred(n: Neighbours<'_>, w: usize, h: usize, dst: &mut [u8], dst_stride: usize) -> Result<()> {
+    let above_row: &[u8] = match n.above {
+        Some(a) if a.len() >= w => a,
+        _ => &[128u8; 64][..w.min(64)],
+    };
+    let left_col: &[u8] = match n.left {
+        Some(l) if l.len() >= h => l,
+        _ => &[128u8; 64][..h.min(64)],
+    };
+    let al = n.above_left.unwrap_or(128) as i32;
+    for (r, &lv) in left_col.iter().enumerate().take(h) {
+        let base = r * dst_stride;
+        let lr = lv as i32;
+        for c in 0..w {
+            let p = lr + above_row[c] as i32 - al;
+            dst[base + c] = p.clamp(0, 255) as u8;
+        }
+    }
+    Ok(())
+}
+
 fn fill(dst: &mut [u8], dst_stride: usize, w: usize, h: usize, v: u8) {
     for row in 0..h {
         let base = row * dst_stride;
@@ -210,6 +242,7 @@ mod tests {
         let n = Neighbours {
             above: Some(&above),
             left: Some(&left),
+            above_left: None,
         };
         let mut dst = [0u8; 16];
         predict(IntraMode::Dc, n, 4, 4, &mut dst, 4).unwrap();
@@ -224,6 +257,7 @@ mod tests {
         let n = Neighbours {
             above: None,
             left: None,
+            above_left: None,
         };
         let mut dst = [0u8; 16];
         predict(IntraMode::Dc, n, 4, 4, &mut dst, 4).unwrap();
@@ -238,6 +272,7 @@ mod tests {
         let n = Neighbours {
             above: Some(&above),
             left: None,
+            above_left: None,
         };
         let mut dst = [0u8; 16];
         predict(IntraMode::V, n, 4, 4, &mut dst, 4).unwrap();
@@ -252,6 +287,7 @@ mod tests {
         let n = Neighbours {
             above: None,
             left: Some(&left),
+            above_left: None,
         };
         let mut dst = [0u8; 16];
         predict(IntraMode::H, n, 4, 4, &mut dst, 4).unwrap();
@@ -262,16 +298,52 @@ mod tests {
     }
 
     #[test]
+    fn tm_pred_matches_formula() {
+        let above = [100u8, 110, 120, 130];
+        let left = [50u8, 60, 70, 80];
+        let al = 90u8;
+        let n = Neighbours {
+            above: Some(&above),
+            left: Some(&left),
+            above_left: Some(al),
+        };
+        let mut dst = [0u8; 16];
+        predict(IntraMode::Tm, n, 4, 4, &mut dst, 4).unwrap();
+        for r in 0..4 {
+            for c in 0..4 {
+                let expected = (left[r] as i32 + above[c] as i32 - al as i32).clamp(0, 255) as u8;
+                assert_eq!(dst[r * 4 + c], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn tm_pred_falls_back_without_corners() {
+        // No above / left / corner: TM_PRED reduces to 128 + 128 - 128 = 128.
+        let n = Neighbours {
+            above: None,
+            left: None,
+            above_left: None,
+        };
+        let mut dst = [0u8; 16];
+        predict(IntraMode::Tm, n, 4, 4, &mut dst, 4).unwrap();
+        for &v in &dst {
+            assert_eq!(v, 128);
+        }
+    }
+
+    #[test]
     fn unsupported_modes_return_clear_error() {
         let n = Neighbours {
             above: None,
             left: None,
+            above_left: None,
         };
         let mut dst = [0u8; 16];
-        let err = predict(IntraMode::Tm, n, 4, 4, &mut dst, 4).unwrap_err();
+        let err = predict(IntraMode::D45, n, 4, 4, &mut dst, 4).unwrap_err();
         match err {
             Error::Unsupported(s) => {
-                assert!(s.contains("TM_PRED"), "msg: {s}");
+                assert!(s.contains("D45_PRED"), "msg: {s}");
                 assert!(s.contains("§8.5.1"), "msg: {s}");
             }
             other => panic!("expected Unsupported, got {other:?}"),

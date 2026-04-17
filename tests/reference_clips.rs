@@ -12,6 +12,7 @@
 
 use std::path::Path;
 
+use oxideav_vp9::ivf;
 use oxideav_vp9::{parse_uncompressed_header, FrameType};
 
 fn read_fixture(path: &str) -> Option<Vec<u8>> {
@@ -53,6 +54,73 @@ fn parse_ivf_first_frame_header() {
     assert_eq!(h.height, 64);
     assert_eq!(h.color_config.bit_depth, 8);
     assert!(h.show_frame);
+}
+
+#[test]
+fn ivf_iterator_walks_every_frame() {
+    let Some(data) = read_fixture("/tmp/vp9.ivf") else {
+        return;
+    };
+    let (hdr, _) = ivf::parse_header(&data).expect("parse IVF header");
+    assert_eq!(&hdr.fourcc, b"VP90");
+    assert_eq!(hdr.width, 64);
+    assert_eq!(hdr.height, 64);
+    let mut n = 0;
+    for f in ivf::iter_frames(&data).unwrap() {
+        let f = f.expect("frame");
+        assert!(!f.payload.is_empty());
+        n += 1;
+    }
+    assert!(n >= 1, "expected at least one frame in fixture");
+}
+
+#[test]
+fn ivf_first_frame_keyframe_header_via_iter() {
+    // The iterator-based path must agree with the manual offset-based one.
+    let Some(data) = read_fixture("/tmp/vp9.ivf") else {
+        return;
+    };
+    let mut it = ivf::iter_frames(&data).unwrap();
+    let f = it.next().unwrap().unwrap();
+    let h = parse_uncompressed_header(f.payload, None).expect("parse");
+    assert_eq!(h.frame_type, FrameType::Key);
+    assert_eq!(h.width, 64);
+    assert_eq!(h.height, 64);
+}
+
+#[test]
+fn keyframe_partition_walk_reaches_block_decode_stop() {
+    // End-to-end: IVF demux → uncompressed header → compressed header →
+    // tile walk. The tile walker exercises the §6.4.2 partition
+    // quadtree against real VP9 default probabilities (§10.5) and the
+    // bool decoder (§9.2); it must either successfully plan a set of
+    // leaves or bail with the specific `Unsupported` pointing at
+    // §6.4.3 `decode_block`. Anything else (panic / InvalidData) would
+    // be a regression.
+    use oxideav_vp9::compressed_header::parse_compressed_header;
+    use oxideav_vp9::tile::decode_tiles;
+
+    let Some(data) = read_fixture("/tmp/vp9.ivf") else {
+        return;
+    };
+    let frame = ivf::iter_frames(&data).unwrap().next().unwrap().unwrap();
+    let h = parse_uncompressed_header(frame.payload, None).expect("uncompressed");
+    assert_eq!(h.frame_type, FrameType::Key);
+    let cmp_start = h.uncompressed_header_size;
+    let cmp_end = cmp_start + h.header_size as usize;
+    assert!(cmp_end <= frame.payload.len(), "compressed header fits");
+    let ch =
+        parse_compressed_header(&frame.payload[cmp_start..cmp_end], &h).expect("compressed header");
+    let tile_payload = &frame.payload[cmp_end..];
+    match decode_tiles(tile_payload, &h, &ch) {
+        Err(oxideav_core::Error::Unsupported(s)) => {
+            assert!(
+                s.contains("§6.4.3") || s.contains("decode_block"),
+                "expected §6.4.3 / decode_block stopping clause, got: {s}"
+            );
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
 }
 
 #[test]

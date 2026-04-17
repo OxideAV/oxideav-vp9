@@ -109,14 +109,17 @@ impl Decoder for Vp9Decoder {
         if self.eof {
             return Err(Error::Eof);
         }
-        // We parsed a header but cannot reconstruct pixels. Tile skeleton,
-        // range decoder, intra primitives (DC/V/H) and 4×4 / 8×8 iDCT are
-        // wired up as primitives; the missing piece is partition syntax.
+        // We parsed a header but cannot reconstruct pixels. Tile walker,
+        // range decoder, intra primitives (DC/V/H/TM) and 4×4 / 8×8 iDCT
+        // are wired up; the missing piece is block-level decode (modes
+        // + coef probs + dequant, §6.4.3 / §10.5).
         if self.last_header.is_some() {
             return Err(Error::unsupported(
-                "vp9 tile_decode: partition syntax §6.4.3 not implemented — \
-                 range decode + intra primitives (DC/V/H, §8.5.1) + \
-                 iDCT 4×4/8×8 (§8.7.1) are available as primitives",
+                "vp9 decode_block §6.4.3 not implemented — \
+                 partition tree (§6.4.2) + bool decoder (§9.2) + intra \
+                 primitives (DC/V/H/TM, §8.5.1) + iDCT 4×4/8×8 (§8.7.1) \
+                 are available; next: kf_intra_mode_probs, coef tree, \
+                 dequant (§10.5 / §8.6)",
             ));
         }
         Err(Error::NeedMore)

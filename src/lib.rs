@@ -1,4 +1,4 @@
-//! Pure-Rust VP9 video decoder scaffold.
+//! Pure-Rust VP9 video header parser + partition-tree walker.
 //!
 //! Status:
 //! * §6.2 uncompressed header — parsed (color_config, frame_size,
@@ -10,22 +10,24 @@
 //! * §6.3 compressed header — partially parsed: tx_mode, reference_mode.
 //!   Coefficient / skip / inter-mode / mv probability sub-procedures are
 //!   not yet decoded.
-//! * §6.4 tile / partition / block decode — skeleton in `tile.rs`:
-//!   initialises the bool decoder per tile, computes the tile grid /
-//!   superblock count, and surfaces `Error::Unsupported` at the first
-//!   partition symbol (§6.4.3) with a precise §ref.
-//! * §8.5.1 intra prediction — `DC_PRED` / `V_PRED` / `H_PRED` available
-//!   as primitives in `intra.rs`. Other modes (`TM_PRED`, directional)
-//!   return `Error::Unsupported`.
+//! * §6.4 tile / partition walk — implemented in `tile.rs`. The partition
+//!   quadtree (§6.4.2) recurses all the way down to 8×8 against the
+//!   default keyframe probabilities (§10.5) and records every leaf; the
+//!   block decode (§6.4.3) then surfaces `Error::Unsupported` with the
+//!   precise stopping clause.
+//! * §8.5.1 intra prediction — `DC_PRED` / `V_PRED` / `H_PRED` /
+//!   `TM_PRED` available as primitives in `intra.rs`. Six directional
+//!   modes return `Error::Unsupported`.
 //! * §8.7.1 inverse transforms — 4×4 and 8×8 inverse DCT-DCT available
-//!   as primitives in `transform.rs`. ADST / WHT / larger sizes return
+//!   as primitives in `transform.rs`. ADST / WHT / 16×16 / 32×32 return
 //!   `Error::Unsupported`.
+//! * IVF demux — `ivf.rs` parses the DKIF container so tests can feed
+//!   ffmpeg-generated clips directly.
 //!
-//! This scaffold is enough for higher layers (containers, the codec
-//! registry, the CLI list output, MP4 demux) to recognise VP9 streams,
-//! report stream dimensions, and surface a clean "decode not yet
-//! implemented" error. The primitives mirror `oxideav-av1` — the two
-//! crates are structurally parallel on purpose.
+//! This is enough for higher layers (containers, the codec registry,
+//! the CLI list output, MP4 demux) to recognise VP9 streams, report
+//! stream dimensions, walk the partition quadtree, and surface a clean
+//! "decode not yet implemented" error pointing at §6.4.3.
 //!
 //! Reference: VP9 Bitstream & Decoding Process Specification, version 0.7
 //! (2017): <https://storage.googleapis.com/downloads.webmproject.org/docs/vp9/vp9-bitstream-specification-v0.7-20170222-draft.pdf>.
@@ -36,6 +38,8 @@ pub mod compressed_header;
 pub mod decoder;
 pub mod headers;
 pub mod intra;
+pub mod ivf;
+pub mod probs;
 pub mod tile;
 pub mod transform;
 

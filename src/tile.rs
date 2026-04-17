@@ -1,29 +1,32 @@
-//! VP9 tile / partition / block decode — skeleton.
+//! VP9 tile / partition / block decode.
 //!
 //! Reference: VP9 spec §6.4 (`decode_tiles`), §6.4.1 (`decode_tile`),
 //! §6.4.2 (`decode_partition`), §6.4.3 (`decode_block`), §7.4 (block-level
 //! semantic process), §8.5 (intra prediction), §8.6 (inter prediction),
 //! §8.7 (reconstruction), §8.8 (loop filter).
 //!
-//! Status: this module wires up the machinery — bool decoder per tile,
-//! tile-grid walk, superblock counting — and stops at the first piece of
-//! tile syntax we can't yet consume (§6.4.3 partition decode). Each
-//! boundary raises an `Error::Unsupported` with a precise §ref so future
-//! work can pick up exactly where we stop.
+//! Status (this revision): the partition quadtree (§6.4.2) is implemented
+//! against the keyframe default partition probabilities (§10.5). Given a
+//! bool-engine cursor and a superblock origin, the decoder recurses down
+//! to 8×8 and records each leaf's size + position in a flat
+//! [`PartitionPlan`]. This is the plumbing the next milestone —
+//! per-block mode / coefficient decode (§6.4.3) — hangs off.
 //!
-//! The intra primitives and inverse transforms landed alongside this are
-//! available as standalone primitives via `crate::intra` and
-//! `crate::transform`, ready to be wired in once partition / mode /
-//! coefficient decoding lands.
+//! Stops at the first `decode_block` call: that's where
+//! `kf_intra_mode_probs` (§10.5), coefficient tree probs (§10.5 again)
+//! and residual dequant (§8.6) would kick in — several thousand lines
+//! of tables and arithmetic. The error carries a precise §ref so callers
+//! know exactly how far the decoder reached.
 //!
-//! Structural parallel to `oxideav_av1::tile_decode` — the two crates
-//! mirror each other on purpose.
+//! The intra primitives and inverse transforms (`crate::intra`,
+//! `crate::transform`) are available standalone.
 
 use oxideav_core::{Error, Result};
 
 use crate::bool_decoder::BoolDecoder;
 use crate::compressed_header::CompressedHeader;
 use crate::headers::UncompressedHeader;
+use crate::probs::{read_partition_from_tree, PartitionType, KF_PARTITION_PROBS, PARTITION_PROBS};
 
 /// VP9 superblock size is always 64×64 (§3).
 pub const SUPERBLOCK_SIZE: u32 = 64;
@@ -32,7 +35,8 @@ pub const SUPERBLOCK_SIZE: u32 = 64;
 ///
 /// The `PARTITION_NONE` / `PARTITION_HORZ` / `PARTITION_VERT` /
 /// `PARTITION_SPLIT` enumeration is reused at every level of the partition
-/// quadtree (§6.4.2).
+/// quadtree (§6.4.2). `Partition` is kept as a public alias of the
+/// internal `PartitionType` so downstream consumers can reference it.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Partition {
@@ -51,6 +55,15 @@ impl Partition {
             3 => Self::Split,
             _ => return Err(Error::invalid(format!("vp9 partition: invalid {v}"))),
         })
+    }
+
+    fn from_ptype(p: PartitionType) -> Self {
+        match p {
+            PartitionType::None => Self::None,
+            PartitionType::Horz => Self::Horz,
+            PartitionType::Vert => Self::Vert,
+            PartitionType::Split => Self::Split,
+        }
     }
 }
 
@@ -89,10 +102,39 @@ impl TileGrid {
     }
 }
 
-/// A single-tile decode context. In VP9 this would be the `decode_tile()`
-/// procedure of §6.4.1 — in this skeleton we only initialise the bool
-/// decoder, log superblock iteration, and surface a precise `Unsupported`
-/// at the first piece of syntax we can't consume.
+/// One leaf of the partition quadtree — a block we would feed to
+/// `decode_block` (§6.4.3) if block-level decode were implemented.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PartitionLeaf {
+    /// Pixel column of the block's top-left corner within the tile.
+    pub col: u32,
+    /// Pixel row of the block's top-left corner within the tile.
+    pub row: u32,
+    /// Block width in pixels (power of two, 8..=64).
+    pub width: u32,
+    /// Block height in pixels.
+    pub height: u32,
+    /// Partition type that produced this leaf.
+    pub kind: Partition,
+}
+
+/// Full partition plan for a superblock — the ordered list of leaves
+/// `decode_block` would have been invoked on, in VP9's raster-scan order.
+#[derive(Clone, Debug, Default)]
+pub struct PartitionPlan {
+    pub leaves: Vec<PartitionLeaf>,
+}
+
+impl PartitionPlan {
+    fn push(&mut self, l: PartitionLeaf) {
+        self.leaves.push(l);
+    }
+}
+
+/// A single-tile decode context. `TileDecoder::new` establishes the bool
+/// engine over `tile_data`; `walk_partitions` then runs the full
+/// superblock / partition-tree traversal of §6.4.2. Block-level decode
+/// (§6.4.3) is not implemented — the walk returns the plan instead.
 pub struct TileDecoder<'a> {
     pub hdr: &'a UncompressedHeader,
     pub ch: &'a CompressedHeader,
@@ -122,27 +164,70 @@ impl<'a> TileDecoder<'a> {
         })
     }
 
-    /// Iterate the tile's superblocks and stop at the first piece of tile
-    /// syntax we don't yet handle (partition decode, §6.4.3).
+    /// Walk the partition quadtree for every superblock in this tile,
+    /// returning the flat list of leaves the §6.4.3 block decoder would
+    /// have run against. The bool-engine cursor ends up pointing at the
+    /// first unread bit — the one `decode_block` would consume.
+    ///
+    /// This intentionally does NOT invoke `decode_block`: we don't yet
+    /// have the §10.5 mode / coefficient probabilities wired up, so any
+    /// further progress would be guesswork. Callers wanting a terminal
+    /// `Error::Unsupported` should use [`Self::decode`].
+    pub fn walk_partitions(&mut self, tile_width: u32, tile_height: u32) -> Result<PartitionPlan> {
+        let mut plan = PartitionPlan::default();
+        let keyframe =
+            matches!(self.hdr.frame_type, crate::headers::FrameType::Key,) || self.hdr.intra_only;
+        let sbs_x = tile_width.div_ceil(SUPERBLOCK_SIZE);
+        let sbs_y = tile_height.div_ceil(SUPERBLOCK_SIZE);
+        for sby in 0..sbs_y {
+            for sbx in 0..sbs_x {
+                let col = sbx * SUPERBLOCK_SIZE;
+                let row = sby * SUPERBLOCK_SIZE;
+                decode_partition_recursive(
+                    &mut self.bool_dec,
+                    row,
+                    col,
+                    SUPERBLOCK_SIZE,
+                    tile_width,
+                    tile_height,
+                    keyframe,
+                    &mut plan,
+                )?;
+            }
+        }
+        Ok(plan)
+    }
+
+    /// Walk the partition tree, then surface `Error::Unsupported` at the
+    /// first `decode_block` call site (§6.4.3). This is the recommended
+    /// entry point for higher-level code — the walk fully exercises
+    /// [`read_partition_from_tree`] against real probabilities, and the
+    /// error message carries the exact stopping clause.
     pub fn decode(&mut self) -> Result<()> {
-        // Walking the first superblock is the most informative boundary: it
-        // forces us to decode a partition symbol, which in turn requires the
-        // default partition probability tables (§10.5).
+        let w = self.hdr.width;
+        let h = self.hdr.height;
+        let plan = self.walk_partitions(w, h)?;
         Err(Error::unsupported(format!(
-            "vp9 tile_decode: partition syntax §6.4.3 not implemented \
-             (tile={},{}); range decode + intra primitives (DC/V/H) + \
-             iDCT 4×4/8×8 are available as primitives — next milestone: \
-             default partition probs (§10.5) + decode_partition (§6.4.2)",
-            self.tile_col, self.tile_row,
+            "vp9 decode_block §6.4.3 not implemented \
+             (tile={},{}; partition tree walked OK, {} leaves planned). \
+             Next: kf_intra_mode_probs (§10.5), coef tree + probs \
+             (§10.5), dequant (§8.6), clip-add reconstruction (§8.7).",
+            self.tile_col,
+            self.tile_row,
+            plan.leaves.len(),
         )))
     }
 }
 
 /// Walk the tile / partition / block tree per §6.4. The compressed header
-/// must already have been parsed by the caller. Currently this computes
-/// the tile grid, initialises a `TileDecoder` for the first tile, and
-/// surfaces a precise `Unsupported` pointing at the next unimplemented
-/// clause.
+/// must already have been parsed by the caller. This version actually
+/// exercises the partition quadtree of §6.4.2 against the default
+/// keyframe probabilities (§10.5), then surfaces an `Error::Unsupported`
+/// at the first `decode_block` call.
+///
+/// For multi-tile frames this walks only tile (0,0). The tile-size prefix
+/// syntax (§6.4) for subsequent tiles is simple to add but brings no new
+/// coverage until block decode lands — tracked in the crate README.
 pub fn decode_tiles(
     tile_payload: &[u8],
     hdr: &UncompressedHeader,
@@ -159,34 +244,191 @@ pub fn decode_tiles(
             "vp9 decode_tiles: tile payload empty — §6.4",
         ));
     }
-    // For now we only try to enter the first tile; the tile-size prefix
-    // parsing for subsequent tiles is simple (§6.4) but irrelevant until
-    // the first tile actually decodes. Stop at the first partition symbol.
     let mut td = TileDecoder::new(hdr, ch, tile_payload, 0, 0)?;
     td.decode()
 }
 
-/// Recurse into a single 64×64 superblock per §6.4.2 — stub. Exposed so
-/// unit tests / higher layers can poke at the entry point without standing
-/// up the full `TileDecoder`.
-pub fn decode_partition(
-    _bd: &mut BoolDecoder<'_>,
-    _row: u32,
-    _col: u32,
-    _sb_size: u32,
+/// Public recursive-descent entry — decode one partition node at (row,
+/// col) of the current superblock. The caller owns the bool-engine
+/// cursor; this function advances it. On exit either `plan` has gained
+/// the leaves the node expanded into, or an error is returned.
+///
+/// `bsize` is the block's side in pixels (64 → top of a SB, 8 → smallest
+/// VP9 block). `frame_w` and `frame_h` clip against the frame edge —
+/// when a block spills off the bottom or right edge VP9 implicitly
+/// forces SPLIT per §6.4.2.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_partition_recursive(
+    bd: &mut BoolDecoder<'_>,
+    row: u32,
+    col: u32,
+    bsize: u32,
+    frame_w: u32,
+    frame_h: u32,
+    keyframe: bool,
+    plan: &mut PartitionPlan,
 ) -> Result<()> {
-    Err(Error::unsupported(
-        "vp9 §6.4.2 decode_partition: partition quadtree not implemented \
-         (needs default partition probability tables, §10.5)",
-    ))
+    debug_assert!(matches!(bsize, 64 | 32 | 16 | 8));
+    if row >= frame_h || col >= frame_w {
+        return Ok(()); // fully outside frame — no partition symbol.
+    }
+    let partition = if bsize == 8 {
+        // At the 8×8 level §6.4.2 removes SPLIT from the tree — the only
+        // valid outcomes are NONE / HORZ / VERT. We still consume the
+        // two bits the tree shape dictates.
+        read_partition_8x8(bd, partition_probs(bsize, keyframe))?
+    } else {
+        let on_right = col + bsize > frame_w;
+        let on_bottom = row + bsize > frame_h;
+        if on_right && on_bottom {
+            // Both edges cross — SPLIT is forced, no probability bit is
+            // read (§6.4.2 last paragraph).
+            Partition::Split
+        } else if on_right {
+            // Right edge — either VERT or SPLIT. One bit with probs[2].
+            let bit = bd.read(partition_probs(bsize, keyframe)[2])?;
+            if bit == 0 {
+                Partition::Vert
+            } else {
+                Partition::Split
+            }
+        } else if on_bottom {
+            // Bottom edge — either HORZ or SPLIT. One bit with probs[1].
+            let bit = bd.read(partition_probs(bsize, keyframe)[1])?;
+            if bit == 0 {
+                Partition::Horz
+            } else {
+                Partition::Split
+            }
+        } else {
+            let probs = partition_probs(bsize, keyframe);
+            Partition::from_ptype(read_partition_from_tree(bd, probs)?)
+        }
+    };
+    let half = bsize / 2;
+    match partition {
+        Partition::None => {
+            plan.push(PartitionLeaf {
+                col,
+                row,
+                width: bsize,
+                height: bsize,
+                kind: partition,
+            });
+        }
+        Partition::Horz => {
+            plan.push(PartitionLeaf {
+                col,
+                row,
+                width: bsize,
+                height: half,
+                kind: partition,
+            });
+            if row + half < frame_h {
+                plan.push(PartitionLeaf {
+                    col,
+                    row: row + half,
+                    width: bsize,
+                    height: half,
+                    kind: partition,
+                });
+            }
+        }
+        Partition::Vert => {
+            plan.push(PartitionLeaf {
+                col,
+                row,
+                width: half,
+                height: bsize,
+                kind: partition,
+            });
+            if col + half < frame_w {
+                plan.push(PartitionLeaf {
+                    col: col + half,
+                    row,
+                    width: half,
+                    height: bsize,
+                    kind: partition,
+                });
+            }
+        }
+        Partition::Split => {
+            if bsize == 8 {
+                return Err(Error::invalid("vp9 §6.4.2: PARTITION_SPLIT invalid at 8×8"));
+            }
+            for (dr, dc) in [(0, 0), (0, half), (half, 0), (half, half)] {
+                decode_partition_recursive(
+                    bd,
+                    row + dr,
+                    col + dc,
+                    half,
+                    frame_w,
+                    frame_h,
+                    keyframe,
+                    plan,
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
-/// Decode one block per §6.4.3 — stub.
+/// Back-compat stub; new code should use [`decode_partition_recursive`].
+pub fn decode_partition(bd: &mut BoolDecoder<'_>, row: u32, col: u32, sb_size: u32) -> Result<()> {
+    let mut plan = PartitionPlan::default();
+    decode_partition_recursive(bd, row, col, sb_size, u32::MAX, u32::MAX, true, &mut plan)
+}
+
+/// Decode one block per §6.4.3 — not implemented. Surfaces the exact
+/// stopping point so callers can report where the decoder gave up.
 pub fn decode_block(_bd: &mut BoolDecoder<'_>, _row: u32, _col: u32, _bsize: u32) -> Result<()> {
     Err(Error::unsupported(
         "vp9 §6.4.3 decode_block: block decode (residual + prediction + \
-         reconstruction) not implemented",
+         reconstruction) not implemented — needs §10.5 kf_intra_mode_probs, \
+         coef tree probs, dequant tables (§8.6), clip-add (§8.7)",
     ))
+}
+
+/// 8×8 partition decode (§6.4.2): SPLIT is forbidden, so the tree is
+/// pruned to `{NONE, HORZ, VERT}`. The boolean engine reads `probs[0]`
+/// then — on "not NONE" — `probs[1]` to pick HORZ vs VERT.
+fn read_partition_8x8(bd: &mut BoolDecoder<'_>, probs: [u8; 3]) -> Result<Partition> {
+    let b0 = bd.read(probs[0])?;
+    if b0 == 0 {
+        return Ok(Partition::None);
+    }
+    let b1 = bd.read(probs[1])?;
+    Ok(if b1 == 0 {
+        Partition::Horz
+    } else {
+        Partition::Vert
+    })
+}
+
+/// Look up the `[3]` probability row for a given block size. `bsize=64`
+/// maps to bsl=0, `bsize=8` maps to bsl=3. The partition context is not
+/// yet derived from above / left neighbours — we use context 0 for now,
+/// which matches `decode_partition` when no decoded neighbours exist
+/// (the top-left superblock). This is one of the known TODOs listed in
+/// the crate README.
+fn partition_probs(bsize: u32, keyframe: bool) -> [u8; 3] {
+    let bsl = match bsize {
+        64 => 0usize,
+        32 => 1,
+        16 => 2,
+        8 => 3,
+        _ => 0,
+    };
+    // Context 0 always; correct multi-SB decoding needs §6.4.2's
+    // `partition_plane_context`, which requires tracking decoded sizes
+    // across the whole frame — deferred until block decode lands.
+    let ctx = 0usize;
+    let idx = ctx + bsl * 4;
+    if keyframe {
+        KF_PARTITION_PROBS[idx]
+    } else {
+        PARTITION_PROBS[idx]
+    }
 }
 
 #[cfg(test)]
@@ -259,18 +501,46 @@ mod tests {
     }
 
     #[test]
-    fn decode_tiles_surfaces_partition_unsupported() {
+    fn decode_tiles_stops_at_block_decode() {
         let h = synth_header(64, 64);
         let ch = CompressedHeader::default();
-        // A byte buffer that the bool decoder can initialise from.
-        let payload = [0xAB, 0x00, 0xCD, 0xEF];
+        // Bool decoder needs f(8) value + marker bit 0, then arbitrary bits.
+        let payload = [0xAB, 0x00, 0xCD, 0xEF, 0x12, 0x34];
         match decode_tiles(&payload, &h, &ch) {
             Err(Error::Unsupported(s)) => {
                 assert!(s.contains("§6.4.3"), "msg should cite §6.4.3: {s}");
-                assert!(s.contains("partition"), "msg should mention partition: {s}");
+                assert!(
+                    s.contains("decode_block"),
+                    "msg should mention decode_block: {s}"
+                );
+                assert!(
+                    s.contains("leaves planned"),
+                    "msg should report partition-walk success: {s}"
+                );
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn walk_partitions_all_zeros_gives_single_64x64_leaf() {
+        // With p[0]=158 (high), a run of zero bits from a flat bool-decoder
+        // input tends to yield "not SPLIT, not HORZ, not VERT" => NONE
+        // at the top level, producing a single 64×64 leaf.
+        let h = synth_header(64, 64);
+        let ch = CompressedHeader::default();
+        // Bool decoder needs a non-zero initial 8 bits so the window is
+        // non-trivial; marker bit at position 9 must be zero.
+        let payload = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut td = TileDecoder::new(&h, &ch, &payload, 0, 0).unwrap();
+        let plan = td.walk_partitions(64, 64).unwrap();
+        assert_eq!(plan.leaves.len(), 1, "expected PARTITION_NONE leaf");
+        let leaf = plan.leaves[0];
+        assert_eq!(leaf.col, 0);
+        assert_eq!(leaf.row, 0);
+        assert_eq!(leaf.width, 64);
+        assert_eq!(leaf.height, 64);
+        assert_eq!(leaf.kind, Partition::None);
     }
 
     #[test]

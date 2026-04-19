@@ -36,10 +36,13 @@ pub mod bitreader;
 pub mod bool_decoder;
 pub mod compressed_header;
 pub mod decoder;
+pub mod detokenize;
 pub mod headers;
 pub mod intra;
 pub mod ivf;
 pub mod probs;
+pub mod reconintra;
+pub mod tables;
 pub mod tile;
 pub mod transform;
 

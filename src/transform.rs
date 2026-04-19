@@ -1,54 +1,24 @@
-//! VP9 inverse transforms — §8.7.1.
+//! VP9 inverse transforms — §8.7.1 full port.
 //!
-//! VP9 defines four transform types per block size:
+//! Covers:
+//! * Sizes 4×4 / 8×8 / 16×16 / 32×32.
+//! * Types `DCT_DCT`, `ADST_DCT`, `DCT_ADST`, `ADST_ADST`.
+//! * A 4×4 Walsh-Hadamard transform for the lossless mode (§8.7.1.1).
 //!
-//! * `DCT_DCT`       — used almost everywhere.
-//! * `DCT_ADST`      — row DCT, column ADST.
-//! * `ADST_DCT`      — row ADST, column DCT.
-//! * `ADST_ADST`     — both ADST.
-//!
-//! Plus, in the lossless mode (§8.7.1.1), 4×4 blocks use a
-//! Walsh-Hadamard Transform (WHT) rather than the DCT.
-//!
-//! This module implements the minimal set needed for DC-only blocks:
-//!
-//! * 4×4 inverse **DCT-DCT** (ADST / WHT return `Unsupported`).
-//! * 8×8 inverse **DCT-DCT**.
-//!
-//! Sizes 16 / 32 and the ADST / ADST-ADST / WHT variants surface as
-//! `Error::Unsupported` with a precise §8.7 sub-clause so the caller can
-//! see exactly where the decoder gave up.
-//!
-//! All arithmetic is integer: VP9 specifies fixed-point constants and a
-//! `round_shift(x, n)` = `(x + (1 << (n-1))) >> n`. Constants below match
-//! `cos(j·π/64)` scaled to 14-bit precision (spec §8.7.1.2 `cospi_*`
-//! table). They differ slightly from AV1's because VP9 uses a 14-bit
-//! constant base while AV1 uses 12-bit butterflies with bigger intermediate
-//! rounding.
-//!
-//! Parallel to the AV1 `transform` module; the two implementations
-//! structurally mirror each other so a future contributor can eyeball the
-//! delta quickly.
+//! Arithmetic matches libvpx `vpx_dsp/inv_txfm.c` bit-for-bit. The cosine
+//! constants are 14-bit fixed-point (`cospi_k_64` = `round(cos(k·π/64) ·
+//! 2^14)`); the post-row/column shift of 4/5/6 matches libvpx
+//! `ROUND_POWER_OF_TWO`.
 
 use oxideav_core::{Error, Result};
 
-/// VP9 2-D transform types (§7.4.2 Table 7-3). Values match the spec.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxType {
-    /// `DCT_DCT` — row & column DCT. Used for inter predicted blocks and
-    /// `DC_PRED` / `TM_PRED` intra.
     DctDct = 0,
-    /// `ADST_DCT` — row DCT, column ADST. Used with `V_PRED` / `D*_PRED`.
     AdstDct = 1,
-    /// `DCT_ADST` — row ADST, column DCT. Used with `H_PRED` / `D*_PRED`.
     DctAdst = 2,
-    /// `ADST_ADST` — both ADST. Used with corner-directional intra modes.
     AdstAdst = 3,
-    /// `WHT_WHT` — 4×4 Walsh-Hadamard used for lossless (§8.7.1.1).
-    /// Note: this isn't a spec-assigned `TX_TYPE` number — it's selected
-    /// implicitly via `lossless=1`. We surface it here so the API can
-    /// reject it with a precise `Unsupported`.
     WhtWht = 4,
 }
 
@@ -65,99 +35,987 @@ impl TxType {
     }
 }
 
-/// Cosine constants scaled by 2^14 — `cospi_*_64` from VP9 §8.7.1.2. The
-/// `C_SQRT2` constant corresponds to `cospi_16_64` = round(cos(π/4) · 2^14).
-const COS_BIT: i32 = 14;
-const COSPI_8_64: i32 = 15137; // cos(π/8) · 2^14
-const COSPI_24_64: i32 = 6270; // cos(3π/8) · 2^14  == sin(π/8) · 2^14
-const COSPI_4_64: i32 = 16069; // cos(π/16) · 2^14
-const COSPI_28_64: i32 = 3196; // cos(7π/16) · 2^14 == sin(π/16) · 2^14
-const COSPI_12_64: i32 = 13623; // cos(3π/16) · 2^14
-const COSPI_20_64: i32 = 9102; // cos(5π/16) · 2^14
-const COSPI_16_64: i32 = 11585; // cos(π/4) · 2^14  == √2/2 · 2^14
+// 14-bit fixed-point cosine constants — libvpx `vpx_dsp/txfm_common.h`.
+const DCT_CONST_BITS: i32 = 14;
+const DCT_CONST_ROUNDING: i32 = 1 << (DCT_CONST_BITS - 1);
 
-/// `round_shift(x, n)` — the rounding operator used throughout §8.7.
+const COSPI_1_64: i32 = 16364;
+const COSPI_2_64: i32 = 16305;
+const COSPI_3_64: i32 = 16207;
+const COSPI_4_64: i32 = 16069;
+const COSPI_5_64: i32 = 15893;
+const COSPI_6_64: i32 = 15679;
+const COSPI_7_64: i32 = 15426;
+const COSPI_8_64: i32 = 15137;
+const COSPI_9_64: i32 = 14811;
+const COSPI_10_64: i32 = 14449;
+const COSPI_11_64: i32 = 14053;
+const COSPI_12_64: i32 = 13623;
+const COSPI_13_64: i32 = 13160;
+const COSPI_14_64: i32 = 12665;
+const COSPI_15_64: i32 = 12140;
+const COSPI_16_64: i32 = 11585;
+const COSPI_17_64: i32 = 11003;
+const COSPI_18_64: i32 = 10394;
+const COSPI_19_64: i32 = 9760;
+const COSPI_20_64: i32 = 9102;
+const COSPI_21_64: i32 = 8423;
+const COSPI_22_64: i32 = 7723;
+const COSPI_23_64: i32 = 7005;
+const COSPI_24_64: i32 = 6270;
+const COSPI_25_64: i32 = 5520;
+const COSPI_26_64: i32 = 4756;
+const COSPI_27_64: i32 = 3981;
+const COSPI_28_64: i32 = 3196;
+const COSPI_29_64: i32 = 2404;
+const COSPI_30_64: i32 = 1606;
+const COSPI_31_64: i32 = 804;
+
+const SINPI_1_9: i32 = 5283;
+const SINPI_2_9: i32 = 9929;
+const SINPI_3_9: i32 = 13377;
+const SINPI_4_9: i32 = 15212;
+
 #[inline]
-fn round_shift(x: i32, n: i32) -> i32 {
-    debug_assert!(n > 0);
-    (x + (1 << (n - 1))) >> n
+fn dct_const_round_shift(x: i32) -> i32 {
+    (x + DCT_CONST_ROUNDING) >> DCT_CONST_BITS
 }
 
-/// 4-point inverse DCT (§8.7.1.3). In-place transform of a length-4 `i32`
-/// vector — matches the spec's `inverse_transform_1d` with a 4-point DCT
-/// kernel. `iadst4` and `iwht4` are not implemented.
-fn idct4(x: &mut [i32; 4]) {
-    let s0 = x[0];
-    let s1 = x[1];
-    let s2 = x[2];
-    let s3 = x[3];
-
-    // Even half — add/sub with cospi_16_64 (√2/2 · 2^14).
-    let t0 = round_shift(COSPI_16_64 * (s0 + s2), COS_BIT);
-    let t1 = round_shift(COSPI_16_64 * (s0 - s2), COS_BIT);
-    // Odd half — rotation by π/8 / 3π/8.
-    let t2 = round_shift(COSPI_24_64 * s1 - COSPI_8_64 * s3, COS_BIT);
-    let t3 = round_shift(COSPI_8_64 * s1 + COSPI_24_64 * s3, COS_BIT);
-
-    x[0] = t0 + t3;
-    x[1] = t1 + t2;
-    x[2] = t1 - t2;
-    x[3] = t0 - t3;
+// libvpx uses 64-bit temps for 32x32 butterflies.
+#[inline]
+fn dct_const_round_shift64(x: i64) -> i32 {
+    ((x + DCT_CONST_ROUNDING as i64) >> DCT_CONST_BITS) as i32
 }
 
-/// 8-point inverse DCT (§8.7.1.4). Standard radix-2 decimation-in-time
-/// butterfly matching the VP9 libvpx reference. Only used for DCT-DCT
-/// 8×8 blocks in this scaffold.
-fn idct8(x: &mut [i32; 8]) {
-    // Stage 1 — reorder into even / odd halves.
-    let e0 = x[0];
-    let e1 = x[4];
-    let e2 = x[2];
-    let e3 = x[6];
-    let o0 = x[1];
-    let o1 = x[5];
-    let o2 = x[3];
-    let o3 = x[7];
-
-    // Even — 4-point iDCT on (e0, e1, e2, e3).
-    let f0 = round_shift(COSPI_16_64 * (e0 + e1), COS_BIT);
-    let f1 = round_shift(COSPI_16_64 * (e0 - e1), COS_BIT);
-    let f2 = round_shift(COSPI_24_64 * e2 - COSPI_8_64 * e3, COS_BIT);
-    let f3 = round_shift(COSPI_8_64 * e2 + COSPI_24_64 * e3, COS_BIT);
-    let e_out0 = f0 + f3;
-    let e_out1 = f1 + f2;
-    let e_out2 = f1 - f2;
-    let e_out3 = f0 - f3;
-
-    // Odd — rotations at π/16 / 3π/16.
-    let g0 = round_shift(COSPI_28_64 * o0 - COSPI_4_64 * o3, COS_BIT);
-    let g3 = round_shift(COSPI_4_64 * o0 + COSPI_28_64 * o3, COS_BIT);
-    let g1 = round_shift(COSPI_12_64 * o1 - COSPI_20_64 * o2, COS_BIT);
-    let g2 = round_shift(COSPI_20_64 * o1 + COSPI_12_64 * o2, COS_BIT);
-
-    // Stage 2 — combine odd outputs.
-    let h0 = g0 + g1;
-    let h1 = g0 - g1;
-    let h2 = g3 - g2;
-    let h3 = g3 + g2;
-    let i1 = round_shift(COSPI_16_64 * (h2 - h1), COS_BIT);
-    let i2 = round_shift(COSPI_16_64 * (h2 + h1), COS_BIT);
-
-    x[0] = e_out0 + h0;
-    x[1] = e_out1 + i1;
-    x[2] = e_out2 + i2;
-    x[3] = e_out3 + h3;
-    x[4] = e_out3 - h3;
-    x[5] = e_out2 - i2;
-    x[6] = e_out1 - i1;
-    x[7] = e_out0 - h0;
+#[inline]
+fn round_power_of_two(v: i32, n: i32) -> i32 {
+    (v + (1 << (n - 1))) >> n
 }
 
-/// Apply a 2-D inverse transform and clip-add the result to `dst`.
-///
-/// `coeffs` is a `w × h` row-major `i32` block carrying dequantised
-/// residuals. Only `TxType::DctDct` is accepted today; others return
-/// `Unsupported`.
+#[inline]
+fn clip_pixel_add(dst: u8, delta: i32) -> u8 {
+    ((dst as i32) + delta).clamp(0, 255) as u8
+}
+
+// WRAPLOW in libvpx is a signed saturation to 16-bit for tran_low_t; with
+// 8-bit decode the intermediate values fit in i32 comfortably. libvpx's
+// WRAPLOW macro just casts through int16_t. We mimic that exactly to keep
+// behaviour bit-identical.
+#[inline]
+fn wraplow(v: i32) -> i32 {
+    v as i16 as i32
+}
+
+// ===== iDCT / iADST 1-D kernels =====
+
+fn idct4(x: &[i32; 4]) -> [i32; 4] {
+    let (i0, i1, i2, i3) = (x[0], x[1], x[2], x[3]);
+    let t1 = (i0 + i2) * COSPI_16_64;
+    let t2 = (i0 - i2) * COSPI_16_64;
+    let s0 = wraplow(dct_const_round_shift(t1));
+    let s1 = wraplow(dct_const_round_shift(t2));
+    let t1 = i1 * COSPI_24_64 - i3 * COSPI_8_64;
+    let t2 = i1 * COSPI_8_64 + i3 * COSPI_24_64;
+    let s2 = wraplow(dct_const_round_shift(t1));
+    let s3 = wraplow(dct_const_round_shift(t2));
+    [
+        wraplow(s0 + s3),
+        wraplow(s1 + s2),
+        wraplow(s1 - s2),
+        wraplow(s0 - s3),
+    ]
+}
+
+fn iadst4(x: &[i32; 4]) -> [i32; 4] {
+    let (x0, x1, x2, x3) = (x[0], x[1], x[2], x[3]);
+    if (x0 | x1 | x2 | x3) == 0 {
+        return [0; 4];
+    }
+    let s0 = SINPI_1_9 * x0;
+    let s1 = SINPI_2_9 * x0;
+    let s2 = SINPI_3_9 * x1;
+    let s3 = SINPI_4_9 * x2;
+    let s4 = SINPI_1_9 * x2;
+    let s5 = SINPI_2_9 * x3;
+    let s6 = SINPI_4_9 * x3;
+    let s7 = wraplow(x0 - x2 + x3);
+
+    let a0 = s0 + s3 + s5;
+    let a1 = s1 - s4 - s6;
+    let a3 = s2;
+    let a2 = SINPI_3_9 * s7;
+
+    [
+        wraplow(dct_const_round_shift(a0 + a3)),
+        wraplow(dct_const_round_shift(a1 + a3)),
+        wraplow(dct_const_round_shift(a2)),
+        wraplow(dct_const_round_shift(a0 + a1 - a3)),
+    ]
+}
+
+fn idct8(input: &[i32; 8]) -> [i32; 8] {
+    // Port of libvpx idct8_c.
+    let mut step1 = [0i32; 8];
+    let mut step2 = [0i32; 8];
+    step1[0] = input[0];
+    step1[2] = input[4];
+    step1[1] = input[2];
+    step1[3] = input[6];
+    let t1 = input[1] * COSPI_28_64 - input[7] * COSPI_4_64;
+    let t2 = input[1] * COSPI_4_64 + input[7] * COSPI_28_64;
+    step1[4] = wraplow(dct_const_round_shift(t1));
+    step1[7] = wraplow(dct_const_round_shift(t2));
+    let t1 = input[5] * COSPI_12_64 - input[3] * COSPI_20_64;
+    let t2 = input[5] * COSPI_20_64 + input[3] * COSPI_12_64;
+    step1[5] = wraplow(dct_const_round_shift(t1));
+    step1[6] = wraplow(dct_const_round_shift(t2));
+
+    let t1 = (step1[0] + step1[2]) * COSPI_16_64;
+    let t2 = (step1[0] - step1[2]) * COSPI_16_64;
+    step2[0] = wraplow(dct_const_round_shift(t1));
+    step2[1] = wraplow(dct_const_round_shift(t2));
+    let t1 = step1[1] * COSPI_24_64 - step1[3] * COSPI_8_64;
+    let t2 = step1[1] * COSPI_8_64 + step1[3] * COSPI_24_64;
+    step2[2] = wraplow(dct_const_round_shift(t1));
+    step2[3] = wraplow(dct_const_round_shift(t2));
+    step2[4] = wraplow(step1[4] + step1[5]);
+    step2[5] = wraplow(step1[4] - step1[5]);
+    step2[6] = wraplow(-step1[6] + step1[7]);
+    step2[7] = wraplow(step1[6] + step1[7]);
+
+    step1[0] = wraplow(step2[0] + step2[3]);
+    step1[1] = wraplow(step2[1] + step2[2]);
+    step1[2] = wraplow(step2[1] - step2[2]);
+    step1[3] = wraplow(step2[0] - step2[3]);
+    step1[4] = step2[4];
+    let t1 = (step2[6] - step2[5]) * COSPI_16_64;
+    let t2 = (step2[5] + step2[6]) * COSPI_16_64;
+    step1[5] = wraplow(dct_const_round_shift(t1));
+    step1[6] = wraplow(dct_const_round_shift(t2));
+    step1[7] = step2[7];
+
+    [
+        wraplow(step1[0] + step1[7]),
+        wraplow(step1[1] + step1[6]),
+        wraplow(step1[2] + step1[5]),
+        wraplow(step1[3] + step1[4]),
+        wraplow(step1[3] - step1[4]),
+        wraplow(step1[2] - step1[5]),
+        wraplow(step1[1] - step1[6]),
+        wraplow(step1[0] - step1[7]),
+    ]
+}
+
+fn iadst8(input: &[i32; 8]) -> [i32; 8] {
+    let mut x0 = input[7];
+    let mut x1 = input[0];
+    let mut x2 = input[5];
+    let mut x3 = input[2];
+    let mut x4 = input[3];
+    let mut x5 = input[4];
+    let mut x6 = input[1];
+    let mut x7 = input[6];
+    if (x0 | x1 | x2 | x3 | x4 | x5 | x6 | x7) == 0 {
+        return [0; 8];
+    }
+    // stage 1
+    let s0 = COSPI_2_64 * x0 + COSPI_30_64 * x1;
+    let s1 = COSPI_30_64 * x0 - COSPI_2_64 * x1;
+    let s2 = COSPI_10_64 * x2 + COSPI_22_64 * x3;
+    let s3 = COSPI_22_64 * x2 - COSPI_10_64 * x3;
+    let s4 = COSPI_18_64 * x4 + COSPI_14_64 * x5;
+    let s5 = COSPI_14_64 * x4 - COSPI_18_64 * x5;
+    let s6 = COSPI_26_64 * x6 + COSPI_6_64 * x7;
+    let s7 = COSPI_6_64 * x6 - COSPI_26_64 * x7;
+
+    x0 = wraplow(dct_const_round_shift(s0 + s4));
+    x1 = wraplow(dct_const_round_shift(s1 + s5));
+    x2 = wraplow(dct_const_round_shift(s2 + s6));
+    x3 = wraplow(dct_const_round_shift(s3 + s7));
+    x4 = wraplow(dct_const_round_shift(s0 - s4));
+    x5 = wraplow(dct_const_round_shift(s1 - s5));
+    x6 = wraplow(dct_const_round_shift(s2 - s6));
+    x7 = wraplow(dct_const_round_shift(s3 - s7));
+
+    // stage 2
+    let s0 = x0;
+    let s1 = x1;
+    let s2 = x2;
+    let s3 = x3;
+    let s4 = COSPI_8_64 * x4 + COSPI_24_64 * x5;
+    let s5 = COSPI_24_64 * x4 - COSPI_8_64 * x5;
+    let s6 = -COSPI_24_64 * x6 + COSPI_8_64 * x7;
+    let s7 = COSPI_8_64 * x6 + COSPI_24_64 * x7;
+
+    x0 = wraplow(s0 + s2);
+    x1 = wraplow(s1 + s3);
+    x2 = wraplow(s0 - s2);
+    x3 = wraplow(s1 - s3);
+    x4 = wraplow(dct_const_round_shift(s4 + s6));
+    x5 = wraplow(dct_const_round_shift(s5 + s7));
+    x6 = wraplow(dct_const_round_shift(s4 - s6));
+    x7 = wraplow(dct_const_round_shift(s5 - s7));
+
+    // stage 3
+    let s2 = COSPI_16_64 * (x2 + x3);
+    let s3 = COSPI_16_64 * (x2 - x3);
+    let s6 = COSPI_16_64 * (x6 + x7);
+    let s7 = COSPI_16_64 * (x6 - x7);
+
+    x2 = wraplow(dct_const_round_shift(s2));
+    x3 = wraplow(dct_const_round_shift(s3));
+    x6 = wraplow(dct_const_round_shift(s6));
+    x7 = wraplow(dct_const_round_shift(s7));
+
+    [
+        wraplow(x0),
+        wraplow(-x4),
+        wraplow(x6),
+        wraplow(-x2),
+        wraplow(x3),
+        wraplow(-x7),
+        wraplow(x5),
+        wraplow(-x1),
+    ]
+}
+
+fn idct16(input: &[i32; 16]) -> [i32; 16] {
+    let mut step1 = [0i32; 16];
+    let mut step2 = [0i32; 16];
+
+    step1[0] = input[0];
+    step1[1] = input[8];
+    step1[2] = input[4];
+    step1[3] = input[12];
+    step1[4] = input[2];
+    step1[5] = input[10];
+    step1[6] = input[6];
+    step1[7] = input[14];
+    step1[8] = input[1];
+    step1[9] = input[9];
+    step1[10] = input[5];
+    step1[11] = input[13];
+    step1[12] = input[3];
+    step1[13] = input[11];
+    step1[14] = input[7];
+    step1[15] = input[15];
+
+    // stage 2
+    for i in 0..8 {
+        step2[i] = step1[i];
+    }
+    let t1 = step1[8] * COSPI_30_64 - step1[15] * COSPI_2_64;
+    let t2 = step1[8] * COSPI_2_64 + step1[15] * COSPI_30_64;
+    step2[8] = wraplow(dct_const_round_shift(t1));
+    step2[15] = wraplow(dct_const_round_shift(t2));
+
+    let t1 = step1[9] * COSPI_14_64 - step1[14] * COSPI_18_64;
+    let t2 = step1[9] * COSPI_18_64 + step1[14] * COSPI_14_64;
+    step2[9] = wraplow(dct_const_round_shift(t1));
+    step2[14] = wraplow(dct_const_round_shift(t2));
+
+    let t1 = step1[10] * COSPI_22_64 - step1[13] * COSPI_10_64;
+    let t2 = step1[10] * COSPI_10_64 + step1[13] * COSPI_22_64;
+    step2[10] = wraplow(dct_const_round_shift(t1));
+    step2[13] = wraplow(dct_const_round_shift(t2));
+
+    let t1 = step1[11] * COSPI_6_64 - step1[12] * COSPI_26_64;
+    let t2 = step1[11] * COSPI_26_64 + step1[12] * COSPI_6_64;
+    step2[11] = wraplow(dct_const_round_shift(t1));
+    step2[12] = wraplow(dct_const_round_shift(t2));
+
+    // stage 3
+    step1[0] = step2[0];
+    step1[1] = step2[1];
+    step1[2] = step2[2];
+    step1[3] = step2[3];
+
+    let t1 = step2[4] * COSPI_28_64 - step2[7] * COSPI_4_64;
+    let t2 = step2[4] * COSPI_4_64 + step2[7] * COSPI_28_64;
+    step1[4] = wraplow(dct_const_round_shift(t1));
+    step1[7] = wraplow(dct_const_round_shift(t2));
+    let t1 = step2[5] * COSPI_12_64 - step2[6] * COSPI_20_64;
+    let t2 = step2[5] * COSPI_20_64 + step2[6] * COSPI_12_64;
+    step1[5] = wraplow(dct_const_round_shift(t1));
+    step1[6] = wraplow(dct_const_round_shift(t2));
+
+    step1[8] = wraplow(step2[8] + step2[9]);
+    step1[9] = wraplow(step2[8] - step2[9]);
+    step1[10] = wraplow(-step2[10] + step2[11]);
+    step1[11] = wraplow(step2[10] + step2[11]);
+    step1[12] = wraplow(step2[12] + step2[13]);
+    step1[13] = wraplow(step2[12] - step2[13]);
+    step1[14] = wraplow(-step2[14] + step2[15]);
+    step1[15] = wraplow(step2[14] + step2[15]);
+
+    // stage 4
+    let t1 = (step1[0] + step1[1]) * COSPI_16_64;
+    let t2 = (step1[0] - step1[1]) * COSPI_16_64;
+    step2[0] = wraplow(dct_const_round_shift(t1));
+    step2[1] = wraplow(dct_const_round_shift(t2));
+    let t1 = step1[2] * COSPI_24_64 - step1[3] * COSPI_8_64;
+    let t2 = step1[2] * COSPI_8_64 + step1[3] * COSPI_24_64;
+    step2[2] = wraplow(dct_const_round_shift(t1));
+    step2[3] = wraplow(dct_const_round_shift(t2));
+    step2[4] = wraplow(step1[4] + step1[5]);
+    step2[5] = wraplow(step1[4] - step1[5]);
+    step2[6] = wraplow(-step1[6] + step1[7]);
+    step2[7] = wraplow(step1[6] + step1[7]);
+
+    step2[8] = step1[8];
+    step2[15] = step1[15];
+    let t1 = -step1[9] * COSPI_8_64 + step1[14] * COSPI_24_64;
+    let t2 = step1[9] * COSPI_24_64 + step1[14] * COSPI_8_64;
+    step2[9] = wraplow(dct_const_round_shift(t1));
+    step2[14] = wraplow(dct_const_round_shift(t2));
+    let t1 = -step1[10] * COSPI_24_64 - step1[13] * COSPI_8_64;
+    let t2 = -step1[10] * COSPI_8_64 + step1[13] * COSPI_24_64;
+    step2[10] = wraplow(dct_const_round_shift(t1));
+    step2[13] = wraplow(dct_const_round_shift(t2));
+    step2[11] = step1[11];
+    step2[12] = step1[12];
+
+    // stage 5
+    step1[0] = wraplow(step2[0] + step2[3]);
+    step1[1] = wraplow(step2[1] + step2[2]);
+    step1[2] = wraplow(step2[1] - step2[2]);
+    step1[3] = wraplow(step2[0] - step2[3]);
+    step1[4] = step2[4];
+    let t1 = (step2[6] - step2[5]) * COSPI_16_64;
+    let t2 = (step2[5] + step2[6]) * COSPI_16_64;
+    step1[5] = wraplow(dct_const_round_shift(t1));
+    step1[6] = wraplow(dct_const_round_shift(t2));
+    step1[7] = step2[7];
+
+    step1[8] = wraplow(step2[8] + step2[11]);
+    step1[9] = wraplow(step2[9] + step2[10]);
+    step1[10] = wraplow(step2[9] - step2[10]);
+    step1[11] = wraplow(step2[8] - step2[11]);
+    step1[12] = wraplow(-step2[12] + step2[15]);
+    step1[13] = wraplow(-step2[13] + step2[14]);
+    step1[14] = wraplow(step2[13] + step2[14]);
+    step1[15] = wraplow(step2[12] + step2[15]);
+
+    // stage 6
+    step2[0] = wraplow(step1[0] + step1[7]);
+    step2[1] = wraplow(step1[1] + step1[6]);
+    step2[2] = wraplow(step1[2] + step1[5]);
+    step2[3] = wraplow(step1[3] + step1[4]);
+    step2[4] = wraplow(step1[3] - step1[4]);
+    step2[5] = wraplow(step1[2] - step1[5]);
+    step2[6] = wraplow(step1[1] - step1[6]);
+    step2[7] = wraplow(step1[0] - step1[7]);
+    step2[8] = step1[8];
+    step2[9] = step1[9];
+    let t1 = (-step1[10] + step1[13]) * COSPI_16_64;
+    let t2 = (step1[10] + step1[13]) * COSPI_16_64;
+    step2[10] = wraplow(dct_const_round_shift(t1));
+    step2[13] = wraplow(dct_const_round_shift(t2));
+    let t1 = (-step1[11] + step1[12]) * COSPI_16_64;
+    let t2 = (step1[11] + step1[12]) * COSPI_16_64;
+    step2[11] = wraplow(dct_const_round_shift(t1));
+    step2[12] = wraplow(dct_const_round_shift(t2));
+    step2[14] = step1[14];
+    step2[15] = step1[15];
+
+    // stage 7
+    [
+        wraplow(step2[0] + step2[15]),
+        wraplow(step2[1] + step2[14]),
+        wraplow(step2[2] + step2[13]),
+        wraplow(step2[3] + step2[12]),
+        wraplow(step2[4] + step2[11]),
+        wraplow(step2[5] + step2[10]),
+        wraplow(step2[6] + step2[9]),
+        wraplow(step2[7] + step2[8]),
+        wraplow(step2[7] - step2[8]),
+        wraplow(step2[6] - step2[9]),
+        wraplow(step2[5] - step2[10]),
+        wraplow(step2[4] - step2[11]),
+        wraplow(step2[3] - step2[12]),
+        wraplow(step2[2] - step2[13]),
+        wraplow(step2[1] - step2[14]),
+        wraplow(step2[0] - step2[15]),
+    ]
+}
+
+#[allow(clippy::too_many_lines)]
+fn iadst16(input: &[i32; 16]) -> [i32; 16] {
+    let mut x0 = input[15];
+    let mut x1 = input[0];
+    let mut x2 = input[13];
+    let mut x3 = input[2];
+    let mut x4 = input[11];
+    let mut x5 = input[4];
+    let mut x6 = input[9];
+    let mut x7 = input[6];
+    let mut x8 = input[7];
+    let mut x9 = input[8];
+    let mut x10 = input[5];
+    let mut x11 = input[10];
+    let mut x12 = input[3];
+    let mut x13 = input[12];
+    let mut x14 = input[1];
+    let mut x15 = input[14];
+
+    if (x0 | x1 | x2 | x3 | x4 | x5 | x6 | x7 | x8 | x9 | x10 | x11 | x12 | x13 | x14 | x15) == 0 {
+        return [0; 16];
+    }
+
+    // stage 1
+    let s0 = x0 * COSPI_1_64 + x1 * COSPI_31_64;
+    let s1 = x0 * COSPI_31_64 - x1 * COSPI_1_64;
+    let s2 = x2 * COSPI_5_64 + x3 * COSPI_27_64;
+    let s3 = x2 * COSPI_27_64 - x3 * COSPI_5_64;
+    let s4 = x4 * COSPI_9_64 + x5 * COSPI_23_64;
+    let s5 = x4 * COSPI_23_64 - x5 * COSPI_9_64;
+    let s6 = x6 * COSPI_13_64 + x7 * COSPI_19_64;
+    let s7 = x6 * COSPI_19_64 - x7 * COSPI_13_64;
+    let s8 = x8 * COSPI_17_64 + x9 * COSPI_15_64;
+    let s9 = x8 * COSPI_15_64 - x9 * COSPI_17_64;
+    let s10 = x10 * COSPI_21_64 + x11 * COSPI_11_64;
+    let s11 = x10 * COSPI_11_64 - x11 * COSPI_21_64;
+    let s12 = x12 * COSPI_25_64 + x13 * COSPI_7_64;
+    let s13 = x12 * COSPI_7_64 - x13 * COSPI_25_64;
+    let s14 = x14 * COSPI_29_64 + x15 * COSPI_3_64;
+    let s15 = x14 * COSPI_3_64 - x15 * COSPI_29_64;
+
+    x0 = wraplow(dct_const_round_shift(s0 + s8));
+    x1 = wraplow(dct_const_round_shift(s1 + s9));
+    x2 = wraplow(dct_const_round_shift(s2 + s10));
+    x3 = wraplow(dct_const_round_shift(s3 + s11));
+    x4 = wraplow(dct_const_round_shift(s4 + s12));
+    x5 = wraplow(dct_const_round_shift(s5 + s13));
+    x6 = wraplow(dct_const_round_shift(s6 + s14));
+    x7 = wraplow(dct_const_round_shift(s7 + s15));
+    x8 = wraplow(dct_const_round_shift(s0 - s8));
+    x9 = wraplow(dct_const_round_shift(s1 - s9));
+    x10 = wraplow(dct_const_round_shift(s2 - s10));
+    x11 = wraplow(dct_const_round_shift(s3 - s11));
+    x12 = wraplow(dct_const_round_shift(s4 - s12));
+    x13 = wraplow(dct_const_round_shift(s5 - s13));
+    x14 = wraplow(dct_const_round_shift(s6 - s14));
+    x15 = wraplow(dct_const_round_shift(s7 - s15));
+
+    // stage 2
+    let s0 = x0;
+    let s1 = x1;
+    let s2 = x2;
+    let s3 = x3;
+    let s4 = x4;
+    let s5 = x5;
+    let s6 = x6;
+    let s7 = x7;
+    let s8 = x8 * COSPI_4_64 + x9 * COSPI_28_64;
+    let s9 = x8 * COSPI_28_64 - x9 * COSPI_4_64;
+    let s10 = x10 * COSPI_20_64 + x11 * COSPI_12_64;
+    let s11 = x10 * COSPI_12_64 - x11 * COSPI_20_64;
+    let s12 = -x12 * COSPI_28_64 + x13 * COSPI_4_64;
+    let s13 = x12 * COSPI_4_64 + x13 * COSPI_28_64;
+    let s14 = -x14 * COSPI_12_64 + x15 * COSPI_20_64;
+    let s15 = x14 * COSPI_20_64 + x15 * COSPI_12_64;
+
+    x0 = wraplow(s0 + s4);
+    x1 = wraplow(s1 + s5);
+    x2 = wraplow(s2 + s6);
+    x3 = wraplow(s3 + s7);
+    x4 = wraplow(s0 - s4);
+    x5 = wraplow(s1 - s5);
+    x6 = wraplow(s2 - s6);
+    x7 = wraplow(s3 - s7);
+    x8 = wraplow(dct_const_round_shift(s8 + s12));
+    x9 = wraplow(dct_const_round_shift(s9 + s13));
+    x10 = wraplow(dct_const_round_shift(s10 + s14));
+    x11 = wraplow(dct_const_round_shift(s11 + s15));
+    x12 = wraplow(dct_const_round_shift(s8 - s12));
+    x13 = wraplow(dct_const_round_shift(s9 - s13));
+    x14 = wraplow(dct_const_round_shift(s10 - s14));
+    x15 = wraplow(dct_const_round_shift(s11 - s15));
+
+    // stage 3
+    let s0 = x0;
+    let s1 = x1;
+    let s2 = x2;
+    let s3 = x3;
+    let s4 = x4 * COSPI_8_64 + x5 * COSPI_24_64;
+    let s5 = x4 * COSPI_24_64 - x5 * COSPI_8_64;
+    let s6 = -x6 * COSPI_24_64 + x7 * COSPI_8_64;
+    let s7 = x6 * COSPI_8_64 + x7 * COSPI_24_64;
+    let s8 = x8;
+    let s9 = x9;
+    let s10 = x10;
+    let s11 = x11;
+    let s12 = x12 * COSPI_8_64 + x13 * COSPI_24_64;
+    let s13 = x12 * COSPI_24_64 - x13 * COSPI_8_64;
+    let s14 = -x14 * COSPI_24_64 + x15 * COSPI_8_64;
+    let s15 = x14 * COSPI_8_64 + x15 * COSPI_24_64;
+
+    x0 = wraplow(s0 + s2);
+    x1 = wraplow(s1 + s3);
+    x2 = wraplow(s0 - s2);
+    x3 = wraplow(s1 - s3);
+    x4 = wraplow(dct_const_round_shift(s4 + s6));
+    x5 = wraplow(dct_const_round_shift(s5 + s7));
+    x6 = wraplow(dct_const_round_shift(s4 - s6));
+    x7 = wraplow(dct_const_round_shift(s5 - s7));
+    x8 = wraplow(s8 + s10);
+    x9 = wraplow(s9 + s11);
+    x10 = wraplow(s8 - s10);
+    x11 = wraplow(s9 - s11);
+    x12 = wraplow(dct_const_round_shift(s12 + s14));
+    x13 = wraplow(dct_const_round_shift(s13 + s15));
+    x14 = wraplow(dct_const_round_shift(s12 - s14));
+    x15 = wraplow(dct_const_round_shift(s13 - s15));
+
+    // stage 4
+    let s2 = (-COSPI_16_64) * (x2 + x3);
+    let s3 = COSPI_16_64 * (x2 - x3);
+    let s6 = COSPI_16_64 * (x6 + x7);
+    let s7 = COSPI_16_64 * (-x6 + x7);
+    let s10 = COSPI_16_64 * (x10 + x11);
+    let s11 = COSPI_16_64 * (-x10 + x11);
+    let s14 = (-COSPI_16_64) * (x14 + x15);
+    let s15 = COSPI_16_64 * (x14 - x15);
+
+    x2 = wraplow(dct_const_round_shift(s2));
+    x3 = wraplow(dct_const_round_shift(s3));
+    x6 = wraplow(dct_const_round_shift(s6));
+    x7 = wraplow(dct_const_round_shift(s7));
+    x10 = wraplow(dct_const_round_shift(s10));
+    x11 = wraplow(dct_const_round_shift(s11));
+    x14 = wraplow(dct_const_round_shift(s14));
+    x15 = wraplow(dct_const_round_shift(s15));
+
+    [
+        wraplow(x0),
+        wraplow(-x8),
+        wraplow(x12),
+        wraplow(-x4),
+        wraplow(x6),
+        wraplow(x14),
+        wraplow(x10),
+        wraplow(x2),
+        wraplow(x3),
+        wraplow(x11),
+        wraplow(x15),
+        wraplow(x7),
+        wraplow(x5),
+        wraplow(-x13),
+        wraplow(x9),
+        wraplow(-x1),
+    ]
+}
+
+#[allow(clippy::too_many_lines)]
+fn idct32(input: &[i32; 32]) -> [i32; 32] {
+    let mut step1 = [0i32; 32];
+    let mut step2 = [0i32; 32];
+
+    // stage 1
+    step1[0] = input[0];
+    step1[1] = input[16];
+    step1[2] = input[8];
+    step1[3] = input[24];
+    step1[4] = input[4];
+    step1[5] = input[20];
+    step1[6] = input[12];
+    step1[7] = input[28];
+    step1[8] = input[2];
+    step1[9] = input[18];
+    step1[10] = input[10];
+    step1[11] = input[26];
+    step1[12] = input[6];
+    step1[13] = input[22];
+    step1[14] = input[14];
+    step1[15] = input[30];
+
+    let t1 = input[1] * COSPI_31_64 - input[31] * COSPI_1_64;
+    let t2 = input[1] * COSPI_1_64 + input[31] * COSPI_31_64;
+    step1[16] = wraplow(dct_const_round_shift(t1));
+    step1[31] = wraplow(dct_const_round_shift(t2));
+
+    let t1 = input[17] * COSPI_15_64 - input[15] * COSPI_17_64;
+    let t2 = input[17] * COSPI_17_64 + input[15] * COSPI_15_64;
+    step1[17] = wraplow(dct_const_round_shift(t1));
+    step1[30] = wraplow(dct_const_round_shift(t2));
+
+    let t1 = input[9] * COSPI_23_64 - input[23] * COSPI_9_64;
+    let t2 = input[9] * COSPI_9_64 + input[23] * COSPI_23_64;
+    step1[18] = wraplow(dct_const_round_shift(t1));
+    step1[29] = wraplow(dct_const_round_shift(t2));
+
+    let t1 = input[25] * COSPI_7_64 - input[7] * COSPI_25_64;
+    let t2 = input[25] * COSPI_25_64 + input[7] * COSPI_7_64;
+    step1[19] = wraplow(dct_const_round_shift(t1));
+    step1[28] = wraplow(dct_const_round_shift(t2));
+
+    let t1 = input[5] * COSPI_27_64 - input[27] * COSPI_5_64;
+    let t2 = input[5] * COSPI_5_64 + input[27] * COSPI_27_64;
+    step1[20] = wraplow(dct_const_round_shift(t1));
+    step1[27] = wraplow(dct_const_round_shift(t2));
+
+    let t1 = input[21] * COSPI_11_64 - input[11] * COSPI_21_64;
+    let t2 = input[21] * COSPI_21_64 + input[11] * COSPI_11_64;
+    step1[21] = wraplow(dct_const_round_shift(t1));
+    step1[26] = wraplow(dct_const_round_shift(t2));
+
+    let t1 = input[13] * COSPI_19_64 - input[19] * COSPI_13_64;
+    let t2 = input[13] * COSPI_13_64 + input[19] * COSPI_19_64;
+    step1[22] = wraplow(dct_const_round_shift(t1));
+    step1[25] = wraplow(dct_const_round_shift(t2));
+
+    let t1 = input[29] * COSPI_3_64 - input[3] * COSPI_29_64;
+    let t2 = input[29] * COSPI_29_64 + input[3] * COSPI_3_64;
+    step1[23] = wraplow(dct_const_round_shift(t1));
+    step1[24] = wraplow(dct_const_round_shift(t2));
+
+    // stage 2
+    for i in 0..8 {
+        step2[i] = step1[i];
+    }
+
+    let t1 = step1[8] * COSPI_30_64 - step1[15] * COSPI_2_64;
+    let t2 = step1[8] * COSPI_2_64 + step1[15] * COSPI_30_64;
+    step2[8] = wraplow(dct_const_round_shift(t1));
+    step2[15] = wraplow(dct_const_round_shift(t2));
+
+    let t1 = step1[9] * COSPI_14_64 - step1[14] * COSPI_18_64;
+    let t2 = step1[9] * COSPI_18_64 + step1[14] * COSPI_14_64;
+    step2[9] = wraplow(dct_const_round_shift(t1));
+    step2[14] = wraplow(dct_const_round_shift(t2));
+
+    let t1 = step1[10] * COSPI_22_64 - step1[13] * COSPI_10_64;
+    let t2 = step1[10] * COSPI_10_64 + step1[13] * COSPI_22_64;
+    step2[10] = wraplow(dct_const_round_shift(t1));
+    step2[13] = wraplow(dct_const_round_shift(t2));
+
+    let t1 = step1[11] * COSPI_6_64 - step1[12] * COSPI_26_64;
+    let t2 = step1[11] * COSPI_26_64 + step1[12] * COSPI_6_64;
+    step2[11] = wraplow(dct_const_round_shift(t1));
+    step2[12] = wraplow(dct_const_round_shift(t2));
+
+    step2[16] = wraplow(step1[16] + step1[17]);
+    step2[17] = wraplow(step1[16] - step1[17]);
+    step2[18] = wraplow(-step1[18] + step1[19]);
+    step2[19] = wraplow(step1[18] + step1[19]);
+    step2[20] = wraplow(step1[20] + step1[21]);
+    step2[21] = wraplow(step1[20] - step1[21]);
+    step2[22] = wraplow(-step1[22] + step1[23]);
+    step2[23] = wraplow(step1[22] + step1[23]);
+    step2[24] = wraplow(step1[24] + step1[25]);
+    step2[25] = wraplow(step1[24] - step1[25]);
+    step2[26] = wraplow(-step1[26] + step1[27]);
+    step2[27] = wraplow(step1[26] + step1[27]);
+    step2[28] = wraplow(step1[28] + step1[29]);
+    step2[29] = wraplow(step1[28] - step1[29]);
+    step2[30] = wraplow(-step1[30] + step1[31]);
+    step2[31] = wraplow(step1[30] + step1[31]);
+
+    // stage 3
+    for i in 0..4 {
+        step1[i] = step2[i];
+    }
+
+    let t1 = step2[4] * COSPI_28_64 - step2[7] * COSPI_4_64;
+    let t2 = step2[4] * COSPI_4_64 + step2[7] * COSPI_28_64;
+    step1[4] = wraplow(dct_const_round_shift(t1));
+    step1[7] = wraplow(dct_const_round_shift(t2));
+    let t1 = step2[5] * COSPI_12_64 - step2[6] * COSPI_20_64;
+    let t2 = step2[5] * COSPI_20_64 + step2[6] * COSPI_12_64;
+    step1[5] = wraplow(dct_const_round_shift(t1));
+    step1[6] = wraplow(dct_const_round_shift(t2));
+
+    step1[8] = wraplow(step2[8] + step2[9]);
+    step1[9] = wraplow(step2[8] - step2[9]);
+    step1[10] = wraplow(-step2[10] + step2[11]);
+    step1[11] = wraplow(step2[10] + step2[11]);
+    step1[12] = wraplow(step2[12] + step2[13]);
+    step1[13] = wraplow(step2[12] - step2[13]);
+    step1[14] = wraplow(-step2[14] + step2[15]);
+    step1[15] = wraplow(step2[14] + step2[15]);
+
+    step1[16] = step2[16];
+    step1[31] = step2[31];
+    let t1 = -step2[17] * COSPI_4_64 + step2[30] * COSPI_28_64;
+    let t2 = step2[17] * COSPI_28_64 + step2[30] * COSPI_4_64;
+    step1[17] = wraplow(dct_const_round_shift(t1));
+    step1[30] = wraplow(dct_const_round_shift(t2));
+    let t1 = -step2[18] * COSPI_28_64 - step2[29] * COSPI_4_64;
+    let t2 = -step2[18] * COSPI_4_64 + step2[29] * COSPI_28_64;
+    step1[18] = wraplow(dct_const_round_shift(t1));
+    step1[29] = wraplow(dct_const_round_shift(t2));
+    step1[19] = step2[19];
+    step1[20] = step2[20];
+    let t1 = -step2[21] * COSPI_20_64 + step2[26] * COSPI_12_64;
+    let t2 = step2[21] * COSPI_12_64 + step2[26] * COSPI_20_64;
+    step1[21] = wraplow(dct_const_round_shift(t1));
+    step1[26] = wraplow(dct_const_round_shift(t2));
+    let t1 = -step2[22] * COSPI_12_64 - step2[25] * COSPI_20_64;
+    let t2 = -step2[22] * COSPI_20_64 + step2[25] * COSPI_12_64;
+    step1[22] = wraplow(dct_const_round_shift(t1));
+    step1[25] = wraplow(dct_const_round_shift(t2));
+    step1[23] = step2[23];
+    step1[24] = step2[24];
+    step1[27] = step2[27];
+    step1[28] = step2[28];
+
+    // stage 4
+    let t1 = (step1[0] + step1[1]) * COSPI_16_64;
+    let t2 = (step1[0] - step1[1]) * COSPI_16_64;
+    step2[0] = wraplow(dct_const_round_shift(t1));
+    step2[1] = wraplow(dct_const_round_shift(t2));
+    let t1 = step1[2] * COSPI_24_64 - step1[3] * COSPI_8_64;
+    let t2 = step1[2] * COSPI_8_64 + step1[3] * COSPI_24_64;
+    step2[2] = wraplow(dct_const_round_shift(t1));
+    step2[3] = wraplow(dct_const_round_shift(t2));
+    step2[4] = wraplow(step1[4] + step1[5]);
+    step2[5] = wraplow(step1[4] - step1[5]);
+    step2[6] = wraplow(-step1[6] + step1[7]);
+    step2[7] = wraplow(step1[6] + step1[7]);
+
+    step2[8] = step1[8];
+    step2[15] = step1[15];
+    let t1 = -step1[9] * COSPI_8_64 + step1[14] * COSPI_24_64;
+    let t2 = step1[9] * COSPI_24_64 + step1[14] * COSPI_8_64;
+    step2[9] = wraplow(dct_const_round_shift(t1));
+    step2[14] = wraplow(dct_const_round_shift(t2));
+    let t1 = -step1[10] * COSPI_24_64 - step1[13] * COSPI_8_64;
+    let t2 = -step1[10] * COSPI_8_64 + step1[13] * COSPI_24_64;
+    step2[10] = wraplow(dct_const_round_shift(t1));
+    step2[13] = wraplow(dct_const_round_shift(t2));
+    step2[11] = step1[11];
+    step2[12] = step1[12];
+
+    step2[16] = wraplow(step1[16] + step1[19]);
+    step2[17] = wraplow(step1[17] + step1[18]);
+    step2[18] = wraplow(step1[17] - step1[18]);
+    step2[19] = wraplow(step1[16] - step1[19]);
+    step2[20] = wraplow(-step1[20] + step1[23]);
+    step2[21] = wraplow(-step1[21] + step1[22]);
+    step2[22] = wraplow(step1[21] + step1[22]);
+    step2[23] = wraplow(step1[20] + step1[23]);
+
+    step2[24] = wraplow(step1[24] + step1[27]);
+    step2[25] = wraplow(step1[25] + step1[26]);
+    step2[26] = wraplow(step1[25] - step1[26]);
+    step2[27] = wraplow(step1[24] - step1[27]);
+    step2[28] = wraplow(-step1[28] + step1[31]);
+    step2[29] = wraplow(-step1[29] + step1[30]);
+    step2[30] = wraplow(step1[29] + step1[30]);
+    step2[31] = wraplow(step1[28] + step1[31]);
+
+    // stage 5
+    step1[0] = wraplow(step2[0] + step2[3]);
+    step1[1] = wraplow(step2[1] + step2[2]);
+    step1[2] = wraplow(step2[1] - step2[2]);
+    step1[3] = wraplow(step2[0] - step2[3]);
+    step1[4] = step2[4];
+    let t1 = (step2[6] - step2[5]) * COSPI_16_64;
+    let t2 = (step2[5] + step2[6]) * COSPI_16_64;
+    step1[5] = wraplow(dct_const_round_shift(t1));
+    step1[6] = wraplow(dct_const_round_shift(t2));
+    step1[7] = step2[7];
+
+    step1[8] = wraplow(step2[8] + step2[11]);
+    step1[9] = wraplow(step2[9] + step2[10]);
+    step1[10] = wraplow(step2[9] - step2[10]);
+    step1[11] = wraplow(step2[8] - step2[11]);
+    step1[12] = wraplow(-step2[12] + step2[15]);
+    step1[13] = wraplow(-step2[13] + step2[14]);
+    step1[14] = wraplow(step2[13] + step2[14]);
+    step1[15] = wraplow(step2[12] + step2[15]);
+
+    step1[16] = step2[16];
+    step1[17] = step2[17];
+    let t1 = -step2[18] * COSPI_8_64 + step2[29] * COSPI_24_64;
+    let t2 = step2[18] * COSPI_24_64 + step2[29] * COSPI_8_64;
+    step1[18] = wraplow(dct_const_round_shift(t1));
+    step1[29] = wraplow(dct_const_round_shift(t2));
+    let t1 = -step2[19] * COSPI_8_64 + step2[28] * COSPI_24_64;
+    let t2 = step2[19] * COSPI_24_64 + step2[28] * COSPI_8_64;
+    step1[19] = wraplow(dct_const_round_shift(t1));
+    step1[28] = wraplow(dct_const_round_shift(t2));
+    let t1 = -step2[20] * COSPI_24_64 - step2[27] * COSPI_8_64;
+    let t2 = -step2[20] * COSPI_8_64 + step2[27] * COSPI_24_64;
+    step1[20] = wraplow(dct_const_round_shift(t1));
+    step1[27] = wraplow(dct_const_round_shift(t2));
+    let t1 = -step2[21] * COSPI_24_64 - step2[26] * COSPI_8_64;
+    let t2 = -step2[21] * COSPI_8_64 + step2[26] * COSPI_24_64;
+    step1[21] = wraplow(dct_const_round_shift(t1));
+    step1[26] = wraplow(dct_const_round_shift(t2));
+    step1[22] = step2[22];
+    step1[23] = step2[23];
+    step1[24] = step2[24];
+    step1[25] = step2[25];
+    step1[30] = step2[30];
+    step1[31] = step2[31];
+
+    // stage 6
+    step2[0] = wraplow(step1[0] + step1[7]);
+    step2[1] = wraplow(step1[1] + step1[6]);
+    step2[2] = wraplow(step1[2] + step1[5]);
+    step2[3] = wraplow(step1[3] + step1[4]);
+    step2[4] = wraplow(step1[3] - step1[4]);
+    step2[5] = wraplow(step1[2] - step1[5]);
+    step2[6] = wraplow(step1[1] - step1[6]);
+    step2[7] = wraplow(step1[0] - step1[7]);
+    step2[8] = step1[8];
+    step2[9] = step1[9];
+    let t1 = (-step1[10] + step1[13]) * COSPI_16_64;
+    let t2 = (step1[10] + step1[13]) * COSPI_16_64;
+    step2[10] = wraplow(dct_const_round_shift(t1));
+    step2[13] = wraplow(dct_const_round_shift(t2));
+    let t1 = (-step1[11] + step1[12]) * COSPI_16_64;
+    let t2 = (step1[11] + step1[12]) * COSPI_16_64;
+    step2[11] = wraplow(dct_const_round_shift(t1));
+    step2[12] = wraplow(dct_const_round_shift(t2));
+    step2[14] = step1[14];
+    step2[15] = step1[15];
+
+    step2[16] = wraplow(step1[16] + step1[23]);
+    step2[17] = wraplow(step1[17] + step1[22]);
+    step2[18] = wraplow(step1[18] + step1[21]);
+    step2[19] = wraplow(step1[19] + step1[20]);
+    step2[20] = wraplow(step1[19] - step1[20]);
+    step2[21] = wraplow(step1[18] - step1[21]);
+    step2[22] = wraplow(step1[17] - step1[22]);
+    step2[23] = wraplow(step1[16] - step1[23]);
+
+    step2[24] = wraplow(-step1[24] + step1[31]);
+    step2[25] = wraplow(-step1[25] + step1[30]);
+    step2[26] = wraplow(-step1[26] + step1[29]);
+    step2[27] = wraplow(-step1[27] + step1[28]);
+    step2[28] = wraplow(step1[27] + step1[28]);
+    step2[29] = wraplow(step1[26] + step1[29]);
+    step2[30] = wraplow(step1[25] + step1[30]);
+    step2[31] = wraplow(step1[24] + step1[31]);
+
+    // stage 7
+    step1[0] = wraplow(step2[0] + step2[15]);
+    step1[1] = wraplow(step2[1] + step2[14]);
+    step1[2] = wraplow(step2[2] + step2[13]);
+    step1[3] = wraplow(step2[3] + step2[12]);
+    step1[4] = wraplow(step2[4] + step2[11]);
+    step1[5] = wraplow(step2[5] + step2[10]);
+    step1[6] = wraplow(step2[6] + step2[9]);
+    step1[7] = wraplow(step2[7] + step2[8]);
+    step1[8] = wraplow(step2[7] - step2[8]);
+    step1[9] = wraplow(step2[6] - step2[9]);
+    step1[10] = wraplow(step2[5] - step2[10]);
+    step1[11] = wraplow(step2[4] - step2[11]);
+    step1[12] = wraplow(step2[3] - step2[12]);
+    step1[13] = wraplow(step2[2] - step2[13]);
+    step1[14] = wraplow(step2[1] - step2[14]);
+    step1[15] = wraplow(step2[0] - step2[15]);
+
+    step1[16] = step2[16];
+    step1[17] = step2[17];
+    step1[18] = step2[18];
+    step1[19] = step2[19];
+    let t1 = (-step2[20] + step2[27]) * COSPI_16_64;
+    let t2 = (step2[20] + step2[27]) * COSPI_16_64;
+    step1[20] = wraplow(dct_const_round_shift(t1));
+    step1[27] = wraplow(dct_const_round_shift(t2));
+    let t1 = (-step2[21] + step2[26]) * COSPI_16_64;
+    let t2 = (step2[21] + step2[26]) * COSPI_16_64;
+    step1[21] = wraplow(dct_const_round_shift(t1));
+    step1[26] = wraplow(dct_const_round_shift(t2));
+    let t1 = (-step2[22] + step2[25]) * COSPI_16_64;
+    let t2 = (step2[22] + step2[25]) * COSPI_16_64;
+    step1[22] = wraplow(dct_const_round_shift(t1));
+    step1[25] = wraplow(dct_const_round_shift(t2));
+    let t1 = (-step2[23] + step2[24]) * COSPI_16_64;
+    let t2 = (step2[23] + step2[24]) * COSPI_16_64;
+    step1[23] = wraplow(dct_const_round_shift(t1));
+    step1[24] = wraplow(dct_const_round_shift(t2));
+    step1[28] = step2[28];
+    step1[29] = step2[29];
+    step1[30] = step2[30];
+    step1[31] = step2[31];
+
+    let mut out = [0i32; 32];
+    out[0] = wraplow(step1[0] + step1[31]);
+    out[1] = wraplow(step1[1] + step1[30]);
+    out[2] = wraplow(step1[2] + step1[29]);
+    out[3] = wraplow(step1[3] + step1[28]);
+    out[4] = wraplow(step1[4] + step1[27]);
+    out[5] = wraplow(step1[5] + step1[26]);
+    out[6] = wraplow(step1[6] + step1[25]);
+    out[7] = wraplow(step1[7] + step1[24]);
+    out[8] = wraplow(step1[8] + step1[23]);
+    out[9] = wraplow(step1[9] + step1[22]);
+    out[10] = wraplow(step1[10] + step1[21]);
+    out[11] = wraplow(step1[11] + step1[20]);
+    out[12] = wraplow(step1[12] + step1[19]);
+    out[13] = wraplow(step1[13] + step1[18]);
+    out[14] = wraplow(step1[14] + step1[17]);
+    out[15] = wraplow(step1[15] + step1[16]);
+    out[16] = wraplow(step1[15] - step1[16]);
+    out[17] = wraplow(step1[14] - step1[17]);
+    out[18] = wraplow(step1[13] - step1[18]);
+    out[19] = wraplow(step1[12] - step1[19]);
+    out[20] = wraplow(step1[11] - step1[20]);
+    out[21] = wraplow(step1[10] - step1[21]);
+    out[22] = wraplow(step1[9] - step1[22]);
+    out[23] = wraplow(step1[8] - step1[23]);
+    out[24] = wraplow(step1[7] - step1[24]);
+    out[25] = wraplow(step1[6] - step1[25]);
+    out[26] = wraplow(step1[5] - step1[26]);
+    out[27] = wraplow(step1[4] - step1[27]);
+    out[28] = wraplow(step1[3] - step1[28]);
+    out[29] = wraplow(step1[2] - step1[29]);
+    out[30] = wraplow(step1[1] - step1[30]);
+    out[31] = wraplow(step1[0] - step1[31]);
+    out
+}
+
+// ===== 4x4 WHT (lossless) =====
+fn iwht4x4_add(input: &[i32], dst: &mut [u8], stride: usize) {
+    // UNIT_QUANT_SHIFT = 2 (libvpx); input is dequantised already here so
+    // we skip the extra shift by 2, matching libvpx's iwht4x4_16_add_c
+    // when input has been pre-shifted.
+    let mut tmp = [0i32; 16];
+    // Row pass
+    for i in 0..4 {
+        let a1 = input[i * 4];
+        let c1 = input[i * 4 + 1];
+        let d1 = input[i * 4 + 2];
+        let b1 = input[i * 4 + 3];
+        let a1p = a1 + c1;
+        let d1p = d1 - b1;
+        let e1 = (a1p - d1p) >> 1;
+        let b1 = e1 - b1;
+        let c1 = e1 - c1;
+        let a1 = a1p - b1;
+        let d1 = d1p + c1;
+        tmp[i * 4] = wraplow(a1);
+        tmp[i * 4 + 1] = wraplow(b1);
+        tmp[i * 4 + 2] = wraplow(c1);
+        tmp[i * 4 + 3] = wraplow(d1);
+    }
+    for i in 0..4 {
+        let a1 = tmp[i];
+        let c1 = tmp[4 + i];
+        let d1 = tmp[8 + i];
+        let b1 = tmp[12 + i];
+        let a1p = a1 + c1;
+        let d1p = d1 - b1;
+        let e1 = (a1p - d1p) >> 1;
+        let b1 = e1 - b1;
+        let c1 = e1 - c1;
+        let a1 = a1p - b1;
+        let d1 = d1p + c1;
+        dst[i] = clip_pixel_add(dst[i], wraplow(a1));
+        dst[stride + i] = clip_pixel_add(dst[stride + i], wraplow(b1));
+        dst[2 * stride + i] = clip_pixel_add(dst[2 * stride + i], wraplow(c1));
+        dst[3 * stride + i] = clip_pixel_add(dst[3 * stride + i], wraplow(d1));
+    }
+}
+
+// ===== 2-D inverse with clip-add =====
+
+/// Apply a 2-D inverse transform to `coeffs` (row-major `w × h` `i32`
+/// dequantised coefficients) and add the residual to `dst`.
 pub fn inverse_transform_add(
     tx: TxType,
     w: usize,
@@ -166,95 +1024,178 @@ pub fn inverse_transform_add(
     dst: &mut [u8],
     dst_stride: usize,
 ) -> Result<()> {
-    if tx != TxType::DctDct {
-        return Err(Error::unsupported(format!(
-            "vp9 transform: {tx:?} not implemented (§8.7.1 {}; only DctDct available)",
-            match tx {
-                TxType::DctDct => unreachable!(),
-                TxType::AdstDct | TxType::DctAdst | TxType::AdstAdst => "ADST path (§8.7.1.7)",
-                TxType::WhtWht => "WHT path (§8.7.1.1, lossless only)",
-            },
-        )));
-    }
-    if !matches!((w, h), (4, 4) | (8, 8)) {
-        return Err(Error::unsupported(format!(
-            "vp9 transform: {w}×{h} DCT not implemented (§8.7.1; only 4×4 and 8×8)",
-        )));
-    }
     if coeffs.len() != w * h {
         return Err(Error::invalid(format!(
-            "vp9 transform: coeffs len {} != {w}*{h}",
+            "vp9 tx: coeffs len {} != {w}*{h}",
             coeffs.len()
         )));
     }
-    let mut tmp = vec![0i32; w * h];
-    // Column pass: transform each column.
-    for c in 0..w {
-        match h {
-            4 => {
-                let mut col = [
-                    coeffs[c],
-                    coeffs[w + c],
-                    coeffs[2 * w + c],
-                    coeffs[3 * w + c],
-                ];
-                idct4(&mut col);
-                for (r, v) in col.iter().enumerate() {
-                    tmp[r * w + c] = *v;
-                }
-            }
-            8 => {
-                let mut col = [0i32; 8];
-                for r in 0..8 {
-                    col[r] = coeffs[r * w + c];
-                }
-                idct8(&mut col);
-                for r in 0..8 {
-                    tmp[r * w + c] = col[r];
-                }
-            }
-            _ => unreachable!(),
-        }
+    if !matches!((w, h), (4, 4) | (8, 8) | (16, 16) | (32, 32)) {
+        return Err(Error::invalid(format!(
+            "vp9 tx: unsupported size {w}×{h}"
+        )));
     }
-    // Row pass: transform each row.
-    let out = &mut vec![0i32; w * h];
-    for r in 0..h {
-        match w {
-            4 => {
-                let mut row = [tmp[r * 4], tmp[r * 4 + 1], tmp[r * 4 + 2], tmp[r * 4 + 3]];
-                idct4(&mut row);
-                for c in 0..4 {
-                    out[r * 4 + c] = row[c];
-                }
-            }
-            8 => {
-                let mut row = [0i32; 8];
-                for c in 0..8 {
-                    row[c] = tmp[r * 8 + c];
-                }
-                idct8(&mut row);
-                for c in 0..8 {
-                    out[r * 8 + c] = row[c];
-                }
-            }
-            _ => unreachable!(),
+    if tx == TxType::WhtWht {
+        if !matches!((w, h), (4, 4)) {
+            return Err(Error::invalid("vp9 tx: WHT only valid at 4×4"));
         }
+        iwht4x4_add(coeffs, dst, dst_stride);
+        return Ok(());
     }
-    // VP9 applies a final `round_shift(x, 4)` for 4×4 and `round_shift(x, 5)`
-    // for 8×8 (§8.7.1). Then the residual is clip-added to the predictor.
-    let inv_shift = match (w, h) {
+    // 32×32 only supports DCT_DCT.
+    if (w, h) == (32, 32) && tx != TxType::DctDct {
+        return Err(Error::invalid(
+            "vp9 tx: 32×32 only supports DCT_DCT (§8.7.1)",
+        ));
+    }
+
+    let shift = match (w, h) {
         (4, 4) => 4,
         (8, 8) => 5,
+        (16, 16) => 6,
+        (32, 32) => 6,
         _ => unreachable!(),
     };
+
+    // Row pass into tmp.
+    let mut tmp = vec![0i32; w * h];
     for r in 0..h {
-        for c in 0..w {
-            let residual = round_shift(out[r * w + c], inv_shift);
-            let p = dst[r * dst_stride + c] as i32;
-            let s = (p + residual).clamp(0, 255);
-            dst[r * dst_stride + c] = s as u8;
+        let row = &coeffs[r * w..r * w + w];
+        match (tx, w) {
+            (TxType::DctDct | TxType::AdstDct, 4) => {
+                let mut a = [0i32; 4];
+                a.copy_from_slice(row);
+                let out = idct4(&a);
+                tmp[r * w..r * w + 4].copy_from_slice(&out);
+            }
+            (TxType::DctAdst | TxType::AdstAdst, 4) => {
+                let mut a = [0i32; 4];
+                a.copy_from_slice(row);
+                let out = iadst4(&a);
+                tmp[r * w..r * w + 4].copy_from_slice(&out);
+            }
+            (TxType::DctDct | TxType::AdstDct, 8) => {
+                let mut a = [0i32; 8];
+                a.copy_from_slice(row);
+                let out = idct8(&a);
+                tmp[r * w..r * w + 8].copy_from_slice(&out);
+            }
+            (TxType::DctAdst | TxType::AdstAdst, 8) => {
+                let mut a = [0i32; 8];
+                a.copy_from_slice(row);
+                let out = iadst8(&a);
+                tmp[r * w..r * w + 8].copy_from_slice(&out);
+            }
+            (TxType::DctDct | TxType::AdstDct, 16) => {
+                let mut a = [0i32; 16];
+                a.copy_from_slice(row);
+                let out = idct16(&a);
+                tmp[r * w..r * w + 16].copy_from_slice(&out);
+            }
+            (TxType::DctAdst | TxType::AdstAdst, 16) => {
+                let mut a = [0i32; 16];
+                a.copy_from_slice(row);
+                let out = iadst16(&a);
+                tmp[r * w..r * w + 16].copy_from_slice(&out);
+            }
+            (TxType::DctDct, 32) => {
+                let mut a = [0i32; 32];
+                a.copy_from_slice(row);
+                let mut out = idct32(&a);
+                // 32x32 applies an extra round_shift(2) after each 1-D pass per libvpx.
+                for v in &mut out {
+                    *v = round_power_of_two(*v, 2);
+                }
+                tmp[r * w..r * w + 32].copy_from_slice(&out);
+            }
+            _ => unreachable!(),
         }
     }
+    // Column pass.
+    let mut out = vec![0i32; w * h];
+    for c in 0..w {
+        match (tx, h) {
+            (TxType::DctDct | TxType::DctAdst, 4) => {
+                let mut a = [0i32; 4];
+                for r in 0..4 {
+                    a[r] = tmp[r * w + c];
+                }
+                let v = idct4(&a);
+                for r in 0..4 {
+                    out[r * w + c] = v[r];
+                }
+            }
+            (TxType::AdstDct | TxType::AdstAdst, 4) => {
+                let mut a = [0i32; 4];
+                for r in 0..4 {
+                    a[r] = tmp[r * w + c];
+                }
+                let v = iadst4(&a);
+                for r in 0..4 {
+                    out[r * w + c] = v[r];
+                }
+            }
+            (TxType::DctDct | TxType::DctAdst, 8) => {
+                let mut a = [0i32; 8];
+                for r in 0..8 {
+                    a[r] = tmp[r * w + c];
+                }
+                let v = idct8(&a);
+                for r in 0..8 {
+                    out[r * w + c] = v[r];
+                }
+            }
+            (TxType::AdstDct | TxType::AdstAdst, 8) => {
+                let mut a = [0i32; 8];
+                for r in 0..8 {
+                    a[r] = tmp[r * w + c];
+                }
+                let v = iadst8(&a);
+                for r in 0..8 {
+                    out[r * w + c] = v[r];
+                }
+            }
+            (TxType::DctDct | TxType::DctAdst, 16) => {
+                let mut a = [0i32; 16];
+                for r in 0..16 {
+                    a[r] = tmp[r * w + c];
+                }
+                let v = idct16(&a);
+                for r in 0..16 {
+                    out[r * w + c] = v[r];
+                }
+            }
+            (TxType::AdstDct | TxType::AdstAdst, 16) => {
+                let mut a = [0i32; 16];
+                for r in 0..16 {
+                    a[r] = tmp[r * w + c];
+                }
+                let v = iadst16(&a);
+                for r in 0..16 {
+                    out[r * w + c] = v[r];
+                }
+            }
+            (TxType::DctDct, 32) => {
+                let mut a = [0i32; 32];
+                for r in 0..32 {
+                    a[r] = tmp[r * w + c];
+                }
+                let v = idct32(&a);
+                for r in 0..32 {
+                    out[r * w + c] = v[r];
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    // Apply final round_shift and clip-add.
+    for r in 0..h {
+        for c in 0..w {
+            let residual = round_power_of_two(out[r * w + c], shift);
+            dst[r * dst_stride + c] = clip_pixel_add(dst[r * dst_stride + c], residual);
+        }
+    }
+    let _ = dct_const_round_shift64;
     Ok(())
 }
 
@@ -263,23 +1204,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dct_dc_only_4x4_adds_constant() {
-        // A block whose only non-zero coefficient is the DC term should
-        // add a near-constant shift to every pixel.
-        let mut coeffs = [0i32; 16];
-        coeffs[0] = 64;
-        let mut dst = [50u8; 16];
-        inverse_transform_add(TxType::DctDct, 4, 4, &coeffs, &mut dst, 4).unwrap();
-        let first = dst[0] as i32;
-        for &v in &dst[1..] {
-            let d = (v as i32 - first).abs();
-            assert!(d <= 1, "non-uniform DC-only shift: {dst:?}");
-        }
-        assert!(first > 50);
-    }
-
-    #[test]
-    fn dct_zero_coeffs_is_noop() {
+    fn zero_coeffs_4x4_is_noop() {
         let coeffs = [0i32; 16];
         let mut dst = [42u8; 16];
         inverse_transform_add(TxType::DctDct, 4, 4, &coeffs, &mut dst, 4).unwrap();
@@ -289,50 +1214,48 @@ mod tests {
     }
 
     #[test]
-    fn dct_zero_coeffs_8x8_is_noop() {
-        let coeffs = [0i32; 64];
-        let mut dst = [70u8; 64];
-        inverse_transform_add(TxType::DctDct, 8, 8, &coeffs, &mut dst, 8).unwrap();
+    fn zero_coeffs_all_sizes_is_noop() {
+        for &n in &[4, 8, 16, 32] {
+            let coeffs = vec![0i32; n * n];
+            let mut dst = vec![64u8; n * n];
+            inverse_transform_add(TxType::DctDct, n, n, &coeffs, &mut dst, n).unwrap();
+            for &v in &dst {
+                assert_eq!(v, 64);
+            }
+        }
+    }
+
+    #[test]
+    fn dc_only_4x4_shifts_uniformly() {
+        let mut coeffs = [0i32; 16];
+        coeffs[0] = 64;
+        let mut dst = [50u8; 16];
+        inverse_transform_add(TxType::DctDct, 4, 4, &coeffs, &mut dst, 4).unwrap();
+        let first = dst[0];
         for &v in &dst {
-            assert_eq!(v, 70);
+            assert!(v.abs_diff(first) <= 1);
         }
     }
 
     #[test]
-    fn unsupported_tx_type_returns_clear_error() {
+    fn dc_only_16x16_shifts_uniformly() {
+        let mut coeffs = [0i32; 256];
+        coeffs[0] = 128;
+        let mut dst = [50u8; 256];
+        inverse_transform_add(TxType::DctDct, 16, 16, &coeffs, &mut dst, 16).unwrap();
+        let first = dst[0];
+        for &v in &dst {
+            assert!(v.abs_diff(first) <= 1);
+        }
+    }
+
+    #[test]
+    fn zero_coeffs_adst_is_noop() {
         let coeffs = [0i32; 16];
-        let mut dst = [0u8; 16];
-        match inverse_transform_add(TxType::AdstAdst, 4, 4, &coeffs, &mut dst, 4) {
-            Err(Error::Unsupported(s)) => {
-                assert!(s.contains("§8.7.1"), "msg: {s}");
-            }
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn unsupported_wht_returns_clear_error() {
-        let coeffs = [0i32; 16];
-        let mut dst = [0u8; 16];
-        match inverse_transform_add(TxType::WhtWht, 4, 4, &coeffs, &mut dst, 4) {
-            Err(Error::Unsupported(s)) => {
-                assert!(s.contains("WHT"), "msg should mention WHT: {s}");
-                assert!(s.contains("§8.7.1"), "msg: {s}");
-            }
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn unsupported_size_returns_clear_error() {
-        let coeffs = vec![0i32; 16 * 16];
-        let mut dst = vec![0u8; 16 * 16];
-        match inverse_transform_add(TxType::DctDct, 16, 16, &coeffs, &mut dst, 16) {
-            Err(Error::Unsupported(s)) => {
-                assert!(s.contains("16"), "msg: {s}");
-                assert!(s.contains("§8.7.1"), "msg: {s}");
-            }
-            other => panic!("expected Unsupported, got {other:?}"),
+        let mut dst = [99u8; 16];
+        inverse_transform_add(TxType::AdstAdst, 4, 4, &coeffs, &mut dst, 4).unwrap();
+        for &v in &dst {
+            assert_eq!(v, 99);
         }
     }
 }

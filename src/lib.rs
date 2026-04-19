@@ -43,7 +43,7 @@ pub mod probs;
 pub mod tile;
 pub mod transform;
 
-use oxideav_codec::CodecRegistry;
+use oxideav_codec::{CodecInfo, CodecRegistry};
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
 
 pub const CODEC_ID_STR: &str = "vp9";
@@ -54,17 +54,17 @@ pub const CODEC_ID_STR: &str = "vp9";
 /// `Error::Unsupported` at frame-pull time — but parses headers and
 /// populates parameters successfully.
 pub fn register(reg: &mut CodecRegistry) {
-    let cid = CodecId::new(CODEC_ID_STR);
     let caps = CodecCapabilities::video("vp9_sw")
         .with_lossy(true)
         .with_intra_only(false)
         .with_max_size(8192, 8192);
-    reg.register_decoder_impl(cid.clone(), caps, decoder::make_decoder);
-
     // AVI FourCC claims — `VP90` canonical, `VP9 ` trailing-space variant.
-    for fcc in &[b"VP90", b"VP9 "] {
-        reg.claim_tag(cid.clone(), CodecTag::fourcc(fcc), 10, None);
-    }
+    reg.register(
+        CodecInfo::new(CodecId::new(CODEC_ID_STR))
+            .capabilities(caps)
+            .decoder(decoder::make_decoder)
+            .tags([CodecTag::fourcc(b"VP90"), CodecTag::fourcc(b"VP9 ")]),
+    );
 }
 
 pub use compressed_header::{parse_compressed_header, CompressedHeader, ReferenceMode, TxMode};

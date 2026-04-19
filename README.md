@@ -41,8 +41,8 @@ Concretely, given an IVF or MP4 clip carrying VP9:
 
 ```toml
 [dependencies]
-oxideav-core = "0.0"
-oxideav-codec = "0.0"
+oxideav-core = "0.1"
+oxideav-codec = "0.1"
 oxideav-vp9 = "0.0"
 ```
 

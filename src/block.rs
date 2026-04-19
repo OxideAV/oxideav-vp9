@@ -97,7 +97,7 @@ impl BlockSize {
     }
 
     /// Max transform size allowed for this block size (§7.4.3).
-    fn max_tx_size_log2(&self) -> usize {
+    pub fn max_tx_size_log2(&self) -> usize {
         match self {
             Self::B4x4 | Self::B4x8 | Self::B8x4 => 0,
             Self::B8x8 | Self::B8x16 | Self::B16x8 => 1,

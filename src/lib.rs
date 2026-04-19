@@ -26,6 +26,7 @@ pub mod decoder;
 pub mod detokenize;
 pub mod dpb;
 pub mod headers;
+pub mod inter;
 pub mod intra;
 pub mod ivf;
 pub mod mcfilter;

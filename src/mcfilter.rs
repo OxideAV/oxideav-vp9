@@ -192,9 +192,9 @@ pub fn mc_block<S: RefSampler>(
         for c in 0..dst_w {
             let base_col = int_col + c as isize;
             let mut acc = 0i32;
-            for k in 0..SUBPEL_TAPS {
+            for (k, &tap) in fcol.iter().enumerate() {
                 let s = src.sample(src_row, base_col + k as isize - 3) as i32;
-                acc += s * fcol[k];
+                acc += s * tap;
             }
             // libvpx rounds/shifts by `FILTER_BITS` with `ROUND_POWER_OF_TWO`.
             let v = (acc + (1 << (FILTER_BITS - 1))) >> FILTER_BITS;
@@ -206,8 +206,8 @@ pub fn mc_block<S: RefSampler>(
     for r in 0..dst_h {
         for c in 0..dst_w {
             let mut acc = 0i32;
-            for k in 0..SUBPEL_TAPS {
-                acc += inter[(r + k) * dst_w + c] * frow[k];
+            for (k, &tap) in frow.iter().enumerate() {
+                acc += inter[(r + k) * dst_w + c] * tap;
             }
             let v = (acc + (1 << (FILTER_BITS - 1))) >> FILTER_BITS;
             dst[r * dst_stride + c] = v.clamp(0, 255) as u8;
@@ -230,7 +230,18 @@ mod tests {
     fn integer_sub_pel_copies_reference() {
         let src = Flat(99);
         let mut dst = vec![0u8; 16 * 16];
-        mc_block(&src, InterpFilter::EightTap, &mut dst, 16, 16, 16, 0, 0, 0, 0);
+        mc_block(
+            &src,
+            InterpFilter::EightTap,
+            &mut dst,
+            16,
+            16,
+            16,
+            0,
+            0,
+            0,
+            0,
+        );
         for &v in &dst {
             assert_eq!(v, 99);
         }

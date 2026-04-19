@@ -17,7 +17,9 @@ use oxideav_core::{
 use crate::block::IntraTile;
 use crate::bool_decoder::BoolDecoder;
 use crate::compressed_header::parse_compressed_header;
+use crate::dpb::{Dpb, RefFrame};
 use crate::headers::{parse_uncompressed_header, ColorConfig, FrameType, UncompressedHeader};
+use crate::inter::InterTile;
 
 /// Build a `CodecParameters` from a parsed uncompressed header.
 pub fn codec_parameters_from_header(h: &UncompressedHeader) -> CodecParameters {
@@ -56,6 +58,8 @@ pub struct Vp9Decoder {
     pending_pts: Option<i64>,
     /// Time base of the current stream (container-supplied).
     current_time_base: TimeBase,
+    /// 8-slot reference picture buffer (§6.2).
+    dpb: Dpb,
     eof: bool,
 }
 
@@ -68,6 +72,7 @@ impl Vp9Decoder {
             ready_frames: VecDeque::new(),
             pending_pts: None,
             current_time_base: TimeBase::new(1, 90_000),
+            dpb: Dpb::new(),
             eof: false,
         }
     }
@@ -77,12 +82,13 @@ impl Vp9Decoder {
     }
 
     /// Parse one packet and update internal state. Returns `Ok(())` on
-    /// successful header parse. For keyframe / intra-only frames the
-    /// pixel pipeline runs; inter frames surface `Error::Unsupported`.
+    /// successful decode. Keyframe / intra-only frames run the intra
+    /// pipeline; non-key / non-intra-only frames run the inter pipeline
+    /// against the persistent DPB.
     fn ingest(&mut self, packet: &Packet) -> Result<()> {
         self.pending_pts = packet.pts;
         self.current_time_base = packet.time_base;
-        let h = parse_uncompressed_header(&packet.data, self.last_color_config)?;
+        let mut h = parse_uncompressed_header(&packet.data, self.last_color_config)?;
         if h.show_existing_frame {
             self.last_header = Some(h);
             return Ok(());
@@ -90,11 +96,19 @@ impl Vp9Decoder {
         if h.frame_type == FrameType::Key || h.intra_only {
             self.last_color_config = Some(h.color_config);
         }
-        if !(h.frame_type == FrameType::Key || h.intra_only) {
-            // Inter frames — out of scope for this milestone.
-            self.last_header = Some(h);
-            return Err(Error::unsupported("vp9 inter frame pending"));
+        let is_intra = h.frame_type == FrameType::Key || h.intra_only;
+        // Inter frames using `frame_size_with_refs`'s "found_ref" path
+        // inherit their dimensions from the selected reference. The
+        // parser returns 0×0 in that case — patch it up here.
+        if !is_intra && (h.width == 0 || h.height == 0) {
+            if let Some(r) = self.dpb.get(h.ref_frame_idx[0]) {
+                h.width = r.width as u32;
+                h.height = r.height as u32;
+            } else {
+                return Err(Error::invalid("vp9 §6.2.2.1: found_ref but slot is empty"));
+            }
         }
+
         // Parse compressed header (§6.3).
         let cmp_start = h.uncompressed_header_size;
         let cmp_end = cmp_start.saturating_add(h.header_size as usize);
@@ -102,45 +116,92 @@ impl Vp9Decoder {
             return Err(Error::invalid("vp9 compressed header missing or truncated"));
         }
         let ch = parse_compressed_header(&packet.data[cmp_start..cmp_end], &h)?;
-        // Tile payload starts right after the compressed header.
         let tile_payload = &packet.data[cmp_end..];
         if tile_payload.is_empty() {
             return Err(Error::invalid("vp9 tile payload empty"));
         }
-        // Single-tile keyframe fast path — no length prefix.
         if h.tile_info.log2_tile_cols != 0 || h.tile_info.log2_tile_rows != 0 {
             self.last_header = Some(h);
             return Err(Error::unsupported(
-                "vp9 multi-tile intra frames pending (log2_tile > 0)",
+                "vp9 multi-tile frames pending (log2_tile > 0)",
             ));
         }
-        let mut tile = IntraTile::new(&h, &ch);
-        let mut bd = BoolDecoder::new(tile_payload)?;
-        tile.decode(&mut bd)?;
 
-        // Package reconstructed frame.
-        let frame = VideoFrame {
-            format: pixel_format_from_color_config(&h.color_config),
-            width: h.width,
-            height: h.height,
-            pts: self.pending_pts.take(),
-            time_base: self.current_time_base,
-            planes: vec![
-                VideoPlane {
-                    stride: tile.y_stride,
-                    data: tile.y,
-                },
-                VideoPlane {
-                    stride: tile.uv_stride,
-                    data: tile.u,
-                },
-                VideoPlane {
-                    stride: tile.uv_stride,
-                    data: tile.v,
-                },
-            ],
+        let (y, y_stride, u, v, uv_stride, uv_w, uv_h) = if is_intra {
+            let mut tile = IntraTile::new(&h, &ch);
+            let mut bd = BoolDecoder::new(tile_payload)?;
+            tile.decode(&mut bd)?;
+            (
+                tile.y,
+                tile.y_stride,
+                tile.u,
+                tile.v,
+                tile.uv_stride,
+                tile.uv_w,
+                tile.uv_h,
+            )
+        } else {
+            let refs = [
+                self.dpb.get(h.ref_frame_idx[0]),
+                self.dpb.get(h.ref_frame_idx[1]),
+                self.dpb.get(h.ref_frame_idx[2]),
+            ];
+            let mut tile = InterTile::new(&h, &ch, h.width as usize, h.height as usize, refs);
+            let mut bd = BoolDecoder::new(tile_payload)?;
+            tile.decode(&mut bd)?;
+            (
+                tile.y,
+                tile.y_stride,
+                tile.u,
+                tile.v,
+                tile.uv_stride,
+                tile.uv_w,
+                tile.uv_h,
+            )
         };
-        self.ready_frames.push_back(frame);
+
+        // Update DPB according to refresh_frame_flags.
+        let sub_x = h.color_config.subsampling_x as u8;
+        let sub_y = h.color_config.subsampling_y as u8;
+        let rf = RefFrame {
+            y: y.clone(),
+            y_stride,
+            u: u.clone(),
+            v: v.clone(),
+            uv_stride,
+            width: h.width as usize,
+            height: h.height as usize,
+            uv_width: uv_w,
+            uv_height: uv_h,
+            subsampling_x: sub_x,
+            subsampling_y: sub_y,
+        };
+        self.dpb.refresh(h.refresh_frame_flags, &rf);
+
+        if h.show_frame {
+            let frame = VideoFrame {
+                format: pixel_format_from_color_config(&h.color_config),
+                width: h.width,
+                height: h.height,
+                pts: self.pending_pts.take(),
+                time_base: self.current_time_base,
+                planes: vec![
+                    VideoPlane {
+                        stride: y_stride,
+                        data: y,
+                    },
+                    VideoPlane {
+                        stride: uv_stride,
+                        data: u,
+                    },
+                    VideoPlane {
+                        stride: uv_stride,
+                        data: v,
+                    },
+                ],
+            };
+            self.ready_frames.push_back(frame);
+        }
         self.last_header = Some(h);
         Ok(())
     }
@@ -175,6 +236,7 @@ impl Decoder for Vp9Decoder {
         self.last_header = None;
         self.ready_frames.clear();
         self.pending_pts = None;
+        self.dpb = Dpb::new();
         self.eof = false;
         Ok(())
     }

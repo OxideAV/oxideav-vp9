@@ -1,4 +1,4 @@
-//! Pure-Rust VP9 video decoder — keyframe / intra-only coverage.
+//! Pure-Rust VP9 video decoder — keyframe + single-reference inter.
 //!
 //! The decoder runs §6.2 uncompressed header + §6.3 compressed header +
 //! §6.4 tile / superblock / partition walk + §6.4.23 coefficient decode +
@@ -6,9 +6,14 @@
 //! (4/8/16/32, DCT + ADST combos, 4×4 WHT) + clip-add reconstruction,
 //! producing a `Yuv420P` `VideoFrame` from any 8-bit 4:2:0 VP9 keyframe.
 //!
-//! Non-key inter frames surface `Error::Unsupported` — inter prediction
-//! (§8.6) is out of scope for this crate today. Multi-tile frames and
-//! higher bit depths are also explicitly deferred.
+//! On top of that it keeps the 8-slot reference buffer (§6.2) and runs
+//! single-reference inter prediction (§8.5 / §8.6) with full §6.4.19 MV
+//! decode + §8.5.1 8-tap sub-pel interpolation, so single-reference P
+//! frames (LAST / GOLDEN / ALTREF, NEARESTMV / NEARMV / ZEROMV / NEWMV)
+//! decode into `VideoFrame`s.
+//!
+//! Deferred: compound prediction (§6.4.20), scaled references (§8.5.4),
+//! multi-tile frames, segmentation-driven deltas, higher bit depths.
 //!
 //! Reference: VP9 Bitstream & Decoding Process Specification, version 0.7
 //! (2017): <https://storage.googleapis.com/downloads.webmproject.org/docs/vp9/vp9-bitstream-specification-v0.7-20170222-draft.pdf>.
@@ -19,6 +24,7 @@ pub mod bool_decoder;
 pub mod compressed_header;
 pub mod decoder;
 pub mod detokenize;
+pub mod dpb;
 pub mod headers;
 pub mod intra;
 pub mod ivf;

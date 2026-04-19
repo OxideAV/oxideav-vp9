@@ -28,6 +28,7 @@ pub mod dpb;
 pub mod headers;
 pub mod intra;
 pub mod ivf;
+pub mod mcfilter;
 pub mod mv;
 pub mod probs;
 pub mod reconintra;

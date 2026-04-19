@@ -44,7 +44,7 @@ pub mod tile;
 pub mod transform;
 
 use oxideav_codec::CodecRegistry;
-use oxideav_core::{CodecCapabilities, CodecId};
+use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
 
 pub const CODEC_ID_STR: &str = "vp9";
 
@@ -59,7 +59,12 @@ pub fn register(reg: &mut CodecRegistry) {
         .with_lossy(true)
         .with_intra_only(false)
         .with_max_size(8192, 8192);
-    reg.register_decoder_impl(cid, caps, decoder::make_decoder);
+    reg.register_decoder_impl(cid.clone(), caps, decoder::make_decoder);
+
+    // AVI FourCC claims — `VP90` canonical, `VP9 ` trailing-space variant.
+    for fcc in &[b"VP90", b"VP9 "] {
+        reg.claim_tag(cid.clone(), CodecTag::fourcc(fcc), 10, None);
+    }
 }
 
 pub use compressed_header::{parse_compressed_header, CompressedHeader, ReferenceMode, TxMode};

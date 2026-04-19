@@ -13,7 +13,7 @@
 //! magnitude before dequant (shift right by 1) — `dq_shift` encodes
 //! this.
 
-use oxideav_core::{Error, Result};
+use oxideav_core::Result;
 
 use crate::bool_decoder::BoolDecoder;
 use crate::tables::{
@@ -184,11 +184,6 @@ fn read_coeff(bd: &mut BoolDecoder<'_>, probs: &[u8]) -> Result<i32> {
     Ok(val)
 }
 
-/// Suppress dead_code in case a Result variant isn't used anywhere.
-const _: fn() = || {
-    let _ = Error::invalid("never used — but keeps use-imports honest");
-};
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,9 +196,9 @@ mod tests {
         let payload = [0x00u8, 0x00, 0x00, 0x00, 0x00, 0x00];
         let mut bd = BoolDecoder::new(&payload).unwrap();
         let mut probs: CoefProbs = [[[0u8; 3]; 6]; 6];
-        for b in 0..6 {
-            for cctx in 0..6 {
-                probs[b][cctx] = [1, 0, 0];
+        for band in probs.iter_mut() {
+            for ctx in band.iter_mut() {
+                *ctx = [1, 0, 0];
             }
         }
         let dq = [8i16, 8];

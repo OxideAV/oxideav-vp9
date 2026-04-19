@@ -81,12 +81,6 @@ fn dct_const_round_shift(x: i32) -> i32 {
     (x + DCT_CONST_ROUNDING) >> DCT_CONST_BITS
 }
 
-// libvpx uses 64-bit temps for 32x32 butterflies.
-#[inline]
-fn dct_const_round_shift64(x: i64) -> i32 {
-    ((x + DCT_CONST_ROUNDING as i64) >> DCT_CONST_BITS) as i32
-}
-
 #[inline]
 fn round_power_of_two(v: i32, n: i32) -> i32 {
     (v + (1 << (n - 1))) >> n
@@ -301,9 +295,7 @@ fn idct16(input: &[i32; 16]) -> [i32; 16] {
     step1[15] = input[15];
 
     // stage 2
-    for i in 0..8 {
-        step2[i] = step1[i];
-    }
+    step2[..8].copy_from_slice(&step1[..8]);
     let t1 = step1[8] * COSPI_30_64 - step1[15] * COSPI_2_64;
     let t2 = step1[8] * COSPI_2_64 + step1[15] * COSPI_30_64;
     step2[8] = wraplow(dct_const_round_shift(t1));
@@ -670,9 +662,7 @@ fn idct32(input: &[i32; 32]) -> [i32; 32] {
     step1[24] = wraplow(dct_const_round_shift(t2));
 
     // stage 2
-    for i in 0..8 {
-        step2[i] = step1[i];
-    }
+    step2[..8].copy_from_slice(&step1[..8]);
 
     let t1 = step1[8] * COSPI_30_64 - step1[15] * COSPI_2_64;
     let t2 = step1[8] * COSPI_2_64 + step1[15] * COSPI_30_64;
@@ -712,9 +702,7 @@ fn idct32(input: &[i32; 32]) -> [i32; 32] {
     step2[31] = wraplow(step1[30] + step1[31]);
 
     // stage 3
-    for i in 0..4 {
-        step1[i] = step2[i];
-    }
+    step1[..4].copy_from_slice(&step2[..4]);
 
     let t1 = step2[4] * COSPI_28_64 - step2[7] * COSPI_4_64;
     let t2 = step2[4] * COSPI_4_64 + step2[7] * COSPI_28_64;
@@ -1031,9 +1019,7 @@ pub fn inverse_transform_add(
         )));
     }
     if !matches!((w, h), (4, 4) | (8, 8) | (16, 16) | (32, 32)) {
-        return Err(Error::invalid(format!(
-            "vp9 tx: unsupported size {w}×{h}"
-        )));
+        return Err(Error::invalid(format!("vp9 tx: unsupported size {w}×{h}")));
     }
     if tx == TxType::WhtWht {
         if !matches!((w, h), (4, 4)) {
@@ -1195,7 +1181,6 @@ pub fn inverse_transform_add(
             dst[r * dst_stride + c] = clip_pixel_add(dst[r * dst_stride + c], residual);
         }
     }
-    let _ = dct_const_round_shift64;
     Ok(())
 }
 

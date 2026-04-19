@@ -223,33 +223,39 @@ fn unsupported_intra_modes_have_precise_error_text() {
 }
 
 #[test]
-fn unsupported_transform_sizes_have_precise_error_text() {
-    let coeffs = vec![0i32; 16 * 16];
-    let mut dst = vec![0u8; 16 * 16];
-    match inverse_transform_add(TxType::DctDct, 16, 16, &coeffs, &mut dst, 16) {
-        Err(Error::Unsupported(s)) => {
-            assert!(s.contains("16"), "msg should name size: {s}");
-            assert!(s.contains("§8.7.1"), "msg should ref §8.7.1: {s}");
+fn transform_sizes_up_to_32_succeed() {
+    // The crate now ships 4/8/16/32 inverse DCT; check each size runs
+    // without error on all-zero coefficients (noop), and leaves the
+    // predictor untouched.
+    for &n in &[4usize, 8, 16, 32] {
+        let coeffs = vec![0i32; n * n];
+        let mut dst = vec![73u8; n * n];
+        inverse_transform_add(TxType::DctDct, n, n, &coeffs, &mut dst, n)
+            .unwrap_or_else(|e| panic!("{n}×{n} DctDct failed: {e:?}"));
+        for &v in &dst {
+            assert_eq!(v, 73, "noop transform should not mutate pixels");
         }
-        other => panic!("expected Unsupported for 16×16 iDCT, got {other:?}"),
     }
 }
 
 #[test]
-fn unsupported_adst_and_wht_have_precise_error_text() {
-    let coeffs = [0i32; 16];
-    let mut dst = [0u8; 16];
+fn adst_and_wht_accept_zero_coefficients() {
+    // All four TxType variants now have implementations (ADST/DCT
+    // combinations + 4×4 WHT). They must at least accept the zero input
+    // and leave the predictor intact.
     for tx in [
+        TxType::DctDct,
         TxType::AdstDct,
         TxType::DctAdst,
         TxType::AdstAdst,
         TxType::WhtWht,
     ] {
-        match inverse_transform_add(tx, 4, 4, &coeffs, &mut dst, 4) {
-            Err(Error::Unsupported(s)) => {
-                assert!(s.contains("§8.7.1"), "msg should ref §8.7.1: {s}");
-            }
-            other => panic!("expected Unsupported for {tx:?}, got {other:?}"),
+        let coeffs = [0i32; 16];
+        let mut dst = [17u8; 16];
+        inverse_transform_add(tx, 4, 4, &coeffs, &mut dst, 4)
+            .unwrap_or_else(|e| panic!("{tx:?} failed: {e:?}"));
+        for &v in &dst {
+            assert_eq!(v, 17, "noop {tx:?} transform should not mutate pixels");
         }
     }
 }

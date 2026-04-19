@@ -10,9 +10,12 @@ use std::collections::VecDeque;
 
 use oxideav_codec::Decoder;
 use oxideav_core::{
-    CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Rational, Result, VideoFrame,
+    CodecId, CodecParameters, Error, Frame, Packet, PixelFormat, Rational, Result, TimeBase,
+    VideoFrame, VideoPlane,
 };
 
+use crate::block::IntraTile;
+use crate::bool_decoder::BoolDecoder;
 use crate::compressed_header::parse_compressed_header;
 use crate::headers::{parse_uncompressed_header, ColorConfig, FrameType, UncompressedHeader};
 
@@ -46,9 +49,13 @@ pub struct Vp9Decoder {
     last_color_config: Option<ColorConfig>,
     /// Last-parsed header, kept for inspection.
     last_header: Option<UncompressedHeader>,
-    /// Decoded frames waiting to be drained. Always empty in the current
-    /// scaffold (we don't reconstruct pixels yet).
+    /// Decoded frames waiting to be drained.
     ready_frames: VecDeque<VideoFrame>,
+    /// PTS of the packet currently being ingested — attached to the
+    /// next produced video frame.
+    pending_pts: Option<i64>,
+    /// Time base of the current stream (container-supplied).
+    current_time_base: TimeBase,
     eof: bool,
 }
 
@@ -59,6 +66,8 @@ impl Vp9Decoder {
             last_color_config: None,
             last_header: None,
             ready_frames: VecDeque::new(),
+            pending_pts: None,
+            current_time_base: TimeBase::new(1, 90_000),
             eof: false,
         }
     }
@@ -68,9 +77,11 @@ impl Vp9Decoder {
     }
 
     /// Parse one packet and update internal state. Returns `Ok(())` on
-    /// successful header parse — decoding the actual residual is
-    /// `Unsupported` and reported by `receive_frame`.
+    /// successful header parse. For keyframe / intra-only frames the
+    /// pixel pipeline runs; inter frames surface `Error::Unsupported`.
     fn ingest(&mut self, packet: &Packet) -> Result<()> {
+        self.pending_pts = packet.pts;
+        self.current_time_base = packet.time_base;
         let h = parse_uncompressed_header(&packet.data, self.last_color_config)?;
         if h.show_existing_frame {
             self.last_header = Some(h);
@@ -79,15 +90,57 @@ impl Vp9Decoder {
         if h.frame_type == FrameType::Key || h.intra_only {
             self.last_color_config = Some(h.color_config);
         }
-        // Best-effort compressed-header parse — failing here doesn't
-        // invalidate the stream-level metadata.
-        if h.header_size > 0 {
-            let cmp_start = h.uncompressed_header_size;
-            let cmp_end = cmp_start.saturating_add(h.header_size as usize);
-            if cmp_end <= packet.data.len() {
-                let _ = parse_compressed_header(&packet.data[cmp_start..cmp_end], &h);
-            }
+        if !(h.frame_type == FrameType::Key || h.intra_only) {
+            // Inter frames — out of scope for this milestone.
+            self.last_header = Some(h);
+            return Err(Error::unsupported("vp9 inter frame pending"));
         }
+        // Parse compressed header (§6.3).
+        let cmp_start = h.uncompressed_header_size;
+        let cmp_end = cmp_start.saturating_add(h.header_size as usize);
+        if cmp_end > packet.data.len() || h.header_size == 0 {
+            return Err(Error::invalid("vp9 compressed header missing or truncated"));
+        }
+        let ch = parse_compressed_header(&packet.data[cmp_start..cmp_end], &h)?;
+        // Tile payload starts right after the compressed header.
+        let tile_payload = &packet.data[cmp_end..];
+        if tile_payload.is_empty() {
+            return Err(Error::invalid("vp9 tile payload empty"));
+        }
+        // Single-tile keyframe fast path — no length prefix.
+        if h.tile_info.log2_tile_cols != 0 || h.tile_info.log2_tile_rows != 0 {
+            self.last_header = Some(h);
+            return Err(Error::unsupported(
+                "vp9 multi-tile intra frames pending (log2_tile > 0)",
+            ));
+        }
+        let mut tile = IntraTile::new(&h, &ch);
+        let mut bd = BoolDecoder::new(tile_payload)?;
+        tile.decode(&mut bd)?;
+
+        // Package reconstructed frame.
+        let frame = VideoFrame {
+            format: pixel_format_from_color_config(&h.color_config),
+            width: h.width,
+            height: h.height,
+            pts: self.pending_pts.take(),
+            time_base: self.current_time_base,
+            planes: vec![
+                VideoPlane {
+                    stride: tile.y_stride,
+                    data: tile.y,
+                },
+                VideoPlane {
+                    stride: tile.uv_stride,
+                    data: tile.u,
+                },
+                VideoPlane {
+                    stride: tile.uv_stride,
+                    data: tile.v,
+                },
+            ],
+        };
+        self.ready_frames.push_back(frame);
         self.last_header = Some(h);
         Ok(())
     }
@@ -109,19 +162,6 @@ impl Decoder for Vp9Decoder {
         if self.eof {
             return Err(Error::Eof);
         }
-        // We parsed a header but cannot reconstruct pixels. Tile walker,
-        // range decoder, intra primitives (DC/V/H/TM) and 4×4 / 8×8 iDCT
-        // are wired up; the missing piece is block-level decode (modes
-        // + coef probs + dequant, §6.4.3 / §10.5).
-        if self.last_header.is_some() {
-            return Err(Error::unsupported(
-                "vp9 decode_block §6.4.3 not implemented — \
-                 partition tree (§6.4.2) + bool decoder (§9.2) + intra \
-                 primitives (DC/V/H/TM, §8.5.1) + iDCT 4×4/8×8 (§8.7.1) \
-                 are available; next: kf_intra_mode_probs, coef tree, \
-                 dequant (§10.5 / §8.6)",
-            ));
-        }
         Err(Error::NeedMore)
     }
 
@@ -131,15 +171,10 @@ impl Decoder for Vp9Decoder {
     }
 
     fn reset(&mut self) -> Result<()> {
-        // Scaffold decoder — only header-level state is retained. Drop
-        // the last parsed header and remembered color_config (the latter
-        // is used by non-key frames to infer subsampling / bit depth, so
-        // if we kept it an inter-frame before the next key would be
-        // decoded with stale colour metadata). Ready queue + eof flag
-        // are always transient.
         self.last_color_config = None;
         self.last_header = None;
         self.ready_frames.clear();
+        self.pending_pts = None;
         self.eof = false;
         Ok(())
     }
@@ -232,17 +267,21 @@ mod tests {
         }
     }
 
+    /// Synthetic keyframe with an empty compressed header triggers the
+    /// "compressed header missing" guard path and surfaces InvalidData.
     #[test]
-    fn unsupported_after_header_parse() {
+    fn empty_compressed_header_surfaces_error() {
         let codec_id = CodecId::new(crate::CODEC_ID_STR);
         let params = CodecParameters::video(codec_id);
         let mut d = make_decoder(&params).unwrap();
         let buf = synth_key_frame_header();
         let pkt = Packet::new(0, TimeBase::new(1, 90_000), buf);
-        d.send_packet(&pkt).unwrap();
-        match d.receive_frame() {
-            Err(Error::Unsupported(_)) => {}
-            other => panic!("expected Unsupported, got {other:?}"),
+        // send_packet returns the ingest error directly now that
+        // ingest runs the full pipeline.
+        let r = d.send_packet(&pkt);
+        match r {
+            Err(Error::InvalidData(_)) | Err(Error::Unsupported(_)) => {}
+            other => panic!("expected error, got {other:?}"),
         }
     }
 }

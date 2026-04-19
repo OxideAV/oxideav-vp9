@@ -55,6 +55,7 @@ impl NeighbourBuf {
     ///
     /// Matches libvpx's `build_intra_predictors` — 127 / 129 fill for
     /// unavailable neighbours, above-right extension for D45 / D63.
+    #[allow(clippy::too_many_arguments)]
     pub fn build(
         bs: usize,
         tx_size_log2: usize,
@@ -93,9 +94,8 @@ impl NeighbourBuf {
             above_left.unwrap_or(127)
         } else if have_above {
             129
-        } else if have_left {
-            127
         } else {
+            // No above row: fall back to 127 whether or not left is present.
             127
         };
         if have_above {
@@ -159,7 +159,15 @@ pub fn predict(mode: IntraMode, nb: &NeighbourBuf, dst: &mut [u8], dst_stride: u
     let above_left = above_buf[0];
     let left = nb.left_slice();
     match mode {
-        IntraMode::Dc => dc_pred(nb.have_above, nb.have_left, bs, above, left, dst, dst_stride),
+        IntraMode::Dc => dc_pred(
+            nb.have_above,
+            nb.have_left,
+            bs,
+            above,
+            left,
+            dst,
+            dst_stride,
+        ),
         IntraMode::V => v_pred(bs, above, dst, dst_stride),
         IntraMode::H => h_pred(bs, left, dst, dst_stride),
         IntraMode::D45 => d45_pred(bs, above, dst, dst_stride),
@@ -229,16 +237,16 @@ fn v_pred(bs: usize, above: &[u8], dst: &mut [u8], stride: usize) {
 }
 
 fn h_pred(bs: usize, left: &[u8], dst: &mut [u8], stride: usize) {
-    for r in 0..bs {
-        fill_row(dst, stride, r, left[r], bs);
+    for (r, &v) in left.iter().take(bs).enumerate() {
+        fill_row(dst, stride, r, v, bs);
     }
 }
 
 fn tm_pred(bs: usize, above: &[u8], left: &[u8], above_left: u8, dst: &mut [u8], stride: usize) {
     let al = above_left as i32;
-    for r in 0..bs {
+    for (r, &lv) in left.iter().take(bs).enumerate() {
         let base = r * stride;
-        let lr = left[r] as i32;
+        let lr = lv as i32;
         for c in 0..bs {
             let p = lr + above[c] as i32 - al;
             dst[base + c] = p.clamp(0, 255) as u8;
@@ -385,7 +393,7 @@ fn d135_pred(bs: usize, above: &[u8], left: &[u8], al: u8, dst: &mut [u8], strid
     // libvpx builds a border array of length 2*bs-1 containing the outer
     // border from bottom-left to top-right, with 3-tap averaging.
     let mut border = [0u8; 64]; // covers up to bs=32 -> 63 entries
-    // Border from bottom-left upward.
+                                // Border from bottom-left upward.
     for i in 0..(bs - 2) {
         border[i] = avg3(left[bs - 3 - i], left[bs - 2 - i], left[bs - 1 - i]);
     }
@@ -408,6 +416,7 @@ fn d135_pred(bs: usize, above: &[u8], left: &[u8], al: u8, dst: &mut [u8], strid
     }
 }
 
+#[allow(clippy::needless_range_loop)]
 fn d153_pred(bs: usize, above: &[u8], left: &[u8], al: u8, dst: &mut [u8], stride: usize) {
     // Column 0
     dst[0] = avg2(al, left[0]);
@@ -420,16 +429,9 @@ fn d153_pred(bs: usize, above: &[u8], left: &[u8], al: u8, dst: &mut [u8], strid
     for r in 2..bs {
         dst[r * stride + 1] = avg3(left[r - 2], left[r - 1], left[r]);
     }
-    // Row 0 columns 2..
+    // Row 0 columns 2..bs — 3-tap horizontal average.
     for c in 2..bs {
-        // libvpx: dst[c] = AVG3(above[c-1], above[c], above[c+1]) for c in 0..bs-2
-        // the loop writes dst starting at &dst[2], so c index runs 0..bs-2
-        // Below, we write to dst[2..bs] = AVG3(above[c-1..=c+1]) where c = loop+1
         let j = c - 2;
-        // Original: for c in 0..bs-2 { dst[c] = AVG3(above[c-1], above[c], above[c+1]); }
-        // dst (already advanced by 2) so dst[c] is effectively dst[c+2].
-        // above is unshifted so uses above[-1]? No: above is the original `above`
-        // with above[-1] encoded as `al`. Let's replicate: when j=0, need above[-1]=al.
         let a_m1 = if j == 0 { al } else { above[j - 1] };
         let a_0 = above[j];
         let a_p1 = above[j + 1];

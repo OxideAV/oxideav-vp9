@@ -220,14 +220,13 @@ impl<'a> TileDecoder<'a> {
 }
 
 /// Walk the tile / partition / block tree per §6.4. The compressed header
-/// must already have been parsed by the caller. This version actually
-/// exercises the partition quadtree of §6.4.2 against the default
-/// keyframe probabilities (§10.5), then surfaces an `Error::Unsupported`
-/// at the first `decode_block` call.
+/// must already have been parsed by the caller. For keyframe / intra_only
+/// frames this drives the full [`crate::block::IntraTile`] pipeline and
+/// returns `Ok(())` on success. Inter frames surface `Unsupported`.
 ///
-/// For multi-tile frames this walks only tile (0,0). The tile-size prefix
-/// syntax (§6.4) for subsequent tiles is simple to add but brings no new
-/// coverage until block decode lands — tracked in the crate README.
+/// Multi-tile (`log2_tile_{rows,cols} > 0`) also surfaces `Unsupported`
+/// for the moment: the tile-size-prefix syntax (§6.4) is simple to add
+/// but brings no new coverage until the fixture exercises it.
 pub fn decode_tiles(
     tile_payload: &[u8],
     hdr: &UncompressedHeader,
@@ -244,8 +243,18 @@ pub fn decode_tiles(
             "vp9 decode_tiles: tile payload empty — §6.4",
         ));
     }
-    let mut td = TileDecoder::new(hdr, ch, tile_payload, 0, 0)?;
-    td.decode()
+    if hdr.tile_info.log2_tile_cols != 0 || hdr.tile_info.log2_tile_rows != 0 {
+        return Err(Error::unsupported(
+            "vp9 multi-tile frame — single-tile only for now",
+        ));
+    }
+    let is_intra = matches!(hdr.frame_type, crate::headers::FrameType::Key) || hdr.intra_only;
+    if !is_intra {
+        return Err(Error::unsupported("vp9 inter frame pending"));
+    }
+    let mut tile = crate::block::IntraTile::new(hdr, ch);
+    let mut bd = BoolDecoder::new(tile_payload)?;
+    tile.decode(&mut bd)
 }
 
 /// Public recursive-descent entry — decode one partition node at (row,
@@ -501,25 +510,16 @@ mod tests {
     }
 
     #[test]
-    fn decode_tiles_stops_at_block_decode() {
+    fn decode_tiles_runs_to_completion_on_synth_keyframe() {
+        // The tile walker + block decoder will happily chew through an
+        // arbitrary byte stream as long as it doesn't run out of bits:
+        // probabilities never reject, they just bias. So any non-empty
+        // payload paired with a valid single-tile keyframe header should
+        // return `Ok(())` with a reconstructed (garbage-looking) plane.
         let h = synth_header(64, 64);
         let ch = CompressedHeader::default();
-        // Bool decoder needs f(8) value + marker bit 0, then arbitrary bits.
-        let payload = [0xAB, 0x00, 0xCD, 0xEF, 0x12, 0x34];
-        match decode_tiles(&payload, &h, &ch) {
-            Err(Error::Unsupported(s)) => {
-                assert!(s.contains("§6.4.3"), "msg should cite §6.4.3: {s}");
-                assert!(
-                    s.contains("decode_block"),
-                    "msg should mention decode_block: {s}"
-                );
-                assert!(
-                    s.contains("leaves planned"),
-                    "msg should report partition-walk success: {s}"
-                );
-            }
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
+        let payload = [0xAB, 0x00, 0xCD, 0xEF, 0x12, 0x34, 0x56, 0x78];
+        decode_tiles(&payload, &h, &ch).expect("decode completes");
     }
 
     #[test]

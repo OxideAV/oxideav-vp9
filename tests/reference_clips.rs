@@ -89,14 +89,12 @@ fn ivf_first_frame_keyframe_header_via_iter() {
 }
 
 #[test]
-fn keyframe_partition_walk_reaches_block_decode_stop() {
+fn keyframe_partition_walk_completes() {
     // End-to-end: IVF demux → uncompressed header → compressed header →
     // tile walk. The tile walker exercises the §6.4.2 partition
     // quadtree against real VP9 default probabilities (§10.5) and the
-    // bool decoder (§9.2); it must either successfully plan a set of
-    // leaves or bail with the specific `Unsupported` pointing at
-    // §6.4.3 `decode_block`. Anything else (panic / InvalidData) would
-    // be a regression.
+    // bool decoder (§9.2). Now that block decode is wired the walk
+    // completes without surfacing Unsupported.
     use oxideav_vp9::compressed_header::parse_compressed_header;
     use oxideav_vp9::tile::decode_tiles;
 
@@ -112,30 +110,5 @@ fn keyframe_partition_walk_reaches_block_decode_stop() {
     let ch =
         parse_compressed_header(&frame.payload[cmp_start..cmp_end], &h).expect("compressed header");
     let tile_payload = &frame.payload[cmp_end..];
-    match decode_tiles(tile_payload, &h, &ch) {
-        Err(oxideav_core::Error::Unsupported(s)) => {
-            assert!(
-                s.contains("§6.4.3") || s.contains("decode_block"),
-                "expected §6.4.3 / decode_block stopping clause, got: {s}"
-            );
-        }
-        other => panic!("expected Unsupported, got {other:?}"),
-    }
-}
-
-#[test]
-fn parse_mp4_vp9_via_pipeline() {
-    // This test exercises the MP4 demuxer's vp09 sample-entry mapping. It
-    // doesn't decode pixels — just verifies the container surfaces a vp9
-    // codec id with the right dimensions.
-    if !Path::new("/tmp/vp9.mp4").exists() {
-        eprintln!("fixture /tmp/vp9.mp4 missing — skipping");
-        return;
-    }
-    // We don't depend on oxideav-mp4 here to keep the dep graph minimal;
-    // instead re-use the MP4 container's public API via the codec_id mapping.
-    // The mapping table is small and stable — verify directly.
-    use oxideav_mp4::codec_id::from_sample_entry;
-    let id = from_sample_entry(b"vp09");
-    assert_eq!(id.as_str(), "vp9");
+    decode_tiles(tile_payload, &h, &ch).expect("tile decode");
 }

@@ -29,6 +29,7 @@ pub mod headers;
 pub mod inter;
 pub mod intra;
 pub mod ivf;
+pub mod loopfilter;
 pub mod mcfilter;
 pub mod mv;
 pub mod probs;

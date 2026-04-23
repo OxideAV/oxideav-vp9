@@ -3,7 +3,8 @@
 Pure-Rust **VP9** video decoder. Parses the full uncompressed header
 (§6.2), the compressed header (§6.3), walks the tile / superblock
 partition quadtree (§6.4.2) and reconstructs keyframe / intra-only
-**and** single-reference inter frames down to pixels via intra
+**and** inter frames (single and compound reference, scaled
+references) across one or more tiles, down to pixels via intra
 prediction, 8-tap sub-pel motion compensation, inverse transform and
 dequantised-coefficient add. Zero C dependencies.
 
@@ -15,10 +16,26 @@ framework but usable standalone.
 * **Keyframe / intra-only frames** (`FrameType::Key` and the
   `intra_only` mid-stream variant) decode to a `VideoFrame` with
   3-plane 8-bit 4:2:0 luma + chroma data.
-* **Single-reference inter (P) frames**. The decoder keeps the VP9
-  8-slot DPB (§6.2, `refresh_frame_flags` semantics), reads every
-  block's `is_inter` / `ref_frame` / `inter_mode` / MV and runs
-  §8.5.1 motion compensation against the referenced slot.
+* **Inter (P) frames — single and compound reference**. The decoder
+  keeps the VP9 8-slot DPB (§6.2, `refresh_frame_flags` semantics),
+  reads every block's `is_inter` / `ref_frame` / `inter_mode` / MV and
+  runs §8.5.2 motion compensation. For compound blocks (§6.4.17 with
+  `reference_mode` ∈ {COMPOUND, SELECT}) both references are MC'd
+  independently, then blended per §8.5.2 with `Round2(a + b, 1)`.
+* **Scaled references (§8.5.2.3)**. When a reference frame's size
+  differs from the current frame, the MV and sub-pel interpolator pick
+  up `x_step_q4 = (16 * (RefW << 14) / CurW) >> 14` (same for y).
+* **Multi-tile frames (§6.4)**. Tile-column and tile-row partitioning
+  is supported. The tile payload is split at 4-byte big-endian length
+  prefixes (last tile consumes the remainder), the boolean engine is
+  reset per tile, and §6.4.1 `get_tile_offset` yields each tile's
+  pixel bounds. The §8.8 loop filter runs once after all tiles are
+  decoded.
+* **Segmentation deltas (§8.6.1 / §8.8.1)**: `SEG_LVL_ALT_Q` overrides
+  the block quantiser; `SEG_LVL_ALT_L` overrides the per-segment
+  loop-filter level. Both respect `abs_delta` vs delta mode. The
+  per-block segmentation-map read is still scaffold — every block
+  currently reports `segment_id = 0`.
 * **All 10 intra modes** (§8.5.1): `DC_PRED`, `V_PRED`, `H_PRED`,
   `D45_PRED`, `D135_PRED`, `D117_PRED`, `D153_PRED`, `D207_PRED`,
   `D63_PRED`, `TM_PRED`. Block sides 4 / 8 / 16 / 32 supported. 127 /
@@ -101,29 +118,20 @@ Both the intra and inter paths ship, but a handful of accuracy
 refinements remain before the decoder matches a libvpx reference
 bit-for-bit:
 
-* **Compound prediction (§6.4.20)**: every inter block is decoded as
-  single-reference. VP9 clips that enable compound mode will produce
-  degraded but non-zero output for those blocks.
-* **Scaled-reference inter (§8.5.4)**: the interpolator assumes the
-  reference frame matches the current frame's geometry. Stream
-  resizes mid-sequence are not handled.
 * **MV-candidate list (`find_mv_refs` / `find_best_ref_mvs`)**:
   `NEARESTMV` and `NEARMV` currently resolve to a zero predictor
   instead of the full neighbour-derived candidate list (§6.4.17).
   `ZEROMV` and `NEWMV` are correct; `NEARESTMV`/`NEARMV` degrade to
   the ZEROMV spatial result.
-* **Segmentation deltas (§6.2.5)**: the parser round-trips the
-  segment parameters but the block decode path does not apply
-  `SEG_FEATURE_ALT_Q` / `SEG_LVL_ALT_LF` / `SEG_LVL_REF_FRAME` /
-  `SEG_LVL_SKIP`. Segmentation-disabled streams (the default) are
-  unaffected.
+* **Per-block segmentation map**: `SEG_LVL_ALT_Q` / `SEG_LVL_ALT_L`
+  deltas are applied, but the segmentation-map tree decode + temporal
+  predicted-segment lookup is not wired — every block falls through
+  to segment 0. `SEG_LVL_REF_FRAME` / `SEG_LVL_SKIP` are not applied.
 * **Neighbour-aware probability contexts**: the crate uses context 0
   for the partition tree (§6.4.2 `partition_plane_context`), for the
-  KF intra-mode probability selection, for `skip_prob` and for
-  `is_inter_prob`. Output diverges from the libvpx reference but
-  stays plausible.
-* **Multi-tile frames**: `log2_tile_cols > 0` and `log2_tile_rows > 0`
-  return `Unsupported`.
+  KF intra-mode probability selection, for `skip_prob`, `is_inter`,
+  `comp_mode` and `comp_ref`. Output diverges from the libvpx
+  reference but stays plausible.
 * **Higher bit depths (profiles 2 / 3)**: the parser recognises
   10-bit / 12-bit colour configs but the reconstruction pipeline only
   runs on 8-bit `Yuv420P`.

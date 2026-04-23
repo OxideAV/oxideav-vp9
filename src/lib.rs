@@ -1,4 +1,4 @@
-//! Pure-Rust VP9 video decoder — keyframe + single-reference inter.
+//! Pure-Rust VP9 video decoder — keyframes + inter + compound + multi-tile.
 //!
 //! The decoder runs §6.2 uncompressed header + §6.3 compressed header +
 //! §6.4 tile / superblock / partition walk + §6.4.23 coefficient decode +
@@ -7,17 +7,26 @@
 //! producing a `Yuv420P` `VideoFrame` from any 8-bit 4:2:0 VP9 keyframe.
 //!
 //! On top of that it keeps the 8-slot reference buffer (§6.2) and runs
-//! single-reference inter prediction (§8.5 / §8.6) with full §6.4.19 MV
-//! decode + §8.5.1 8-tap sub-pel interpolation, so single-reference P
-//! frames (LAST / GOLDEN / ALTREF, NEARESTMV / NEARMV / ZEROMV / NEWMV)
-//! decode into `VideoFrame`s.
+//! inter prediction (§8.5 / §8.6) with full §6.4.19 MV decode + §8.5.1
+//! 8-tap sub-pel interpolation. Single-reference (LAST / GOLDEN /
+//! ALTREF) and compound-reference (§6.4.17 / §8.5.2) modes both decode
+//! into `VideoFrame`s, with Round2(a + b, 1) blending for compound.
 //!
-//! After reconstruction the §8.8 loop filter / deblocking pass runs on
-//! the Y/U/V planes (filter_mask + flat_mask + narrow/wide filter),
-//! cleaning the 8×8 block boundaries.
+//! Scaled-reference motion compensation (§8.5.2.3) is supported: a
+//! variable-step interpolator applies per-reference `x_step_q4` /
+//! `y_step_q4` computed from `RefFrameWidth / FrameWidth`.
 //!
-//! Deferred: compound prediction (§6.4.20), scaled references (§8.5.4),
-//! multi-tile frames, segmentation-driven deltas, higher bit depths.
+//! Multi-tile frames (§6.4) split the tile payload at 4-byte
+//! big-endian length prefixes, reset the boolean engine per tile, and
+//! run the §8.8 loop filter once after all tiles are decoded.
+//!
+//! Segmentation deltas §8.6.1 `SEG_LVL_ALT_Q` and §8.8.1 `SEG_LVL_ALT_L`
+//! apply through `SegmentationParams::get_qindex` and
+//! `LvlLookup::build_with_segmentation` (the per-block segmentation-map
+//! read is still scaffold, so all blocks report segment 0 for now).
+//!
+//! Deferred: higher bit depths (10/12-bit), per-block segmentation-map
+//! read, neighbour-aware probability contexts.
 //!
 //! Reference: VP9 Bitstream & Decoding Process Specification, version 0.7
 //! (2017): <https://storage.googleapis.com/downloads.webmproject.org/docs/vp9/vp9-bitstream-specification-v0.7-20170222-draft.pdf>.

@@ -215,6 +215,78 @@ pub fn mc_block<S: RefSampler>(
     }
 }
 
+/// Variable-step version of [`mc_block`] that supports scaled references
+/// (§8.5.2.3 / §8.5.2.4). Sampling positions `(start_y + r*y_step_q4,
+/// start_x + c*x_step_q4)` live in 1/16-sample units; `x_step_q4 == 16` and
+/// `y_step_q4 == 16` reduces to the normal per-pixel walk.
+///
+/// Output is produced at `dst[r*dst_stride + c]` for r in 0..dst_h, c in
+/// 0..dst_w. Integer and sub-pel parts are recomputed per sample — the
+/// horizontal pass width stays at `dst_w`, the intermediate height grows
+/// with `y_step_q4` per spec.
+#[allow(clippy::too_many_arguments)]
+pub fn mc_block_scaled<S: RefSampler>(
+    src: &S,
+    filter: InterpFilter,
+    dst: &mut [u8],
+    dst_stride: usize,
+    dst_w: usize,
+    dst_h: usize,
+    start_x_q4: i32,
+    start_y_q4: i32,
+    x_step_q4: i32,
+    y_step_q4: i32,
+) {
+    let tbl = filter_table(filter);
+
+    // Intermediate height per §8.5.2.4: (((h - 1) * yStep + 15) >> 4) + 8.
+    let inter_h = if dst_h == 0 {
+        0
+    } else {
+        ((((dst_h as i32 - 1) * y_step_q4 + 15) >> 4) + 8) as usize
+    };
+    let mut inter = vec![0i32; inter_h * dst_w];
+
+    // Horizontal pass (filters samples along rows of the reference).
+    // Row base for the intermediate buffer is (start_y >> 4) - 3.
+    let y_int_base = (start_y_q4 >> 4) as isize - 3;
+    for r in 0..inter_h {
+        let src_row = y_int_base + r as isize;
+        for c in 0..dst_w {
+            let p = start_x_q4 + x_step_q4 * c as i32;
+            let phase = (p & 15) as usize;
+            let base_col = (p >> 4) as isize - 3;
+            let taps = &tbl[phase];
+            let mut acc = 0i32;
+            for (k, &tap) in taps.iter().enumerate() {
+                let s = src.sample(src_row, base_col + k as isize) as i32;
+                acc += s * tap;
+            }
+            let v = (acc + (1 << (FILTER_BITS - 1))) >> FILTER_BITS;
+            inter[r * dst_w + c] = v.clamp(0, 255);
+        }
+    }
+
+    // Vertical pass.
+    for r in 0..dst_h {
+        let p = (start_y_q4 & 15) + y_step_q4 * r as i32;
+        let phase = (p & 15) as usize;
+        let base = (p >> 4) as usize;
+        let taps = &tbl[phase];
+        for c in 0..dst_w {
+            let mut acc = 0i32;
+            for (k, &tap) in taps.iter().enumerate() {
+                let idx = (base + k) * dst_w + c;
+                if idx < inter.len() {
+                    acc += inter[idx] * tap;
+                }
+            }
+            let v = (acc + (1 << (FILTER_BITS - 1))) >> FILTER_BITS;
+            dst[r * dst_stride + c] = v.clamp(0, 255) as u8;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +340,63 @@ mod tests {
             );
             for &v in &dst {
                 assert_eq!(v, 123, "phase {phase} broke flat field");
+            }
+        }
+    }
+
+    #[test]
+    fn scaled_identity_matches_unscaled() {
+        // With start=0, step=16 (i.e. 1/16 = 1 sample per step), the scaled
+        // variant should produce the same output as the fixed-step version.
+        struct Ramp;
+        impl RefSampler for Ramp {
+            fn sample(&self, row: isize, col: isize) -> u8 {
+                let r = row.clamp(0, 15) as u8;
+                let c = col.clamp(0, 15) as u8;
+                r.wrapping_mul(7).wrapping_add(c.wrapping_mul(3))
+            }
+        }
+        let w = 8;
+        let h = 8;
+        let mut a = vec![0u8; w * h];
+        let mut b = vec![0u8; w * h];
+        // sub-phase = 4 in both axes.
+        mc_block(&Ramp, InterpFilter::EightTap, &mut a, w, w, h, 0, 0, 4, 4);
+        mc_block_scaled(
+            &Ramp,
+            InterpFilter::EightTap,
+            &mut b,
+            w,
+            w,
+            h,
+            4,  // start_x_q4 = sub_col
+            4,  // start_y_q4 = sub_row
+            16, // x_step_q4 = 1/16 * 16 = 1 sample
+            16, // y_step_q4 = same
+        );
+        assert_eq!(a, b, "scaled identity walk diverged from fixed");
+    }
+
+    #[test]
+    fn scaled_flat_preserves_flat_field() {
+        // Any scaling of a constant field must still return the constant.
+        for step in [8i32, 16, 20, 24, 32, 40] {
+            let src = Flat(200);
+            let mut dst = vec![0u8; 8 * 8];
+            mc_block_scaled(
+                &src,
+                InterpFilter::EightTap,
+                &mut dst,
+                8,
+                8,
+                8,
+                3, // start_x
+                5, // start_y
+                step,
+                step,
+            );
+            for &v in &dst {
+                assert_eq!(v, 200, "step {step} broke flat field");
             }
         }
     }

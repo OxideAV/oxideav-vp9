@@ -11,28 +11,32 @@
 //!   §8.5.1 8-tap sub-pel filter, optionally add a residual decoded from
 //!   §6.4.23 tokens.
 //!
-//! Simplifications used in this first inter revision — documented in the
+//! Simplifications used in this revision — documented in the
 //! README's "Deferred" section:
 //!
-//! * **Compound prediction (§6.4.20)** — forced off; `reference_mode`
-//!   must be SINGLE for each block.
-//! * **Scaled references (§8.5.4)** — assumed off; reference dimensions
-//!   must equal the current frame.
+//! * **Compound prediction (§6.4.17 / §8.5.2)** — supported: when
+//!   `reference_mode` is `COMPOUND_REFERENCE` or `REFERENCE_MODE_SELECT`,
+//!   per-block `comp_mode` / `comp_ref` signalling picks two references,
+//!   each MC'd independently, then averaged with `Round2(a+b, 1)`.
+//! * **Scaled references (§8.5.2.3)** — supported via per-reference
+//!   `x_step_q4` / `y_step_q4` applied through the variable-step
+//!   interpolator.
 //! * **Neighbour-aware probability contexts** — context 0 everywhere
 //!   (same compromise as the keyframe path).
-//! * **Segmentation deltas** — never applied.
+//! * **Segmentation deltas** — `SEG_LVL_ALT_Q` and `SEG_LVL_ALT_L` are
+//!   honoured per-block when segmentation is enabled.
 
 use oxideav_core::{Error, Result};
 
 use crate::block::{BlockSize, SUPERBLOCK_SIZE};
 use crate::bool_decoder::BoolDecoder;
-use crate::compressed_header::{CompressedHeader, TxMode};
+use crate::compressed_header::{CompressedHeader, ReferenceMode, TxMode};
 use crate::detokenize::decode_coefs;
 use crate::dpb::RefFrame;
 use crate::headers::UncompressedHeader;
 use crate::intra::IntraMode;
 use crate::loopfilter::{LoopFilter, MiInfo, MiInfoPlane, INTRA_FRAME};
-use crate::mcfilter::{mc_block, InterpFilter, RefSampler};
+use crate::mcfilter::{mc_block_scaled, InterpFilter, RefSampler};
 use crate::mv::{read_mv_component, read_mv_joint, DEFAULT_MV_COMP_PROBS, MV_JOINT_PROBS};
 use crate::probs::{read_partition_from_tree, PARTITION_PROBS};
 use crate::reconintra::{predict as predict_intra, NeighbourBuf};
@@ -61,6 +65,14 @@ const DEFAULT_INTER_MODE_PROBS: [u8; 3] = [2, 173, 34];
 /// `comp_mode`-ignored single-reference selection prob (§10.5 ctx 0).
 const DEFAULT_SINGLE_REF_PROB: [u8; 2] = [33, 16];
 
+/// Default `comp_mode` probability (§10.5 `default_comp_mode_prob`, ctx 0)
+/// — picks COMPOUND vs SINGLE when `reference_mode == REFERENCE_MODE_SELECT`.
+const DEFAULT_COMP_MODE_PROB: u8 = 128;
+
+/// Default `comp_ref` probability — picks which variable reference frame
+/// is used in compound prediction (§10.5 `default_comp_ref_prob`, ctx 0).
+const DEFAULT_COMP_REF_PROB: u8 = 128;
+
 /// Default interp-filter selection probabilities — used when
 /// `interpolation_filter == SWITCHABLE` (§7.3.7). ctx 0, two conditional
 /// splits: first EIGHTTAP vs rest, then EIGHTTAP_SMOOTH vs EIGHTTAP_SHARP.
@@ -73,6 +85,48 @@ const DEFAULT_IF_Y_MODE_PROBS: [u8; 9] = [65, 32, 18, 144, 162, 194, 41, 51, 98]
 /// Inter-frame chroma-intra-mode probs — used when `is_inter = false`.
 /// Indexed by luma mode; we always use the 9-prob sub-row for luma=DC.
 const DEFAULT_IF_UV_MODE_PROBS: [u8; 9] = [120, 7, 76, 176, 208, 126, 28, 221, 29];
+
+/// Compound-reference index resolution per §6.3.18
+/// `setup_compound_reference_mode`. Driven by `ref_frame_sign_bias`.
+///
+/// `fixed` is one of {LAST=1, GOLDEN=2, ALTREF=3} — the "fixed" side of
+/// compound prediction. `var[0]` / `var[1]` are the two candidates
+/// selectable via the `comp_ref` bit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompRefs {
+    pub fixed: u8,
+    pub var: [u8; 2],
+}
+
+impl CompRefs {
+    pub fn from_sign_bias(sign_bias: &[bool; 4]) -> Self {
+        // Index 1 = LAST, 2 = GOLDEN, 3 = ALTREF.
+        let b_last = sign_bias[1];
+        let b_golden = sign_bias[2];
+        let b_altref = sign_bias[3];
+        if b_last == b_golden {
+            CompRefs {
+                fixed: 3,
+                var: [1, 2],
+            }
+        } else if b_last == b_altref {
+            CompRefs {
+                fixed: 2,
+                var: [1, 3],
+            }
+        } else {
+            CompRefs {
+                fixed: 1,
+                var: [2, 3],
+            }
+        }
+    }
+
+    /// Map a ref-frame code (1..=3) to its DPB slot index (0..=2).
+    fn slot_of(code: u8) -> usize {
+        (code as usize).saturating_sub(1)
+    }
+}
 
 /// Inter-only mode enumeration (§6.4.16 Table 9-31).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -367,19 +421,43 @@ impl<'a> InterTile<'a> {
         tx_size_log2: usize,
         skip: bool,
     ) -> Result<()> {
-        // Single-reference only. Read the 1-bit reference selector
-        // (slot 0 vs rest — §6.4.15). For our purposes (default probs
-        // at ctx 0) we just read two bits to pick LAST / GOLDEN / ALTREF.
-        let first = bd.read(DEFAULT_SINGLE_REF_PROB[0])?;
-        let ref_slot = if first == 0 {
-            0 // LAST
+        // Determine whether this block is compound or single.
+        // §6.4.17 read_ref_frames:
+        //   - If reference_mode == REFERENCE_MODE_SELECT read comp_mode,
+        //     else comp_mode = reference_mode.
+        //   - If compound: read comp_ref; idx = sign_bias[CompFixedRef];
+        //     ref_frame[idx] = CompFixedRef, ref_frame[!idx] = CompVarRef[comp_ref].
+        //   - Else: read single_ref_p1 / single_ref_p2.
+        let frame_ref_mode = self.ch.reference_mode.unwrap_or(ReferenceMode::SingleReference);
+        let is_compound = match frame_ref_mode {
+            ReferenceMode::SingleReference => false,
+            ReferenceMode::CompoundReference => true,
+            ReferenceMode::ReferenceModeSelect => bd.read(DEFAULT_COMP_MODE_PROB)? != 0,
+        };
+
+        // ref_frame_codes[0], ref_frame_codes[1] — LAST=1, GOLDEN=2, ALTREF=3.
+        // ref_frame_codes[1] is 0 (NONE) when single.
+        let (ref_code_a, ref_code_b) = if is_compound {
+            let comp_refs = CompRefs::from_sign_bias(&self.hdr.ref_frame_sign_bias);
+            let comp_ref_bit = bd.read(DEFAULT_COMP_REF_PROB)? as usize;
+            let idx = self.hdr.ref_frame_sign_bias[comp_refs.fixed as usize] as usize;
+            let mut refs = [0u8; 2];
+            refs[idx] = comp_refs.fixed;
+            refs[idx ^ 1] = comp_refs.var[comp_ref_bit];
+            (refs[0], refs[1])
         } else {
-            let second = bd.read(DEFAULT_SINGLE_REF_PROB[1])?;
-            if second == 0 {
-                1 // GOLDEN
+            let first = bd.read(DEFAULT_SINGLE_REF_PROB[0])?;
+            let code = if first == 0 {
+                1u8 // LAST
             } else {
-                2 // ALTREF
-            }
+                let second = bd.read(DEFAULT_SINGLE_REF_PROB[1])?;
+                if second == 0 {
+                    2u8 // GOLDEN
+                } else {
+                    3u8 // ALTREF
+                }
+            };
+            (code, 0u8)
         };
         let inter_mode = read_inter_mode(bd, DEFAULT_INTER_MODE_PROBS)?;
 
@@ -389,7 +467,6 @@ impl<'a> InterTile<'a> {
         let mi_w = (bs.w() / 8).max(1) as u8;
         let mi_h = (bs.h() / 8).max(1) as u8;
         let mode_is_non_zero_inter = !matches!(inter_mode, InterMode::Zeromv);
-        let ref_frame_code = 1 + ref_slot as u8; // LAST=1, GOLDEN=2, ALTREF=3.
         self.mi_info.fill(
             mi_row_units,
             mi_col_units,
@@ -398,7 +475,7 @@ impl<'a> InterTile<'a> {
                 mi_h_8x8: mi_h,
                 tx_size_log2: tx_size_log2 as u8,
                 skip,
-                ref_frame: ref_frame_code,
+                ref_frame: ref_code_a, // primary ref drives LF deltas.
                 mode_is_non_zero_inter,
                 segment_id: 0,
             },
@@ -411,64 +488,114 @@ impl<'a> InterTile<'a> {
             read_switchable_filter(bd, DEFAULT_INTERP_PROBS)?
         };
 
-        // Motion vector. For ZEROMV the spec forces (0, 0) without any
-        // reads. NEARESTMV / NEARMV look up neighbour predictors (we
-        // currently don't build the candidate list → they degrade to
-        // (0, 0)). NEWMV reads a full §6.4.19 MV delta on top of the
-        // (0, 0) predictor.
-        let mv = if matches!(inter_mode, InterMode::Newmv) {
-            let joint = read_mv_joint(bd, MV_JOINT_PROBS)?;
-            let mv_row = if joint.has_row() {
-                read_mv_component(bd, &DEFAULT_MV_COMP_PROBS, self.hdr.allow_high_precision_mv)?
-            } else {
-                0
-            };
-            let mv_col = if joint.has_col() {
-                read_mv_component(bd, &DEFAULT_MV_COMP_PROBS, self.hdr.allow_high_precision_mv)?
-            } else {
-                0
-            };
-            (mv_row, mv_col)
+        // Read MVs: for NEWMV one component-tree read per reference, else
+        // zero. (NEARESTMV / NEARMV candidate lists aren't built yet; they
+        // degrade to zero — same compromise as the single-ref path.)
+        let mv_a = if matches!(inter_mode, InterMode::Newmv) {
+            self.read_new_mv(bd)?
+        } else {
+            (0i16, 0i16)
+        };
+        let mv_b = if is_compound && matches!(inter_mode, InterMode::Newmv) {
+            self.read_new_mv(bd)?
         } else {
             (0i16, 0i16)
         };
 
-        // Apply motion compensation if the selected reference exists —
-        // otherwise fall back to a flat mid-grey block (degraded but
-        // avoids aborting the whole frame).
-        let rf = self.refs.get(ref_slot).copied().flatten();
-        if let Some(rf) = rf {
-            self.mc_luma_block(rf, row as usize, col as usize, bs, mv.0, mv.1, filter);
-            let sub_x = self.hdr.color_config.subsampling_x as i32;
-            let sub_y = self.hdr.color_config.subsampling_y as i32;
-            let c_row = (row as usize) >> sub_y;
-            let c_col = (col as usize) >> sub_x;
-            let c_w = bs.w() as usize >> sub_x;
-            let c_h = bs.h() as usize >> sub_y;
-            if c_w >= 4 && c_h >= 4 {
-                self.mc_chroma_block(rf, c_row, c_col, c_w, c_h, mv.0, mv.1, filter, 1);
-                self.mc_chroma_block(rf, c_row, c_col, c_w, c_h, mv.0, mv.1, filter, 2);
+        // Motion-compensate each reference independently, then average
+        // for compound. §8.5.2: preds[0..1+isCompound], then
+        // Round2(a+b, 1) when compound.
+        let w_px = bs.w() as usize;
+        let h_px = bs.h() as usize;
+        let eff_w = w_px.min(self.width.saturating_sub(col as usize));
+        let eff_h = h_px.min(self.height.saturating_sub(row as usize));
+        let sub_x = self.hdr.color_config.subsampling_x as usize;
+        let sub_y = self.hdr.color_config.subsampling_y as usize;
+        let c_row = (row as usize) >> sub_y;
+        let c_col = (col as usize) >> sub_x;
+        let c_w = w_px >> sub_x;
+        let c_h = h_px >> sub_y;
+        let eff_cw = c_w.min(self.uv_w.saturating_sub(c_col));
+        let eff_ch = c_h.min(self.uv_h.saturating_sub(c_row));
+
+        // Predict into a temporary so we can round-average for compound.
+        let mut luma_a = vec![0u8; eff_w * eff_h];
+        let mut luma_b = vec![0u8; eff_w * eff_h];
+        let mut chroma_a = [vec![0u8; eff_cw * eff_ch], vec![0u8; eff_cw * eff_ch]];
+        let mut chroma_b = [vec![0u8; eff_cw * eff_ch], vec![0u8; eff_cw * eff_ch]];
+
+        let mut have_a = false;
+        let mut have_b = false;
+
+        if ref_code_a != 0 {
+            if let Some(rf) = self.ref_by_code(ref_code_a) {
+                self.mc_luma_to(
+                    rf,
+                    row as usize,
+                    col as usize,
+                    eff_w,
+                    eff_h,
+                    mv_a.0,
+                    mv_a.1,
+                    filter,
+                    &mut luma_a,
+                );
+                if eff_cw >= 4 && eff_ch >= 4 {
+                    self.mc_chroma_to(rf, c_row, c_col, eff_cw, eff_ch, mv_a.0, mv_a.1, filter, 1, &mut chroma_a[0]);
+                    self.mc_chroma_to(rf, c_row, c_col, eff_cw, eff_ch, mv_a.0, mv_a.1, filter, 2, &mut chroma_a[1]);
+                }
+                have_a = true;
+            }
+        }
+        if is_compound && ref_code_b != 0 {
+            if let Some(rf) = self.ref_by_code(ref_code_b) {
+                self.mc_luma_to(
+                    rf,
+                    row as usize,
+                    col as usize,
+                    eff_w,
+                    eff_h,
+                    mv_b.0,
+                    mv_b.1,
+                    filter,
+                    &mut luma_b,
+                );
+                if eff_cw >= 4 && eff_ch >= 4 {
+                    self.mc_chroma_to(rf, c_row, c_col, eff_cw, eff_ch, mv_b.0, mv_b.1, filter, 1, &mut chroma_b[0]);
+                    self.mc_chroma_to(rf, c_row, c_col, eff_cw, eff_ch, mv_b.0, mv_b.1, filter, 2, &mut chroma_b[1]);
+                }
+                have_b = true;
+            }
+        }
+
+        // Blit — average if compound, else copy. Fall back to grey fill
+        // when the reference is missing (preserves decode progress).
+        if is_compound && have_a && have_b {
+            average_into(&mut luma_a, &luma_b);
+            self.blit_plane(0, row as usize, col as usize, eff_w, eff_h, &luma_a, eff_w);
+            if eff_cw >= 4 && eff_ch >= 4 {
+                average_into(&mut chroma_a[0], &chroma_b[0]);
+                average_into(&mut chroma_a[1], &chroma_b[1]);
+                self.blit_plane(1, c_row, c_col, eff_cw, eff_ch, &chroma_a[0], eff_cw);
+                self.blit_plane(2, c_row, c_col, eff_cw, eff_ch, &chroma_a[1], eff_cw);
+            }
+        } else if have_a {
+            self.blit_plane(0, row as usize, col as usize, eff_w, eff_h, &luma_a, eff_w);
+            if eff_cw >= 4 && eff_ch >= 4 {
+                self.blit_plane(1, c_row, c_col, eff_cw, eff_ch, &chroma_a[0], eff_cw);
+                self.blit_plane(2, c_row, c_col, eff_cw, eff_ch, &chroma_a[1], eff_cw);
+            }
+        } else if have_b {
+            self.blit_plane(0, row as usize, col as usize, eff_w, eff_h, &luma_b, eff_w);
+            if eff_cw >= 4 && eff_ch >= 4 {
+                self.blit_plane(1, c_row, c_col, eff_cw, eff_ch, &chroma_b[0], eff_cw);
+                self.blit_plane(2, c_row, c_col, eff_cw, eff_ch, &chroma_b[1], eff_cw);
             }
         } else {
-            // No reference — fill with 128. Surfaces as grey but decode
-            // stays sound.
-            self.fill_block(
-                row as usize,
-                col as usize,
-                bs.w() as usize,
-                bs.h() as usize,
-                0,
-                128,
-            );
-            let sub_x = self.hdr.color_config.subsampling_x as i32;
-            let sub_y = self.hdr.color_config.subsampling_y as i32;
-            let c_row = (row as usize) >> sub_y;
-            let c_col = (col as usize) >> sub_x;
-            let c_w = bs.w() as usize >> sub_x;
-            let c_h = bs.h() as usize >> sub_y;
-            if c_w >= 4 && c_h >= 4 {
-                self.fill_block(c_row, c_col, c_w, c_h, 1, 128);
-                self.fill_block(c_row, c_col, c_w, c_h, 2, 128);
+            self.fill_block(row as usize, col as usize, eff_w, eff_h, 0, 128);
+            if eff_cw >= 4 && eff_ch >= 4 {
+                self.fill_block(c_row, c_col, eff_cw, eff_ch, 1, 128);
+                self.fill_block(c_row, c_col, eff_cw, eff_ch, 2, 128);
             }
         }
 
@@ -478,6 +605,29 @@ impl<'a> InterTile<'a> {
             self.add_residual(bd, row, col, bs, tx_size_log2, TxType::DctDct)?;
         }
         Ok(())
+    }
+
+    /// Locate a decoded reference frame by its 1..=3 code (LAST=1,
+    /// GOLDEN=2, ALTREF=3). Returns None if the slot is empty.
+    fn ref_by_code(&self, code: u8) -> Option<&'a RefFrame> {
+        let slot = CompRefs::slot_of(code);
+        self.refs.get(slot).copied().flatten()
+    }
+
+    /// Read one NEWMV delta pair (row, col) in 1/8-pel units.
+    fn read_new_mv(&self, bd: &mut BoolDecoder<'_>) -> Result<(i16, i16)> {
+        let joint = read_mv_joint(bd, MV_JOINT_PROBS)?;
+        let mv_row = if joint.has_row() {
+            read_mv_component(bd, &DEFAULT_MV_COMP_PROBS, self.hdr.allow_high_precision_mv)?
+        } else {
+            0
+        };
+        let mv_col = if joint.has_col() {
+            read_mv_component(bd, &DEFAULT_MV_COMP_PROBS, self.hdr.allow_high_precision_mv)?
+        } else {
+            0
+        };
+        Ok((mv_row, mv_col))
     }
 
     fn decode_intra_block(
@@ -557,80 +707,113 @@ impl<'a> InterTile<'a> {
         }
     }
 
+    /// Luma MC into a caller-provided buffer `dst[eff_w * eff_h]`. Uses
+    /// the scaled interpolator so per-reference `x_step_q4` / `y_step_q4`
+    /// can differ from the current-frame resolution (§8.5.2.3).
     #[allow(clippy::too_many_arguments)]
-    fn mc_luma_block(
-        &mut self,
+    fn mc_luma_to(
+        &self,
         rf: &RefFrame,
         row: usize,
         col: usize,
-        bs: BlockSize,
+        eff_w: usize,
+        eff_h: usize,
         mv_row: i16,
         mv_col: i16,
         filter: InterpFilter,
+        dst: &mut [u8],
     ) {
-        let w = bs.w() as usize;
-        let h = bs.h() as usize;
-        let eff_w = w.min(self.width.saturating_sub(col));
-        let eff_h = h.min(self.height.saturating_sub(row));
         if eff_w == 0 || eff_h == 0 {
             return;
         }
-        // MV in 1/8-pel; integer = mv >> 3, sub-phase = (mv & 7) * 2
-        // (mapping to 0..16 sub-pel table). libvpx encodes sub_row with
-        // `SUBPEL_BITS = 4` on the interpolator side.
-        let int_row = row as isize + (mv_row as isize >> 3);
-        let int_col = col as isize + (mv_col as isize >> 3);
-        let sub_row = ((mv_row & 7) as u32) << 1;
-        let sub_col = ((mv_col & 7) as u32) << 1;
-        let mut dst = vec![0u8; eff_w * eff_h];
+        // §8.5.2.3: xScale = (RefW << 14) / CurW; stepX = (16 * xScale) >> 14.
+        //            startX = (baseX << 4) + ((clampedMv * xScale) >> 14) + fracX.
+        // We work entirely in 1/16 sample units (q4) for the interpolator.
+        let ref_w = rf.width as i32;
+        let ref_h = rf.height as i32;
+        let cur_w = self.width as i32;
+        let cur_h = self.height as i32;
+        let scale_shift = 14;
+        let x_scale = (ref_w << scale_shift) / cur_w.max(1);
+        let y_scale = (ref_h << scale_shift) / cur_h.max(1);
+        let x_step_q4 = (16 * x_scale) >> scale_shift;
+        let y_step_q4 = (16 * y_scale) >> scale_shift;
+        // base position in ref: (cur_pos * scale) >> shift, scaled pos
+        // to q4 by shifting << 4.
+        // Spec uses 2x-precision clampedMv; for 4:2:0 luma sx=sy=0 →
+        // clampedMv = 2 * mv. Units are 1/8-pel for mv, so
+        // clampedMv * xScale / 16384 → q4 offset in ref.
+        let mv_r = (mv_row as i32) * 2;
+        let mv_c = (mv_col as i32) * 2;
+        let base_x_q4 = (((col as i32) * x_scale) >> scale_shift) << 4;
+        let base_y_q4 = (((row as i32) * y_scale) >> scale_shift) << 4;
+        let frac_x = ((16 * (col as i32) * x_scale) >> scale_shift) & 15;
+        let frac_y = ((16 * (row as i32) * y_scale) >> scale_shift) & 15;
+        let d_x = ((mv_c * x_scale) >> scale_shift) + frac_x;
+        let d_y = ((mv_r * y_scale) >> scale_shift) + frac_y;
+        let start_x_q4 = base_x_q4 + d_x;
+        let start_y_q4 = base_y_q4 + d_y;
         let sampler = LumaSampler(rf);
-        mc_block(
-            &sampler, filter, &mut dst, eff_w, eff_w, eff_h, int_row, int_col, sub_row, sub_col,
+        mc_block_scaled(
+            &sampler, filter, dst, eff_w, eff_w, eff_h, start_x_q4, start_y_q4, x_step_q4,
+            y_step_q4,
         );
-        self.blit_plane(0, row, col, eff_w, eff_h, &dst, eff_w);
     }
 
+    /// Chroma MC into a caller-provided buffer.
     #[allow(clippy::too_many_arguments)]
-    fn mc_chroma_block(
-        &mut self,
+    fn mc_chroma_to(
+        &self,
         rf: &RefFrame,
         row: usize,
         col: usize,
-        w: usize,
-        h: usize,
+        eff_w: usize,
+        eff_h: usize,
         mv_row_luma: i16,
         mv_col_luma: i16,
         filter: InterpFilter,
         plane: u8,
+        dst: &mut [u8],
     ) {
-        let eff_w = w.min(self.uv_w.saturating_sub(col));
-        let eff_h = h.min(self.uv_h.saturating_sub(row));
         if eff_w == 0 || eff_h == 0 {
             return;
         }
-        // Convert luma 1/8-pel MV → chroma 1/16-pel for 4:2:0 (spec
-        // §8.5.1): chroma_mv = (luma_mv * 2) >> subsampling.
-        let sub_x = self.hdr.color_config.subsampling_x as u32;
-        let sub_y = self.hdr.color_config.subsampling_y as u32;
-        // For subsampling=1 this is effectively mv (already 1/8-pel luma
-        // → 1/16-pel chroma because the chroma grid is half the luma
-        // resolution). For subsampling=0 (4:4:4) we'd scale by 2.
-        let mv_row = mv_row_luma as i32;
-        let mv_col = mv_col_luma as i32;
-        let int_row = row as isize + ((mv_row >> (3 + sub_y as i32)) as isize);
-        let int_col = col as isize + ((mv_col >> (3 + sub_x as i32)) as isize);
-        let sub_row_phase =
-            ((mv_row & ((1 << (3 + sub_y as i32)) - 1)) as u32) << (1 - sub_y.min(1));
-        let sub_col_phase =
-            ((mv_col & ((1 << (3 + sub_x as i32)) - 1)) as u32) << (1 - sub_x.min(1));
-        let sub_row = sub_row_phase & 15;
-        let sub_col = sub_col_phase & 15;
-        let mut dst = vec![0u8; eff_w * eff_h];
+        let sub_x = self.hdr.color_config.subsampling_x as i32;
+        let sub_y = self.hdr.color_config.subsampling_y as i32;
+        // Reference chroma plane dimensions — needed both for the
+        // sampler clamp (done inside RefFrame) and for scaling.
+        let ref_cur_w = self.width as i32;
+        let ref_cur_h = self.height as i32;
+        let ref_w = rf.width as i32;
+        let ref_h = rf.height as i32;
+        let scale_shift = 14;
+        let x_scale = (ref_w << scale_shift) / ref_cur_w.max(1);
+        let y_scale = (ref_h << scale_shift) / ref_cur_h.max(1);
+        let x_step_q4 = (16 * x_scale) >> scale_shift;
+        let y_step_q4 = (16 * y_scale) >> scale_shift;
+        // §8.5.2.2 clampedMv = (2 * mv) >> sy. For chroma plane we also
+        // use the luma-relative position multiplied by sub_x / sub_y for
+        // the "lumaX" coordinate as the spec notes.
+        let mv_r = ((mv_row_luma as i32) * 2) >> sub_y;
+        let mv_c = ((mv_col_luma as i32) * 2) >> sub_x;
+        // lumaX = col << sub_x for chroma planes.
+        let luma_x = (col as i32) << sub_x;
+        let luma_y = (row as i32) << sub_y;
+        let base_x_q4 = ((luma_x * x_scale) >> scale_shift) << 4;
+        let base_y_q4 = ((luma_y * y_scale) >> scale_shift) << 4;
+        let frac_x = ((16 * luma_x * x_scale) >> scale_shift) & 15;
+        let frac_y = ((16 * luma_y * y_scale) >> scale_shift) & 15;
+        let d_x = ((mv_c * x_scale) >> scale_shift) + frac_x;
+        let d_y = ((mv_r * y_scale) >> scale_shift) + frac_y;
+        // For chroma we want start position in chroma-plane coords, so
+        // the base needs to be divided by the sub-factor.
+        let start_x_q4 = (base_x_q4 + d_x) >> sub_x;
+        let start_y_q4 = (base_y_q4 + d_y) >> sub_y;
         let sampler = ChromaSampler { frame: rf, plane };
-        mc_block(
-            &sampler, filter, &mut dst, eff_w, eff_w, eff_h, int_row, int_col, sub_row, sub_col,
+        mc_block_scaled(
+            &sampler, filter, dst, eff_w, eff_w, eff_h, start_x_q4, start_y_q4, x_step_q4,
+            y_step_q4,
         );
-        self.blit_plane(plane as usize, row, col, eff_w, eff_h, &dst, eff_w);
     }
 
     fn fill_block(&mut self, row: usize, col: usize, w: usize, h: usize, plane: usize, v: u8) {
@@ -1055,6 +1238,15 @@ fn clamp_q(q: i32) -> usize {
     q.clamp(0, 255) as usize
 }
 
+/// In-place average of two equal-length byte buffers per §8.5.2:
+/// `a[i] = Round2(a[i] + b[i], 1) = (a[i] + b[i] + 1) >> 1`.
+fn average_into(a: &mut [u8], b: &[u8]) {
+    let n = a.len().min(b.len());
+    for i in 0..n {
+        a[i] = (((a[i] as u32) + (b[i] as u32) + 1) >> 1) as u8;
+    }
+}
+
 fn clamp_tx_size(log2: usize, w: usize, h: usize) -> usize {
     let max_by_w = match w {
         32.. => 3,
@@ -1087,5 +1279,44 @@ impl InterMode {
             Self::Zeromv => "ZEROMV",
             Self::Newmv => "NEWMV",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn comp_refs_last_golden_same_sign() {
+        // When LAST / GOLDEN share a sign, ALTREF is the fixed ref.
+        let sign_bias = [false, false, false, true];
+        let c = CompRefs::from_sign_bias(&sign_bias);
+        assert_eq!(c.fixed, 3);
+        assert_eq!(c.var, [1, 2]);
+    }
+
+    #[test]
+    fn comp_refs_last_altref_same_sign() {
+        let sign_bias = [false, false, true, false];
+        let c = CompRefs::from_sign_bias(&sign_bias);
+        assert_eq!(c.fixed, 2);
+        assert_eq!(c.var, [1, 3]);
+    }
+
+    #[test]
+    fn comp_refs_last_different_from_both() {
+        let sign_bias = [false, true, false, false];
+        let c = CompRefs::from_sign_bias(&sign_bias);
+        assert_eq!(c.fixed, 1);
+        assert_eq!(c.var, [2, 3]);
+    }
+
+    #[test]
+    fn average_into_round2_matches_spec() {
+        let mut a = [10u8, 20, 30, 40];
+        let b = [20u8, 21, 29, 42];
+        average_into(&mut a, &b);
+        // Round2(a + b, 1) = (a + b + 1) >> 1.
+        assert_eq!(a, [15, 21, 30, 41]);
     }
 }

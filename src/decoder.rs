@@ -88,7 +88,25 @@ impl Vp9Decoder {
     fn ingest(&mut self, packet: &Packet) -> Result<()> {
         self.pending_pts = packet.pts;
         self.current_time_base = packet.time_base;
-        let mut h = parse_uncompressed_header(&packet.data, self.last_color_config)?;
+        // VP9 Annex B: packets may carry a "superframe" trailer that
+        // concatenates several frames into one access unit. Split them
+        // and decode each sub-frame individually.
+        let frames = split_superframe(&packet.data);
+        for (i, frame_data) in frames.iter().enumerate() {
+            // Only attach the packet's PTS to the first shown frame of a
+            // superframe — the rest are typically altref (hidden).
+            if i > 0 {
+                self.pending_pts = None;
+            } else {
+                self.pending_pts = packet.pts;
+            }
+            self.ingest_one(frame_data)?;
+        }
+        Ok(())
+    }
+
+    fn ingest_one(&mut self, frame_data: &[u8]) -> Result<()> {
+        let mut h = parse_uncompressed_header(frame_data, self.last_color_config)?;
         if h.show_existing_frame {
             self.last_header = Some(h);
             return Ok(());
@@ -112,11 +130,11 @@ impl Vp9Decoder {
         // Parse compressed header (§6.3).
         let cmp_start = h.uncompressed_header_size;
         let cmp_end = cmp_start.saturating_add(h.header_size as usize);
-        if cmp_end > packet.data.len() || h.header_size == 0 {
+        if cmp_end > frame_data.len() || h.header_size == 0 {
             return Err(Error::invalid("vp9 compressed header missing or truncated"));
         }
-        let ch = parse_compressed_header(&packet.data[cmp_start..cmp_end], &h)?;
-        let tile_payload = &packet.data[cmp_end..];
+        let ch = parse_compressed_header(&frame_data[cmp_start..cmp_end], &h)?;
+        let tile_payload = &frame_data[cmp_end..];
         if tile_payload.is_empty() {
             return Err(Error::invalid("vp9 tile payload empty"));
         }
@@ -256,6 +274,54 @@ impl Decoder for Vp9Decoder {
         self.eof = false;
         Ok(())
     }
+}
+
+/// Split a VP9 Annex B superframe into one or more sub-frames. Most
+/// packets are single-frame and this returns a one-element vec. When
+/// the trailing marker byte's top 3 bits are `110`, the tail carries
+/// `num_frames` size fields (each 1..=4 bytes) that slice the rest of
+/// the payload into individual frames.
+pub fn split_superframe(data: &[u8]) -> Vec<&[u8]> {
+    if data.is_empty() {
+        return vec![data];
+    }
+    let last = data[data.len() - 1];
+    if last & 0xe0 != 0xc0 {
+        return vec![data];
+    }
+    let bytes_per_size = (((last >> 3) & 0x3) + 1) as usize;
+    let num_frames = ((last & 0x7) + 1) as usize;
+    let index_bytes = 2 + num_frames * bytes_per_size;
+    if data.len() < index_bytes {
+        return vec![data];
+    }
+    let index_start = data.len() - index_bytes;
+    // The byte immediately before the size fields must match the trailer.
+    if data[index_start] != last {
+        return vec![data];
+    }
+    let mut sizes = Vec::with_capacity(num_frames);
+    let size_table_start = index_start + 1;
+    for i in 0..num_frames {
+        let off = size_table_start + i * bytes_per_size;
+        let mut sz = 0usize;
+        // Little-endian per the Annex B.
+        for b in 0..bytes_per_size {
+            sz |= (data[off + b] as usize) << (8 * b);
+        }
+        sizes.push(sz);
+    }
+    let mut out = Vec::with_capacity(num_frames);
+    let mut cursor = 0usize;
+    for sz in sizes {
+        if cursor + sz > index_start {
+            // Malformed — fall back to the whole packet as a single frame.
+            return vec![data];
+        }
+        out.push(&data[cursor..cursor + sz]);
+        cursor += sz;
+    }
+    out
 }
 
 /// Split the tile payload into `tile_rows * tile_cols` byte slices per
@@ -411,6 +477,37 @@ mod tests {
             self.out.extend_from_slice(&[0u8; 4]);
             self.out
         }
+    }
+
+    #[test]
+    fn split_superframe_single_frame_passthrough() {
+        let buf = [0x01u8, 0x02, 0x03, 0x04];
+        let out = split_superframe(&buf);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], &buf[..]);
+    }
+
+    #[test]
+    fn split_superframe_two_frames() {
+        // A manually crafted two-frame superframe: frame A (3 bytes),
+        // frame B (5 bytes), then the size table (2 * 1-byte) and the
+        // marker duplicated.
+        //   bytes_per_size = 1, num_frames = 2
+        //   marker = 0b110_00_001 = 0xc1 (nf-1=1, bps-1=0)
+        let frame_a = [0x11u8, 0x22, 0x33];
+        let frame_b = [0x44u8, 0x55, 0x66, 0x77, 0x88];
+        let marker = 0xc1;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&frame_a);
+        buf.extend_from_slice(&frame_b);
+        buf.push(marker);
+        buf.push(frame_a.len() as u8);
+        buf.push(frame_b.len() as u8);
+        buf.push(marker);
+        let out = split_superframe(&buf);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], &frame_a[..]);
+        assert_eq!(out[1], &frame_b[..]);
     }
 
     /// Synthetic keyframe with an empty compressed header triggers the

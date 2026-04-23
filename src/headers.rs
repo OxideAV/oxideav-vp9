@@ -121,6 +121,35 @@ pub struct SegmentationParams {
     pub feature_enabled: [[bool; 4]; 8],
 }
 
+/// `SEG_LVL_ALT_Q` — index 0 in `feature_data` / `feature_enabled`.
+pub const SEG_LVL_ALT_Q: usize = 0;
+/// `SEG_LVL_ALT_L` — index 1.
+pub const SEG_LVL_ALT_L: usize = 1;
+/// `SEG_LVL_REF_FRAME` — index 2.
+pub const SEG_LVL_REF_FRAME: usize = 2;
+/// `SEG_LVL_SKIP` — index 3.
+pub const SEG_LVL_SKIP: usize = 3;
+
+impl SegmentationParams {
+    /// Apply `SEG_LVL_ALT_Q` per §8.6.1: return the segment-adjusted
+    /// `qindex` for the given segment_id. When the feature is inactive
+    /// this returns `base_q_idx` unchanged.
+    pub fn get_qindex(&self, segment_id: u8, base_q_idx: u8) -> i32 {
+        let s = (segment_id as usize).min(7);
+        if self.enabled && self.feature_enabled[s][SEG_LVL_ALT_Q] {
+            let data = self.feature_data[s][SEG_LVL_ALT_Q] as i32;
+            let v = if self.abs_delta {
+                data
+            } else {
+                (base_q_idx as i32) + data
+            };
+            v.clamp(0, 255)
+        } else {
+            base_q_idx as i32
+        }
+    }
+}
+
 /// `tile_info` from §6.2.6.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TileInfo {
@@ -786,6 +815,43 @@ mod tests {
         assert_eq!(h.tile_info.log2_tile_cols, 0);
         assert_eq!(h.tile_info.log2_tile_rows, 0);
         assert_eq!(h.header_size, 0);
+    }
+
+    #[test]
+    fn seg_alt_q_abs_overrides_base() {
+        let mut s = SegmentationParams {
+            enabled: true,
+            abs_delta: true,
+            ..Default::default()
+        };
+        s.feature_enabled[3][SEG_LVL_ALT_Q] = true;
+        s.feature_data[3][SEG_LVL_ALT_Q] = 72;
+        // abs mode: value replaces base_q_idx.
+        assert_eq!(s.get_qindex(3, 100), 72);
+        // Other segments fall through to base.
+        assert_eq!(s.get_qindex(0, 100), 100);
+    }
+
+    #[test]
+    fn seg_alt_q_delta_adjusts_base() {
+        let mut s = SegmentationParams {
+            enabled: true,
+            abs_delta: false,
+            ..Default::default()
+        };
+        s.feature_enabled[2][SEG_LVL_ALT_Q] = true;
+        s.feature_data[2][SEG_LVL_ALT_Q] = -30;
+        // delta mode: data is an offset.
+        assert_eq!(s.get_qindex(2, 100), 70);
+        // Clamp at 0.
+        s.feature_data[2][SEG_LVL_ALT_Q] = -500;
+        assert_eq!(s.get_qindex(2, 100), 0);
+    }
+
+    #[test]
+    fn seg_disabled_is_passthrough() {
+        let s = SegmentationParams::default();
+        assert_eq!(s.get_qindex(5, 123), 123);
     }
 
     #[test]

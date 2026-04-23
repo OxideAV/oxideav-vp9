@@ -28,7 +28,7 @@
 //! adaptive filter strength pick (§8.8.4) and the edge-type checks
 //! (§8.8.2 items 10-14).
 
-use crate::headers::LoopFilterParams;
+use crate::headers::{LoopFilterParams, SegmentationParams};
 
 /// Max filter level clamp — spec constant `MAX_LOOP_FILTER` (§3 Table 3-2).
 pub const MAX_LOOP_FILTER: i32 = 63;
@@ -129,34 +129,50 @@ pub struct LvlLookup {
 }
 
 impl LvlLookup {
-    /// Build the lookup table per §8.8.1. Segmentation is not yet applied
-    /// by the decoder, so we treat every segment as having zero deltas.
+    /// Build the lookup table per §8.8.1 using the frame's loop-filter
+    /// params only. Segmentation is assumed disabled.
     pub fn build(lf: &LoopFilterParams) -> Self {
+        Self::build_with_segmentation(lf, &SegmentationParams::default())
+    }
+
+    /// Build the lookup table per §8.8.1 with segmentation overrides.
+    /// When `seg.feature_enabled[s][SEG_LVL_ALT_L]` is set, `lvlSeg` for
+    /// that segment is replaced (abs) or offset (delta) by
+    /// `seg.feature_data[s][SEG_LVL_ALT_L]` per §8.8.1 step 2.
+    pub fn build_with_segmentation(lf: &LoopFilterParams, seg: &SegmentationParams) -> Self {
         let base = lf.level as i32;
         let n_shift = base >> 5;
         let mut table = [[[0u8; MAX_MODE_LF_DELTAS]; MAX_REF_FRAMES]; MAX_SEGMENTS];
-        for seg in 0..MAX_SEGMENTS {
-            let lvl_seg = base; // SEG_LVL_ALT_L not applied yet.
+        for s in 0..MAX_SEGMENTS {
+            // Spec §8.8.1 step 1–2: default lvlSeg = base, but if
+            // SEG_LVL_ALT_L (feature index 1) is active use
+            // FeatureData (abs) or base + FeatureData (delta).
+            let mut lvl_seg = base;
+            if seg.enabled && seg.feature_enabled[s][1] {
+                let data = seg.feature_data[s][1] as i32;
+                lvl_seg = if seg.abs_delta { data } else { base + data };
+                lvl_seg = lvl_seg.clamp(0, MAX_LOOP_FILTER);
+            }
             if !lf.mode_ref_delta_enabled {
                 let clamped = lvl_seg.clamp(0, MAX_LOOP_FILTER) as u8;
                 for rf in 0..MAX_REF_FRAMES {
                     for m in 0..MAX_MODE_LF_DELTAS {
-                        table[seg][rf][m] = clamped;
+                        table[s][rf][m] = clamped;
                     }
                 }
                 continue;
             }
             // Intra: modeType is always 0.
             let intra_lvl = lvl_seg + ((lf.ref_deltas[0] as i32) << n_shift);
-            table[seg][INTRA_FRAME as usize][0] = intra_lvl.clamp(0, MAX_LOOP_FILTER) as u8;
-            table[seg][INTRA_FRAME as usize][1] = table[seg][INTRA_FRAME as usize][0];
+            table[s][INTRA_FRAME as usize][0] = intra_lvl.clamp(0, MAX_LOOP_FILTER) as u8;
+            table[s][INTRA_FRAME as usize][1] = table[s][INTRA_FRAME as usize][0];
             // Inter.
             for rf in 1..MAX_REF_FRAMES {
                 for mode in 0..MAX_MODE_LF_DELTAS {
                     let inter_lvl = lvl_seg
                         + ((lf.ref_deltas[rf] as i32) << n_shift)
                         + ((lf.mode_deltas[mode] as i32) << n_shift);
-                    table[seg][rf][mode] = inter_lvl.clamp(0, MAX_LOOP_FILTER) as u8;
+                    table[s][rf][mode] = inter_lvl.clamp(0, MAX_LOOP_FILTER) as u8;
                 }
             }
         }
@@ -225,6 +241,26 @@ impl LoopFilter {
         Self {
             lf: *lf,
             lvl: LvlLookup::build(lf),
+            mi_cols,
+            mi_rows,
+            subsampling_x,
+            subsampling_y,
+        }
+    }
+
+    /// Construct with segmentation-driven per-segment `lvl_seg` overrides
+    /// applied per §8.8.1 step 2.
+    pub fn with_segmentation(
+        lf: &LoopFilterParams,
+        seg: &SegmentationParams,
+        mi_cols: usize,
+        mi_rows: usize,
+        subsampling_x: bool,
+        subsampling_y: bool,
+    ) -> Self {
+        Self {
+            lf: *lf,
+            lvl: LvlLookup::build_with_segmentation(lf, seg),
             mi_cols,
             mi_rows,
             subsampling_x,
@@ -632,6 +668,47 @@ mod tests {
         let mut v = vec![100u8; 8 * 8];
         f.apply_frame(&info, &mut y, 16, 16, 16, &mut u, &mut v, 8, 8, 8);
         assert_eq!(y, before);
+    }
+
+    #[test]
+    fn lvl_lookup_honours_seg_alt_l_abs() {
+        // Frame-level filter level = 32, but segment 2 overrides to 8.
+        let lf = LoopFilterParams {
+            level: 32,
+            ..Default::default()
+        };
+        let mut seg = SegmentationParams {
+            enabled: true,
+            abs_delta: true,
+            ..Default::default()
+        };
+        seg.feature_enabled[2][1] = true;
+        seg.feature_data[2][1] = 8;
+        let l = LvlLookup::build_with_segmentation(&lf, &seg);
+        // Without deltas, the table collapses per-ref/mode.
+        assert_eq!(l.get(0, 0, 0), 32);
+        assert_eq!(l.get(2, 0, 0), 8);
+    }
+
+    #[test]
+    fn lvl_lookup_honours_seg_alt_l_delta() {
+        let lf = LoopFilterParams {
+            level: 32,
+            ..Default::default()
+        };
+        let mut seg = SegmentationParams {
+            enabled: true,
+            abs_delta: false,
+            ..Default::default()
+        };
+        seg.feature_enabled[1][1] = true;
+        seg.feature_data[1][1] = -20;
+        let l = LvlLookup::build_with_segmentation(&lf, &seg);
+        assert_eq!(l.get(1, 0, 0), 12);
+        // Clamp at 0.
+        seg.feature_data[1][1] = -100;
+        let l = LvlLookup::build_with_segmentation(&lf, &seg);
+        assert_eq!(l.get(1, 0, 0), 0);
     }
 
     #[test]

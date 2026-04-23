@@ -280,8 +280,9 @@ impl<'a> InterTile<'a> {
     fn apply_loop_filter(&mut self) {
         let subsampling_x = self.hdr.color_config.subsampling_x;
         let subsampling_y = self.hdr.color_config.subsampling_y;
-        let lf = LoopFilter::new(
+        let lf = LoopFilter::with_segmentation(
             &self.hdr.loop_filter,
+            &self.hdr.segmentation,
             self.mi_info.mi_cols,
             self.mi_info.mi_rows,
             subsampling_x,
@@ -937,16 +938,19 @@ impl<'a> InterTile<'a> {
         let scan = get_scan(tx_size_log2);
         let probs = coef_probs_for(tx_size_log2, plane_type);
 
-        let qp = self.hdr.quantization.base_q_idx as usize;
+        let qp = self.hdr.segmentation.get_qindex(
+            0, // segment_id (per-block segmentation map not yet built).
+            self.hdr.quantization.base_q_idx,
+        );
         let (dc, ac) = if plane == 0 {
             (
-                DC_QLOOKUP[clamp_q(qp as i32 + self.hdr.quantization.delta_q_y_dc as i32)],
-                AC_QLOOKUP[clamp_q(qp as i32)],
+                DC_QLOOKUP[clamp_q(qp + self.hdr.quantization.delta_q_y_dc as i32)],
+                AC_QLOOKUP[clamp_q(qp)],
             )
         } else {
             (
-                DC_QLOOKUP[clamp_q(qp as i32 + self.hdr.quantization.delta_q_uv_dc as i32)],
-                AC_QLOOKUP[clamp_q(qp as i32 + self.hdr.quantization.delta_q_uv_ac as i32)],
+                DC_QLOOKUP[clamp_q(qp + self.hdr.quantization.delta_q_uv_dc as i32)],
+                AC_QLOOKUP[clamp_q(qp + self.hdr.quantization.delta_q_uv_ac as i32)],
             )
         };
         let dq = [dc, ac];
@@ -1013,16 +1017,19 @@ impl<'a> InterTile<'a> {
         let scan = get_scan(tx_size_log2);
         let probs = coef_probs_for(tx_size_log2, plane_type);
 
-        let qp = self.hdr.quantization.base_q_idx as usize;
+        let qp = self.hdr.segmentation.get_qindex(
+            0, // segment_id (per-block segmentation map not yet built).
+            self.hdr.quantization.base_q_idx,
+        );
         let (dc, ac) = if plane == 0 {
             (
-                DC_QLOOKUP[clamp_q(qp as i32 + self.hdr.quantization.delta_q_y_dc as i32)],
-                AC_QLOOKUP[clamp_q(qp as i32)],
+                DC_QLOOKUP[clamp_q(qp + self.hdr.quantization.delta_q_y_dc as i32)],
+                AC_QLOOKUP[clamp_q(qp)],
             )
         } else {
             (
-                DC_QLOOKUP[clamp_q(qp as i32 + self.hdr.quantization.delta_q_uv_dc as i32)],
-                AC_QLOOKUP[clamp_q(qp as i32 + self.hdr.quantization.delta_q_uv_ac as i32)],
+                DC_QLOOKUP[clamp_q(qp + self.hdr.quantization.delta_q_uv_dc as i32)],
+                AC_QLOOKUP[clamp_q(qp + self.hdr.quantization.delta_q_uv_ac as i32)],
             )
         };
         let dq = [dc, ac];

@@ -31,6 +31,7 @@ use crate::detokenize::decode_coefs;
 use crate::dpb::RefFrame;
 use crate::headers::UncompressedHeader;
 use crate::intra::IntraMode;
+use crate::loopfilter::{LoopFilter, MiInfo, MiInfoPlane, INTRA_FRAME};
 use crate::mcfilter::{mc_block, InterpFilter, RefSampler};
 use crate::mv::{read_mv_component, read_mv_joint, DEFAULT_MV_COMP_PROBS, MV_JOINT_PROBS};
 use crate::probs::{read_partition_from_tree, PARTITION_PROBS};
@@ -153,6 +154,8 @@ pub struct InterTile<'a> {
     /// Effective interpolation filter picked per header. When
     /// `interpolation_filter == SWITCHABLE` each block reads its own.
     pub default_filter: Option<InterpFilter>,
+    /// Per-8x8-MI block metadata for §8.8 loop filtering.
+    pub mi_info: MiInfoPlane,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,6 +185,8 @@ impl<'a> InterTile<'a> {
         } else {
             None
         };
+        let mi_cols = width.div_ceil(8).max(1);
+        let mi_rows = height.div_ceil(8).max(1);
         Self {
             hdr,
             ch,
@@ -196,6 +201,7 @@ impl<'a> InterTile<'a> {
             width,
             height,
             default_filter,
+            mi_info: MiInfoPlane::new(mi_cols, mi_rows),
         }
     }
 
@@ -211,7 +217,34 @@ impl<'a> InterTile<'a> {
                 self.decode_partition(bd, row, col, SUPERBLOCK_SIZE)?;
             }
         }
+        // §8.8 loop filter pass.
+        self.apply_loop_filter();
         Ok(())
+    }
+
+    /// Run the §8.8 loop filter over the reconstructed planes.
+    fn apply_loop_filter(&mut self) {
+        let subsampling_x = self.hdr.color_config.subsampling_x;
+        let subsampling_y = self.hdr.color_config.subsampling_y;
+        let lf = LoopFilter::new(
+            &self.hdr.loop_filter,
+            self.mi_info.mi_cols,
+            self.mi_info.mi_rows,
+            subsampling_x,
+            subsampling_y,
+        );
+        lf.apply_frame(
+            &self.mi_info,
+            &mut self.y,
+            self.y_stride,
+            self.width,
+            self.height,
+            &mut self.u,
+            &mut self.v,
+            self.uv_stride,
+            self.uv_w,
+            self.uv_h,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -350,6 +383,27 @@ impl<'a> InterTile<'a> {
         };
         let inter_mode = read_inter_mode(bd, DEFAULT_INTER_MODE_PROBS)?;
 
+        // Record §8.8 MI metadata for this inter block.
+        let mi_row_units = (row as usize) / 8;
+        let mi_col_units = (col as usize) / 8;
+        let mi_w = (bs.w() / 8).max(1) as u8;
+        let mi_h = (bs.h() / 8).max(1) as u8;
+        let mode_is_non_zero_inter = !matches!(inter_mode, InterMode::Zeromv);
+        let ref_frame_code = 1 + ref_slot as u8; // LAST=1, GOLDEN=2, ALTREF=3.
+        self.mi_info.fill(
+            mi_row_units,
+            mi_col_units,
+            MiInfo {
+                mi_w_8x8: mi_w,
+                mi_h_8x8: mi_h,
+                tx_size_log2: tx_size_log2 as u8,
+                skip,
+                ref_frame: ref_frame_code,
+                mode_is_non_zero_inter,
+                segment_id: 0,
+            },
+        );
+
         // Interpolation filter (optionally switchable).
         let filter = if let Some(f) = self.default_filter {
             f
@@ -437,6 +491,24 @@ impl<'a> InterTile<'a> {
     ) -> Result<()> {
         let y_mode = read_intra_mode_tree(bd, &DEFAULT_IF_Y_MODE_PROBS)?;
         let uv_mode = read_intra_mode_tree(bd, &DEFAULT_IF_UV_MODE_PROBS)?;
+        // Record §8.8 MI metadata for this intra-in-inter block.
+        let mi_row_units = (row as usize) / 8;
+        let mi_col_units = (col as usize) / 8;
+        let mi_w = (bs.w() / 8).max(1) as u8;
+        let mi_h = (bs.h() / 8).max(1) as u8;
+        self.mi_info.fill(
+            mi_row_units,
+            mi_col_units,
+            MiInfo {
+                mi_w_8x8: mi_w,
+                mi_h_8x8: mi_h,
+                tx_size_log2: tx_size_log2 as u8,
+                skip,
+                ref_frame: INTRA_FRAME,
+                mode_is_non_zero_inter: false,
+                segment_id: 0,
+            },
+        );
         // Luma predict + residual.
         self.recon_intra_plane(
             bd,

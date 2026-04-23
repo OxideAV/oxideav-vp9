@@ -21,6 +21,7 @@ use crate::compressed_header::{CompressedHeader, TxMode};
 use crate::detokenize::decode_coefs;
 use crate::headers::UncompressedHeader;
 use crate::intra::IntraMode;
+use crate::loopfilter::{LoopFilter, MiInfo, MiInfoPlane, INTRA_FRAME};
 use crate::probs::{read_partition_from_tree, KF_PARTITION_PROBS};
 use crate::reconintra::{predict as predict_intra, NeighbourBuf};
 use crate::tables::{
@@ -125,6 +126,8 @@ pub struct IntraTile<'a> {
     /// Frame dimensions (luma).
     pub width: usize,
     pub height: usize,
+    /// Per-8x8-MI block metadata for §8.8 loop filtering.
+    pub mi_info: MiInfoPlane,
 }
 
 /// Scan + neighbour tables for a (tx_size, tx_type) pair. Mirrors
@@ -259,6 +262,8 @@ impl<'a> IntraTile<'a> {
         let uv_w = (width + sub_x) >> sub_x;
         let uv_h = (height + sub_y) >> sub_y;
         let uv_stride = uv_w.max(1);
+        let mi_cols = width.div_ceil(8).max(1);
+        let mi_rows = height.div_ceil(8).max(1);
         Self {
             hdr,
             ch,
@@ -271,6 +276,7 @@ impl<'a> IntraTile<'a> {
             uv_h,
             width,
             height,
+            mi_info: MiInfoPlane::new(mi_cols, mi_rows),
         }
     }
 
@@ -291,7 +297,34 @@ impl<'a> IntraTile<'a> {
                 self.decode_partition(bd, row, col, SUPERBLOCK_SIZE)?;
             }
         }
+        // §8.8 loop filter pass after all blocks reconstructed.
+        self.apply_loop_filter();
         Ok(())
+    }
+
+    /// Run the §8.8 loop filter in place on the reconstructed planes.
+    fn apply_loop_filter(&mut self) {
+        let subsampling_x = self.hdr.color_config.subsampling_x;
+        let subsampling_y = self.hdr.color_config.subsampling_y;
+        let lf = LoopFilter::new(
+            &self.hdr.loop_filter,
+            self.mi_info.mi_cols,
+            self.mi_info.mi_rows,
+            subsampling_x,
+            subsampling_y,
+        );
+        lf.apply_frame(
+            &self.mi_info,
+            &mut self.y,
+            self.y_stride,
+            self.width,
+            self.height,
+            &mut self.u,
+            &mut self.v,
+            self.uv_stride,
+            self.uv_w,
+            self.uv_h,
+        );
     }
 
     fn is_keyframe_like(&self) -> bool {
@@ -423,6 +456,23 @@ impl<'a> IntraTile<'a> {
             self.read_intra_mode(bd)?
         };
         let uv_mode = self.read_intra_mode_uv(bd, y_mode)?;
+
+        // Record MI metadata for §8.8 loop filter. Keyframes are intra
+        // by construction — ref_frame stays at INTRA_FRAME.
+        let mi_row_units = (row as usize) / 8;
+        let mi_col_units = (col as usize) / 8;
+        let mi_w = (bs.w() / 8).max(1) as u8;
+        let mi_h = (bs.h() / 8).max(1) as u8;
+        let mi = MiInfo {
+            mi_w_8x8: mi_w,
+            mi_h_8x8: mi_h,
+            tx_size_log2: tx_size_log2 as u8,
+            skip,
+            ref_frame: INTRA_FRAME,
+            mode_is_non_zero_inter: false,
+            segment_id: 0,
+        };
+        self.mi_info.fill(mi_row_units, mi_col_units, mi);
 
         // Reconstruct luma plane for this block.
         self.reconstruct_plane(

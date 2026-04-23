@@ -80,3 +80,37 @@ fn decode_keyframe_then_p_frame() {
         "frame 2 identical to frame 1 — inter decode produced no change"
     );
 }
+
+/// Smoke test for the §8.8 loop filter wiring: the keyframe in this
+/// fixture carries `loop_filter_level = 3`, so the deblocking pass
+/// actually runs across every 8x8 boundary. We don't have a bit-exact
+/// libvpx oracle plumbed, but we do assert that:
+///
+/// * Decode still finishes without panic (no OOB on filter neighbour
+///   reads).
+/// * The reconstructed luma plane is not constant — i.e. the filter
+///   didn't zero / flatten the whole image.
+#[test]
+fn loop_filter_does_not_destroy_keyframe() {
+    if !Path::new(FIXTURE).exists() {
+        panic!("fixture {FIXTURE} missing — regenerate via module docs");
+    }
+    let data = std::fs::read(FIXTURE).expect("read fixture");
+    let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+    let mut dec = make_decoder(&params).expect("make_decoder");
+    let mut iter = ivf::iter_frames(&data).expect("iter frames");
+    let f1 = iter.next().expect("f1").expect("f1 ok");
+    dec.send_packet(&Packet::new(0, TimeBase::new(1, 24), f1.payload.to_vec()))
+        .expect("send frame 1");
+    let frame = match dec.receive_frame().expect("receive") {
+        Frame::Video(v) => v,
+        other => panic!("expected Video, got {other:?}"),
+    };
+    let y = &frame.planes[0].data;
+    let mn = *y.iter().min().unwrap();
+    let mx = *y.iter().max().unwrap();
+    assert!(
+        mx > mn,
+        "loop filter flattened the whole keyframe (min={mn}, max={mx})"
+    );
+}

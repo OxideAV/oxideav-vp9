@@ -12,6 +12,10 @@
 //! frames (LAST / GOLDEN / ALTREF, NEARESTMV / NEARMV / ZEROMV / NEWMV)
 //! decode into `VideoFrame`s.
 //!
+//! After reconstruction the §8.8 loop filter / deblocking pass runs on
+//! the Y/U/V planes (filter_mask + flat_mask + narrow/wide filter),
+//! cleaning the 8×8 block boundaries.
+//!
 //! Deferred: compound prediction (§6.4.20), scaled references (§8.5.4),
 //! multi-tile frames, segmentation-driven deltas, higher bit depths.
 //!

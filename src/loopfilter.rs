@@ -374,15 +374,8 @@ impl LoopFilter {
                     || (pass == 0 && x == 0)
                     || (pass == 1 && y == 0));
                 // §8.8.2 step 14 applyFilter.
-                let apply_filter = if !on_screen {
-                    false
-                } else if is_block_edge {
-                    true
-                } else if is_tx_edge && is_intra {
-                    true
-                } else {
-                    is_tx_edge && !skip
-                };
+                let apply_filter = on_screen
+                    && (is_block_edge || (is_tx_edge && (is_intra || !skip)));
                 // §8.8.3 filter size: log2 of filter side (0=TX_4X4,
                 // 1=TX_8X8, 2=TX_16X16).
                 let base_size = if tx_sz == 0 && is32_edge {
@@ -391,17 +384,15 @@ impl LoopFilter {
                     tx_sz.min(2)
                 };
                 // Right/bottom edge reduction for chroma 16x16 base_size.
-                let filter_size = if pass == 0
+                let chroma_right_shrink = pass == 0
                     && sub_x == 1
                     && base_size == 2
-                    && (x >> 3) == (self.mi_cols as i32) - 1
-                {
-                    1
-                } else if pass == 1
+                    && (x >> 3) == (self.mi_cols as i32) - 1;
+                let chroma_bottom_shrink = pass == 1
                     && sub_y == 1
                     && base_size == 2
-                    && (y >> 3) == (self.mi_rows as i32) - 1
-                {
+                    && (y >> 3) == (self.mi_rows as i32) - 1;
+                let filter_size = if chroma_right_shrink || chroma_bottom_shrink {
                     1
                 } else {
                     base_size
@@ -565,7 +556,6 @@ fn filter4(plane: &mut PlaneMut<'_>, x: i32, y: i32, dx: i32, dy: i32, hev_mask:
 fn filter_wide(plane: &mut PlaneMut<'_>, x: i32, y: i32, dx: i32, dy: i32, log2_size: u32) {
     let n = (1i32 << (log2_size - 1)) - 1;
     // Gather 2n+2 samples indexed -(n+1) .. n inclusive.
-    let nn = (n + 1) as usize;
     let len = (2 * n + 2) as usize;
     let mut samples = vec![0i32; len];
     for (idx, i) in (-(n + 1)..=n).enumerate() {
@@ -585,8 +575,6 @@ fn filter_wide(plane: &mut PlaneMut<'_>, x: i32, y: i32, dx: i32, dy: i32, log2_
         let val = out[(i + n) as usize].clamp(0, 255) as u8;
         plane.write((y + i * dy) as isize, (x + i * dx) as isize, val);
     }
-    let _ = nn;
-    let _ = &samples; // keep the mutable-unused lint quiet if any
 }
 
 #[cfg(test)]

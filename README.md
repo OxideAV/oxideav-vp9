@@ -41,6 +41,14 @@ framework but usable standalone.
   CAT1..6), sign bit, per-position context via neighbour magnitudes,
   dequantisation against `DC_QLOOKUP` / `AC_QLOOKUP` and the 32×32
   `dq_shift`.
+* **Loop filter / deblocking** (§8.8): after reconstruction the tile
+  walker applies the §8.8 deblocking pass — §8.8.1 `LvlLookup` with
+  ref / mode deltas, §8.8.2 raster walk in 8×8-MI units over both
+  passes and all three planes, §8.8.3 filter-size clamp, §8.8.4
+  adaptive filter strength (limit / blimit / thresh) and §8.8.5
+  sample filter (narrow `filter4`, wide `filter8` / `filter16` with
+  `flat_mask` / `flat_mask2`). Segmentation deltas and multi-tile
+  coordination are still pending. 8-bit 4:2:0 only.
 * **IVF demux** (`ivf::iter_frames`) lets tests feed ffmpeg-generated
   clips directly.
 
@@ -114,8 +122,6 @@ bit-for-bit:
   KF intra-mode probability selection, for `skip_prob` and for
   `is_inter_prob`. Output diverges from the libvpx reference but
   stays plausible.
-* **Deblocking loop filter (§8.8)**: not yet applied. Block
-  boundaries remain visible on the reconstructed output.
 * **Multi-tile frames**: `log2_tile_cols > 0` and `log2_tile_rows > 0`
   return `Unsupported`.
 * **Higher bit depths (profiles 2 / 3)**: the parser recognises

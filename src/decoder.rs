@@ -120,17 +120,26 @@ impl Vp9Decoder {
         if tile_payload.is_empty() {
             return Err(Error::invalid("vp9 tile payload empty"));
         }
-        if h.tile_info.log2_tile_cols != 0 || h.tile_info.log2_tile_rows != 0 {
-            self.last_header = Some(h);
-            return Err(Error::unsupported(
-                "vp9 multi-tile frames pending (log2_tile > 0)",
-            ));
-        }
+
+        let tile_cols = 1u32 << h.tile_info.log2_tile_cols as u32;
+        let tile_rows = 1u32 << h.tile_info.log2_tile_rows as u32;
+
+        // Split tile_payload into `tile_rows * tile_cols` sub-slices. All
+        // tiles except the last are prefixed with a 4-byte big-endian
+        // length (§6.4 decode_tiles).
+        let tile_slices = split_tile_payload(tile_payload, tile_cols, tile_rows)?;
 
         let (y, y_stride, u, v, uv_stride, uv_w, uv_h) = if is_intra {
             let mut tile = IntraTile::new(&h, &ch);
-            let mut bd = BoolDecoder::new(tile_payload)?;
-            tile.decode(&mut bd)?;
+            for tr in 0..tile_rows {
+                for tc in 0..tile_cols {
+                    let slice = tile_slices[(tr * tile_cols + tc) as usize];
+                    let mut bd = BoolDecoder::new(slice)?;
+                    let (col_s, col_e, row_s, row_e) = tile_pixel_bounds(&h, tc, tr);
+                    tile.decode_rect(&mut bd, col_s, col_e, row_s, row_e)?;
+                }
+            }
+            tile.finalize();
             (
                 tile.y,
                 tile.y_stride,
@@ -147,8 +156,15 @@ impl Vp9Decoder {
                 self.dpb.get(h.ref_frame_idx[2]),
             ];
             let mut tile = InterTile::new(&h, &ch, h.width as usize, h.height as usize, refs);
-            let mut bd = BoolDecoder::new(tile_payload)?;
-            tile.decode(&mut bd)?;
+            for tr in 0..tile_rows {
+                for tc in 0..tile_cols {
+                    let slice = tile_slices[(tr * tile_cols + tc) as usize];
+                    let mut bd = BoolDecoder::new(slice)?;
+                    let (col_s, col_e, row_s, row_e) = tile_pixel_bounds(&h, tc, tr);
+                    tile.decode_rect(&mut bd, col_s, col_e, row_s, row_e)?;
+                }
+            }
+            tile.finalize();
             (
                 tile.y,
                 tile.y_stride,
@@ -240,6 +256,74 @@ impl Decoder for Vp9Decoder {
         self.eof = false;
         Ok(())
     }
+}
+
+/// Split the tile payload into `tile_rows * tile_cols` byte slices per
+/// §6.4 decode_tiles: every tile except the last is prefixed with a
+/// 4-byte big-endian length; the final tile consumes the remainder.
+fn split_tile_payload<'a>(
+    payload: &'a [u8],
+    tile_cols: u32,
+    tile_rows: u32,
+) -> Result<Vec<&'a [u8]>> {
+    let total = (tile_cols as usize) * (tile_rows as usize);
+    let mut out: Vec<&'a [u8]> = Vec::with_capacity(total);
+    let mut cursor = 0usize;
+    for i in 0..total {
+        let is_last = i + 1 == total;
+        let (slice, next) = if is_last {
+            (&payload[cursor..], payload.len())
+        } else {
+            if cursor + 4 > payload.len() {
+                return Err(Error::invalid("vp9 multi-tile: truncated tile_size prefix"));
+            }
+            let sz = u32::from_be_bytes([
+                payload[cursor],
+                payload[cursor + 1],
+                payload[cursor + 2],
+                payload[cursor + 3],
+            ]) as usize;
+            let start = cursor + 4;
+            let end = start + sz;
+            if end > payload.len() {
+                return Err(Error::invalid("vp9 multi-tile: tile_size overruns payload"));
+            }
+            (&payload[start..end], end)
+        };
+        out.push(slice);
+        cursor = next;
+    }
+    Ok(out)
+}
+
+/// Pixel-space bounds `(col_start, col_end, row_start, row_end)` for
+/// tile (`tile_col`, `tile_row`) per §6.4.1 `get_tile_offset`. The
+/// returned bounds are clamped to the frame dimensions.
+fn tile_pixel_bounds(
+    h: &UncompressedHeader,
+    tile_col: u32,
+    tile_row: u32,
+) -> (u32, u32, u32, u32) {
+    let mi_cols = h.width.div_ceil(8);
+    let mi_rows = h.height.div_ceil(8);
+    let col_s = get_tile_offset(tile_col, mi_cols, h.tile_info.log2_tile_cols as u32) * 8;
+    let col_e = get_tile_offset(tile_col + 1, mi_cols, h.tile_info.log2_tile_cols as u32) * 8;
+    let row_s = get_tile_offset(tile_row, mi_rows, h.tile_info.log2_tile_rows as u32) * 8;
+    let row_e = get_tile_offset(tile_row + 1, mi_rows, h.tile_info.log2_tile_rows as u32) * 8;
+    (
+        col_s.min(h.width),
+        col_e.min(h.width),
+        row_s.min(h.height),
+        row_e.min(h.height),
+    )
+}
+
+/// §6.4.1 get_tile_offset: offset = ((tileNum * sbs) >> tileSzLog2) << 3;
+/// return min(offset, mis).
+fn get_tile_offset(tile_num: u32, mis: u32, tile_sz_log2: u32) -> u32 {
+    let sbs = mis.div_ceil(8);
+    let offset = ((tile_num * sbs) >> tile_sz_log2) << 3;
+    offset.min(mis)
 }
 
 /// Helper that returns frame_rate from container-supplied stream timing

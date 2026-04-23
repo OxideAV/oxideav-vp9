@@ -276,6 +276,36 @@ impl<'a> InterTile<'a> {
         Ok(())
     }
 
+    /// Decode one tile rectangle in pixel coordinates. The caller owns
+    /// the outer `bd` — each tile's boolean engine is independent per
+    /// §6.4. The loop-filter pass is NOT invoked here; it must run once
+    /// after all tiles of the frame have been decoded.
+    pub fn decode_rect(
+        &mut self,
+        bd: &mut BoolDecoder<'_>,
+        col_start: u32,
+        col_end: u32,
+        row_start: u32,
+        row_end: u32,
+    ) -> Result<()> {
+        let mut r = row_start;
+        while r < row_end {
+            let mut c = col_start;
+            while c < col_end {
+                self.decode_partition(bd, r, c, SUPERBLOCK_SIZE)?;
+                c += SUPERBLOCK_SIZE;
+            }
+            r += SUPERBLOCK_SIZE;
+        }
+        Ok(())
+    }
+
+    /// Run the §8.8 loop filter pass after all tiles are decoded.
+    /// Separate from `decode_rect` so multi-tile callers can defer.
+    pub fn finalize(&mut self) {
+        self.apply_loop_filter();
+    }
+
     /// Run the §8.8 loop filter over the reconstructed planes.
     fn apply_loop_filter(&mut self) {
         let subsampling_x = self.hdr.color_config.subsampling_x;

@@ -302,6 +302,40 @@ impl<'a> IntraTile<'a> {
         Ok(())
     }
 
+    /// Decode one tile rectangle in pixel coordinates. The bool decoder
+    /// `bd` is already positioned at the first byte of this tile's
+    /// payload (each tile resets the boolean engine per §6.4).
+    pub fn decode_rect(
+        &mut self,
+        bd: &mut BoolDecoder<'a>,
+        col_start: u32,
+        col_end: u32,
+        row_start: u32,
+        row_end: u32,
+    ) -> Result<()> {
+        if !self.is_keyframe_like() {
+            return Err(Error::unsupported(
+                "vp9 inter frame pending — only keyframe / intra_only decode is wired",
+            ));
+        }
+        let mut r = row_start;
+        while r < row_end {
+            let mut c = col_start;
+            while c < col_end {
+                self.decode_partition(bd, r, c, SUPERBLOCK_SIZE)?;
+                c += SUPERBLOCK_SIZE;
+            }
+            r += SUPERBLOCK_SIZE;
+        }
+        Ok(())
+    }
+
+    /// Run the §8.8 loop filter pass. Multi-tile callers use this once
+    /// after all tiles are decoded.
+    pub fn finalize(&mut self) {
+        self.apply_loop_filter();
+    }
+
     /// Run the §8.8 loop filter in place on the reconstructed planes.
     fn apply_loop_filter(&mut self) {
         let subsampling_x = self.hdr.color_config.subsampling_x;

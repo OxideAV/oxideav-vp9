@@ -120,16 +120,35 @@ impl Default for CompressedHeader {
 
 /// Parse the §6.3 compressed header in full. All probability deltas are
 /// folded into the embedded `FrameContext`; tile decode should use it
-/// for all entropy decisions.
+/// for all entropy decisions. The seed FrameContext is built from the
+/// §10.5 default tables — callers wanting per-slot saved contexts
+/// (§8.10) should use [`parse_compressed_header_with_seed`].
 pub fn parse_compressed_header(
     payload: &[u8],
     hdr: &UncompressedHeader,
+) -> Result<CompressedHeader> {
+    parse_compressed_header_with_seed(payload, hdr, FrameContext::new_default())
+}
+
+/// Like [`parse_compressed_header`] but seeds the frame context with
+/// `seed` instead of the default. Used by the top-level decoder to
+/// carry probability state across frames via the four `frame_context_idx`
+/// slots (§8.10).
+pub fn parse_compressed_header_with_seed(
+    payload: &[u8],
+    hdr: &UncompressedHeader,
+    seed: FrameContext,
 ) -> Result<CompressedHeader> {
     if payload.is_empty() {
         return Err(Error::invalid("vp9 §6.3: compressed header missing"));
     }
     let mut bd = BoolDecoder::new(payload)?;
-    let mut out = CompressedHeader::default();
+    let mut out = CompressedHeader {
+        tx_mode: None,
+        reference_mode: None,
+        compound_refs: CompoundRefs::default(),
+        ctx: seed,
+    };
 
     // §6.3.1 read_tx_mode.
     let tx_mode = if hdr.quantization.lossless {

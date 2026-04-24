@@ -16,8 +16,9 @@ use oxideav_core::{
 
 use crate::block::IntraTile;
 use crate::bool_decoder::BoolDecoder;
-use crate::compressed_header::parse_compressed_header;
+use crate::compressed_header::parse_compressed_header_with_seed;
 use crate::dpb::{Dpb, RefFrame};
+use crate::frame_ctx::FrameContext;
 use crate::headers::{parse_uncompressed_header, ColorConfig, FrameType, UncompressedHeader};
 use crate::inter::InterTile;
 
@@ -60,6 +61,13 @@ pub struct Vp9Decoder {
     current_time_base: TimeBase,
     /// 8-slot reference picture buffer (§6.2).
     dpb: Dpb,
+    /// Four saved frame-context slots (§8.10). Each frame picks its
+    /// seed slot via `frame_context_idx` (0..=3) and, if
+    /// `refresh_frame_context` was set, writes its post-compressed-header
+    /// context back to the same slot at end-of-frame. Keyframes /
+    /// intra_only / `reset_frame_context >= 2` reset all four slots to
+    /// the §10.5 defaults.
+    saved_ctx: [FrameContext; 4],
     eof: bool,
 }
 
@@ -73,6 +81,12 @@ impl Vp9Decoder {
             pending_pts: None,
             current_time_base: TimeBase::new(1, 90_000),
             dpb: Dpb::new(),
+            saved_ctx: [
+                FrameContext::new_default(),
+                FrameContext::new_default(),
+                FrameContext::new_default(),
+                FrameContext::new_default(),
+            ],
             eof: false,
         }
     }
@@ -127,13 +141,37 @@ impl Vp9Decoder {
             }
         }
 
-        // Parse compressed header (§6.3).
+        // Parse compressed header (§6.3). Seed the per-frame context
+        // from either the §10.5 defaults (on keyframe / intra_only /
+        // reset_frame_context >= 2) or from the saved slot indicated by
+        // `frame_context_idx` (§8.10).
         let cmp_start = h.uncompressed_header_size;
         let cmp_end = cmp_start.saturating_add(h.header_size as usize);
         if cmp_end > frame_data.len() || h.header_size == 0 {
             return Err(Error::invalid("vp9 compressed header missing or truncated"));
         }
-        let ch = parse_compressed_header(&frame_data[cmp_start..cmp_end], &h)?;
+        let reset_all = is_intra || h.reset_frame_context >= 2;
+        if reset_all {
+            for slot in self.saved_ctx.iter_mut() {
+                *slot = FrameContext::new_default();
+            }
+        }
+        let slot_idx = (h.frame_context_idx as usize).min(3);
+        let seed = if reset_all {
+            FrameContext::new_default()
+        } else {
+            self.saved_ctx[slot_idx].clone()
+        };
+        let ch = parse_compressed_header_with_seed(&frame_data[cmp_start..cmp_end], &h, seed)?;
+        // §8.10 reference_frame_update: if refresh_frame_context is set
+        // and frame_parallel_decoding_mode is 0, save our post-§6.3
+        // context back into the slot. (With fpdm=1 the spec technically
+        // uses backward adaptation; we approximate by saving the
+        // compressed-header-only state — still better than starting
+        // every inter frame from defaults.)
+        if h.refresh_frame_context {
+            self.saved_ctx[slot_idx] = ch.ctx.clone();
+        }
         let tile_payload = &frame_data[cmp_end..];
         if tile_payload.is_empty() {
             return Err(Error::invalid("vp9 tile payload empty"));
@@ -290,6 +328,12 @@ impl Decoder for Vp9Decoder {
         self.ready_frames.clear();
         self.pending_pts = None;
         self.dpb = Dpb::new();
+        self.saved_ctx = [
+            FrameContext::new_default(),
+            FrameContext::new_default(),
+            FrameContext::new_default(),
+            FrameContext::new_default(),
+        ];
         self.eof = false;
         Ok(())
     }

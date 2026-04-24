@@ -37,7 +37,7 @@ use crate::headers::UncompressedHeader;
 use crate::intra::IntraMode;
 use crate::loopfilter::{LoopFilter, MiInfo, MiInfoPlane, INTRA_FRAME};
 use crate::mcfilter::{mc_block_scaled, InterpFilter, RefSampler};
-use crate::mv::{read_mv_component, read_mv_joint, Mv, DEFAULT_MV_COMP_PROBS, MV_JOINT_PROBS};
+use crate::mv::{read_mv_component, read_mv_joint, Mv, MvComponentProbs};
 use crate::mvref::{
     clamp_mv_pair, find_best_ref_mvs, find_mv_refs_geom, use_mv_hp, BlockGeom, InterMiCell,
     InterMiGrid, BORDERINPIXELS, INTERP_EXTEND, NONE_FRAME,
@@ -1012,14 +1012,22 @@ impl<'a> InterTile<'a> {
                 // (`(|delta|>>3) < COMPANDED_MVREF_THRESH = 8`).
                 let best = candidates.best_mv();
                 let hp = self.hdr.allow_high_precision_mv && use_mv_hp(best);
-                let joint = read_mv_joint(bd, MV_JOINT_PROBS)?;
+                // Per-frame MV probs — §6.3.16 mv_probs updated on top
+                // of §10.5 defaults.
+                let joint = read_mv_joint(bd, self.ch.ctx.mv_probs.joints)?;
+                // Layout bridge: frame_ctx::MvComponentProbs (spec-faithful,
+                // class0_fr is [[MV_FR_SIZE-1]; CLASS0_SIZE]) → mv::MvComponentProbs
+                // (flat [u8; 3] for both class0_fr and fr, plus 10 class probs
+                // vs 11 in the spec — the last class slot is never read).
+                let row_probs = mv_component_probs_from_ctx(&self.ch.ctx.mv_probs.comps[0]);
+                let col_probs = mv_component_probs_from_ctx(&self.ch.ctx.mv_probs.comps[1]);
                 let dmv_row = if joint.has_row() {
-                    read_mv_component(bd, &DEFAULT_MV_COMP_PROBS, hp)?
+                    read_mv_component(bd, &row_probs, hp)?
                 } else {
                     0
                 };
                 let dmv_col = if joint.has_col() {
-                    read_mv_component(bd, &DEFAULT_MV_COMP_PROBS, hp)?
+                    read_mv_component(bd, &col_probs, hp)?
                 } else {
                     0
                 };
@@ -1691,6 +1699,27 @@ fn read_intra_mode_tree(bd: &mut BoolDecoder<'_>, p: &[u8; 9]) -> Result<IntraMo
         } else {
             Ok(IntraMode::D207)
         }
+    }
+}
+
+/// Convert the spec-faithful `frame_ctx::MvComponentProbs` into the
+/// (simplified) `mv::MvComponentProbs` the existing MV decoder consumes.
+///
+/// The existing decoder uses a single 3-prob `class0_fr` row instead of
+/// the spec's `[CLASS0_SIZE=2][MV_FR_SIZE-1=3]` table — we map the
+/// `d=0` row through. `classes` has 10 entries in both layouts
+/// (`MV_CLASSES - 1 = 10`). `bits` is 10 entries in both
+/// (`MV_OFFSET_BITS = 10`).
+fn mv_component_probs_from_ctx(src: &crate::frame_ctx::MvComponentProbs) -> MvComponentProbs {
+    MvComponentProbs {
+        sign: src.sign,
+        classes: src.classes,
+        class0_bit: src.class0_bit,
+        class0_fr: src.class0_fr[0],
+        class0_hp: src.class0_hp,
+        bits: src.bits,
+        fr: src.fr,
+        hp: src.hp,
     }
 }
 

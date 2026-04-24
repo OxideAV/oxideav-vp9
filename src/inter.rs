@@ -1388,7 +1388,8 @@ impl<'a> InterTile<'a> {
             (self.uv_w, self.uv_h)
         };
         let scan = get_scan(tx_size_log2);
-        let probs = coef_probs_for(tx_size_log2, plane_type);
+        // Inter block: ref_type = 1.
+        let probs = coef_probs_from_ctx(self.ch, tx_size_log2, plane_type, 1);
 
         let qp = self
             .hdr
@@ -1468,7 +1469,8 @@ impl<'a> InterTile<'a> {
             (self.uv_w, self.uv_h)
         };
         let scan = get_scan(tx_size_log2);
-        let probs = coef_probs_for(tx_size_log2, plane_type);
+        // Intra block inside an inter frame: ref_type = 0.
+        let probs = coef_probs_from_ctx(self.ch, tx_size_log2, plane_type, 0);
 
         let qp = self
             .hdr
@@ -1641,6 +1643,7 @@ fn get_scan(tx_size_log2: usize) -> ScanOrder {
     }
 }
 
+#[allow(dead_code)]
 fn coef_probs_for(tx_size_log2: usize, plane_type: usize) -> &'static [[[u8; 3]; 6]; 6] {
     match tx_size_log2 {
         0 => &COEF_PROBS_4X4[plane_type][0],
@@ -1649,6 +1652,19 @@ fn coef_probs_for(tx_size_log2: usize, plane_type: usize) -> &'static [[[u8; 3];
         3 => &COEF_PROBS_32X32[plane_type][0],
         _ => &COEF_PROBS_4X4[0][0],
     }
+}
+
+/// Borrow the per-frame coefficient probabilities for a given
+/// tx_size / plane_type / ref_type. Mirrors `block::coef_probs_from_ctx`
+/// but lives here so inter blocks don't depend on `block`.
+fn coef_probs_from_ctx(
+    ch: &CompressedHeader,
+    tx_size_log2: usize,
+    plane_type: usize,
+    ref_type: usize,
+) -> &[[[u8; 3]; 6]; 6] {
+    let ts = tx_size_log2.min(3);
+    &ch.ctx.coef_probs[ts][plane_type][ref_type]
 }
 
 fn read_intra_mode_tree(bd: &mut BoolDecoder<'_>, p: &[u8; 9]) -> Result<IntraMode> {

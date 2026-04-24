@@ -26,13 +26,13 @@ use crate::probs::{read_partition_from_tree, KF_PARTITION_PROBS};
 use crate::reconintra::{predict as predict_intra, NeighbourBuf};
 use crate::segmentation::{read_intra_segment_id, SegPredContext, SegmentIdMap};
 use crate::tables::{
-    AC_QLOOKUP, COEFBAND_TRANS_4X4, COEFBAND_TRANS_8X8PLUS, COEF_PROBS_16X16, COEF_PROBS_32X32,
-    COEF_PROBS_4X4, COEF_PROBS_8X8, COL_SCAN_16X16, COL_SCAN_16X16_NEIGHBORS, COL_SCAN_4X4,
-    COL_SCAN_4X4_NEIGHBORS, COL_SCAN_8X8, COL_SCAN_8X8_NEIGHBORS, DC_QLOOKUP, DEFAULT_SCAN_16X16,
-    DEFAULT_SCAN_16X16_NEIGHBORS, DEFAULT_SCAN_32X32, DEFAULT_SCAN_32X32_NEIGHBORS,
-    DEFAULT_SCAN_4X4, DEFAULT_SCAN_4X4_NEIGHBORS, DEFAULT_SCAN_8X8, DEFAULT_SCAN_8X8_NEIGHBORS,
-    KF_UV_MODE_PROBS, KF_Y_MODE_PROBS, ROW_SCAN_16X16, ROW_SCAN_16X16_NEIGHBORS, ROW_SCAN_4X4,
-    ROW_SCAN_4X4_NEIGHBORS, ROW_SCAN_8X8, ROW_SCAN_8X8_NEIGHBORS,
+    AC_QLOOKUP, COEFBAND_TRANS_4X4, COEFBAND_TRANS_8X8PLUS, COL_SCAN_16X16,
+    COL_SCAN_16X16_NEIGHBORS, COL_SCAN_4X4, COL_SCAN_4X4_NEIGHBORS, COL_SCAN_8X8,
+    COL_SCAN_8X8_NEIGHBORS, DC_QLOOKUP, DEFAULT_SCAN_16X16, DEFAULT_SCAN_16X16_NEIGHBORS,
+    DEFAULT_SCAN_32X32, DEFAULT_SCAN_32X32_NEIGHBORS, DEFAULT_SCAN_4X4, DEFAULT_SCAN_4X4_NEIGHBORS,
+    DEFAULT_SCAN_8X8, DEFAULT_SCAN_8X8_NEIGHBORS, KF_UV_MODE_PROBS, KF_Y_MODE_PROBS, ROW_SCAN_16X16,
+    ROW_SCAN_16X16_NEIGHBORS, ROW_SCAN_4X4, ROW_SCAN_4X4_NEIGHBORS, ROW_SCAN_8X8,
+    ROW_SCAN_8X8_NEIGHBORS,
 };
 use crate::transform::{inverse_transform_add, TxType};
 
@@ -250,14 +250,18 @@ fn get_scan(tx_size_log2: usize, tx_type: TxType) -> ScanOrder {
     }
 }
 
-fn coef_probs_for(tx_size_log2: usize, plane_type: usize) -> &'static [[[u8; 3]; 6]; 6] {
-    match tx_size_log2 {
-        0 => &COEF_PROBS_4X4[plane_type][0],
-        1 => &COEF_PROBS_8X8[plane_type][0],
-        2 => &COEF_PROBS_16X16[plane_type][0],
-        3 => &COEF_PROBS_32X32[plane_type][0],
-        _ => &COEF_PROBS_4X4[0][0],
-    }
+/// Borrow a `[band][ctx][node]` slice from the per-frame coefficient
+/// table. `ref_type` is 0 for intra, 1 for inter — per §7.4.17 and the
+/// §6.3.7 update layout. The returned shape matches what `decode_coefs`
+/// expects: `[6][6][3]`.
+fn coef_probs_from_ctx(
+    ch: &CompressedHeader,
+    tx_size_log2: usize,
+    plane_type: usize,
+    ref_type: usize,
+) -> &[[[u8; 3]; 6]; 6] {
+    let ts = tx_size_log2.min(3);
+    &ch.ctx.coef_probs[ts][plane_type][ref_type]
 }
 
 /// Intra-mode → tx-type lookup (§7.4.2 Table 7-5 / libvpx
@@ -787,7 +791,7 @@ impl<'a> IntraTile<'a> {
             TxType::DctDct
         };
         let scan = get_scan(tx_size_log2, tx_type);
-        let probs = coef_probs_for(tx_size_log2, plane_type);
+        let probs = coef_probs_from_ctx(self.ch, tx_size_log2, plane_type, 0);
 
         // Quant: base_q_idx; libvpx applies delta_q_y_dc only to luma DC,
         // delta_q_uv_ac / uv_dc to chroma AC / DC. Segmentation may

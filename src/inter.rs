@@ -37,7 +37,8 @@ use crate::headers::UncompressedHeader;
 use crate::intra::IntraMode;
 use crate::loopfilter::{LoopFilter, MiInfo, MiInfoPlane, INTRA_FRAME};
 use crate::mcfilter::{mc_block_scaled, InterpFilter, RefSampler};
-use crate::mv::{read_mv_component, read_mv_joint, DEFAULT_MV_COMP_PROBS, MV_JOINT_PROBS};
+use crate::mv::{read_mv_component, read_mv_joint, Mv, DEFAULT_MV_COMP_PROBS, MV_JOINT_PROBS};
+use crate::mvref::{find_mv_refs, InterMiCell, InterMiGrid, NONE_FRAME};
 use crate::probs::{read_partition_from_tree, PARTITION_PROBS};
 use crate::reconintra::{predict as predict_intra, NeighbourBuf};
 use crate::tables::{
@@ -210,6 +211,14 @@ pub struct InterTile<'a> {
     pub default_filter: Option<InterpFilter>,
     /// Per-8x8-MI block metadata for §8.8 loop filtering.
     pub mi_info: MiInfoPlane,
+    /// Per-8x8-MI inter metadata for §6.5 find_mv_refs — stores the
+    /// decoded `ref_frame[2]` / `mv[2]` for every already-decoded block.
+    pub mv_grid: InterMiGrid,
+    /// Tile boundary in MI units for is_inside checks. Initialised to
+    /// the full frame and narrowed per `decode_rect`.
+    tile_mi_col_start: i32,
+    tile_mi_col_end: i32,
+    mi_rows: i32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,6 +265,10 @@ impl<'a> InterTile<'a> {
             height,
             default_filter,
             mi_info: MiInfoPlane::new(mi_cols, mi_rows),
+            mv_grid: InterMiGrid::new(mi_cols, mi_rows),
+            tile_mi_col_start: 0,
+            tile_mi_col_end: mi_cols as i32,
+            mi_rows: mi_rows as i32,
         }
     }
 
@@ -288,6 +301,9 @@ impl<'a> InterTile<'a> {
         row_start: u32,
         row_end: u32,
     ) -> Result<()> {
+        // §6.5.2 tile left/right MI bounds — candidates can't cross these.
+        self.tile_mi_col_start = (col_start as i32) / 8;
+        self.tile_mi_col_end = (col_end as i32 + 7) / 8;
         let mut r = row_start;
         while r < row_end {
             let mut c = col_start;
@@ -452,13 +468,14 @@ impl<'a> InterTile<'a> {
         tx_size_log2: usize,
         skip: bool,
     ) -> Result<()> {
-        // Determine whether this block is compound or single.
-        // §6.4.17 read_ref_frames:
-        //   - If reference_mode == REFERENCE_MODE_SELECT read comp_mode,
-        //     else comp_mode = reference_mode.
-        //   - If compound: read comp_ref; idx = sign_bias[CompFixedRef];
-        //     ref_frame[idx] = CompFixedRef, ref_frame[!idx] = CompVarRef[comp_ref].
-        //   - Else: read single_ref_p1 / single_ref_p2.
+        // Spec order (§6.4.16 inter_block_mode_info):
+        //   1. read_ref_frames
+        //   2. for each ref: find_mv_refs + find_best_ref_mvs
+        //   3. read inter_mode
+        //   4. read interp_filter
+        //   5. assign_mv (read_mv for NEWMV, else NearestMv / NearMv / 0)
+
+        // §6.4.17 read_ref_frames.
         let frame_ref_mode = self.ch.reference_mode.unwrap_or(ReferenceMode::SingleReference);
         let is_compound = match frame_ref_mode {
             ReferenceMode::SingleReference => false,
@@ -490,6 +507,38 @@ impl<'a> InterTile<'a> {
             };
             (code, 0u8)
         };
+
+        // §6.5.1 find_mv_refs — run for each active ref_frame slot.
+        let mi_row = (row as i32) / 8;
+        let mi_col = (col as i32) / 8;
+        let bsize_code = bs as usize;
+        let refs_a = find_mv_refs(
+            &self.mv_grid,
+            &self.hdr.ref_frame_sign_bias,
+            ref_code_a,
+            bsize_code,
+            mi_row,
+            mi_col,
+            self.tile_mi_col_start,
+            self.tile_mi_col_end,
+            self.mi_rows,
+        );
+        let refs_b = if is_compound {
+            find_mv_refs(
+                &self.mv_grid,
+                &self.hdr.ref_frame_sign_bias,
+                ref_code_b,
+                bsize_code,
+                mi_row,
+                mi_col,
+                self.tile_mi_col_start,
+                self.tile_mi_col_end,
+                self.mi_rows,
+            )
+        } else {
+            Default::default()
+        };
+
         let inter_mode = read_inter_mode(bd, DEFAULT_INTER_MODE_PROBS)?;
 
         // Record §8.8 MI metadata for this inter block.
@@ -519,19 +568,34 @@ impl<'a> InterTile<'a> {
             read_switchable_filter(bd, DEFAULT_INTERP_PROBS)?
         };
 
-        // Read MVs: for NEWMV one component-tree read per reference, else
-        // zero. (NEARESTMV / NEARMV candidate lists aren't built yet; they
-        // degrade to zero — same compromise as the single-ref path.)
-        let mv_a = if matches!(inter_mode, InterMode::Newmv) {
-            self.read_new_mv(bd)?
+        // §6.4.18 assign_mv.
+        let mv_a = self.assign_mv(bd, inter_mode, refs_a)?;
+        let mv_b = if is_compound {
+            self.assign_mv(bd, inter_mode, refs_b)?
         } else {
             (0i16, 0i16)
         };
-        let mv_b = if is_compound && matches!(inter_mode, InterMode::Newmv) {
-            self.read_new_mv(bd)?
+
+        // Record this block's MVs + ref_frames in the grid so later
+        // neighbours' find_mv_refs can see them (§6.5 requires a
+        // raster-order-consistent grid).
+        let mut cell = InterMiCell::default();
+        cell.ref_frame[0] = ref_code_a;
+        cell.mv[0] = Mv::new(mv_a.0, mv_a.1);
+        if is_compound {
+            cell.ref_frame[1] = ref_code_b;
+            cell.mv[1] = Mv::new(mv_b.0, mv_b.1);
         } else {
-            (0i16, 0i16)
-        };
+            cell.ref_frame[1] = NONE_FRAME;
+            cell.mv[1] = Mv::ZERO;
+        }
+        self.mv_grid.fill(
+            mi_row_units,
+            mi_col_units,
+            mi_w as usize,
+            mi_h as usize,
+            cell,
+        );
 
         // Motion-compensate each reference independently, then average
         // for compound. §8.5.2: preds[0..1+isCompound], then
@@ -645,20 +709,48 @@ impl<'a> InterTile<'a> {
         self.refs.get(slot).copied().flatten()
     }
 
-    /// Read one NEWMV delta pair (row, col) in 1/8-pel units.
-    fn read_new_mv(&self, bd: &mut BoolDecoder<'_>) -> Result<(i16, i16)> {
-        let joint = read_mv_joint(bd, MV_JOINT_PROBS)?;
-        let mv_row = if joint.has_row() {
-            read_mv_component(bd, &DEFAULT_MV_COMP_PROBS, self.hdr.allow_high_precision_mv)?
-        } else {
-            0
-        };
-        let mv_col = if joint.has_col() {
-            read_mv_component(bd, &DEFAULT_MV_COMP_PROBS, self.hdr.allow_high_precision_mv)?
-        } else {
-            0
-        };
-        Ok((mv_row, mv_col))
+    /// §6.4.18 assign_mv — produce the (row, col) MV for one ref slot.
+    /// `candidates` is the §6.5 `find_mv_refs` output. Reads MV bits from
+    /// the stream only when inter_mode == NEWMV.
+    fn assign_mv(
+        &self,
+        bd: &mut BoolDecoder<'_>,
+        inter_mode: InterMode,
+        candidates: crate::mvref::MvRefs,
+    ) -> Result<(i16, i16)> {
+        match inter_mode {
+            InterMode::Zeromv => Ok((0, 0)),
+            InterMode::Nearestmv => {
+                let m = candidates.nearest_mv();
+                Ok((m.row, m.col))
+            }
+            InterMode::Nearmv => {
+                let m = candidates.near_mv();
+                Ok((m.row, m.col))
+            }
+            InterMode::Newmv => {
+                // §6.4.19 read_mv — delta is relative to BestMv.
+                // §6.5.13 use_mv_hp: HP only active when BestMv is small.
+                let best = candidates.best_mv();
+                let hp = self.hdr.allow_high_precision_mv
+                    && (best.row.unsigned_abs() as u32) < (1 << 5) * 8
+                    && (best.col.unsigned_abs() as u32) < (1 << 5) * 8;
+                let joint = read_mv_joint(bd, MV_JOINT_PROBS)?;
+                let dmv_row = if joint.has_row() {
+                    read_mv_component(bd, &DEFAULT_MV_COMP_PROBS, hp)?
+                } else {
+                    0
+                };
+                let dmv_col = if joint.has_col() {
+                    read_mv_component(bd, &DEFAULT_MV_COMP_PROBS, hp)?
+                } else {
+                    0
+                };
+                let out_r = (best.row as i32 + dmv_row as i32).clamp(-32768, 32767) as i16;
+                let out_c = (best.col as i32 + dmv_col as i32).clamp(-32768, 32767) as i16;
+                Ok((out_r, out_c))
+            }
+        }
     }
 
     fn decode_intra_block(

@@ -35,6 +35,14 @@ fn psnr_plane(a: &[u8], b: &[u8]) -> f64 {
     10.0 * (255.0 * 255.0 / mse).log10()
 }
 
+fn mean_and_std(d: &[u8]) -> (f64, f64) {
+    let n = d.len() as f64;
+    let s: u64 = d.iter().map(|&b| b as u64).sum();
+    let mean = s as f64 / n;
+    let ss: f64 = d.iter().map(|&b| (b as f64 - mean).powi(2)).sum();
+    (mean, (ss / n).sqrt())
+}
+
 #[test]
 fn measure_compound_luma_psnr() {
     if !Path::new(FIXTURE).exists() {
@@ -102,8 +110,10 @@ fn measure_compound_luma_psnr() {
                     let yp = psnr_plane(&our_y, ref_y);
                     let up = psnr_plane(&our_u, ref_u);
                     let vp = psnr_plane(&our_v, ref_v);
+                    let (rm, rs) = mean_and_std(ref_y);
+                    let (om, os) = mean_and_std(&our_y);
                     eprintln!(
-                        "frame {frame_idx}: Y={yp:.2} dB U={up:.2} dB V={vp:.2} dB"
+                        "frame {frame_idx}: Y={yp:.2} dB U={up:.2} dB V={vp:.2} dB | ref Y mean={rm:.1} std={rs:.1} | our Y mean={om:.1} std={os:.1}"
                     );
                     if yp.is_finite() {
                         total_y_psnr += yp;

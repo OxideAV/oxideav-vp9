@@ -46,6 +46,7 @@ pub mod ivf;
 pub mod loopfilter;
 pub mod mcfilter;
 pub mod mv;
+pub mod mvref;
 pub mod probs;
 pub mod reconintra;
 pub mod tables;

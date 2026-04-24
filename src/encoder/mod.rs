@@ -12,9 +12,11 @@
 //! and forward boolean coder follow in separate incremental commits.
 
 pub mod bitwriter;
+pub mod bool_encoder;
 pub mod params;
 pub mod uncompressed_header;
 
 pub use bitwriter::BitWriter;
+pub use bool_encoder::BoolEncoder;
 pub use params::EncoderParams;
 pub use uncompressed_header::emit_uncompressed_header;

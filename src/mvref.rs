@@ -57,6 +57,61 @@ pub const INTRA_FRAME: u8 = 0;
 /// single-reference inter blocks and for intra blocks.
 pub const NONE_FRAME: u8 = 255;
 
+/// §6.4.16 Table 9-31 / spec §3 Table "y_mode values":
+/// * 0..=9 — intra modes (`DC_PRED`..`TM_PRED`)
+/// * 10 — `NEARESTMV`
+/// * 11 — `NEARMV`
+/// * 12 — `ZEROMV`
+/// * 13 — `NEWMV`
+pub const Y_MODE_NEARESTMV: u8 = 10;
+pub const Y_MODE_NEARMV: u8 = 11;
+pub const Y_MODE_ZEROMV: u8 = 12;
+pub const Y_MODE_NEWMV: u8 = 13;
+
+/// §6.5 `mode_2_counter[MB_MODE_COUNT]` — used to accumulate the per-
+/// block `contextCounter` in `find_mv_refs`.
+///
+/// * intra modes (0..9) contribute 9 each (they bias towards the
+///   `INTRA_PLUS_NON_INTRA` / `BOTH_INTRA` buckets).
+/// * `NEARESTMV`, `NEARMV` contribute 0 (predicted modes).
+/// * `ZEROMV` contributes 3.
+/// * `NEWMV` contributes 1.
+pub const MODE_2_COUNTER: [u8; 14] = [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 0, 0, 3, 1];
+
+/// §6.5 `counter_to_context[19]` — maps the accumulated `contextCounter`
+/// (0..=18) to the 7-entry inter-mode context table.
+///
+/// Entries labelled `INVALID_CASE` (value 9) correspond to counter
+/// values that can never arise under the §6.5 accumulation rules; we
+/// still emit them so the table is fully dense and lookups are infallible.
+pub const COUNTER_TO_CONTEXT: [u8; 19] = [
+    2, // 0  BOTH_PREDICTED
+    3, // 1  NEW_PLUS_NON_INTRA
+    4, // 2  BOTH_NEW
+    1, // 3  ZERO_PLUS_PREDICTED
+    3, // 4  NEW_PLUS_NON_INTRA
+    9, // 5  INVALID_CASE
+    0, // 6  BOTH_ZERO
+    9, // 7  INVALID_CASE
+    9, // 8  INVALID_CASE
+    5, // 9  INTRA_PLUS_NON_INTRA
+    5, // 10 INTRA_PLUS_NON_INTRA
+    9, // 11 INVALID_CASE
+    5, // 12 INTRA_PLUS_NON_INTRA
+    9, // 13 INVALID_CASE
+    9, // 14 INVALID_CASE
+    9, // 15 INVALID_CASE
+    9, // 16 INVALID_CASE
+    9, // 17 INVALID_CASE
+    6, // 18 BOTH_INTRA
+];
+
+/// Upper bound on the counter used to clamp indexing into `COUNTER_TO_CONTEXT`.
+/// `mode_2_counter` caps at 9 per neighbour and at most two neighbours
+/// contribute (first-two-neighbours loop in `find_mv_refs`), so the
+/// raw sum is in `0..=18`.
+pub const MAX_CONTEXT_COUNTER: u8 = 18;
+
 /// Per-8x8 metadata for §6.5 find_mv_refs.
 #[derive(Clone, Copy, Debug)]
 pub struct InterMiCell {
@@ -65,6 +120,13 @@ pub struct InterMiCell {
     pub ref_frame: [u8; 2],
     /// MV for each ref_frame slot.
     pub mv: [Mv; 2],
+    /// `y_mode` of this block in spec encoding (see constants above).
+    /// Used to drive §6.5 `contextCounter` accumulation. Defaults to
+    /// `DC_PRED` (0) so uninitialised cells look like intra neighbours
+    /// — which contributes the full 9 to the counter, biasing towards
+    /// `BOTH_INTRA`, the safe default at frame / tile edges where no
+    /// neighbour information is available.
+    pub y_mode: u8,
 }
 
 impl Default for InterMiCell {
@@ -72,6 +134,7 @@ impl Default for InterMiCell {
         Self {
             ref_frame: [INTRA_FRAME, NONE_FRAME],
             mv: [Mv::ZERO, Mv::ZERO],
+            y_mode: 0, // DC_PRED — intra sentinel
         }
     }
 }
@@ -161,6 +224,12 @@ pub const MV_REF_BLOCKS: [[(i32, i32); MVREF_NEIGHBOURS]; 13] = [
 pub struct MvRefs {
     pub list: [Mv; MAX_MV_REF_CANDIDATES],
     pub count: u8,
+    /// §6.5 `ModeContext[refFrame] = counter_to_context[contextCounter]`.
+    /// Index in `0..=6` into the 7-row `default_inter_mode_probs` table
+    /// (bucket `INTRA_PLUS_NON_INTRA` = 5 is clamped when the counter
+    /// lands on an `INVALID_CASE` slot — those combinations are ruled
+    /// out by the accumulation rule but clamping keeps lookups safe).
+    pub mode_context: u8,
 }
 
 impl MvRefs {
@@ -279,6 +348,10 @@ pub fn find_mv_refs_geom(
     let searches = &MV_REF_BLOCKS[bsize];
     let mut out = MvRefs::default();
     let mut different_ref_found = false;
+    // §6.5.1 line 3: contextCounter starts at 0 and accumulates
+    // `mode_2_counter[YModes[candidateR][candidateC]]` for the first
+    // two neighbours only (the spec's inner `for i < 2` loop).
+    let mut context_counter: u8 = 0;
 
     // Step 1 (§6.5.1 lines `for i < 2`): First 2 neighbours — any slot j
     // whose ref_frame matches is taken; sets `differentRefFound` either
@@ -292,6 +365,9 @@ pub fn find_mv_refs_geom(
         }
         different_ref_found = true;
         let cell = grid.get(r as usize, c as usize);
+        // §6.5.1: contextCounter += mode_2_counter[YModes[...]]
+        let ym = (cell.y_mode as usize).min(MODE_2_COUNTER.len() - 1);
+        context_counter = context_counter.saturating_add(MODE_2_COUNTER[ym]);
         for j in 0..2 {
             if cell.ref_frame[j] == ref_frame {
                 add_mv_ref_list(&mut out, cell.mv[j]);
@@ -338,6 +414,15 @@ pub fn find_mv_refs_geom(
     for i in 0..(out.count as usize) {
         out.list[i] = clamp_mv_ref(out.list[i], &geom);
     }
+    // §6.5.1 line `ModeContext[refFrame] = counter_to_context[contextCounter]`.
+    // Counter is in 0..=18 by construction (≤9 per neighbour × 2
+    // neighbours). Entries marked INVALID_CASE map to 9 — we clamp
+    // down to INTRA_PLUS_NON_INTRA (5) since these counter values
+    // can only occur if the neighbour grid is not well-formed, and
+    // the remaining 7-entry inter-mode prob table has no ctx 9.
+    let cc = context_counter.min(MAX_CONTEXT_COUNTER) as usize;
+    let ctx = COUNTER_TO_CONTEXT[cc];
+    out.mode_context = if ctx <= 6 { ctx } else { 5 };
     out
 }
 
@@ -567,6 +652,7 @@ mod tests {
             InterMiCell {
                 ref_frame: [1, NONE_FRAME],
                 mv: [mv, Mv::ZERO],
+                y_mode: Y_MODE_NEWMV,
             },
         );
         let sb: RefSignBias = [false; 4];
@@ -581,8 +667,20 @@ mod tests {
     fn dedup_same_mv_is_not_added_twice() {
         let mut grid = InterMiGrid::new(4, 4);
         let mv = Mv::new(8, 8);
-        grid.fill(1, 1, 1, 1, InterMiCell { ref_frame: [1, NONE_FRAME], mv: [mv, Mv::ZERO] });
-        grid.fill(2, 1, 1, 1, InterMiCell { ref_frame: [1, NONE_FRAME], mv: [mv, Mv::ZERO] });
+        grid.fill(
+            1,
+            1,
+            1,
+            1,
+            InterMiCell { ref_frame: [1, NONE_FRAME], mv: [mv, Mv::ZERO], y_mode: Y_MODE_NEWMV },
+        );
+        grid.fill(
+            2,
+            1,
+            1,
+            1,
+            InterMiCell { ref_frame: [1, NONE_FRAME], mv: [mv, Mv::ZERO], y_mode: Y_MODE_NEWMV },
+        );
         let sb: RefSignBias = [false; 4];
         let r = find_mv_refs(&grid, &sb, 1, 6, 2, 2, 0, 4, 4);
         assert_eq!(r.count, 1, "duplicate MVs should collapse");
@@ -600,6 +698,7 @@ mod tests {
             InterMiCell {
                 ref_frame: [2, NONE_FRAME],
                 mv: [Mv::new(20, -10), Mv::ZERO],
+                y_mode: Y_MODE_NEWMV,
             },
         );
         let mut sb: RefSignBias = [false; 4];
@@ -641,6 +740,7 @@ mod tests {
             InterMiCell {
                 ref_frame: [1, NONE_FRAME],
                 mv: [Mv::new(10_000, 10_000), Mv::ZERO],
+                y_mode: Y_MODE_NEWMV,
             },
         );
         let sb: RefSignBias = [false; 4];
@@ -663,7 +763,11 @@ mod tests {
 
     #[test]
     fn find_best_ref_mvs_rounds_when_hp_disabled() {
-        let mut refs = MvRefs { list: [Mv::new(17, -21), Mv::ZERO], count: 1 };
+        let mut refs = MvRefs {
+            list: [Mv::new(17, -21), Mv::ZERO],
+            count: 1,
+            mode_context: 0,
+        };
         let g = geom(4, 4, 2, 2, 16, 16);
         find_best_ref_mvs(&mut refs, false, &g);
         // 17 is odd → (17 > 0 ? -1 : 1) → 16. -21 is odd → -20.
@@ -682,7 +786,11 @@ mod tests {
 
     #[test]
     fn find_best_ref_mvs_keeps_hp_bit_when_allowed_and_small() {
-        let mut refs = MvRefs { list: [Mv::new(5, 7), Mv::ZERO], count: 1 };
+        let mut refs = MvRefs {
+            list: [Mv::new(5, 7), Mv::ZERO],
+            count: 1,
+            mode_context: 0,
+        };
         let g = geom(4, 4, 2, 2, 16, 16);
         find_best_ref_mvs(&mut refs, true, &g);
         // HP applicable → no rounding.
@@ -691,12 +799,104 @@ mod tests {
 
     #[test]
     fn find_best_ref_mvs_rounds_large_mv_even_with_hp_flag() {
-        let mut refs = MvRefs { list: [Mv::new(513, 3), Mv::ZERO], count: 1 };
+        let mut refs = MvRefs {
+            list: [Mv::new(513, 3), Mv::ZERO],
+            count: 1,
+            mode_context: 0,
+        };
         let g = geom(4, 4, 2, 2, 16, 16);
         find_best_ref_mvs(&mut refs, true, &g);
         // |513|>>3 = 64 not < 8, so HP disabled — 513 rounds to 512.
         assert_eq!(refs.list[0].row, 512);
         // Col 3 is odd: rounded to 2.
         assert_eq!(refs.list[0].col, 2);
+    }
+
+    // §6.5 mode_context derivation: for each of the seven buckets, set
+    // up the two first-neighbour cells so the counter lands on the
+    // spec's expected row of counter_to_context[].
+    //
+    // Layout for all tests: 16x16 block at (mi_row=2, mi_col=2) with
+    // block_size_code=6 → searches = MV_REF_BLOCKS[6]:
+    //   searches[0] = (-1, 0)   (above)
+    //   searches[1] = (0, -1)   (left)
+    // Fill those two cells with the two y_modes that should drive the
+    // counter.
+    fn mode_ctx(a: u8, b: u8) -> u8 {
+        let mut grid = InterMiGrid::new(4, 4);
+        let mut ca = InterMiCell::default();
+        ca.y_mode = a;
+        ca.ref_frame[0] = 1; // LAST — otherwise spec still hits the mode branch
+        let mut cb = InterMiCell::default();
+        cb.y_mode = b;
+        cb.ref_frame[0] = 1;
+        // (mi_row-1, mi_col) = (1, 2)
+        grid.fill(1, 2, 1, 1, ca);
+        // (mi_row, mi_col-1) = (2, 1)
+        grid.fill(2, 1, 1, 1, cb);
+        let sb: RefSignBias = [false; 4];
+        let r = find_mv_refs_geom(&grid, &sb, 1, 6, geom(2, 2, 2, 2, 4, 4), 0, 4);
+        r.mode_context
+    }
+
+    #[test]
+    fn mode_context_both_predicted() {
+        // NEARESTMV (counter += 0) × 2 → counter = 0 → BOTH_PREDICTED (2).
+        assert_eq!(mode_ctx(Y_MODE_NEARESTMV, Y_MODE_NEARMV), 2);
+    }
+
+    #[test]
+    fn mode_context_both_zero() {
+        // ZEROMV (counter += 3) × 2 → counter = 6 → BOTH_ZERO (0).
+        assert_eq!(mode_ctx(Y_MODE_ZEROMV, Y_MODE_ZEROMV), 0);
+    }
+
+    #[test]
+    fn mode_context_both_new() {
+        // NEWMV (counter += 1) × 2 → counter = 2 → BOTH_NEW (4).
+        assert_eq!(mode_ctx(Y_MODE_NEWMV, Y_MODE_NEWMV), 4);
+    }
+
+    #[test]
+    fn mode_context_zero_plus_predicted() {
+        // NEARESTMV (0) + ZEROMV (3) → counter = 3 → ZERO_PLUS_PREDICTED (1).
+        assert_eq!(mode_ctx(Y_MODE_NEARESTMV, Y_MODE_ZEROMV), 1);
+    }
+
+    #[test]
+    fn mode_context_new_plus_non_intra() {
+        // NEARESTMV (0) + NEWMV (1) → counter = 1 → NEW_PLUS_NON_INTRA (3).
+        assert_eq!(mode_ctx(Y_MODE_NEARESTMV, Y_MODE_NEWMV), 3);
+        // ZEROMV (3) + NEWMV (1) → counter = 4 → NEW_PLUS_NON_INTRA (3).
+        assert_eq!(mode_ctx(Y_MODE_ZEROMV, Y_MODE_NEWMV), 3);
+    }
+
+    #[test]
+    fn mode_context_intra_plus_non_intra() {
+        // DC_PRED (9) + NEARESTMV (0) → counter = 9 → INTRA_PLUS_NON_INTRA (5).
+        assert_eq!(mode_ctx(0, Y_MODE_NEARESTMV), 5);
+        // DC_PRED (9) + NEWMV (1) → counter = 10 → INTRA_PLUS_NON_INTRA (5).
+        assert_eq!(mode_ctx(0, Y_MODE_NEWMV), 5);
+        // DC_PRED (9) + ZEROMV (3) → counter = 12 → INTRA_PLUS_NON_INTRA (5).
+        assert_eq!(mode_ctx(0, Y_MODE_ZEROMV), 5);
+    }
+
+    #[test]
+    fn mode_context_both_intra() {
+        // DC_PRED (9) × 2 → counter = 18 → BOTH_INTRA (6).
+        assert_eq!(mode_ctx(0, 0), 6);
+        // TM_PRED (9) × 2 → counter = 18 → BOTH_INTRA (6).
+        assert_eq!(mode_ctx(9, 9), 6);
+    }
+
+    #[test]
+    fn mode_context_defaults_to_both_intra_at_frame_origin() {
+        // Block at (0,0) has no neighbours, so counter = 0 →
+        // BOTH_PREDICTED (2). This is a spec artefact but matches
+        // the "no information, defer to the most common bucket" row.
+        let grid = InterMiGrid::new(4, 4);
+        let sb: RefSignBias = [false; 4];
+        let r = find_mv_refs_geom(&grid, &sb, 1, 6, geom(0, 0, 2, 2, 4, 4), 0, 4);
+        assert_eq!(r.mode_context, 2);
     }
 }

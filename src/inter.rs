@@ -61,9 +61,29 @@ const DEFAULT_IS_INTER_PROBS: [u8; 4] = [9, 102, 187, 225];
 /// §10.5 `default_skip_probs[3]` — ctx = (AboveSkip ? 1 : 0) + (LeftSkip ? 1 : 0).
 const DEFAULT_SKIP_PROBS: [u8; 3] = [192, 128, 64];
 
-/// Inter mode tree defaults (§10.5 `default_inter_mode_probs`, ctx 0).
-/// Layout: `[p_non_zeromv, p_not_nearestmv, p_not_nearmv]`.
-const DEFAULT_INTER_MODE_PROBS: [u8; 3] = [2, 173, 34];
+/// Inter mode tree defaults (§10.5 `default_inter_mode_probs`,
+/// `INTER_MODE_CONTEXTS = 7`).
+///
+/// Row layout matches §6.5 `counter_to_context` enumeration:
+/// * 0 — BOTH_ZERO
+/// * 1 — ZERO_PLUS_PREDICTED
+/// * 2 — BOTH_PREDICTED (default for ctx==0 in older single-ctx decoders)
+/// * 3 — NEW_PLUS_NON_INTRA
+/// * 4 — BOTH_NEW
+/// * 5 — INTRA_PLUS_NON_INTRA
+/// * 6 — BOTH_INTRA
+///
+/// Column layout: `[p_non_zeromv, p_not_nearestmv, p_not_nearmv]`
+/// (the 3-node `vp9_inter_mode_tree` — see `read_inter_mode`).
+const DEFAULT_INTER_MODE_PROBS: [[u8; 3]; 7] = [
+    [2, 173, 34],  // 0 BOTH_ZERO
+    [7, 145, 85],  // 1 ZERO_PLUS_PREDICTED
+    [7, 166, 63],  // 2 BOTH_PREDICTED
+    [7, 94, 66],   // 3 NEW_PLUS_NON_INTRA
+    [8, 64, 46],   // 4 BOTH_NEW
+    [17, 81, 31],  // 5 INTRA_PLUS_NON_INTRA
+    [25, 29, 30],  // 6 BOTH_INTRA
+];
 
 /// `comp_mode`-ignored single-reference selection prob (§10.5 ctx 0).
 const DEFAULT_SINGLE_REF_PROB: [u8; 2] = [33, 16];
@@ -794,7 +814,12 @@ impl<'a> InterTile<'a> {
             find_best_ref_mvs(&mut refs_b, self.hdr.allow_high_precision_mv, &geom);
         }
 
-        let inter_mode = read_inter_mode(bd, DEFAULT_INTER_MODE_PROBS)?;
+        // §6.4.16 `inter_block_mode_info` — the inter_mode probability
+        // tree is conditioned on `ModeContext[refFrame0]` as computed
+        // by §6.5 `find_mv_refs` (contextCounter → counter_to_context).
+        // `refs_a.mode_context` is already clamped to `0..=6`.
+        let ctx = (refs_a.mode_context as usize).min(6);
+        let inter_mode = read_inter_mode(bd, DEFAULT_INTER_MODE_PROBS[ctx])?;
 
         // Record §8.8 MI metadata for this inter block.
         let mi_row_units = (row as usize) / 8;
@@ -844,6 +869,15 @@ impl<'a> InterTile<'a> {
             cell.ref_frame[1] = NONE_FRAME;
             cell.mv[1] = Mv::ZERO;
         }
+        // §6.5 `YModes[row][col]` — spec encoding: NEARESTMV=10,
+        // NEARMV=11, ZEROMV=12, NEWMV=13. This drives the neighbour
+        // contextCounter of later blocks in raster order.
+        cell.y_mode = match inter_mode {
+            InterMode::Nearestmv => crate::mvref::Y_MODE_NEARESTMV,
+            InterMode::Nearmv => crate::mvref::Y_MODE_NEARMV,
+            InterMode::Zeromv => crate::mvref::Y_MODE_ZEROMV,
+            InterMode::Newmv => crate::mvref::Y_MODE_NEWMV,
+        };
         self.mv_grid.fill(
             mi_row_units,
             mi_col_units,
@@ -1048,6 +1082,23 @@ impl<'a> InterTile<'a> {
                 mode_is_non_zero_inter: false,
                 segment_id,
             },
+        );
+        // Populate the MV-ref grid too so downstream inter blocks see
+        // this cell as an intra neighbour (§6.5 contextCounter += 9).
+        // `ref_frame[0] = INTRA_FRAME`, MVs zero, y_mode carries the
+        // chosen intra mode (0..=9).
+        let mut intra_cell = InterMiCell::default();
+        intra_cell.ref_frame[0] = INTRA_FRAME;
+        intra_cell.ref_frame[1] = NONE_FRAME;
+        intra_cell.mv[0] = Mv::ZERO;
+        intra_cell.mv[1] = Mv::ZERO;
+        intra_cell.y_mode = y_mode as u8; // DC_PRED..TM_PRED = 0..9
+        self.mv_grid.fill(
+            mi_row_units,
+            mi_col_units,
+            mi_w as usize,
+            mi_h as usize,
+            intra_cell,
         );
         // Luma predict + residual.
         self.recon_intra_plane(

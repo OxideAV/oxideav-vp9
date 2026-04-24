@@ -22,6 +22,7 @@ use crate::detokenize::decode_coefs;
 use crate::headers::UncompressedHeader;
 use crate::intra::IntraMode;
 use crate::loopfilter::{LoopFilter, MiInfo, MiInfoPlane, INTRA_FRAME};
+use crate::nonzero_ctx::NonzeroCtx;
 use crate::probs::{read_partition_from_tree, KF_PARTITION_PROBS};
 use crate::reconintra::{predict as predict_intra, NeighbourBuf};
 use crate::segmentation::{read_intra_segment_id, SegPredContext, SegmentIdMap};
@@ -148,6 +149,10 @@ pub struct IntraTile<'a> {
     /// Unused on key / intra-only frames (inter path is the consumer)
     /// but kept parallel to InterTile for symmetry.
     pub seg_pred_ctx: SegPredContext,
+    /// §6.4.22 `AboveNonzeroContext` / `LeftNonzeroContext` — the
+    /// "did my neighbour have any non-zero coefficients" flag arrays
+    /// that drive the initial token context for `more_coefs` (§6.4.24).
+    pub nonzero_ctx: NonzeroCtx,
 }
 
 /// Scan + neighbour tables for a (tx_size, tx_type) pair. Mirrors
@@ -307,6 +312,7 @@ impl<'a> IntraTile<'a> {
             left_mode: vec![IntraMode::Dc; mi_rows],
             segment_ids: SegmentIdMap::zeros(mi_cols, mi_rows),
             seg_pred_ctx: SegPredContext::zeros(mi_cols, mi_rows),
+            nonzero_ctx: NonzeroCtx::new(mi_cols, mi_rows, sub_x, sub_y),
         }
     }
 
@@ -318,9 +324,13 @@ impl<'a> IntraTile<'a> {
                 "vp9 inter frame pending — only keyframe / intra_only decode is wired",
             ));
         }
+        // §7.4.1 clear_above_context — once per tile.
+        self.nonzero_ctx.clear_above();
         let sbs_x = (self.width as u32).div_ceil(SUPERBLOCK_SIZE);
         let sbs_y = (self.height as u32).div_ceil(SUPERBLOCK_SIZE);
         for sby in 0..sbs_y {
+            // §7.4.2 clear_left_context — once per superblock row.
+            self.nonzero_ctx.clear_left();
             for sbx in 0..sbs_x {
                 let col = sbx * SUPERBLOCK_SIZE;
                 let row = sby * SUPERBLOCK_SIZE;
@@ -348,8 +358,12 @@ impl<'a> IntraTile<'a> {
                 "vp9 inter frame pending — only keyframe / intra_only decode is wired",
             ));
         }
+        // §7.4.1 clear_above_context — once per tile.
+        self.nonzero_ctx.clear_above();
         let mut r = row_start;
         while r < row_end {
+            // §7.4.2 clear_left_context — once per superblock row.
+            self.nonzero_ctx.clear_left();
             let mut c = col_start;
             while c < col_end {
                 self.decode_partition(bd, r, c, SUPERBLOCK_SIZE)?;
@@ -835,8 +849,13 @@ impl<'a> IntraTile<'a> {
                 // Copy into plane buffer (respecting edge clipping).
                 self.blit_plane(plane, abs_row, abs_col, tx_w, tx_h, &pred, tx_side);
                 // If not skipping, decode coefs and add residual.
-                if !skip {
-                    let initial_ctx = 0usize; // context-0 fallback
+                // §6.4.24: initial `more_coefs` context is derived from
+                // AboveNonzeroContext / LeftNonzeroContext at this
+                // block's 4×4-aligned coordinates.
+                let initial_ctx =
+                    self.nonzero_ctx
+                        .token_ctx(plane, abs_col, abs_row, scan.tx_size_log2);
+                let nonzero_update = if !skip {
                     let mut coeffs = vec![0i32; tx_side * tx_side];
                     let eob = decode_coefs(
                         bd,
@@ -860,7 +879,23 @@ impl<'a> IntraTile<'a> {
                         )?;
                         self.blit_plane(plane, abs_row, abs_col, tx_w, tx_h, &dst, tx_side);
                     }
-                }
+                    if eob > 0 {
+                        1u8
+                    } else {
+                        0u8
+                    }
+                } else {
+                    0u8
+                };
+                // §6.4.22 post-tokens update: stamp the nonzero flag
+                // into the 4×4 grid so downstream blocks see it.
+                self.nonzero_ctx.update(
+                    plane,
+                    abs_col,
+                    abs_row,
+                    scan.tx_size_log2,
+                    nonzero_update,
+                );
                 let _ = stride;
                 c += tx_side;
             }

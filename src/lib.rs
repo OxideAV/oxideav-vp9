@@ -51,6 +51,7 @@ pub mod loopfilter;
 pub mod mcfilter;
 pub mod mv;
 pub mod mvref;
+pub mod nonzero_ctx;
 pub mod probs;
 pub mod reconintra;
 pub mod segmentation;

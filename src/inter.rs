@@ -42,6 +42,7 @@ use crate::mvref::{
     clamp_mv_pair, find_best_ref_mvs, find_mv_refs_geom, use_mv_hp, BlockGeom, InterMiCell,
     InterMiGrid, BORDERINPIXELS, INTERP_EXTEND, NONE_FRAME,
 };
+use crate::nonzero_ctx::NonzeroCtx;
 use crate::probs::read_partition_from_tree;
 use crate::reconintra::{predict as predict_intra, NeighbourBuf};
 use crate::segmentation::{read_inter_segment_id, SegPredContext, SegmentIdMap};
@@ -237,6 +238,10 @@ pub struct InterTile<'a> {
     /// §7.4.1 / §7.4.2 `AboveSegPredContext` / `LeftSegPredContext`.
     /// Cleared per tile — tracks `seg_id_predicted` from neighbours.
     pub seg_pred_ctx: SegPredContext,
+    /// §6.4.22 `AboveNonzeroContext` / `LeftNonzeroContext` — the
+    /// 4×4-granularity "did my neighbour have any non-zero coefficients"
+    /// flag arrays that drive the initial token context (§6.4.24).
+    pub nonzero_ctx: NonzeroCtx,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -298,6 +303,7 @@ impl<'a> InterTile<'a> {
             prev_segment_ids: SegmentIdMap::zeros(mi_cols, mi_rows),
             segment_ids: SegmentIdMap::zeros(mi_cols, mi_rows),
             seg_pred_ctx: SegPredContext::zeros(mi_cols, mi_rows),
+            nonzero_ctx: NonzeroCtx::new(mi_cols, mi_rows, sub_x, sub_y),
         }
     }
 
@@ -389,9 +395,13 @@ impl<'a> InterTile<'a> {
     /// Decode the tile's superblocks in raster order. The bool decoder
     /// is positioned at the first byte of the tile payload.
     pub fn decode(&mut self, bd: &mut BoolDecoder<'_>) -> Result<()> {
+        // §7.4.1 clear_above_context at tile start.
+        self.nonzero_ctx.clear_above();
         let sbs_x = (self.width as u32).div_ceil(SUPERBLOCK_SIZE);
         let sbs_y = (self.height as u32).div_ceil(SUPERBLOCK_SIZE);
         for sby in 0..sbs_y {
+            // §7.4.2 clear_left_context at each superblock row.
+            self.nonzero_ctx.clear_left();
             for sbx in 0..sbs_x {
                 let col = sbx * SUPERBLOCK_SIZE;
                 let row = sby * SUPERBLOCK_SIZE;
@@ -432,8 +442,15 @@ impl<'a> InterTile<'a> {
         for r in row_mi_s..row_mi_e.min(self.seg_pred_ctx.left.len()) {
             self.seg_pred_ctx.left[r] = 0;
         }
+        // §7.4.1 clear_above_context at tile start — zero the whole
+        // per-frame array once so tiles on the same SB row do not leak
+        // state between each other's left context (cleared per-row
+        // below anyway).
+        self.nonzero_ctx.clear_above();
         let mut r = row_start;
         while r < row_end {
+            // §7.4.2 clear_left_context at each superblock row.
+            self.nonzero_ctx.clear_left();
             let mut c = col_start;
             while c < col_end {
                 self.decode_partition(bd, r, c, SUPERBLOCK_SIZE)?;
@@ -1422,6 +1439,11 @@ impl<'a> InterTile<'a> {
                 let tx_w = tx_side.min(plane_w - abs_col);
                 let tx_h = tx_side.min(plane_h - abs_row);
                 let mut coeffs = vec![0i32; tx_side * tx_side];
+                // §6.4.24 initial token context from AboveNonzeroContext /
+                // LeftNonzeroContext (§6.4.22).
+                let initial_ctx =
+                    self.nonzero_ctx
+                        .token_ctx(plane, abs_col, abs_row, scan.tx_size_log2);
                 let eob = decode_coefs(
                     bd,
                     probs,
@@ -1430,7 +1452,7 @@ impl<'a> InterTile<'a> {
                     scan.neighbors,
                     scan.band_translate,
                     scan.tx_size_log2,
-                    0,
+                    initial_ctx,
                     &mut coeffs,
                 )?;
                 if eob > 0 {
@@ -1439,6 +1461,14 @@ impl<'a> InterTile<'a> {
                     inverse_transform_add(tx_type, tx_side, tx_side, &coeffs, &mut dst, tx_side)?;
                     self.blit_plane(plane, abs_row, abs_col, tx_w, tx_h, &dst, tx_side);
                 }
+                // §6.4.22 post-tokens nonzero update.
+                self.nonzero_ctx.update(
+                    plane,
+                    abs_col,
+                    abs_row,
+                    scan.tx_size_log2,
+                    if eob > 0 { 1 } else { 0 },
+                );
                 c += tx_side;
             }
             r += tx_side;
@@ -1506,7 +1536,10 @@ impl<'a> InterTile<'a> {
                 let mut pred = vec![0u8; tx_side * tx_side];
                 predict_intra(mode, &nb, &mut pred, tx_side);
                 self.blit_plane(plane, abs_row, abs_col, tx_w, tx_h, &pred, tx_side);
-                if !skip {
+                let initial_ctx =
+                    self.nonzero_ctx
+                        .token_ctx(plane, abs_col, abs_row, scan.tx_size_log2);
+                let nonzero_update = if !skip {
                     let mut coeffs = vec![0i32; tx_side * tx_side];
                     let eob = decode_coefs(
                         bd,
@@ -1516,7 +1549,7 @@ impl<'a> InterTile<'a> {
                         scan.neighbors,
                         scan.band_translate,
                         scan.tx_size_log2,
-                        0,
+                        initial_ctx,
                         &mut coeffs,
                     )?;
                     if eob > 0 {
@@ -1532,7 +1565,22 @@ impl<'a> InterTile<'a> {
                         )?;
                         self.blit_plane(plane, abs_row, abs_col, tx_w, tx_h, &dst, tx_side);
                     }
-                }
+                    if eob > 0 {
+                        1u8
+                    } else {
+                        0u8
+                    }
+                } else {
+                    0u8
+                };
+                // §6.4.22 post-tokens update.
+                self.nonzero_ctx.update(
+                    plane,
+                    abs_col,
+                    abs_row,
+                    scan.tx_size_log2,
+                    nonzero_update,
+                );
                 c += tx_side;
             }
             r += tx_side;

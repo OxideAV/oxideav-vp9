@@ -128,6 +128,17 @@ pub struct IntraTile<'a> {
     pub height: usize,
     /// Per-8x8-MI block metadata for §8.8 loop filtering.
     pub mi_info: MiInfoPlane,
+    /// Per-column above-partition context (§7.4.6). One byte per 8x8
+    /// column — bit `i` is set when the last partition at log2 level
+    /// `i` ended at this column.
+    pub above_partition_ctx: Vec<u8>,
+    /// Per-row left-partition context.
+    pub left_partition_ctx: Vec<u8>,
+    /// Per-column above intra mode (last 8x8). Used for KF y-mode
+    /// neighbour context.
+    pub above_mode: Vec<IntraMode>,
+    /// Per-row left intra mode (last 8x8).
+    pub left_mode: Vec<IntraMode>,
 }
 
 /// Scan + neighbour tables for a (tx_size, tx_type) pair. Mirrors
@@ -277,6 +288,10 @@ impl<'a> IntraTile<'a> {
             width,
             height,
             mi_info: MiInfoPlane::new(mi_cols, mi_rows),
+            above_partition_ctx: vec![0u8; mi_cols],
+            left_partition_ctx: vec![0u8; mi_rows],
+            above_mode: vec![IntraMode::Dc; mi_cols],
+            left_mode: vec![IntraMode::Dc; mi_rows],
         }
     }
 

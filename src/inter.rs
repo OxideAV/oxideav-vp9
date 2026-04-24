@@ -53,60 +53,37 @@ use crate::tables::{
 };
 use crate::transform::{inverse_transform_add, TxType};
 
-/// §10.5 `default_is_inter_prob[4]` — neighbour-aware context.
-/// ctx = sum of {AvailU && AboveIntra ? 1 : 0, AvailL && LeftIntra ? 1 : 0, …}
-/// per §7.4.6 (see `is_inter_ctx` below).
+// The following compile-time constants mirror the §10.5 defaults and
+// were the sole source of probability values before §6.3 compressed-header
+// updates were wired in. They are retained as documentation / reference
+// values but are no longer read; the decoder now pulls from
+// `self.ch.ctx.*` which is seeded with these defaults and then updated
+// by the §6.3 probability deltas.
+#[allow(dead_code)]
 const DEFAULT_IS_INTER_PROBS: [u8; 4] = [9, 102, 187, 225];
-
-/// §10.5 `default_skip_probs[3]` — ctx = (AboveSkip ? 1 : 0) + (LeftSkip ? 1 : 0).
+#[allow(dead_code)]
 const DEFAULT_SKIP_PROBS: [u8; 3] = [192, 128, 64];
-
-/// Inter mode tree defaults (§10.5 `default_inter_mode_probs`,
-/// `INTER_MODE_CONTEXTS = 7`).
-///
-/// Row layout matches §6.5 `counter_to_context` enumeration:
-/// * 0 — BOTH_ZERO
-/// * 1 — ZERO_PLUS_PREDICTED
-/// * 2 — BOTH_PREDICTED (default for ctx==0 in older single-ctx decoders)
-/// * 3 — NEW_PLUS_NON_INTRA
-/// * 4 — BOTH_NEW
-/// * 5 — INTRA_PLUS_NON_INTRA
-/// * 6 — BOTH_INTRA
-///
-/// Column layout: `[p_non_zeromv, p_not_nearestmv, p_not_nearmv]`
-/// (the 3-node `vp9_inter_mode_tree` — see `read_inter_mode`).
+#[allow(dead_code)]
 const DEFAULT_INTER_MODE_PROBS: [[u8; 3]; 7] = [
-    [2, 173, 34],  // 0 BOTH_ZERO
-    [7, 145, 85],  // 1 ZERO_PLUS_PREDICTED
-    [7, 166, 63],  // 2 BOTH_PREDICTED
-    [7, 94, 66],   // 3 NEW_PLUS_NON_INTRA
-    [8, 64, 46],   // 4 BOTH_NEW
-    [17, 81, 31],  // 5 INTRA_PLUS_NON_INTRA
-    [25, 29, 30],  // 6 BOTH_INTRA
+    [2, 173, 34],
+    [7, 145, 85],
+    [7, 166, 63],
+    [7, 94, 66],
+    [8, 64, 46],
+    [17, 81, 31],
+    [25, 29, 30],
 ];
-
-/// `comp_mode`-ignored single-reference selection prob (§10.5 ctx 0).
+#[allow(dead_code)]
 const DEFAULT_SINGLE_REF_PROB: [u8; 2] = [33, 16];
-
-/// Default `comp_mode` probability (§10.5 `default_comp_mode_prob`, ctx 0)
-/// — picks COMPOUND vs SINGLE when `reference_mode == REFERENCE_MODE_SELECT`.
+#[allow(dead_code)]
 const DEFAULT_COMP_MODE_PROB: u8 = 128;
-
-/// Default `comp_ref` probability — picks which variable reference frame
-/// is used in compound prediction (§10.5 `default_comp_ref_prob`, ctx 0).
+#[allow(dead_code)]
 const DEFAULT_COMP_REF_PROB: u8 = 128;
-
-/// Default interp-filter selection probabilities — used when
-/// `interpolation_filter == SWITCHABLE` (§7.3.7). ctx 0, two conditional
-/// splits: first EIGHTTAP vs rest, then EIGHTTAP_SMOOTH vs EIGHTTAP_SHARP.
+#[allow(dead_code)]
 const DEFAULT_INTERP_PROBS: [u8; 2] = [235, 162];
-
-/// Inter-frame intra-mode probs (§10.5 `default_if_y_mode_probs`,
-/// ctx 0). Decoded with the same 9-prob tree as KF intra modes.
+#[allow(dead_code)]
 const DEFAULT_IF_Y_MODE_PROBS: [u8; 9] = [65, 32, 18, 144, 162, 194, 41, 51, 98];
-
-/// Inter-frame chroma-intra-mode probs — used when `is_inter = false`.
-/// Indexed by luma mode; we always use the 9-prob sub-row for luma=DC.
+#[allow(dead_code)]
 const DEFAULT_IF_UV_MODE_PROBS: [u8; 9] = [120, 7, 76, 176, 208, 126, 28, 221, 29];
 
 /// Compound-reference index resolution per §6.3.18
@@ -695,7 +672,7 @@ impl<'a> InterTile<'a> {
             true
         } else {
             let skip_ctx = self.skip_ctx(mi_row, mi_col);
-            bd.read(DEFAULT_SKIP_PROBS[skip_ctx])? != 0
+            bd.read(self.ch.ctx.skip_probs[skip_ctx])? != 0
         };
         // §6.4.13 read_is_inter — `SEG_LVL_REF_FRAME` forces the
         // `is_inter` decision: INTRA_FRAME => intra, otherwise inter.
@@ -710,7 +687,7 @@ impl<'a> InterTile<'a> {
                 != INTRA_FRAME as i16
         } else {
             let is_inter_ctx = self.is_inter_ctx(mi_row, mi_col);
-            bd.read(DEFAULT_IS_INTER_PROBS[is_inter_ctx])? != 0
+            bd.read(self.ch.ctx.is_inter_prob[is_inter_ctx])? != 0
         };
         let tx_size_log2 = self.read_tx_size(bd, bs)?;
         let res = if is_inter {
@@ -743,28 +720,32 @@ impl<'a> InterTile<'a> {
 
         // §6.4.17 read_ref_frames.
         let frame_ref_mode = self.ch.reference_mode.unwrap_or(ReferenceMode::SingleReference);
+        // §6.4.17 / §9.3.2: comp_mode, single_ref, comp_ref contexts are
+        // neighbour-aware (5 contexts each). Not yet tracked — use
+        // context 0 for now but pull probs from the per-frame table so
+        // the §6.3.13 deltas have an effect.
         let is_compound = match frame_ref_mode {
             ReferenceMode::SingleReference => false,
             ReferenceMode::CompoundReference => true,
-            ReferenceMode::ReferenceModeSelect => bd.read(DEFAULT_COMP_MODE_PROB)? != 0,
+            ReferenceMode::ReferenceModeSelect => bd.read(self.ch.ctx.comp_mode_prob[0])? != 0,
         };
 
         // ref_frame_codes[0], ref_frame_codes[1] — LAST=1, GOLDEN=2, ALTREF=3.
         // ref_frame_codes[1] is 0 (NONE) when single.
         let (ref_code_a, ref_code_b) = if is_compound {
             let comp_refs = CompRefs::from_sign_bias(&self.hdr.ref_frame_sign_bias);
-            let comp_ref_bit = bd.read(DEFAULT_COMP_REF_PROB)? as usize;
+            let comp_ref_bit = bd.read(self.ch.ctx.comp_ref_prob[0])? as usize;
             let idx = self.hdr.ref_frame_sign_bias[comp_refs.fixed as usize] as usize;
             let mut refs = [0u8; 2];
             refs[idx] = comp_refs.fixed;
             refs[idx ^ 1] = comp_refs.var[comp_ref_bit];
             (refs[0], refs[1])
         } else {
-            let first = bd.read(DEFAULT_SINGLE_REF_PROB[0])?;
+            let first = bd.read(self.ch.ctx.single_ref_prob[0][0])?;
             let code = if first == 0 {
                 1u8 // LAST
             } else {
-                let second = bd.read(DEFAULT_SINGLE_REF_PROB[1])?;
+                let second = bd.read(self.ch.ctx.single_ref_prob[0][1])?;
                 if second == 0 {
                     2u8 // GOLDEN
                 } else {
@@ -819,7 +800,7 @@ impl<'a> InterTile<'a> {
         // by §6.5 `find_mv_refs` (contextCounter → counter_to_context).
         // `refs_a.mode_context` is already clamped to `0..=6`.
         let ctx = (refs_a.mode_context as usize).min(6);
-        let inter_mode = read_inter_mode(bd, DEFAULT_INTER_MODE_PROBS[ctx])?;
+        let inter_mode = read_inter_mode(bd, self.ch.ctx.inter_mode_probs[ctx])?;
 
         // Record §8.8 MI metadata for this inter block.
         let mi_row_units = (row as usize) / 8;
@@ -841,11 +822,14 @@ impl<'a> InterTile<'a> {
             },
         );
 
-        // Interpolation filter (optionally switchable).
+        // Interpolation filter (optionally switchable). §9.3.2 derives
+        // the 4-context id from above / left; we don't track that yet,
+        // so use context 0 — but still source probs from the per-frame
+        // table so the §6.3.10 deltas matter.
         let filter = if let Some(f) = self.default_filter {
             f
         } else {
-            read_switchable_filter(bd, DEFAULT_INTERP_PROBS)?
+            read_switchable_filter(bd, self.ch.ctx.interp_filter_probs[0])?
         };
 
         // §6.4.18 assign_mv.
@@ -1063,8 +1047,16 @@ impl<'a> InterTile<'a> {
         skip: bool,
         segment_id: u8,
     ) -> Result<()> {
-        let y_mode = read_intra_mode_tree(bd, &DEFAULT_IF_Y_MODE_PROBS)?;
-        let uv_mode = read_intra_mode_tree(bd, &DEFAULT_IF_UV_MODE_PROBS)?;
+        // §9.3.2: `y_mode_probs[BlockSizeGroup][INTRA_MODES-1]` where
+        // BlockSizeGroup is derived from MiSize (0: ≤8×8, 1: ≤16×16,
+        // 2: ≤32×32, 3: 64×64). For intra-in-inter we map it off the
+        // picked BlockSize.
+        let bsg = block_size_group(bs);
+        let y_probs = self.ch.ctx.y_mode_probs[bsg];
+        let y_mode = read_intra_mode_tree(bd, &y_probs)?;
+        // UV-mode conditioned on the just-chosen Y mode (INTRA_MODES=10).
+        let uv_probs = self.ch.ctx.uv_mode_probs[y_mode as usize];
+        let uv_mode = read_intra_mode_tree(bd, &uv_probs)?;
         // Record §8.8 MI metadata for this intra-in-inter block.
         let mi_row_units = (row as usize) / 8;
         let mi_col_units = (col as usize) / 8;
@@ -1698,6 +1690,23 @@ fn read_intra_mode_tree(bd: &mut BoolDecoder<'_>, p: &[u8; 9]) -> Result<IntraMo
         } else {
             Ok(IntraMode::D207)
         }
+    }
+}
+
+/// §9.3.2 `BlockSizeGroup` lookup — used to index `y_mode_probs`.
+/// Groups 0..=3 cover: {8x8, 16x8, 8x16}, {16x16, 32x16, 16x32},
+/// {32x32, 64x32, 32x64}, {64x64}.
+fn block_size_group(bs: BlockSize) -> usize {
+    match bs {
+        BlockSize::B4x4
+        | BlockSize::B4x8
+        | BlockSize::B8x4
+        | BlockSize::B8x8
+        | BlockSize::B8x16
+        | BlockSize::B16x8 => 0,
+        BlockSize::B16x16 | BlockSize::B16x32 | BlockSize::B32x16 => 1,
+        BlockSize::B32x32 | BlockSize::B32x64 | BlockSize::B64x32 => 2,
+        BlockSize::B64x64 => 3,
     }
 }
 

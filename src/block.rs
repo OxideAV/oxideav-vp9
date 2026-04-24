@@ -31,8 +31,8 @@ use crate::tables::{
     COL_SCAN_16X16_NEIGHBORS, COL_SCAN_4X4, COL_SCAN_4X4_NEIGHBORS, COL_SCAN_8X8,
     COL_SCAN_8X8_NEIGHBORS, DC_QLOOKUP, DEFAULT_SCAN_16X16, DEFAULT_SCAN_16X16_NEIGHBORS,
     DEFAULT_SCAN_32X32, DEFAULT_SCAN_32X32_NEIGHBORS, DEFAULT_SCAN_4X4, DEFAULT_SCAN_4X4_NEIGHBORS,
-    DEFAULT_SCAN_8X8, DEFAULT_SCAN_8X8_NEIGHBORS, KF_UV_MODE_PROBS, KF_Y_MODE_PROBS, ROW_SCAN_16X16,
-    ROW_SCAN_16X16_NEIGHBORS, ROW_SCAN_4X4, ROW_SCAN_4X4_NEIGHBORS, ROW_SCAN_8X8,
+    DEFAULT_SCAN_8X8, DEFAULT_SCAN_8X8_NEIGHBORS, KF_UV_MODE_PROBS, KF_Y_MODE_PROBS,
+    ROW_SCAN_16X16, ROW_SCAN_16X16_NEIGHBORS, ROW_SCAN_4X4, ROW_SCAN_4X4_NEIGHBORS, ROW_SCAN_8X8,
     ROW_SCAN_8X8_NEIGHBORS,
 };
 use crate::transform::{inverse_transform_add, TxType};
@@ -577,7 +577,7 @@ impl<'a> IntraTile<'a> {
         // For our purposes (approximate), we set the boffset bit when the
         // sub-block is at least the full bsize in that dimension.
         let above_fill = if sub_w_px >= bsize_px {
-            (1u8 << boffset) - 1 + (1u8 << boffset)  // 0x01, 0x03, 0x07, 0x0f
+            (1u8 << boffset) - 1 + (1u8 << boffset) // 0x01, 0x03, 0x07, 0x0f
         } else {
             0
         };
@@ -889,13 +889,8 @@ impl<'a> IntraTile<'a> {
                 };
                 // §6.4.22 post-tokens update: stamp the nonzero flag
                 // into the 4×4 grid so downstream blocks see it.
-                self.nonzero_ctx.update(
-                    plane,
-                    abs_col,
-                    abs_row,
-                    scan.tx_size_log2,
-                    nonzero_update,
-                );
+                self.nonzero_ctx
+                    .update(plane, abs_col, abs_row, scan.tx_size_log2, nonzero_update);
                 let _ = stride;
                 c += tx_side;
             }

@@ -410,8 +410,8 @@ impl LoopFilter {
                     || (pass == 0 && x == 0)
                     || (pass == 1 && y == 0));
                 // §8.8.2 step 14 applyFilter.
-                let apply_filter = on_screen
-                    && (is_block_edge || (is_tx_edge && (is_intra || !skip)));
+                let apply_filter =
+                    on_screen && (is_block_edge || (is_tx_edge && (is_intra || !skip)));
                 // §8.8.3 filter size: log2 of filter side (0=TX_4X4,
                 // 1=TX_8X8, 2=TX_16X16).
                 let base_size = if tx_sz == 0 && is32_edge {
@@ -505,8 +505,7 @@ fn apply_sample_filter(
         plane.read((y - dy * k) as isize, (x - dx * k) as isize) as i32
     });
     // §8.8.5.1 masks.
-    let hev_mask =
-        (p[1] - p[0]).abs() > thresh as i32 || (q[1] - q[0]).abs() > thresh as i32;
+    let hev_mask = (p[1] - p[0]).abs() > thresh as i32 || (q[1] - q[0]).abs() > thresh as i32;
     let mut mask = false;
     mask |= (p[3] - p[2]).abs() > limit as i32;
     mask |= (p[2] - p[1]).abs() > limit as i32;

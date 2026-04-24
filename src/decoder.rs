@@ -428,11 +428,7 @@ fn split_tile_payload<'a>(
 /// Pixel-space bounds `(col_start, col_end, row_start, row_end)` for
 /// tile (`tile_col`, `tile_row`) per §6.4.1 `get_tile_offset`. The
 /// returned bounds are clamped to the frame dimensions.
-fn tile_pixel_bounds(
-    h: &UncompressedHeader,
-    tile_col: u32,
-    tile_row: u32,
-) -> (u32, u32, u32, u32) {
+fn tile_pixel_bounds(h: &UncompressedHeader, tile_col: u32, tile_row: u32) -> (u32, u32, u32, u32) {
     let mi_cols = h.width.div_ceil(8);
     let mi_rows = h.height.div_ceil(8);
     let col_s = get_tile_offset(tile_col, mi_cols, h.tile_info.log2_tile_cols as u32) * 8;

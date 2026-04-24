@@ -40,7 +40,7 @@ fn decode_multi_tile_keyframe() {
     let f1 = iter.next().expect("frame 1").expect("frame 1 ok");
 
     // Peek at the parsed header to confirm multi-tile.
-    let parsed = parse_uncompressed_header(&f1.payload, None).expect("parse header");
+    let parsed = parse_uncompressed_header(f1.payload, None).expect("parse header");
     assert!(
         parsed.tile_info.log2_tile_cols >= 1,
         "fixture should have log2_tile_cols >= 1, got {}",

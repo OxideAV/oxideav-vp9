@@ -69,7 +69,7 @@ impl BoolEncoder {
         }
         // Renormalise.
         let shift = self.range.leading_zeros().saturating_sub(24); // 1..7 while range<128
-        // Apply `shift` successive doublings.
+                                                                   // Apply `shift` successive doublings.
         for _ in 0..shift {
             self.range <<= 1;
         }
@@ -244,7 +244,9 @@ mod tests {
         let mut bits = Vec::with_capacity(2048);
         let mut probs = Vec::with_capacity(2048);
         for _ in 0..2048 {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let prob = ((state >> 32) as u32 & 0xfe) as u8 | 1; // 1..=255
             let bit = (state as u32) & 1;
             bits.push(bit);

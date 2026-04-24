@@ -154,7 +154,16 @@ fn emit_partition(
         emit_partition(be, ctx, row, col, half, frame_w, frame_h, tx_mode);
         emit_partition(be, ctx, row, col + half, half, frame_w, frame_h, tx_mode);
         emit_partition(be, ctx, row + half, col, half, frame_w, frame_h, tx_mode);
-        emit_partition(be, ctx, row + half, col + half, half, frame_w, frame_h, tx_mode);
+        emit_partition(
+            be,
+            ctx,
+            row + half,
+            col + half,
+            half,
+            frame_w,
+            frame_h,
+            tx_mode,
+        );
         return;
     }
     if on_right {
@@ -170,7 +179,16 @@ fn emit_partition(
         emit_partition(be, ctx, row, col, half, frame_w, frame_h, tx_mode);
         emit_partition(be, ctx, row, col + half, half, frame_w, frame_h, tx_mode);
         emit_partition(be, ctx, row + half, col, half, frame_w, frame_h, tx_mode);
-        emit_partition(be, ctx, row + half, col + half, half, frame_w, frame_h, tx_mode);
+        emit_partition(
+            be,
+            ctx,
+            row + half,
+            col + half,
+            half,
+            frame_w,
+            frame_h,
+            tx_mode,
+        );
         return;
     }
     if on_bottom {
@@ -184,7 +202,16 @@ fn emit_partition(
         emit_partition(be, ctx, row, col, half, frame_w, frame_h, tx_mode);
         emit_partition(be, ctx, row, col + half, half, frame_w, frame_h, tx_mode);
         emit_partition(be, ctx, row + half, col, half, frame_w, frame_h, tx_mode);
-        emit_partition(be, ctx, row + half, col + half, half, frame_w, frame_h, tx_mode);
+        emit_partition(
+            be,
+            ctx,
+            row + half,
+            col + half,
+            half,
+            frame_w,
+            frame_h,
+            tx_mode,
+        );
         return;
     }
     // Interior — emit PARTITION_NONE. Tree reads: bit0=0 -> NONE.

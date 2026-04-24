@@ -32,5 +32,8 @@ fn main() {
         32 + 12,
         frame.len()
     );
-    eprintln!("first 32 bytes of VP9 frame: {:02x?}", &frame[..frame.len().min(32)]);
+    eprintln!(
+        "first 32 bytes of VP9 frame: {:02x?}",
+        &frame[..frame.len().min(32)]
+    );
 }

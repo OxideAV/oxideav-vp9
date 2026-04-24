@@ -64,39 +64,32 @@ pub fn decode_coefs(
     let mut ctx = initial_ctx;
     let mut token_cache = [0u8; 32 * 32];
     let mut c = 0usize;
-    let mut band_idx = 0usize;
+    // §6.4.24 `checkEob`: tracks whether the NEXT coefficient position
+    // reads the `more_coefs` / EOB bit. Starts at 1, becomes 0 after a
+    // ZERO_TOKEN (spec text: "TokenCache[pos] = 0; checkEob = 0"), and
+    // returns to 1 after any non-zero token. Skipping the more_coefs
+    // read after a ZERO is critical: reading it would consume bits the
+    // encoder did not emit and misalign the tile bool decoder.
+    let mut check_eob = true;
 
-    loop {
-        if c >= max_eob {
-            break;
-        }
-        let band = band_translate[band_idx] as usize;
-        band_idx += 1;
+    while c < max_eob {
+        let band = band_translate[c] as usize;
         let probs = coef_probs[band][ctx];
-        // EOB bit.
-        if bd.read(probs[EOB_CONTEXT_NODE])? == 0 {
+        if check_eob && bd.read(probs[EOB_CONTEXT_NODE])? == 0 {
             break;
         }
-        // ZERO bit: may loop multiple times, decoding zeros and rolling
-        // context forward.
-        let mut probs = probs;
-        loop {
-            if bd.read(probs[ZERO_CONTEXT_NODE])? == 1 {
-                break;
-            }
+        if bd.read(probs[ZERO_CONTEXT_NODE])? == 0 {
+            // ZERO_TOKEN — emit zero, advance scan position, next iter
+            // skips the EOB test per §6.4.24.
             dqv = dq[1];
             token_cache[scan[c] as usize] = 0;
             c += 1;
             if c >= max_eob {
-                return Ok(c);
+                break;
             }
             ctx = get_coef_context(neighbors, &token_cache, c);
-            let band = band_translate[band_idx] as usize;
-            band_idx += 1;
-            probs = coef_probs[band][ctx];
-            if bd.read(probs[EOB_CONTEXT_NODE])? == 0 {
-                return Ok(c);
-            }
+            check_eob = false;
+            continue;
         }
         // Non-zero coefficient at `c`.
         let magnitude = decode_nonzero(bd, &probs, &mut token_cache, scan, c, dqv, dq_shift)?;
@@ -112,6 +105,7 @@ pub fn decode_coefs(
         }
         ctx = get_coef_context(neighbors, &token_cache, c);
         dqv = dq[1];
+        check_eob = true;
     }
     Ok(c)
 }

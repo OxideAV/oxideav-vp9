@@ -85,13 +85,7 @@ impl SegmentIdMap {
     /// §6.4.14 `get_segment_id()`: predicted id = min over the covered
     /// region of the prior frame's `SegmentIds`. Starts at 7 (spec uses
     /// `seg = 7`), reduces to whatever sits below.
-    pub fn predicted_segment_id(
-        &self,
-        mi_row: usize,
-        mi_col: usize,
-        bw: usize,
-        bh: usize,
-    ) -> u8 {
+    pub fn predicted_segment_id(&self, mi_row: usize, mi_col: usize, bw: usize, bh: usize) -> u8 {
         let xmis = bw.min(self.mi_cols.saturating_sub(mi_col));
         let ymis = bh.min(self.mi_rows.saturating_sub(mi_row));
         let mut seg: u8 = 7;
@@ -237,10 +231,7 @@ pub fn read_inter_segment_id(
 
 /// §6.4.7 `intra_segment_id()` — key / intra-only frames either read a
 /// tree-coded segment_id (`update_map == 1`) or default to 0.
-pub fn read_intra_segment_id(
-    bd: &mut BoolDecoder<'_>,
-    seg: &SegmentationParams,
-) -> Result<u8> {
+pub fn read_intra_segment_id(bd: &mut BoolDecoder<'_>, seg: &SegmentationParams) -> Result<u8> {
     if seg.enabled && seg.update_map {
         read_segment_id(bd, &seg.tree_probs)
     } else {

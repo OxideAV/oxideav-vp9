@@ -168,7 +168,14 @@ impl InterMiGrid {
 
     /// Stamp `info` into every 8x8 MI cell covered by a `w × h` (8x8
     /// units) prediction block rooted at `(mi_row, mi_col)`.
-    pub fn fill(&mut self, mi_row: usize, mi_col: usize, w_8x8: usize, h_8x8: usize, info: InterMiCell) {
+    pub fn fill(
+        &mut self,
+        mi_row: usize,
+        mi_col: usize,
+        w_8x8: usize,
+        h_8x8: usize,
+        info: InterMiCell,
+    ) {
         let w = w_8x8.max(1);
         let h = h_8x8.max(1);
         for dy in 0..h {
@@ -192,31 +199,148 @@ impl InterMiGrid {
 /// Indexed by VP9 `BlockSize` code (0..=12).
 pub const MV_REF_BLOCKS: [[(i32, i32); MVREF_NEIGHBOURS]; 13] = [
     // 0 BLOCK_4X4
-    [(-1, 0), (0, -1), (-1, -1), (-2, 0), (0, -2), (-2, -1), (-1, -2), (-2, -2)],
+    [
+        (-1, 0),
+        (0, -1),
+        (-1, -1),
+        (-2, 0),
+        (0, -2),
+        (-2, -1),
+        (-1, -2),
+        (-2, -2),
+    ],
     // 1 BLOCK_4X8
-    [(-1, 0), (0, -1), (-1, -1), (-2, 0), (0, -2), (-2, -1), (-1, -2), (-2, -2)],
+    [
+        (-1, 0),
+        (0, -1),
+        (-1, -1),
+        (-2, 0),
+        (0, -2),
+        (-2, -1),
+        (-1, -2),
+        (-2, -2),
+    ],
     // 2 BLOCK_8X4
-    [(-1, 0), (0, -1), (-1, -1), (-2, 0), (0, -2), (-2, -1), (-1, -2), (-2, -2)],
+    [
+        (-1, 0),
+        (0, -1),
+        (-1, -1),
+        (-2, 0),
+        (0, -2),
+        (-2, -1),
+        (-1, -2),
+        (-2, -2),
+    ],
     // 3 BLOCK_8X8
-    [(-1, 0), (0, -1), (-1, -1), (-2, 0), (0, -2), (-2, -1), (-1, -2), (-2, -2)],
+    [
+        (-1, 0),
+        (0, -1),
+        (-1, -1),
+        (-2, 0),
+        (0, -2),
+        (-2, -1),
+        (-1, -2),
+        (-2, -2),
+    ],
     // 4 BLOCK_8X16
-    [(0, -1), (-1, 0), (1, -1), (-1, -1), (0, -2), (-2, 0), (-2, -1), (-1, -2)],
+    [
+        (0, -1),
+        (-1, 0),
+        (1, -1),
+        (-1, -1),
+        (0, -2),
+        (-2, 0),
+        (-2, -1),
+        (-1, -2),
+    ],
     // 5 BLOCK_16X8
-    [(-1, 0), (0, -1), (-1, 1), (-1, -1), (-2, 0), (0, -2), (-1, -2), (-2, -1)],
+    [
+        (-1, 0),
+        (0, -1),
+        (-1, 1),
+        (-1, -1),
+        (-2, 0),
+        (0, -2),
+        (-1, -2),
+        (-2, -1),
+    ],
     // 6 BLOCK_16X16
-    [(-1, 0), (0, -1), (-1, 1), (1, -1), (-1, -1), (-3, 0), (0, -3), (-3, -3)],
+    [
+        (-1, 0),
+        (0, -1),
+        (-1, 1),
+        (1, -1),
+        (-1, -1),
+        (-3, 0),
+        (0, -3),
+        (-3, -3),
+    ],
     // 7 BLOCK_16X32
-    [(0, -1), (-1, 0), (2, -1), (-1, -1), (-1, 1), (0, -3), (-3, 0), (-3, -3)],
+    [
+        (0, -1),
+        (-1, 0),
+        (2, -1),
+        (-1, -1),
+        (-1, 1),
+        (0, -3),
+        (-3, 0),
+        (-3, -3),
+    ],
     // 8 BLOCK_32X16
-    [(-1, 0), (0, -1), (-1, 2), (-1, -1), (1, -1), (-3, 0), (0, -3), (-3, -3)],
+    [
+        (-1, 0),
+        (0, -1),
+        (-1, 2),
+        (-1, -1),
+        (1, -1),
+        (-3, 0),
+        (0, -3),
+        (-3, -3),
+    ],
     // 9 BLOCK_32X32
-    [(-1, 1), (1, -1), (-1, 2), (2, -1), (-1, -1), (-3, 0), (0, -3), (-3, -3)],
+    [
+        (-1, 1),
+        (1, -1),
+        (-1, 2),
+        (2, -1),
+        (-1, -1),
+        (-3, 0),
+        (0, -3),
+        (-3, -3),
+    ],
     // 10 BLOCK_32X64
-    [(0, -1), (-1, 0), (4, -1), (-1, 2), (-1, -1), (0, -3), (-3, 0), (2, -1)],
+    [
+        (0, -1),
+        (-1, 0),
+        (4, -1),
+        (-1, 2),
+        (-1, -1),
+        (0, -3),
+        (-3, 0),
+        (2, -1),
+    ],
     // 11 BLOCK_64X32
-    [(-1, 0), (0, -1), (-1, 4), (2, -1), (-1, -1), (-3, 0), (0, -3), (-1, 2)],
+    [
+        (-1, 0),
+        (0, -1),
+        (-1, 4),
+        (2, -1),
+        (-1, -1),
+        (-3, 0),
+        (0, -3),
+        (-1, 2),
+    ],
     // 12 BLOCK_64X64
-    [(-1, 3), (3, -1), (-1, 4), (4, -1), (-1, -1), (-1, 0), (0, -1), (-1, 6)],
+    [
+        (-1, 3),
+        (3, -1),
+        (-1, 4),
+        (4, -1),
+        (-1, -1),
+        (-1, 0),
+        (0, -1),
+        (-1, 6),
+    ],
 ];
 
 /// §6.5 result of `find_mv_refs` — the two-slot candidate list.
@@ -549,11 +673,7 @@ pub fn use_mv_hp(delta: Mv) -> bool {
 /// and re-clamp with the wider `(BORDERINPIXELS - INTERP_EXTEND) << 3
 /// = 1248` border. Mutates `refs` in place; returns the list so
 /// `(NearestMv, NearMv, BestMv)` can be extracted via accessors.
-pub fn find_best_ref_mvs(
-    refs: &mut MvRefs,
-    allow_high_precision_mv: bool,
-    geom: &BlockGeom,
-) {
+pub fn find_best_ref_mvs(refs: &mut MvRefs, allow_high_precision_mv: bool, geom: &BlockGeom) {
     let wider_border = (BORDERINPIXELS - INTERP_EXTEND) << 3;
     for i in 0..(refs.count as usize) {
         let mut row = refs.list[i].row;
@@ -596,10 +716,10 @@ pub fn round_to_quarter_pel(mv: Mv) -> Mv {
 /// occupy one 8x8 MI column).
 fn block_size_w_8x8(code: usize) -> i32 {
     match code {
-        0..=4 => 1,    // 4x4, 4x8, 8x4, 8x8, 8x16
-        5..=7 => 2,    // 16x8, 16x16, 16x32
-        8..=10 => 4,   // 32x16, 32x32, 32x64
-        11 | 12 => 8,  // 64x32, 64x64
+        0..=4 => 1,   // 4x4, 4x8, 8x4, 8x8, 8x16
+        5..=7 => 2,   // 16x8, 16x16, 16x32
+        8..=10 => 4,  // 32x16, 32x32, 32x64
+        11 | 12 => 8, // 64x32, 64x64
         _ => 1,
     }
 }
@@ -607,11 +727,11 @@ fn block_size_w_8x8(code: usize) -> i32 {
 /// `num_8x8_blocks_high_lookup[BlockSize]`.
 fn block_size_h_8x8(code: usize) -> i32 {
     match code {
-        0 | 2 => 1,    // 4x4, 8x4
-        1 | 3 | 5 => 1, // 4x8, 8x8, 16x8
-        4 | 6 | 8 => 2, // 8x16, 16x16, 32x16
+        0 | 2 => 1,      // 4x4, 8x4
+        1 | 3 | 5 => 1,  // 4x8, 8x8, 16x8
+        4 | 6 | 8 => 2,  // 8x16, 16x16, 32x16
         7 | 9 | 11 => 4, // 16x32, 32x32, 64x32
-        10 | 12 => 8,  // 32x64, 64x64
+        10 | 12 => 8,    // 32x64, 64x64
         _ => 1,
     }
 }
@@ -672,14 +792,22 @@ mod tests {
             1,
             1,
             1,
-            InterMiCell { ref_frame: [1, NONE_FRAME], mv: [mv, Mv::ZERO], y_mode: Y_MODE_NEWMV },
+            InterMiCell {
+                ref_frame: [1, NONE_FRAME],
+                mv: [mv, Mv::ZERO],
+                y_mode: Y_MODE_NEWMV,
+            },
         );
         grid.fill(
             2,
             1,
             1,
             1,
-            InterMiCell { ref_frame: [1, NONE_FRAME], mv: [mv, Mv::ZERO], y_mode: Y_MODE_NEWMV },
+            InterMiCell {
+                ref_frame: [1, NONE_FRAME],
+                mv: [mv, Mv::ZERO],
+                y_mode: Y_MODE_NEWMV,
+            },
         );
         let sb: RefSignBias = [false; 4];
         let r = find_mv_refs(&grid, &sb, 1, 6, 2, 2, 0, 4, 4);
@@ -746,15 +874,7 @@ mod tests {
         let sb: RefSignBias = [false; 4];
         // 16x16 at (mi_row=2, mi_col=2), mi_rows=4, mi_cols=4 passed
         // via geom version.
-        let r = find_mv_refs_geom(
-            &grid,
-            &sb,
-            1,
-            6,
-            geom(2, 2, 2, 2, 4, 4),
-            0,
-            4,
-        );
+        let r = find_mv_refs_geom(&grid, &sb, 1, 6, geom(2, 2, 2, 2, 4, 4), 0, 4);
         assert_eq!(r.count, 1);
         // mbToBottomEdge = ((4-2-2)*8)*8 = 0, so max = MV_BORDER = 128.
         assert_eq!(r.list[0].row, 128);

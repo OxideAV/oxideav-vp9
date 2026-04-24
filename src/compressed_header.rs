@@ -37,10 +37,10 @@ use oxideav_core::{Error, Result};
 use crate::bool_decoder::BoolDecoder;
 use crate::frame_ctx::{
     diff_update_prob, update_mv_prob, FrameContext, BLOCK_SIZE_GROUPS, BLOCK_TYPES, COEF_BANDS,
-    COEF_CTX, COEF_NODES, COMP_MODE_CONTEXTS, INTER_MODE_CONTEXTS, INTER_MODE_PROBS,
-    INTERP_FILTER_CONTEXTS, INTERP_FILTER_PROBS, INTRA_MODES, INTRA_MODES_M1, IS_INTER_CONTEXTS,
-    PARTITION_CONTEXTS, PARTITION_TYPES_M1, REF_CONTEXTS, REF_TYPES, SKIP_CONTEXTS,
-    TX_SIZE_CONTEXTS, TX_SIZES,
+    COEF_CTX, COEF_NODES, COMP_MODE_CONTEXTS, INTERP_FILTER_CONTEXTS, INTERP_FILTER_PROBS,
+    INTER_MODE_CONTEXTS, INTER_MODE_PROBS, INTRA_MODES, INTRA_MODES_M1, IS_INTER_CONTEXTS,
+    PARTITION_CONTEXTS, PARTITION_TYPES_M1, REF_CONTEXTS, REF_TYPES, SKIP_CONTEXTS, TX_SIZES,
+    TX_SIZE_CONTEXTS,
 };
 use crate::headers::{FrameType, UncompressedHeader};
 
@@ -201,8 +201,7 @@ pub fn parse_compressed_header_with_seed(
         // §6.3.14 read_y_mode_probs.
         for i in 0..BLOCK_SIZE_GROUPS {
             for j in 0..INTRA_MODES_M1 {
-                out.ctx.y_mode_probs[i][j] =
-                    diff_update_prob(&mut bd, out.ctx.y_mode_probs[i][j])?;
+                out.ctx.y_mode_probs[i][j] = diff_update_prob(&mut bd, out.ctx.y_mode_probs[i][j])?;
             }
         }
 

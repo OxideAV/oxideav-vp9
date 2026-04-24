@@ -737,7 +737,10 @@ impl<'a> InterTile<'a> {
         //   5. assign_mv (read_mv for NEWMV, else NearestMv / NearMv / 0)
 
         // §6.4.17 read_ref_frames.
-        let frame_ref_mode = self.ch.reference_mode.unwrap_or(ReferenceMode::SingleReference);
+        let frame_ref_mode = self
+            .ch
+            .reference_mode
+            .unwrap_or(ReferenceMode::SingleReference);
         // §6.4.17 / §9.3.2: comp_mode, single_ref, comp_ref contexts are
         // neighbour-aware (5 contexts each). Not yet tracked — use
         // context 0 for now but pull probs from the per-frame table so
@@ -927,8 +930,30 @@ impl<'a> InterTile<'a> {
                     &mut luma_a,
                 );
                 if eff_cw >= 4 && eff_ch >= 4 {
-                    self.mc_chroma_to(rf, c_row, c_col, eff_cw, eff_ch, mv_a.0, mv_a.1, filter, 1, &mut chroma_a[0]);
-                    self.mc_chroma_to(rf, c_row, c_col, eff_cw, eff_ch, mv_a.0, mv_a.1, filter, 2, &mut chroma_a[1]);
+                    self.mc_chroma_to(
+                        rf,
+                        c_row,
+                        c_col,
+                        eff_cw,
+                        eff_ch,
+                        mv_a.0,
+                        mv_a.1,
+                        filter,
+                        1,
+                        &mut chroma_a[0],
+                    );
+                    self.mc_chroma_to(
+                        rf,
+                        c_row,
+                        c_col,
+                        eff_cw,
+                        eff_ch,
+                        mv_a.0,
+                        mv_a.1,
+                        filter,
+                        2,
+                        &mut chroma_a[1],
+                    );
                 }
                 have_a = true;
             }
@@ -947,8 +972,30 @@ impl<'a> InterTile<'a> {
                     &mut luma_b,
                 );
                 if eff_cw >= 4 && eff_ch >= 4 {
-                    self.mc_chroma_to(rf, c_row, c_col, eff_cw, eff_ch, mv_b.0, mv_b.1, filter, 1, &mut chroma_b[0]);
-                    self.mc_chroma_to(rf, c_row, c_col, eff_cw, eff_ch, mv_b.0, mv_b.1, filter, 2, &mut chroma_b[1]);
+                    self.mc_chroma_to(
+                        rf,
+                        c_row,
+                        c_col,
+                        eff_cw,
+                        eff_ch,
+                        mv_b.0,
+                        mv_b.1,
+                        filter,
+                        1,
+                        &mut chroma_b[0],
+                    );
+                    self.mc_chroma_to(
+                        rf,
+                        c_row,
+                        c_col,
+                        eff_cw,
+                        eff_ch,
+                        mv_b.0,
+                        mv_b.1,
+                        filter,
+                        2,
+                        &mut chroma_b[1],
+                    );
                 }
                 have_b = true;
             }
@@ -1376,10 +1423,26 @@ impl<'a> InterTile<'a> {
         let c_tx = clamp_tx_size(tx_size_log2, c_w, c_h);
         if c_w >= 4 && c_h >= 4 {
             self.decode_plane_residual(
-                bd, c_row, c_col, c_w, c_h, c_tx, TxType::DctDct, 1, segment_id,
+                bd,
+                c_row,
+                c_col,
+                c_w,
+                c_h,
+                c_tx,
+                TxType::DctDct,
+                1,
+                segment_id,
             )?;
             self.decode_plane_residual(
-                bd, c_row, c_col, c_w, c_h, c_tx, TxType::DctDct, 2, segment_id,
+                bd,
+                c_row,
+                c_col,
+                c_w,
+                c_h,
+                c_tx,
+                TxType::DctDct,
+                2,
+                segment_id,
             )?;
         }
         Ok(())
@@ -1574,13 +1637,8 @@ impl<'a> InterTile<'a> {
                     0u8
                 };
                 // §6.4.22 post-tokens update.
-                self.nonzero_ctx.update(
-                    plane,
-                    abs_col,
-                    abs_row,
-                    scan.tx_size_log2,
-                    nonzero_update,
-                );
+                self.nonzero_ctx
+                    .update(plane, abs_col, abs_row, scan.tx_size_log2, nonzero_update);
                 c += tx_side;
             }
             r += tx_side;

@@ -35,10 +35,7 @@ fn decode_compound_reference_stream() {
 
     let mut shown = 0usize;
     let mut unsupported_frames = 0usize;
-    for (i, frame) in ivf::iter_frames(&data)
-        .expect("iter frames")
-        .enumerate()
-    {
+    for (i, frame) in ivf::iter_frames(&data).expect("iter frames").enumerate() {
         let frame = frame.expect("frame ok");
         let pkt = Packet::new(0, TimeBase::new(1, 24), frame.payload.to_vec());
         match dec.send_packet(&pkt) {
@@ -69,8 +66,6 @@ fn decode_compound_reference_stream() {
             }
         }
     }
-    eprintln!(
-        "vp9-compound fixture: shown={shown} unsupported={unsupported_frames}"
-    );
+    eprintln!("vp9-compound fixture: shown={shown} unsupported={unsupported_frames}");
     assert!(shown > 0, "decoder did not produce any visible frames");
 }

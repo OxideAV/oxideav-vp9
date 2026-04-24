@@ -1,3 +1,11 @@
+#![allow(clippy::derivable_impls)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::manual_div_ceil)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::manual_clamp)]
+#![allow(clippy::field_reassign_with_default)]
 //! Pure-Rust VP9 video decoder — keyframes + inter + compound + multi-tile.
 //!
 //! The decoder runs §6.2 uncompressed header + §6.3 compressed header +
@@ -90,6 +98,6 @@ pub use decoder::{
 };
 pub use headers::{
     parse_uncompressed_header, ColorConfig, ColorSpace, FrameType, LoopFilterParams,
-    QuantizationParams, RefFrame, SegmentationParams, TileInfo, UncompressedHeader,
-    SEG_LVL_ALT_L, SEG_LVL_ALT_Q, SEG_LVL_REF_FRAME, SEG_LVL_SKIP,
+    QuantizationParams, RefFrame, SegmentationParams, TileInfo, UncompressedHeader, SEG_LVL_ALT_L,
+    SEG_LVL_ALT_Q, SEG_LVL_REF_FRAME, SEG_LVL_SKIP,
 };

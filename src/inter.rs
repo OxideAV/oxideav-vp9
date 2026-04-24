@@ -219,6 +219,9 @@ pub struct InterTile<'a> {
     tile_mi_col_start: i32,
     tile_mi_col_end: i32,
     mi_rows: i32,
+    /// §7.4.6 partition contexts (one byte per 8x8 column / row).
+    pub above_partition_ctx: Vec<u8>,
+    pub left_partition_ctx: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -269,6 +272,8 @@ impl<'a> InterTile<'a> {
             tile_mi_col_start: 0,
             tile_mi_col_end: mi_cols as i32,
             mi_rows: mi_rows as i32,
+            above_partition_ctx: vec![0u8; mi_cols],
+            left_partition_ctx: vec![0u8; mi_rows],
         }
     }
 
@@ -360,12 +365,15 @@ impl<'a> InterTile<'a> {
         if row >= self.height as u32 || col >= self.width as u32 {
             return Ok(());
         }
-        let partition = self.read_partition(bd, bsize)?;
+        let mi_row = (row as usize) / 8;
+        let mi_col = (col as usize) / 8;
+        let partition = self.read_partition(bd, bsize, mi_row, mi_col)?;
         let half = bsize / 2;
         match partition {
             Partition::None => {
                 let bs = BlockSize::from_wh(bsize, bsize);
                 self.decode_block(bd, row, col, bs)?;
+                self.update_partition_ctx(mi_row, mi_col, bsize, bsize, bsize);
             }
             Partition::Horz => {
                 let bs = BlockSize::from_wh(bsize, half);
@@ -373,6 +381,7 @@ impl<'a> InterTile<'a> {
                 if row + half < self.height as u32 {
                     self.decode_block(bd, row + half, col, bs)?;
                 }
+                self.update_partition_ctx(mi_row, mi_col, bsize, bsize, half);
             }
             Partition::Vert => {
                 let bs = BlockSize::from_wh(half, bsize);
@@ -380,6 +389,7 @@ impl<'a> InterTile<'a> {
                 if col + half < self.width as u32 {
                     self.decode_block(bd, row, col + half, bs)?;
                 }
+                self.update_partition_ctx(mi_row, mi_col, bsize, half, bsize);
             }
             Partition::Split => {
                 if bsize == 8 {
@@ -390,6 +400,7 @@ impl<'a> InterTile<'a> {
                             self.decode_block(bd, r, c, BlockSize::B4x4)?;
                         }
                     }
+                    self.update_partition_ctx(mi_row, mi_col, bsize, half, half);
                 } else {
                     for (dr, dc) in [(0, 0), (0, half), (half, 0), (half, half)] {
                         self.decode_partition(bd, row + dr, col + dc, half)?;
@@ -400,15 +411,79 @@ impl<'a> InterTile<'a> {
         Ok(())
     }
 
-    fn read_partition(&self, bd: &mut BoolDecoder<'_>, bsize: u32) -> Result<Partition> {
-        let bsl = match bsize {
-            64 => 0usize,
-            32 => 1,
-            16 => 2,
-            8 => 3,
-            _ => 0,
+    fn update_partition_ctx(
+        &mut self,
+        mi_row: usize,
+        mi_col: usize,
+        bsize_px: u32,
+        sub_w_px: u32,
+        sub_h_px: u32,
+    ) {
+        let num8x8 = (bsize_px as usize) / 8;
+        let bsl = match bsize_px {
+            8 => 0usize,
+            16 => 1,
+            32 => 2,
+            64 => 3,
+            _ => 3,
         };
-        let probs = PARTITION_PROBS[bsl * 4];
+        let boffset = 3 - bsl;
+        let above_fill = if sub_w_px >= bsize_px {
+            (1u8 << boffset) - 1 + (1u8 << boffset)
+        } else {
+            0
+        };
+        let left_fill = if sub_h_px >= bsize_px {
+            (1u8 << boffset) - 1 + (1u8 << boffset)
+        } else {
+            0
+        };
+        for i in 0..num8x8 {
+            let c = mi_col + i;
+            if c < self.above_partition_ctx.len() {
+                self.above_partition_ctx[c] = above_fill;
+            }
+            let r = mi_row + i;
+            if r < self.left_partition_ctx.len() {
+                self.left_partition_ctx[r] = left_fill;
+            }
+        }
+    }
+
+    fn read_partition(
+        &self,
+        bd: &mut BoolDecoder<'_>,
+        bsize: u32,
+        mi_row: usize,
+        mi_col: usize,
+    ) -> Result<Partition> {
+        // §7.4.6 partition context.
+        let bsl = match bsize {
+            8 => 0usize,
+            16 => 1,
+            32 => 2,
+            64 => 3,
+            _ => 3,
+        };
+        let num8x8 = (bsize as usize) / 8;
+        let boffset = 3 - bsl;
+        let mut above = 0u8;
+        let mut left = 0u8;
+        for i in 0..num8x8 {
+            let c = mi_col + i;
+            if c < self.above_partition_ctx.len() {
+                above |= self.above_partition_ctx[c];
+            }
+            let r = mi_row + i;
+            if r < self.left_partition_ctx.len() {
+                left |= self.left_partition_ctx[r];
+            }
+        }
+        let above_bit = ((above >> boffset) & 1) as usize;
+        let left_bit = ((left >> boffset) & 1) as usize;
+        let tbl_bsl = 3 - bsl;
+        let ctx = tbl_bsl * 4 + left_bit * 2 + above_bit;
+        let probs = PARTITION_PROBS[ctx];
         if bsize == 8 {
             let b0 = bd.read(probs[0])?;
             if b0 == 0 {

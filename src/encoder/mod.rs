@@ -15,10 +15,12 @@ pub mod bitwriter;
 pub mod bool_encoder;
 pub mod compressed_header;
 pub mod params;
+pub mod tile;
 pub mod uncompressed_header;
 
 pub use bitwriter::BitWriter;
 pub use bool_encoder::BoolEncoder;
 pub use compressed_header::emit_compressed_header;
 pub use params::EncoderParams;
+pub use tile::emit_keyframe_tile;
 pub use uncompressed_header::emit_uncompressed_header;

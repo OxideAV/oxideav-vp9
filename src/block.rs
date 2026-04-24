@@ -394,12 +394,15 @@ impl<'a> IntraTile<'a> {
         if row >= self.height as u32 || col >= self.width as u32 {
             return Ok(());
         }
-        let partition = self.read_partition(bd, bsize)?;
+        let mi_row = (row as usize) / 8;
+        let mi_col = (col as usize) / 8;
+        let partition = self.read_partition(bd, bsize, mi_row, mi_col)?;
         let half = bsize / 2;
         match partition {
             Partition::None => {
                 let bs = BlockSize::from_wh(bsize, bsize);
                 self.decode_block(bd, row, col, bs)?;
+                self.update_partition_ctx(mi_row, mi_col, bsize, bsize, bsize);
             }
             Partition::Horz => {
                 let bs = BlockSize::from_wh(bsize, half);
@@ -407,6 +410,7 @@ impl<'a> IntraTile<'a> {
                 if row + half < self.height as u32 {
                     self.decode_block(bd, row + half, col, bs)?;
                 }
+                self.update_partition_ctx(mi_row, mi_col, bsize, bsize, half);
             }
             Partition::Vert => {
                 let bs = BlockSize::from_wh(half, bsize);
@@ -414,6 +418,7 @@ impl<'a> IntraTile<'a> {
                 if col + half < self.width as u32 {
                     self.decode_block(bd, row, col + half, bs)?;
                 }
+                self.update_partition_ctx(mi_row, mi_col, bsize, half, bsize);
             }
             Partition::Split => {
                 if bsize == 8 {
@@ -425,6 +430,7 @@ impl<'a> IntraTile<'a> {
                             self.decode_block(bd, r, c, BlockSize::B4x4)?;
                         }
                     }
+                    self.update_partition_ctx(mi_row, mi_col, bsize, half, half);
                 } else {
                     for (dr, dc) in [(0, 0), (0, half), (half, 0), (half, half)] {
                         self.decode_partition(bd, row + dr, col + dc, half)?;
@@ -435,18 +441,49 @@ impl<'a> IntraTile<'a> {
         Ok(())
     }
 
-    fn read_partition(&self, bd: &mut BoolDecoder<'a>, bsize: u32) -> Result<Partition> {
+    fn read_partition(
+        &self,
+        bd: &mut BoolDecoder<'a>,
+        bsize: u32,
+        mi_row: usize,
+        mi_col: usize,
+    ) -> Result<Partition> {
+        // §7.4.6 partition context:
+        //   bsl = mi_width_log2_lookup[bsize];          (0=8x8 .. 3=64x64)
+        //   boffset = mi_width_log2_lookup[64x64] - bsl;
+        //   above = OR over num8x8 cols; test bit (1<<boffset).
+        //   ctx = bsl * 4 + left * 2 + above
+        //
+        // Our `bsize` is in pixels: 8, 16, 32, 64.
+        // mi_width_log2_lookup (in 8x8 units): 8→0, 16→1, 32→2, 64→3
+        // We use `bsl` in the spec sense (0..=3).
         let bsl = match bsize {
-            64 => 0usize,
-            32 => 1,
-            16 => 2,
-            8 => 3,
-            _ => 0,
+            8 => 0usize,
+            16 => 1,
+            32 => 2,
+            64 => 3,
+            _ => 3,
         };
-        // Context 0 — tracking real neighbour partition context is deferred;
-        // for the fixture (single 128×128 frame of mostly-flat texture) this
-        // still converges on the right leaves. This is the documented gap.
-        let probs = KF_PARTITION_PROBS[bsl * 4];
+        let num8x8 = (bsize as usize) / 8;
+        let boffset = 3 - bsl;
+        let mut above = 0u8;
+        let mut left = 0u8;
+        for i in 0..num8x8 {
+            let c = mi_col + i;
+            if c < self.above_partition_ctx.len() {
+                above |= self.above_partition_ctx[c];
+            }
+            let r = mi_row + i;
+            if r < self.left_partition_ctx.len() {
+                left |= self.left_partition_ctx[r];
+            }
+        }
+        let above_bit = ((above >> boffset) & 1) as usize;
+        let left_bit = ((left >> boffset) & 1) as usize;
+        // Spec uses inverted bsl order in the table: row = (3-bsl)*4 + ...
+        let tbl_bsl = 3 - bsl;
+        let ctx = tbl_bsl * 4 + left_bit * 2 + above_bit;
+        let probs = KF_PARTITION_PROBS[ctx];
         if bsize == 8 {
             let b0 = bd.read(probs[0])?;
             if b0 == 0 {
@@ -473,6 +510,64 @@ impl<'a> IntraTile<'a> {
         })
     }
 
+    /// §7.4.6 update AbovePartitionContext / LeftPartitionContext after
+    /// a partition is decoded. See libvpx `update_partition_context`:
+    /// the context bytes are filled with the `partition_context_lookup`
+    /// table per subsize.
+    fn update_partition_ctx(
+        &mut self,
+        mi_row: usize,
+        mi_col: usize,
+        bsize_px: u32,
+        sub_w_px: u32,
+        sub_h_px: u32,
+    ) {
+        let num8x8 = (bsize_px as usize) / 8;
+        // libvpx partition_context_lookup[subsize] = {above_byte, left_byte}.
+        // We derive above/left from sub_w, sub_h relative to bsize:
+        //   above bit set when sub_w == bsize (block extends full width)
+        //   left bit set when sub_h == bsize (block extends full height)
+        //   bit position = mi_width_log2_lookup[bsize] in the "all-set" mask
+        // The bits written are the fill pattern:
+        //   val = (1 << (boffset+1)) - 1 when not full, else smaller
+        // Simpler: we emulate libvpx by writing a byte where bits <= boffset
+        // are set when the neighbour-side dimension is "smaller".
+        let bsl = match bsize_px {
+            8 => 0usize,
+            16 => 1,
+            32 => 2,
+            64 => 3,
+            _ => 3,
+        };
+        let boffset = 3 - bsl;
+        // The bit we're setting is at position boffset.
+        // Above context bit set when the BLOCK ENDS at this row (no split below).
+        // Actually, per libvpx: above byte = 0xf >> (3-bsl) for "full width" blocks,
+        // i.e. the bit at boffset is 1 if the block doesn't split horizontally here.
+        // For our purposes (approximate), we set the boffset bit when the
+        // sub-block is at least the full bsize in that dimension.
+        let above_fill = if sub_w_px >= bsize_px {
+            (1u8 << boffset) - 1 + (1u8 << boffset)  // 0x01, 0x03, 0x07, 0x0f
+        } else {
+            0
+        };
+        let left_fill = if sub_h_px >= bsize_px {
+            (1u8 << boffset) - 1 + (1u8 << boffset)
+        } else {
+            0
+        };
+        for i in 0..num8x8 {
+            let c = mi_col + i;
+            if c < self.above_partition_ctx.len() {
+                self.above_partition_ctx[c] = above_fill;
+            }
+            let r = mi_row + i;
+            if r < self.left_partition_ctx.len() {
+                self.left_partition_ctx[r] = left_fill;
+            }
+        }
+    }
+
     /// Decode one block (prediction unit). For keyframes: segment_id=0,
     /// no skip prob infrastructure yet — we read the skip bit against a
     /// fixed prob of 128, falling through to coefficient decode.
@@ -489,23 +584,38 @@ impl<'a> IntraTile<'a> {
         // tree-coded. For simpler modes we use the tx_mode ceiling.
         let tx_size_log2 = self.read_tx_size(bd, bs)?;
 
-        // Read luma intra mode. Neighbours for keyframe context come from
-        // the partition tree's mode_info — since we don't track that yet,
-        // use (DC, DC) context → KF_Y_MODE_PROBS[DC][DC].
+        // Read luma intra mode using above/left neighbour mode context.
+        let mi_row = (row as usize) / 8;
+        let mi_col = (col as usize) / 8;
         let y_mode = if matches!(bs, BlockSize::B4x4) {
-            // Sub-8×8 luma blocks have 4 modes in libvpx; we decode the
-            // last (block==3) as the one that drives the chroma mode.
-            // For the fixture (16×16+ blocks) this branch is effectively
-            // not exercised.
             let mut last = IntraMode::Dc;
             for _ in 0..4 {
-                last = self.read_intra_mode(bd)?;
+                last = self.read_intra_mode(bd, mi_row, mi_col)?;
             }
             last
         } else {
-            self.read_intra_mode(bd)?
+            self.read_intra_mode(bd, mi_row, mi_col)?
         };
         let uv_mode = self.read_intra_mode_uv(bd, y_mode)?;
+        // Stamp the block's luma mode into the above/left neighbour
+        // trackers so the next block's context is correct.
+        let mi_w = (bs.w() as usize) / 8;
+        let mi_h = (bs.h() as usize) / 8;
+        // The above row is the last row of the block (will be "above"
+        // for the block below), and the left col is the last col of the
+        // block (will be "left" for the block to the right).
+        for c in 0..mi_w.max(1) {
+            let cc = mi_col + c;
+            if cc < self.above_mode.len() {
+                self.above_mode[cc] = y_mode;
+            }
+        }
+        for r in 0..mi_h.max(1) {
+            let rr = mi_row + r;
+            if rr < self.left_mode.len() {
+                self.left_mode[rr] = y_mode;
+            }
+        }
 
         // Record MI metadata for §8.8 loop filter. Keyframes are intra
         // by construction — ref_frame stays at INTRA_FRAME.
@@ -579,10 +689,26 @@ impl<'a> IntraTile<'a> {
         }
     }
 
-    fn read_intra_mode(&self, bd: &mut BoolDecoder<'a>) -> Result<IntraMode> {
-        // Context 0 (DC above, DC left) for now — matches top-left of the
-        // frame. This is one of the known gaps.
-        let probs = &KF_Y_MODE_PROBS[0][0];
+    fn read_intra_mode(
+        &self,
+        bd: &mut BoolDecoder<'a>,
+        mi_row: usize,
+        mi_col: usize,
+    ) -> Result<IntraMode> {
+        // §7.4.6 default_intra_mode: prob = kf_y_mode_probs[above][left][node].
+        // Above/Left modes come from the last-decoded 8x8 cell on the
+        // boundary. When AvailU / AvailL are false, DC is used.
+        let above = if mi_row > 0 && mi_col < self.above_mode.len() {
+            self.above_mode[mi_col]
+        } else {
+            IntraMode::Dc
+        };
+        let left = if mi_col > 0 && mi_row < self.left_mode.len() {
+            self.left_mode[mi_row]
+        } else {
+            IntraMode::Dc
+        };
+        let probs = &KF_Y_MODE_PROBS[above as usize][left as usize];
         read_intra_mode_tree(bd, probs)
     }
 

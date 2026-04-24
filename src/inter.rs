@@ -49,15 +49,13 @@ use crate::tables::{
 };
 use crate::transform::{inverse_transform_add, TxType};
 
-/// Default-probability approximation for the `is_inter` flag on
-/// non-key frames. libvpx's per-context table lives in
-/// `vp9_entropymode.c`; for a single-context fallback we use the
-/// average of the four contexts (≈ 195).
-const DEFAULT_IS_INTER_PROB: u8 = 195;
+/// §10.5 `default_is_inter_prob[4]` — neighbour-aware context.
+/// ctx = sum of {AvailU && AboveIntra ? 1 : 0, AvailL && LeftIntra ? 1 : 0, …}
+/// per §7.4.6 (see `is_inter_ctx` below).
+const DEFAULT_IS_INTER_PROBS: [u8; 4] = [9, 102, 187, 225];
 
-/// Default skip probability (§10.5 `default_skip_probs`). Again we
-/// collapse the three contexts to their average.
-const DEFAULT_SKIP_PROB: u8 = 192;
+/// §10.5 `default_skip_probs[3]` — ctx = (AboveSkip ? 1 : 0) + (LeftSkip ? 1 : 0).
+const DEFAULT_SKIP_PROBS: [u8; 3] = [192, 128, 64];
 
 /// Inter mode tree defaults (§10.5 `default_inter_mode_probs`, ctx 0).
 /// Layout: `[p_non_zeromv, p_not_nearestmv, p_not_nearmv]`.
@@ -222,6 +220,13 @@ pub struct InterTile<'a> {
     /// §7.4.6 partition contexts (one byte per 8x8 column / row).
     pub above_partition_ctx: Vec<u8>,
     pub left_partition_ctx: Vec<u8>,
+    /// §7.4.6 per-8x8 skip flag (true when the block was coded with skip=1).
+    pub above_skip: Vec<bool>,
+    pub left_skip: Vec<bool>,
+    /// §7.4.6 per-8x8 "block is intra" flag — drives the `is_inter` and
+    /// `comp_mode` contexts for later neighbours.
+    pub above_intra: Vec<bool>,
+    pub left_intra: Vec<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -274,6 +279,76 @@ impl<'a> InterTile<'a> {
             mi_rows: mi_rows as i32,
             above_partition_ctx: vec![0u8; mi_cols],
             left_partition_ctx: vec![0u8; mi_rows],
+            above_skip: vec![false; mi_cols],
+            left_skip: vec![false; mi_rows],
+            // §7.4.6: for non-key inter frames, an unavailable neighbour
+            // is treated as inter (not intra). Initialise to `false`.
+            above_intra: vec![false; mi_cols],
+            left_intra: vec![false; mi_rows],
+        }
+    }
+
+    /// §7.4.6 skip context: ctx = (AvailU ? AboveSkip : 0) + (AvailL ? LeftSkip : 0).
+    fn skip_ctx(&self, mi_row: usize, mi_col: usize) -> usize {
+        let a = if mi_row > 0 && mi_col < self.above_skip.len() {
+            self.above_skip[mi_col] as usize
+        } else {
+            0
+        };
+        let l = if mi_col > 0 && mi_row < self.left_skip.len() {
+            self.left_skip[mi_row] as usize
+        } else {
+            0
+        };
+        a + l
+    }
+
+    /// §7.4.6 is_inter context.
+    fn is_inter_ctx(&self, mi_row: usize, mi_col: usize) -> usize {
+        let avail_u = mi_row > 0;
+        let avail_l = mi_col > 0;
+        let above_intra = avail_u && mi_col < self.above_intra.len() && self.above_intra[mi_col];
+        let left_intra = avail_l && mi_row < self.left_intra.len() && self.left_intra[mi_row];
+        if avail_u && avail_l {
+            if left_intra && above_intra {
+                3
+            } else if left_intra || above_intra {
+                1
+            } else {
+                0
+            }
+        } else if avail_u || avail_l {
+            let intra = if avail_u { above_intra } else { left_intra };
+            2 * (intra as usize)
+        } else {
+            0
+        }
+    }
+
+    /// Stamp per-8x8 skip / intra flags into the context trackers after
+    /// a block is decoded.
+    fn update_block_ctx(
+        &mut self,
+        mi_row: usize,
+        mi_col: usize,
+        mi_w: usize,
+        mi_h: usize,
+        skip: bool,
+        is_intra: bool,
+    ) {
+        for i in 0..mi_w.max(1) {
+            let c = mi_col + i;
+            if c < self.above_skip.len() {
+                self.above_skip[c] = skip;
+                self.above_intra[c] = is_intra;
+            }
+        }
+        for i in 0..mi_h.max(1) {
+            let r = mi_row + i;
+            if r < self.left_skip.len() {
+                self.left_skip[r] = skip;
+                self.left_intra[r] = is_intra;
+            }
         }
     }
 
@@ -517,21 +592,25 @@ impl<'a> InterTile<'a> {
         col: u32,
         bs: BlockSize,
     ) -> Result<()> {
-        // §6.4.3 `decode_block`:
-        //   1. read_is_inter (prob from ctx; default fallback).
-        //   2. if is_inter: read_inter_frame_mode_info else read_intra_frame_mode_info.
-        //   3. read_skip (§6.4.8).
-        //   4. read tx_size (§6.4.10).
-        //   5. read residual tokens per plane.
-        //   6. reconstruct.
-        let skip = bd.read(DEFAULT_SKIP_PROB)? != 0;
-        let is_inter = bd.read(DEFAULT_IS_INTER_PROB)? != 0;
+        // §6.4.11 decode_partition order:
+        //   read_skip, read_is_inter, read_tx_size, then mode-info.
+        let mi_row = (row as usize) / 8;
+        let mi_col = (col as usize) / 8;
+        let skip_ctx = self.skip_ctx(mi_row, mi_col);
+        let skip = bd.read(DEFAULT_SKIP_PROBS[skip_ctx])? != 0;
+        let is_inter_ctx = self.is_inter_ctx(mi_row, mi_col);
+        let is_inter = bd.read(DEFAULT_IS_INTER_PROBS[is_inter_ctx])? != 0;
         let tx_size_log2 = self.read_tx_size(bd, bs)?;
-        if is_inter {
+        let mi_w = (bs.w() as usize) / 8;
+        let mi_h = (bs.h() as usize) / 8;
+        let res = if is_inter {
             self.decode_inter_block(bd, row, col, bs, tx_size_log2, skip)
         } else {
             self.decode_intra_block(bd, row, col, bs, tx_size_log2, skip)
-        }
+        };
+        // Update per-block skip / intra context trackers.
+        self.update_block_ctx(mi_row, mi_col, mi_w, mi_h, skip, !is_inter);
+        res
     }
 
     fn decode_inter_block(

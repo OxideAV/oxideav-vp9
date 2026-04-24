@@ -373,6 +373,35 @@ mod tests {
     }
 
     #[test]
+    fn self_roundtrip_through_vp9_decoder() {
+        // Exercise the top-level `Vp9Decoder` facade so we know the
+        // bitstream survives ingest / receive_frame.
+        use crate::decoder::make_decoder;
+        use oxideav_codec::Decoder;
+        use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
+
+        let frame = assemble_and_decode(64, 64);
+        let codec_id = CodecId::new(crate::CODEC_ID_STR);
+        let params = CodecParameters::video(codec_id);
+        let mut d = make_decoder(&params).unwrap();
+        let pkt = Packet::new(0, TimeBase::new(1, 30), frame);
+        d.send_packet(&pkt).unwrap();
+        let f = d.receive_frame().unwrap();
+        match f {
+            Frame::Video(v) => {
+                assert_eq!(v.width, 64);
+                assert_eq!(v.height, 64);
+                // Luma plane should be all-128 (DC-chain midgrey).
+                let luma = &v.planes[0].data;
+                for &s in luma {
+                    assert_eq!(s, 128, "all luma samples should be 128");
+                }
+            }
+            _ => panic!("expected Video frame"),
+        }
+    }
+
+    #[test]
     fn self_roundtrip_128x128() {
         use crate::block::IntraTile;
         use crate::bool_decoder::BoolDecoder;
@@ -387,15 +416,16 @@ mod tests {
         let mut tile = IntraTile::new(&h, &ch);
         let mut bd = BoolDecoder::new(&frame[cmp_end..]).unwrap();
         tile.decode(&mut bd).unwrap();
-        // Print out distribution of values to diagnose.
-        let mut counts = std::collections::BTreeMap::new();
+        // All samples should be exactly 128 — DC_PRED neighbour chain
+        // propagates 128 everywhere.
         for &v in &tile.y {
-            *counts.entry(v).or_insert(0u32) += 1;
+            assert_eq!(v, 128);
         }
-        // Allow any uniform predictor (decoder may fall back to 127
-        // if neighbour availability is computed differently).
-        for &v in &tile.y {
-            assert!(v == 128 || v == 127, "unexpected sample {v}, dist: {counts:?}");
+        for &v in &tile.u {
+            assert_eq!(v, 128);
+        }
+        for &v in &tile.v {
+            assert_eq!(v, 128);
         }
     }
 }

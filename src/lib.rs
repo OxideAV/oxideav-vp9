@@ -42,6 +42,7 @@ pub mod decoder;
 pub mod detokenize;
 pub mod dpb;
 pub mod encoder;
+pub mod frame_ctx;
 pub mod headers;
 pub mod inter;
 pub mod intra;

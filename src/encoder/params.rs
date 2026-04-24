@@ -29,3 +29,19 @@ impl EncoderParams {
         }
     }
 }
+
+/// Source planes for a 4:2:0 8-bit YUV keyframe. All planes are
+/// row-major; strides may exceed the plane width. The MVP encoder
+/// ignores this payload (it emits a constant-midgrey keyframe) but
+/// the type is here so callers can hand us their source now and the
+/// future forward-transform path can pick it up without an API break.
+#[derive(Clone, Debug)]
+pub struct YuvFrame<'a> {
+    pub y: &'a [u8],
+    pub y_stride: usize,
+    pub u: &'a [u8],
+    pub v: &'a [u8],
+    pub uv_stride: usize,
+    pub width: u32,
+    pub height: u32,
+}

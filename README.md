@@ -146,6 +146,44 @@ None of the above prevent the crate from decoding a standard
 `libvpx-vp9 -g N` 8-bit 4:2:0 IPPP stream into frames the caller can
 render.
 
+## Encoder (experimental — keyframe MVP)
+
+The `encoder` module produces a valid VP9 keyframe bitstream accepted
+by ffmpeg / libvpx and round-trippable through this crate's decoder.
+
+Scope today:
+* Profile 0, 4:2:0 8-bit, single tile, loop-filter disabled.
+* Emits the full §6.2 uncompressed header, §6.3 compressed header
+  (tx_mode, coef_probs-update flags, skip_prob-update flags) and the
+  tile / partition / block symbols per §6.4.
+* Per-block strategy: `PARTITION_NONE` at 64×64 (SPLIT at edges for
+  non-multiple-of-64 frames), `skip=1` (no coefficient residual),
+  `DC_PRED` luma + chroma intra modes.
+* Partition-context and intra-mode-context trackers mirror the
+  decoder's §7.4.6 state exactly so second-and-later blocks resolve
+  to the correct probability row.
+* `BoolEncoder` is the inverse of `BoolDecoder` — standard binary
+  range coder with pending-byte carry propagation. Roundtrip-tested
+  against the decoder with mixed / skewed / equal / carry-forcing
+  probs and 2048-symbol PRNG streams.
+
+Self-roundtrip: the produced bitstream decodes through
+`Vp9Decoder::send_packet` → `receive_frame` to a uniform 128 (midgrey)
+4:2:0 frame.
+
+ffmpeg-acceptance: `tests/vp9_encoder_ffmpeg.rs` decodes the frame
+with the system `ffmpeg` binary and confirms zero decode errors.
+
+Deferred to follow-up work:
+* Forward 4×4/8×8 DCT + ADST (inverse of the decoder's §8.7.1).
+* Forward quantisation at a fixed QP.
+* Token encoding against the §10.5 coef tree probabilities.
+* Per-block skip-context / is_inter / reference-mode / intra-mode
+  decision making based on RD / SAD of the source YUV.
+
+Entry points: `encoder::encode_keyframe(&EncoderParams)` yields the
+final byte buffer ready for IVF-muxing or `Vp9Decoder::send_packet`.
+
 ## Codec / container IDs
 
 * Codec: `"vp9"`; maps from MP4's `vp09` sample entry.

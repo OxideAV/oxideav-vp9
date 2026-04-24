@@ -23,6 +23,6 @@ pub use bitwriter::BitWriter;
 pub use bool_encoder::BoolEncoder;
 pub use compressed_header::emit_compressed_header;
 pub use frame::encode_keyframe;
-pub use params::EncoderParams;
+pub use params::{EncoderParams, YuvFrame};
 pub use tile::emit_keyframe_tile;
 pub use uncompressed_header::emit_uncompressed_header;

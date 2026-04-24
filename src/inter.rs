@@ -38,7 +38,10 @@ use crate::intra::IntraMode;
 use crate::loopfilter::{LoopFilter, MiInfo, MiInfoPlane, INTRA_FRAME};
 use crate::mcfilter::{mc_block_scaled, InterpFilter, RefSampler};
 use crate::mv::{read_mv_component, read_mv_joint, Mv, DEFAULT_MV_COMP_PROBS, MV_JOINT_PROBS};
-use crate::mvref::{find_mv_refs, InterMiCell, InterMiGrid, NONE_FRAME};
+use crate::mvref::{
+    clamp_mv_pair, find_best_ref_mvs, find_mv_refs_geom, use_mv_hp, BlockGeom, InterMiCell,
+    InterMiGrid, BORDERINPIXELS, INTERP_EXTEND, NONE_FRAME,
+};
 use crate::probs::{read_partition_from_tree, PARTITION_PROBS};
 use crate::reconintra::{predict as predict_intra, NeighbourBuf};
 use crate::segmentation::{read_inter_segment_id, SegPredContext, SegmentIdMap};
@@ -752,35 +755,44 @@ impl<'a> InterTile<'a> {
         };
 
         // §6.5.1 find_mv_refs — run for each active ref_frame slot.
-        let mi_row = (row as i32) / 8;
-        let mi_col = (col as i32) / 8;
         let bsize_code = bs as usize;
-        let refs_a = find_mv_refs(
+        let geom = BlockGeom::from_pixels(
+            row,
+            col,
+            bs.w(),
+            bs.h(),
+            self.mi_rows,
+            self.mv_grid.mi_cols as i32,
+        );
+        let mut refs_a = find_mv_refs_geom(
             &self.mv_grid,
             &self.hdr.ref_frame_sign_bias,
             ref_code_a,
             bsize_code,
-            mi_row,
-            mi_col,
+            geom,
             self.tile_mi_col_start,
             self.tile_mi_col_end,
-            self.mi_rows,
         );
-        let refs_b = if is_compound {
-            find_mv_refs(
+        // §6.5.12 find_best_ref_mvs — round off the 1/8-pel bit when HP
+        // is disabled or the MV is too large, then clamp to the wider
+        // `(BORDERINPIXELS - INTERP_EXTEND) << 3` border.
+        find_best_ref_mvs(&mut refs_a, self.hdr.allow_high_precision_mv, &geom);
+        let mut refs_b = if is_compound {
+            find_mv_refs_geom(
                 &self.mv_grid,
                 &self.hdr.ref_frame_sign_bias,
                 ref_code_b,
                 bsize_code,
-                mi_row,
-                mi_col,
+                geom,
                 self.tile_mi_col_start,
                 self.tile_mi_col_end,
-                self.mi_rows,
             )
         } else {
             Default::default()
         };
+        if is_compound {
+            find_best_ref_mvs(&mut refs_b, self.hdr.allow_high_precision_mv, &geom);
+        }
 
         let inter_mode = read_inter_mode(bd, DEFAULT_INTER_MODE_PROBS)?;
 
@@ -812,9 +824,9 @@ impl<'a> InterTile<'a> {
         };
 
         // §6.4.18 assign_mv.
-        let mv_a = self.assign_mv(bd, inter_mode, refs_a)?;
+        let mv_a = self.assign_mv(bd, inter_mode, refs_a, &geom)?;
         let mv_b = if is_compound {
-            self.assign_mv(bd, inter_mode, refs_b)?
+            self.assign_mv(bd, inter_mode, refs_b, &geom)?
         } else {
             (0i16, 0i16)
         };
@@ -953,13 +965,17 @@ impl<'a> InterTile<'a> {
     }
 
     /// §6.4.18 assign_mv — produce the (row, col) MV for one ref slot.
-    /// `candidates` is the §6.5 `find_mv_refs` output. Reads MV bits from
-    /// the stream only when inter_mode == NEWMV.
+    /// `candidates` is the §6.5 `find_mv_refs` / §6.5.12
+    /// `find_best_ref_mvs` output (so Nearest/Near are already rounded
+    /// and clamped to the wider `(BORDERINPIXELS - INTERP_EXTEND) << 3`
+    /// border). Reads MV bits from the stream only when
+    /// `inter_mode == NEWMV`.
     fn assign_mv(
         &self,
         bd: &mut BoolDecoder<'_>,
         inter_mode: InterMode,
         candidates: crate::mvref::MvRefs,
+        geom: &BlockGeom,
     ) -> Result<(i16, i16)> {
         match inter_mode {
             InterMode::Zeromv => Ok((0, 0)),
@@ -973,11 +989,10 @@ impl<'a> InterTile<'a> {
             }
             InterMode::Newmv => {
                 // §6.4.19 read_mv — delta is relative to BestMv.
-                // §6.5.13 use_mv_hp: HP only active when BestMv is small.
+                // §6.5.13 use_mv_hp: HP only active when BestMv is small
+                // (`(|delta|>>3) < COMPANDED_MVREF_THRESH = 8`).
                 let best = candidates.best_mv();
-                let hp = self.hdr.allow_high_precision_mv
-                    && (best.row.unsigned_abs() as u32) < (1 << 5) * 8
-                    && (best.col.unsigned_abs() as u32) < (1 << 5) * 8;
+                let hp = self.hdr.allow_high_precision_mv && use_mv_hp(best);
                 let joint = read_mv_joint(bd, MV_JOINT_PROBS)?;
                 let dmv_row = if joint.has_row() {
                     read_mv_component(bd, &DEFAULT_MV_COMP_PROBS, hp)?
@@ -989,9 +1004,16 @@ impl<'a> InterTile<'a> {
                 } else {
                     0
                 };
-                let out_r = (best.row as i32 + dmv_row as i32).clamp(-32768, 32767) as i16;
-                let out_c = (best.col as i32 + dmv_col as i32).clamp(-32768, 32767) as i16;
-                Ok((out_r, out_c))
+                // Sum + clamp with `(BORDERINPIXELS - INTERP_EXTEND) << 3 = 1248`
+                // 1/8-pel units per §6.4.18 / mirror of §6.5.12.
+                let sum_r = (best.row as i32 + dmv_row as i32).clamp(-32768, 32767);
+                let sum_c = (best.col as i32 + dmv_col as i32).clamp(-32768, 32767);
+                let clamped = clamp_mv_pair(
+                    Mv::new(sum_r as i16, sum_c as i16),
+                    (BORDERINPIXELS - INTERP_EXTEND) << 3,
+                    geom,
+                );
+                Ok((clamped.row, clamped.col))
             }
         }
     }

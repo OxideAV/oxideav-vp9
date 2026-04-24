@@ -36,14 +36,11 @@ pub fn emit_compressed_header(tx_mode: TxMode, lossless: bool) -> Vec<u8> {
     if !lossless {
         write_tx_mode(&mut be, tx_mode);
     }
-    // §6.3.3 read_coef_probs — for each tx_size up to `TX_MODES`, each
-    // plane_type, each ref_type, each band, each ctx, each of 3 coef
-    // nodes: one bit "update?" for each node, then the new 8-bit prob
-    // if update. We write all "update?=0" bits: this tells the decoder
-    // to keep the default coef probabilities (§10.5).
-    //
-    // The loop is over the tx sizes active under `tx_mode`. Since we
-    // chose ONLY_4X4 we only emit the 4×4 surface — tx_sizes[0..=0].
+    // §6.3.3 read_coef_probs:
+    //   for tx_size = 0..=max_tx:
+    //     update_probs = f(1)
+    //     if update_probs: nested update bits per band/ctx/node
+    // Writing `update_probs=0` skips the nested loop entirely.
     let max_tx = match tx_mode {
         TxMode::Only4x4 => 0,
         TxMode::Allow8x8 => 1,
@@ -51,28 +48,20 @@ pub fn emit_compressed_header(tx_mode: TxMode, lossless: bool) -> Vec<u8> {
         TxMode::Allow32x32 | TxMode::Select => 3,
     };
     for _tx in 0..=max_tx {
-        // 2 plane_types × 2 ref_types × 6 bands × 6 ctxs × 3 nodes
-        // update bits, all "no update".
-        for _ in 0..(2 * 2 * 6 * 6 * 3) {
-            be.write(0, 252);
-        }
+        // update_probs — emit 0 with prob 252 (default).
+        be.write(0, 252);
     }
 
-    // §6.3.4 skip_prob — 3 probs, all "no update".
+    // §6.3.4 read_skip_prob — 3 probs, each guarded by `update_prob`
+    // bit (prob 252). All zero = keep defaults.
     for _ in 0..3 {
         be.write(0, 252);
     }
 
-    // Keyframe stops after skip probs — §6.3.5+ (inter-mode probs,
-    // interp filter, is_inter, reference_mode, y_mode, partition,
-    // mv) are all inter-only. The keyframe bitstream continues to
-    // §6.3.11 read_partition_probs which applies to keyframes too.
-    //
-    // read_partition_probs: 16 partition contexts × 3 probs each,
-    // each guarded by one "update?" bit. All zero = keep defaults.
-    for _ in 0..(16 * 3) {
-        be.write(0, 252);
-    }
+    // §6.3.5+ (inter_mode_probs, interp_filter_probs, is_inter_probs,
+    // frame_reference_mode, y_mode_probs, partition_probs, mv_probs)
+    // are only read for non-key / non-intra-only frames per §6.3. For
+    // keyframes the compressed header ends right after skip_prob.
 
     be.finish()
 }

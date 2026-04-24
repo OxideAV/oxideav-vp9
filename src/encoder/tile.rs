@@ -78,10 +78,11 @@ impl PartitionCtx {
         }
         let above_bit = ((above >> boffset) & 1) as usize;
         let left_bit = ((left >> boffset) & 1) as usize;
-        // Mirror the decoder's indexing exactly. The current
-        // KF_PARTITION_PROBS layout is 8×8-first, so bsl=0 -> row 0
-        // and bsl=3 -> row 12, same as `block::read_partition`.
-        let ctx = bsl * 4 + left_bit * 2 + above_bit;
+        // Mirror `block::read_partition` exactly: tbl_bsl = 3 - bsl so
+        // bsize=64 maps to row 0..3 (KF_PARTITION_PROBS is 64×64-first
+        // in the decoder's internal layout).
+        let tbl_bsl = 3 - bsl;
+        let ctx = tbl_bsl * 4 + left_bit * 2 + above_bit;
         KF_PARTITION_PROBS[ctx]
     }
 
@@ -334,12 +335,6 @@ mod tests {
         // block at the top-left where there are no neighbours). Later
         // blocks have neighbours (all 128), so still 128.
         assert_eq!(tile.y.len(), 64 * 64);
-        let mut y_counts = std::collections::BTreeMap::new();
-        for &v in &tile.y { *y_counts.entry(v).or_insert(0u32) += 1; }
-        let mut u_counts = std::collections::BTreeMap::new();
-        for &v in &tile.u { *u_counts.entry(v).or_insert(0u32) += 1; }
-        println!("y counts: {y_counts:?}");
-        println!("u counts: {u_counts:?}");
         for &v in &tile.y {
             assert_eq!(v, 128);
         }
@@ -353,23 +348,23 @@ mod tests {
 
     #[test]
     fn debug_symbols_128() {
-        // Manually check what symbols we write for a 2-SB stream.
+        // Manually check what symbols we write for a 2-SB stream using
+        // the same probs the 64×64 encoder uses.
         let mut be = BoolEncoder::new();
-        // Two partitions of NONE + two blocks.
+        // bsize=64 -> bsl=3 -> tbl_bsl=0 -> KF_PARTITION_PROBS[0]=158.
+        let p_part = KF_PARTITION_PROBS[0][0];
         for _ in 0..2 {
-            be.write(0, KF_PARTITION_PROBS[0][0]);
-            // block body: skip=1, y_mode=DC, uv_mode=DC
+            be.write(0, p_part);
             be.write(1, SKIP_PROB);
             be.write(0, KF_Y_MODE_PROBS[0][0][0]);
             be.write(0, KF_UV_MODE_PROBS[0][0]);
         }
         let buf = be.finish();
 
-        // Decode back through BoolDecoder.
         use crate::bool_decoder::BoolDecoder;
         let mut bd = BoolDecoder::new(&buf).unwrap();
         for i in 0..2 {
-            let part = bd.read(KF_PARTITION_PROBS[0][0]).unwrap();
+            let part = bd.read(p_part).unwrap();
             assert_eq!(part, 0, "partition sb{i}");
             let skip = bd.read(SKIP_PROB).unwrap();
             assert_eq!(skip, 1, "skip sb{i}");

@@ -235,4 +235,49 @@ mod tests {
         assert_eq!(d.read_literal(8).unwrap(), 0b1011_0010);
         assert_eq!(d.read_literal(12).unwrap(), 0b0110_1100_1001);
     }
+
+    #[test]
+    fn roundtrip_long_stream_pseudo_random() {
+        // Stress test: 2048 symbols with mixed probs — exercises the
+        // carry path and byte-flush logic. Use a tiny PRNG.
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut bits = Vec::with_capacity(2048);
+        let mut probs = Vec::with_capacity(2048);
+        for _ in 0..2048 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let prob = ((state >> 32) as u32 & 0xfe) as u8 | 1; // 1..=255
+            let bit = (state as u32) & 1;
+            bits.push(bit);
+            probs.push(prob);
+        }
+        let mut e = BoolEncoder::new();
+        for i in 0..bits.len() {
+            e.write(bits[i], probs[i]);
+        }
+        let buf = e.finish();
+        let mut d = BoolDecoder::new(&buf).unwrap();
+        for i in 0..bits.len() {
+            assert_eq!(d.read(probs[i]).unwrap(), bits[i], "mismatch at {i}");
+        }
+    }
+
+    #[test]
+    fn roundtrip_forces_carry_chain() {
+        // Repeatedly write "1" with high prob (prob close to 0 means
+        // low-probability-of-0, so bit=1 keeps being encoded via
+        // split shrinks). Alternating patterns should force the
+        // ff-run + carry propagation path.
+        let mut e = BoolEncoder::new();
+        let bits: Vec<u32> = (0..500).map(|i| ((i * 7 + 3) & 1) as u32).collect();
+        for &b in &bits {
+            // Prob=2 keeps the split near 1, most of range flows to
+            // the "bit=1" side — exercises arithmetic edge cases.
+            e.write(b, 2);
+        }
+        let buf = e.finish();
+        let mut d = BoolDecoder::new(&buf).unwrap();
+        for &b in &bits {
+            assert_eq!(d.read(2).unwrap(), b);
+        }
+    }
 }

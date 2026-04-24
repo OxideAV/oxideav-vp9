@@ -42,7 +42,7 @@ use crate::mvref::{
     clamp_mv_pair, find_best_ref_mvs, find_mv_refs_geom, use_mv_hp, BlockGeom, InterMiCell,
     InterMiGrid, BORDERINPIXELS, INTERP_EXTEND, NONE_FRAME,
 };
-use crate::probs::{read_partition_from_tree, PARTITION_PROBS};
+use crate::probs::read_partition_from_tree;
 use crate::reconintra::{predict as predict_intra, NeighbourBuf};
 use crate::segmentation::{read_inter_segment_id, SegPredContext, SegmentIdMap};
 use crate::tables::{
@@ -608,7 +608,8 @@ impl<'a> InterTile<'a> {
         // bsl when indexing.
         let tbl_bsl = 3 - bsl;
         let ctx = tbl_bsl * 4 + left_bit * 2 + above_bit;
-        let probs = PARTITION_PROBS[ctx];
+        // §6.3.15: partition_probs come from the per-frame context.
+        let probs = self.ch.ctx.partition_probs[ctx];
         if bsize == 8 {
             let b0 = bd.read(probs[0])?;
             if b0 == 0 {

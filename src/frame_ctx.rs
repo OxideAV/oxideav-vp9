@@ -363,6 +363,49 @@ fn fill_coef_probs(out: &mut CoefProbTable) {
 mod tests {
     use super::*;
 
+    /// Build a BoolDecoder whose underlying bit stream is the MSB-first
+    /// concatenation of the given bit sequence. Each bit is read via
+    /// `read_literal(1)` which internally runs a `bd.read(128)`, so a
+    /// deterministic bit stream is obtained by feeding bytes that encode
+    /// those bits as "value < split" / "value >= split" decisions.
+    ///
+    /// A simpler approach — which we use for the tests below — is just
+    /// to test `decode_term_subexp` against crafted bit strings by
+    /// checking `inv_remap_prob` on known inputs.
+    #[test]
+    fn inv_map_table_maps_index_zero_to_seven() {
+        // §10.5 spec: inv_map_table[0] = 7.
+        assert_eq!(INV_MAP_TABLE[0], 7);
+        assert_eq!(INV_MAP_TABLE[19], 254);
+        assert_eq!(INV_MAP_TABLE[20], 1);
+    }
+
+    #[test]
+    fn inv_recenter_identity_for_small_offsets() {
+        // v <= 2m, v even  ->  m + v/2.
+        assert_eq!(inv_recenter_nonneg(0, 10), 10);
+        assert_eq!(inv_recenter_nonneg(2, 10), 11);
+        assert_eq!(inv_recenter_nonneg(4, 10), 12);
+        // v <= 2m, v odd  ->  m - (v+1)/2.
+        assert_eq!(inv_recenter_nonneg(1, 10), 9);
+        assert_eq!(inv_recenter_nonneg(3, 10), 8);
+        // v > 2m -> v.
+        assert_eq!(inv_recenter_nonneg(21, 10), 21);
+    }
+
+    #[test]
+    fn inv_remap_prob_handles_edge_probs() {
+        // prob=1: m-- = 0, (m << 1) = 0 <= 255, so m = 1 + inv_recenter(v, 0).
+        // For v=0, inv_recenter(0, 0)=0 → out = 1. For v=7 (inv_map[0]),
+        // inv_recenter(7, 0): 7 > 0, so returns 7 → out = 8.
+        assert_eq!(inv_remap_prob(0, 1), 8);
+        // prob=255: m-- = 254, (m << 1) = 508 > 255.
+        let p = inv_remap_prob(0, 255);
+        assert!(p > 0 && p < 255);
+        // prob=0: defensive passthrough.
+        assert_eq!(inv_remap_prob(100, 0), 0);
+    }
+
     #[test]
     fn default_context_seeds_from_spec_tables() {
         let ctx = FrameContext::new_default();

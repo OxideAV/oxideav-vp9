@@ -109,7 +109,7 @@ pub struct QuantizationParams {
     pub lossless: bool,
 }
 
-/// `segmentation_params` from §6.2.5 — raw fields.
+/// `segmentation_params` from §6.2.5 / §6.2.11 — raw fields.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SegmentationParams {
     pub enabled: bool,
@@ -119,6 +119,14 @@ pub struct SegmentationParams {
     pub abs_delta: bool,
     pub feature_data: [[i16; 4]; 8],
     pub feature_enabled: [[bool; 4]; 8],
+    /// `segmentation_tree_probs[0..7]` from §6.2.11. Used to decode the
+    /// `segment_id` symbol (§9.3.2 / §6.4.14). When `update_map` is 0
+    /// these are left at 255 (the read_prob "no update" default).
+    pub tree_probs: [u8; 7],
+    /// `segmentation_pred_prob[0..3]` from §6.2.11. Used to decode the
+    /// `seg_id_predicted` symbol (§6.4.12). When `temporal_update == 0`
+    /// all three entries are 255 per the spec.
+    pub pred_probs: [u8; 3],
 }
 
 /// `SEG_LVL_ALT_Q` — index 0 in `feature_data` / `feature_enabled`.
@@ -147,6 +155,26 @@ impl SegmentationParams {
         } else {
             base_q_idx as i32
         }
+    }
+
+    /// §6.4.9 `seg_feature_active(feature)` — true when segmentation is
+    /// on *and* the feature is enabled for `segment_id`.
+    #[inline]
+    pub fn feature_active(&self, segment_id: u8, feature: usize) -> bool {
+        let s = (segment_id as usize).min(7);
+        let f = feature.min(3);
+        self.enabled && self.feature_enabled[s][f]
+    }
+
+    /// §8.6.1 step 2: value of the feature for a segment (`FeatureData`),
+    /// clamped to the feature's domain. Callers that want the abs/delta
+    /// semantics of `SEG_LVL_ALT_Q` / `SEG_LVL_ALT_L` must apply them
+    /// themselves (see `get_qindex` above / `LvlLookup::build_with_segmentation`).
+    #[inline]
+    pub fn feature_value(&self, segment_id: u8, feature: usize) -> i16 {
+        let s = (segment_id as usize).min(7);
+        let f = feature.min(3);
+        self.feature_data[s][f]
     }
 }
 
@@ -569,6 +597,16 @@ fn parse_quantization(br: &mut BitReader<'_>) -> Result<QuantizationParams> {
     })
 }
 
+/// §6.2.12 `read_prob()` — one-bit `prob_coded` flag, then an 8-bit
+/// probability when set; otherwise 255.
+fn read_prob(br: &mut BitReader<'_>) -> Result<u8> {
+    if br.bit()? {
+        Ok(br.f(8)? as u8)
+    } else {
+        Ok(255)
+    }
+}
+
 fn read_delta_q(br: &mut BitReader<'_>) -> Result<i8> {
     if br.bit()? {
         let v = br.f(4)? as i32;
@@ -580,9 +618,11 @@ fn read_delta_q(br: &mut BitReader<'_>) -> Result<i8> {
 }
 
 fn parse_segmentation(br: &mut BitReader<'_>) -> Result<SegmentationParams> {
-    // §6.2.5 segmentation_params.
+    // §6.2.11 segmentation_params.
     let mut s = SegmentationParams {
         enabled: br.bit()?,
+        tree_probs: [255; 7],
+        pred_probs: [255; 3],
         ..Default::default()
     };
     if !s.enabled {
@@ -590,19 +630,20 @@ fn parse_segmentation(br: &mut BitReader<'_>) -> Result<SegmentationParams> {
     }
     s.update_map = br.bit()?;
     if s.update_map {
-        // Segmentation tree probabilities: 7 conditional probs.
-        for _ in 0..7 {
-            if br.bit()? {
-                let _ = br.f(8)?;
-            }
+        // §6.2.11 + §6.2.12: each of the 7 tree probs uses `read_prob()`
+        //   prob_coded ? f(8) : 255.
+        for i in 0..7 {
+            s.tree_probs[i] = read_prob(br)?;
         }
         s.temporal_update = br.bit()?;
-        if s.temporal_update {
-            for _ in 0..3 {
-                if br.bit()? {
-                    let _ = br.f(8)?;
-                }
-            }
+        // §6.2.11: when temporal_update=1 each of the 3 pred probs is
+        // read_prob(), otherwise they are all 255.
+        for i in 0..3 {
+            s.pred_probs[i] = if s.temporal_update {
+                read_prob(br)?
+            } else {
+                255
+            };
         }
     }
     s.update_data = br.bit()?;

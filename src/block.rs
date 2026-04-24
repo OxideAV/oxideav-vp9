@@ -24,6 +24,7 @@ use crate::intra::IntraMode;
 use crate::loopfilter::{LoopFilter, MiInfo, MiInfoPlane, INTRA_FRAME};
 use crate::probs::{read_partition_from_tree, KF_PARTITION_PROBS};
 use crate::reconintra::{predict as predict_intra, NeighbourBuf};
+use crate::segmentation::{read_intra_segment_id, SegPredContext, SegmentIdMap};
 use crate::tables::{
     AC_QLOOKUP, COEFBAND_TRANS_4X4, COEFBAND_TRANS_8X8PLUS, COEF_PROBS_16X16, COEF_PROBS_32X32,
     COEF_PROBS_4X4, COEF_PROBS_8X8, COL_SCAN_16X16, COL_SCAN_16X16_NEIGHBORS, COL_SCAN_4X4,
@@ -139,6 +140,14 @@ pub struct IntraTile<'a> {
     pub above_mode: Vec<IntraMode>,
     /// Per-row left intra mode (last 8x8).
     pub left_mode: Vec<IntraMode>,
+    /// Per-8x8 segment_id for this frame — written by §6.4.7
+    /// `intra_segment_id()`. Read back by §8.8.4 loop-filter level
+    /// lookup and §8.1 `PrevSegmentIds` update.
+    pub segment_ids: SegmentIdMap,
+    /// §7.4.1 / §7.4.2 `AboveSegPredContext` / `LeftSegPredContext`.
+    /// Unused on key / intra-only frames (inter path is the consumer)
+    /// but kept parallel to InterTile for symmetry.
+    pub seg_pred_ctx: SegPredContext,
 }
 
 /// Scan + neighbour tables for a (tx_size, tx_type) pair. Mirrors
@@ -292,6 +301,8 @@ impl<'a> IntraTile<'a> {
             left_partition_ctx: vec![0u8; mi_rows],
             above_mode: vec![IntraMode::Dc; mi_cols],
             left_mode: vec![IntraMode::Dc; mi_rows],
+            segment_ids: SegmentIdMap::zeros(mi_cols, mi_rows),
+            seg_pred_ctx: SegPredContext::zeros(mi_cols, mi_rows),
         }
     }
 
@@ -569,9 +580,12 @@ impl<'a> IntraTile<'a> {
         }
     }
 
-    /// Decode one block (prediction unit). For keyframes: segment_id=0,
-    /// no skip prob infrastructure yet — we read the skip bit against a
-    /// fixed prob of 128, falling through to coefficient decode.
+    /// Decode one block (prediction unit). Spec order §6.4.6
+    /// `intra_frame_mode_info`:
+    ///   intra_segment_id()  (§6.4.7)
+    ///   read_skip()         (§6.4.8) — honours `SEG_LVL_SKIP`
+    ///   read_tx_size(1)     (§6.4.10)
+    ///   default_intra_mode  (§9.3.2)
     fn decode_block(
         &mut self,
         bd: &mut BoolDecoder<'a>,
@@ -579,15 +593,31 @@ impl<'a> IntraTile<'a> {
         col: u32,
         bs: BlockSize,
     ) -> Result<()> {
-        // Read skip bit (single fixed-context approximation).
-        let skip = bd.read(192)? != 0;
+        // §6.4.7 intra_segment_id — tree-coded when update_map is set.
+        let segment_id = read_intra_segment_id(bd, &self.hdr.segmentation)?;
+        // Stamp this block's segment_id into the current-frame map so
+        // §6.4.14 get_segment_id and §8.8 loop filter can see it.
+        let mi_row = (row as usize) / 8;
+        let mi_col = (col as usize) / 8;
+        let bw = (bs.w() as usize) / 8;
+        let bh = (bs.h() as usize) / 8;
+        self.segment_ids
+            .fill(mi_row, mi_col, bw.max(1), bh.max(1), segment_id);
+        // §6.4.8 read_skip — `SEG_LVL_SKIP` forces skip=1 per §6.4.9.
+        let skip = if self
+            .hdr
+            .segmentation
+            .feature_active(segment_id, crate::headers::SEG_LVL_SKIP)
+        {
+            true
+        } else {
+            bd.read(192)? != 0
+        };
         // Read tx_size. For TX_MODE_SELECT + bsize >= 8x8 the tx_size is
         // tree-coded. For simpler modes we use the tx_mode ceiling.
         let tx_size_log2 = self.read_tx_size(bd, bs)?;
 
         // Read luma intra mode using above/left neighbour mode context.
-        let mi_row = (row as usize) / 8;
-        let mi_col = (col as usize) / 8;
         let y_mode = if matches!(bs, BlockSize::B4x4) {
             let mut last = IntraMode::Dc;
             for _ in 0..4 {
@@ -619,21 +649,20 @@ impl<'a> IntraTile<'a> {
         }
 
         // Record MI metadata for §8.8 loop filter. Keyframes are intra
-        // by construction — ref_frame stays at INTRA_FRAME.
-        let mi_row_units = (row as usize) / 8;
-        let mi_col_units = (col as usize) / 8;
-        let mi_w = (bs.w() / 8).max(1) as u8;
-        let mi_h = (bs.h() / 8).max(1) as u8;
+        // by construction — ref_frame stays at INTRA_FRAME. segment_id
+        // is the one stamped by §6.4.7 at the top of this function.
+        let mi_w_u8 = (bs.w() / 8).max(1) as u8;
+        let mi_h_u8 = (bs.h() / 8).max(1) as u8;
         let mi = MiInfo {
-            mi_w_8x8: mi_w,
-            mi_h_8x8: mi_h,
+            mi_w_8x8: mi_w_u8,
+            mi_h_8x8: mi_h_u8,
             tx_size_log2: tx_size_log2 as u8,
             skip,
             ref_frame: INTRA_FRAME,
             mode_is_non_zero_inter: false,
-            segment_id: 0,
+            segment_id,
         };
-        self.mi_info.fill(mi_row_units, mi_col_units, mi);
+        self.mi_info.fill(mi_row, mi_col, mi);
 
         // Reconstruct luma plane for this block.
         self.reconstruct_plane(
@@ -646,6 +675,7 @@ impl<'a> IntraTile<'a> {
             y_mode,
             0,
             skip,
+            segment_id,
         )?;
         // Chroma (subsampled).
         let sub_x = self.hdr.color_config.subsampling_x as u32;
@@ -659,8 +689,12 @@ impl<'a> IntraTile<'a> {
         // luma tx_size clamped to fit the chroma block.
         let c_tx_log2 = clamp_tx_size(tx_size_log2, c_w, c_h);
         if c_w >= 4 && c_h >= 4 {
-            self.reconstruct_plane(bd, c_row, c_col, c_w, c_h, c_tx_log2, uv_mode, 1, skip)?;
-            self.reconstruct_plane(bd, c_row, c_col, c_w, c_h, c_tx_log2, uv_mode, 2, skip)?;
+            self.reconstruct_plane(
+                bd, c_row, c_col, c_w, c_h, c_tx_log2, uv_mode, 1, skip, segment_id,
+            )?;
+            self.reconstruct_plane(
+                bd, c_row, c_col, c_w, c_h, c_tx_log2, uv_mode, 2, skip, segment_id,
+            )?;
         }
         Ok(())
     }
@@ -732,6 +766,7 @@ impl<'a> IntraTile<'a> {
         mode: IntraMode,
         plane: usize,
         skip: bool,
+        segment_id: u8,
     ) -> Result<()> {
         let tx_side = 4usize << tx_size_log2;
         // Walk the TX blocks within (row,col,w,h).
@@ -760,7 +795,7 @@ impl<'a> IntraTile<'a> {
         let qp = self
             .hdr
             .segmentation
-            .get_qindex(0, self.hdr.quantization.base_q_idx);
+            .get_qindex(segment_id, self.hdr.quantization.base_q_idx);
         let (dc, ac) = if plane == 0 {
             (
                 DC_QLOOKUP[clamp_q(qp + self.hdr.quantization.delta_q_y_dc as i32)],

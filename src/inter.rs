@@ -41,6 +41,7 @@ use crate::mv::{read_mv_component, read_mv_joint, Mv, DEFAULT_MV_COMP_PROBS, MV_
 use crate::mvref::{find_mv_refs, InterMiCell, InterMiGrid, NONE_FRAME};
 use crate::probs::{read_partition_from_tree, PARTITION_PROBS};
 use crate::reconintra::{predict as predict_intra, NeighbourBuf};
+use crate::segmentation::{read_inter_segment_id, SegPredContext, SegmentIdMap};
 use crate::tables::{
     AC_QLOOKUP, COEFBAND_TRANS_4X4, COEFBAND_TRANS_8X8PLUS, COEF_PROBS_16X16, COEF_PROBS_32X32,
     COEF_PROBS_4X4, COEF_PROBS_8X8, DC_QLOOKUP, DEFAULT_SCAN_16X16, DEFAULT_SCAN_16X16_NEIGHBORS,
@@ -227,6 +228,15 @@ pub struct InterTile<'a> {
     /// `comp_mode` contexts for later neighbours.
     pub above_intra: Vec<bool>,
     pub left_intra: Vec<bool>,
+    /// §6.4.14 `PrevSegmentIds` — previous frame's segment map, used to
+    /// compute the predicted segment id for inter blocks. Zeroed at
+    /// §8.2 setup_past_independence.
+    pub prev_segment_ids: SegmentIdMap,
+    /// Current frame's `SegmentIds` — filled as blocks are decoded.
+    pub segment_ids: SegmentIdMap,
+    /// §7.4.1 / §7.4.2 `AboveSegPredContext` / `LeftSegPredContext`.
+    /// Cleared per tile — tracks `seg_id_predicted` from neighbours.
+    pub seg_pred_ctx: SegPredContext,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -285,6 +295,30 @@ impl<'a> InterTile<'a> {
             // is treated as inter (not intra). Initialise to `false`.
             above_intra: vec![false; mi_cols],
             left_intra: vec![false; mi_rows],
+            prev_segment_ids: SegmentIdMap::zeros(mi_cols, mi_rows),
+            segment_ids: SegmentIdMap::zeros(mi_cols, mi_rows),
+            seg_pred_ctx: SegPredContext::zeros(mi_cols, mi_rows),
+        }
+    }
+
+    /// Install the `PrevSegmentIds` map from the previous frame (§6.4.14
+    /// `get_segment_id`). The caller is the decoder facade, which keeps
+    /// one segment map per DPB slot. When `None` the default (all-zero)
+    /// map is used — matches §8.2 `setup_past_independence`.
+    pub fn set_prev_segment_ids(&mut self, map: Option<&SegmentIdMap>) {
+        if let Some(m) = map {
+            // Copy; resize to the current frame's mi grid if needed.
+            if m.mi_cols == self.prev_segment_ids.mi_cols
+                && m.mi_rows == self.prev_segment_ids.mi_rows
+            {
+                self.prev_segment_ids = m.clone();
+            } else {
+                // §8.2 rule: if sizes don't match, treat as independence.
+                self.prev_segment_ids = SegmentIdMap::zeros(
+                    self.prev_segment_ids.mi_cols,
+                    self.prev_segment_ids.mi_rows,
+                );
+            }
         }
     }
 
@@ -384,6 +418,20 @@ impl<'a> InterTile<'a> {
         // §6.5.2 tile left/right MI bounds — candidates can't cross these.
         self.tile_mi_col_start = (col_start as i32) / 8;
         self.tile_mi_col_end = (col_end as i32 + 7) / 8;
+        // §7.4.1 clear_above_context / §7.4.2 clear_left_context for the
+        // seg-id-predicted arrays. Partition/skip context already
+        // handled by their own reset paths. We only zero the slice that
+        // this tile covers.
+        let col_mi_s = (col_start as usize) / 8;
+        let col_mi_e = ((col_end as usize) + 7) / 8;
+        let row_mi_s = (row_start as usize) / 8;
+        let row_mi_e = ((row_end as usize) + 7) / 8;
+        for c in col_mi_s..col_mi_e.min(self.seg_pred_ctx.above.len()) {
+            self.seg_pred_ctx.above[c] = 0;
+        }
+        for r in row_mi_s..row_mi_e.min(self.seg_pred_ctx.left.len()) {
+            self.seg_pred_ctx.left[r] = 0;
+        }
         let mut r = row_start;
         while r < row_end {
             let mut c = col_start;
@@ -594,27 +642,65 @@ impl<'a> InterTile<'a> {
         col: u32,
         bs: BlockSize,
     ) -> Result<()> {
-        // §6.4.11 decode_partition order:
-        //   read_skip, read_is_inter, read_tx_size, then mode-info.
+        // §6.4.11 inter_frame_mode_info order:
+        //   inter_segment_id, read_skip, read_is_inter, read_tx_size,
+        //   then mode-info.
         let mi_row = (row as usize) / 8;
         let mi_col = (col as usize) / 8;
-        let skip_ctx = self.skip_ctx(mi_row, mi_col);
-        let skip = bd.read(DEFAULT_SKIP_PROBS[skip_ctx])? != 0;
-        let is_inter_ctx = self.is_inter_ctx(mi_row, mi_col);
-        let is_inter = bd.read(DEFAULT_IS_INTER_PROBS[is_inter_ctx])? != 0;
-        let tx_size_log2 = self.read_tx_size(bd, bs)?;
         let mi_w = (bs.w() as usize) / 8;
         let mi_h = (bs.h() as usize) / 8;
-        let res = if is_inter {
-            self.decode_inter_block(bd, row, col, bs, tx_size_log2, skip)
+        // §6.4.12 inter_segment_id: may read 0..N bits depending on
+        // `segmentation_enabled / update_map / temporal_update`.
+        let segment_id = read_inter_segment_id(
+            bd,
+            &self.hdr.segmentation,
+            &self.prev_segment_ids,
+            &mut self.seg_pred_ctx,
+            mi_row,
+            mi_col,
+            mi_w.max(1),
+            mi_h.max(1),
+        )?;
+        self.segment_ids
+            .fill(mi_row, mi_col, mi_w.max(1), mi_h.max(1), segment_id);
+        // §6.4.8 read_skip — `SEG_LVL_SKIP` forces skip=1 per §6.4.9.
+        let skip = if self
+            .hdr
+            .segmentation
+            .feature_active(segment_id, crate::headers::SEG_LVL_SKIP)
+        {
+            true
         } else {
-            self.decode_intra_block(bd, row, col, bs, tx_size_log2, skip)
+            let skip_ctx = self.skip_ctx(mi_row, mi_col);
+            bd.read(DEFAULT_SKIP_PROBS[skip_ctx])? != 0
+        };
+        // §6.4.13 read_is_inter — `SEG_LVL_REF_FRAME` forces the
+        // `is_inter` decision: INTRA_FRAME => intra, otherwise inter.
+        let is_inter = if self
+            .hdr
+            .segmentation
+            .feature_active(segment_id, crate::headers::SEG_LVL_REF_FRAME)
+        {
+            self.hdr
+                .segmentation
+                .feature_value(segment_id, crate::headers::SEG_LVL_REF_FRAME)
+                != INTRA_FRAME as i16
+        } else {
+            let is_inter_ctx = self.is_inter_ctx(mi_row, mi_col);
+            bd.read(DEFAULT_IS_INTER_PROBS[is_inter_ctx])? != 0
+        };
+        let tx_size_log2 = self.read_tx_size(bd, bs)?;
+        let res = if is_inter {
+            self.decode_inter_block(bd, row, col, bs, tx_size_log2, skip, segment_id)
+        } else {
+            self.decode_intra_block(bd, row, col, bs, tx_size_log2, skip, segment_id)
         };
         // Update per-block skip / intra context trackers.
         self.update_block_ctx(mi_row, mi_col, mi_w, mi_h, skip, !is_inter);
         res
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn decode_inter_block(
         &mut self,
         bd: &mut BoolDecoder<'_>,
@@ -623,6 +709,7 @@ impl<'a> InterTile<'a> {
         bs: BlockSize,
         tx_size_log2: usize,
         skip: bool,
+        segment_id: u8,
     ) -> Result<()> {
         // Spec order (§6.4.16 inter_block_mode_info):
         //   1. read_ref_frames
@@ -713,7 +800,7 @@ impl<'a> InterTile<'a> {
                 skip,
                 ref_frame: ref_code_a, // primary ref drives LF deltas.
                 mode_is_non_zero_inter,
-                segment_id: 0,
+                segment_id,
             },
         );
 
@@ -853,7 +940,7 @@ impl<'a> InterTile<'a> {
         if !skip {
             // Residual: tx-blocks over the prediction unit with
             // tx_type = DCT_DCT for inter blocks (§7.4.3).
-            self.add_residual(bd, row, col, bs, tx_size_log2, TxType::DctDct)?;
+            self.add_residual(bd, row, col, bs, tx_size_log2, TxType::DctDct, segment_id)?;
         }
         Ok(())
     }
@@ -909,6 +996,7 @@ impl<'a> InterTile<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn decode_intra_block(
         &mut self,
         bd: &mut BoolDecoder<'_>,
@@ -917,6 +1005,7 @@ impl<'a> InterTile<'a> {
         bs: BlockSize,
         tx_size_log2: usize,
         skip: bool,
+        segment_id: u8,
     ) -> Result<()> {
         let y_mode = read_intra_mode_tree(bd, &DEFAULT_IF_Y_MODE_PROBS)?;
         let uv_mode = read_intra_mode_tree(bd, &DEFAULT_IF_UV_MODE_PROBS)?;
@@ -935,7 +1024,7 @@ impl<'a> InterTile<'a> {
                 skip,
                 ref_frame: INTRA_FRAME,
                 mode_is_non_zero_inter: false,
-                segment_id: 0,
+                segment_id,
             },
         );
         // Luma predict + residual.
@@ -949,6 +1038,7 @@ impl<'a> InterTile<'a> {
             y_mode,
             0,
             skip,
+            segment_id,
         )?;
         let sub_x = self.hdr.color_config.subsampling_x as u32;
         let sub_y = self.hdr.color_config.subsampling_y as u32;
@@ -958,8 +1048,12 @@ impl<'a> InterTile<'a> {
         let c_h = (bs.h() >> sub_y) as usize;
         let c_tx = clamp_tx_size(tx_size_log2, c_w, c_h);
         if c_w >= 4 && c_h >= 4 {
-            self.recon_intra_plane(bd, c_row, c_col, c_w, c_h, c_tx, uv_mode, 1, skip)?;
-            self.recon_intra_plane(bd, c_row, c_col, c_w, c_h, c_tx, uv_mode, 2, skip)?;
+            self.recon_intra_plane(
+                bd, c_row, c_col, c_w, c_h, c_tx, uv_mode, 1, skip, segment_id,
+            )?;
+            self.recon_intra_plane(
+                bd, c_row, c_col, c_w, c_h, c_tx, uv_mode, 2, skip, segment_id,
+            )?;
         }
         Ok(())
     }
@@ -1166,6 +1260,7 @@ impl<'a> InterTile<'a> {
         bs: BlockSize,
         tx_size_log2: usize,
         tx_type: TxType,
+        segment_id: u8,
     ) -> Result<()> {
         let w = bs.w() as usize;
         let h = bs.h() as usize;
@@ -1179,6 +1274,7 @@ impl<'a> InterTile<'a> {
             tx_size_log2,
             tx_type,
             0,
+            segment_id,
         )?;
         let sub_x = self.hdr.color_config.subsampling_x as u32;
         let sub_y = self.hdr.color_config.subsampling_y as u32;
@@ -1188,8 +1284,12 @@ impl<'a> InterTile<'a> {
         let c_h = (bs.h() >> sub_y) as usize;
         let c_tx = clamp_tx_size(tx_size_log2, c_w, c_h);
         if c_w >= 4 && c_h >= 4 {
-            self.decode_plane_residual(bd, c_row, c_col, c_w, c_h, c_tx, TxType::DctDct, 1)?;
-            self.decode_plane_residual(bd, c_row, c_col, c_w, c_h, c_tx, TxType::DctDct, 2)?;
+            self.decode_plane_residual(
+                bd, c_row, c_col, c_w, c_h, c_tx, TxType::DctDct, 1, segment_id,
+            )?;
+            self.decode_plane_residual(
+                bd, c_row, c_col, c_w, c_h, c_tx, TxType::DctDct, 2, segment_id,
+            )?;
         }
         Ok(())
     }
@@ -1205,6 +1305,7 @@ impl<'a> InterTile<'a> {
         tx_size_log2: usize,
         tx_type: TxType,
         plane: usize,
+        segment_id: u8,
     ) -> Result<()> {
         let tx_side = 4usize << tx_size_log2;
         let plane_type = if plane == 0 { 0 } else { 1 };
@@ -1216,10 +1317,10 @@ impl<'a> InterTile<'a> {
         let scan = get_scan(tx_size_log2);
         let probs = coef_probs_for(tx_size_log2, plane_type);
 
-        let qp = self.hdr.segmentation.get_qindex(
-            0, // segment_id (per-block segmentation map not yet built).
-            self.hdr.quantization.base_q_idx,
-        );
+        let qp = self
+            .hdr
+            .segmentation
+            .get_qindex(segment_id, self.hdr.quantization.base_q_idx);
         let (dc, ac) = if plane == 0 {
             (
                 DC_QLOOKUP[clamp_q(qp + self.hdr.quantization.delta_q_y_dc as i32)],
@@ -1284,6 +1385,7 @@ impl<'a> InterTile<'a> {
         mode: IntraMode,
         plane: usize,
         skip: bool,
+        segment_id: u8,
     ) -> Result<()> {
         let tx_side = 4usize << tx_size_log2;
         let plane_type = if plane == 0 { 0 } else { 1 };
@@ -1295,10 +1397,10 @@ impl<'a> InterTile<'a> {
         let scan = get_scan(tx_size_log2);
         let probs = coef_probs_for(tx_size_log2, plane_type);
 
-        let qp = self.hdr.segmentation.get_qindex(
-            0, // segment_id (per-block segmentation map not yet built).
-            self.hdr.quantization.base_q_idx,
-        );
+        let qp = self
+            .hdr
+            .segmentation
+            .get_qindex(segment_id, self.hdr.quantization.base_q_idx);
         let (dc, ac) = if plane == 0 {
             (
                 DC_QLOOKUP[clamp_q(qp + self.hdr.quantization.delta_q_y_dc as i32)],

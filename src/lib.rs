@@ -22,11 +22,14 @@
 //!
 //! Segmentation deltas §8.6.1 `SEG_LVL_ALT_Q` and §8.8.1 `SEG_LVL_ALT_L`
 //! apply through `SegmentationParams::get_qindex` and
-//! `LvlLookup::build_with_segmentation` (the per-block segmentation-map
-//! read is still scaffold, so all blocks report segment 0 for now).
+//! `LvlLookup::build_with_segmentation`. Per-block segment_id decode
+//! (§6.4.7 intra / §6.4.12 inter / §6.4.14 predicted) is wired through
+//! the `segmentation` module, with `PrevSegmentIds` carried across
+//! frames alongside the DPB and `AboveSegPredContext / LeftSegPredContext`
+//! cleared per tile (§7.4.1 / §7.4.2).
 //!
-//! Deferred: higher bit depths (10/12-bit), per-block segmentation-map
-//! read, neighbour-aware probability contexts.
+//! Deferred: higher bit depths (10/12-bit), neighbour-aware probability
+//! contexts.
 //!
 //! Reference: VP9 Bitstream & Decoding Process Specification, version 0.7
 //! (2017): <https://storage.googleapis.com/downloads.webmproject.org/docs/vp9/vp9-bitstream-specification-v0.7-20170222-draft.pdf>.
@@ -49,6 +52,7 @@ pub mod mv;
 pub mod mvref;
 pub mod probs;
 pub mod reconintra;
+pub mod segmentation;
 pub mod tables;
 pub mod tile;
 pub mod transform;
@@ -85,4 +89,5 @@ pub use decoder::{
 pub use headers::{
     parse_uncompressed_header, ColorConfig, ColorSpace, FrameType, LoopFilterParams,
     QuantizationParams, RefFrame, SegmentationParams, TileInfo, UncompressedHeader,
+    SEG_LVL_ALT_L, SEG_LVL_ALT_Q, SEG_LVL_REF_FRAME, SEG_LVL_SKIP,
 };

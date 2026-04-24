@@ -32,6 +32,10 @@ pub struct RefFrame {
     /// Subsampling: 1 if subsampled, 0 otherwise.
     pub subsampling_x: u8,
     pub subsampling_y: u8,
+    /// Per-8x8-mi segment-id map saved per §8.1 step 3: only populated
+    /// when `segmentation_enabled && segmentation_update_map`. Used as
+    /// `PrevSegmentIds` for the next inter frame (§6.4.14).
+    pub segment_ids: Option<crate::segmentation::SegmentIdMap>,
 }
 
 impl RefFrame {
@@ -103,6 +107,7 @@ mod tests {
             uv_height: 32,
             subsampling_x: 1,
             subsampling_y: 1,
+            segment_ids: None,
         }
     }
 

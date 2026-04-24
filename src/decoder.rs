@@ -147,7 +147,7 @@ impl Vp9Decoder {
         // length (§6.4 decode_tiles).
         let tile_slices = split_tile_payload(tile_payload, tile_cols, tile_rows)?;
 
-        let (y, y_stride, u, v, uv_stride, uv_w, uv_h) = if is_intra {
+        let (y, y_stride, u, v, uv_stride, uv_w, uv_h, seg_map) = if is_intra {
             let mut tile = IntraTile::new(&h, &ch);
             for tr in 0..tile_rows {
                 for tc in 0..tile_cols {
@@ -158,6 +158,7 @@ impl Vp9Decoder {
                 }
             }
             tile.finalize();
+            let seg_map = Some(tile.segment_ids.clone());
             (
                 tile.y,
                 tile.y_stride,
@@ -166,6 +167,7 @@ impl Vp9Decoder {
                 tile.uv_stride,
                 tile.uv_w,
                 tile.uv_h,
+                seg_map,
             )
         } else {
             let refs = [
@@ -174,6 +176,13 @@ impl Vp9Decoder {
                 self.dpb.get(h.ref_frame_idx[2]),
             ];
             let mut tile = InterTile::new(&h, &ch, h.width as usize, h.height as usize, refs);
+            // §6.4.14 PrevSegmentIds: inherit from the primary reference
+            // when the previous frame saved one. When absent (or sizes
+            // mismatch), the InterTile keeps its all-zero default —
+            // matches §8.2 setup_past_independence.
+            if let Some(rf) = self.dpb.get(h.ref_frame_idx[0]) {
+                tile.set_prev_segment_ids(rf.segment_ids.as_ref());
+            }
             for tr in 0..tile_rows {
                 for tc in 0..tile_cols {
                     let slice = tile_slices[(tr * tile_cols + tc) as usize];
@@ -183,6 +192,14 @@ impl Vp9Decoder {
                 }
             }
             tile.finalize();
+            // §8.1 step 3: save SegmentIds → PrevSegmentIds iff
+            // update_map was set for the frame we just decoded.
+            let seg_map = if h.segmentation.enabled && h.segmentation.update_map {
+                Some(tile.segment_ids.clone())
+            } else {
+                // Carry the prior map forward so stream resumption works.
+                Some(tile.prev_segment_ids.clone())
+            };
             (
                 tile.y,
                 tile.y_stride,
@@ -191,6 +208,7 @@ impl Vp9Decoder {
                 tile.uv_stride,
                 tile.uv_w,
                 tile.uv_h,
+                seg_map,
             )
         };
 
@@ -209,6 +227,7 @@ impl Vp9Decoder {
             uv_height: uv_h,
             subsampling_x: sub_x,
             subsampling_y: sub_y,
+            segment_ids: seg_map,
         };
         self.dpb.refresh(h.refresh_frame_flags, &rf);
 

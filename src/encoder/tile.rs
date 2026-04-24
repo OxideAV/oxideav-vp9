@@ -78,8 +78,10 @@ impl PartitionCtx {
         }
         let above_bit = ((above >> boffset) & 1) as usize;
         let left_bit = ((left >> boffset) & 1) as usize;
-        let tbl_bsl = 3 - bsl;
-        let ctx = tbl_bsl * 4 + left_bit * 2 + above_bit;
+        // Mirror the decoder's indexing exactly. The current
+        // KF_PARTITION_PROBS layout is 8×8-first, so bsl=0 -> row 0
+        // and bsl=3 -> row 12, same as `block::read_partition`.
+        let ctx = bsl * 4 + left_bit * 2 + above_bit;
         KF_PARTITION_PROBS[ctx]
     }
 
@@ -332,6 +334,12 @@ mod tests {
         // block at the top-left where there are no neighbours). Later
         // blocks have neighbours (all 128), so still 128.
         assert_eq!(tile.y.len(), 64 * 64);
+        let mut y_counts = std::collections::BTreeMap::new();
+        for &v in &tile.y { *y_counts.entry(v).or_insert(0u32) += 1; }
+        let mut u_counts = std::collections::BTreeMap::new();
+        for &v in &tile.u { *u_counts.entry(v).or_insert(0u32) += 1; }
+        println!("y counts: {y_counts:?}");
+        println!("u counts: {u_counts:?}");
         for &v in &tile.y {
             assert_eq!(v, 128);
         }

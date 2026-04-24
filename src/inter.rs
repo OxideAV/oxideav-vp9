@@ -556,6 +556,8 @@ impl<'a> InterTile<'a> {
         }
         let above_bit = ((above >> boffset) & 1) as usize;
         let left_bit = ((left >> boffset) & 1) as usize;
+        // PARTITION_PROBS is 64x64-first (matches libvpx layout); invert
+        // bsl when indexing.
         let tbl_bsl = 3 - bsl;
         let ctx = tbl_bsl * 4 + left_bit * 2 + above_bit;
         let probs = PARTITION_PROBS[ctx];

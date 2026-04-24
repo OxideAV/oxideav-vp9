@@ -480,10 +480,10 @@ impl<'a> IntraTile<'a> {
         }
         let above_bit = ((above >> boffset) & 1) as usize;
         let left_bit = ((left >> boffset) & 1) as usize;
-        // §7.4.6: ctx = bsl * 4 + left*2 + above.
-        // bsl = mi_width_log2_lookup[bsize]: 0 for 8x8, 3 for 64x64.
-        // KF_PARTITION_PROBS row ordering matches the spec (8x8 → 64x64).
-        let ctx = bsl * 4 + left_bit * 2 + above_bit;
+        // Match the encoder's table-ordering: KF_PARTITION_PROBS is
+        // arranged 64x64-first, so ctx uses (3 - bsl) in place of bsl.
+        let tbl_bsl = 3 - bsl;
+        let ctx = tbl_bsl * 4 + left_bit * 2 + above_bit;
         let probs = KF_PARTITION_PROBS[ctx];
         if bsize == 8 {
             let b0 = bd.read(probs[0])?;

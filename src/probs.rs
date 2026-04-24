@@ -38,22 +38,22 @@
 /// (Equivalently the decode tree: first bit chooses SPLIT vs non-SPLIT,
 /// second chooses HORZ vs {VERT, NONE}, third chooses VERT vs NONE.)
 pub const KF_PARTITION_PROBS: [[u8; 3]; 16] = [
-    // 64×64 (bsl=0)
+    // 64×64 (indexed as ctx = (3 - bsl) * 4 + ...)
     [158, 97, 94],
     [93, 24, 99],
     [85, 119, 44],
     [62, 59, 67],
-    // 32×32 (bsl=1)
+    // 32×32
     [149, 53, 53],
     [94, 20, 48],
     [83, 53, 24],
     [52, 18, 18],
-    // 16×16 (bsl=2)
+    // 16×16
     [150, 40, 39],
     [78, 12, 26],
     [67, 33, 11],
     [24, 7, 5],
-    // 8×8 (bsl=3) — ONLY_4X4 is implicit at this level.
+    // 8×8 — ONLY_4X4 is implicit at this level.
     [174, 35, 49],
     [68, 11, 27],
     [57, 15, 9],

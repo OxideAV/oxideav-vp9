@@ -38,6 +38,7 @@ pub mod compressed_header;
 pub mod decoder;
 pub mod detokenize;
 pub mod dpb;
+pub mod encoder;
 pub mod headers;
 pub mod inter;
 pub mod intra;

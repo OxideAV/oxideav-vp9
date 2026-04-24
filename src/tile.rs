@@ -421,6 +421,8 @@ fn read_partition_8x8(bd: &mut BoolDecoder<'_>, probs: [u8; 3]) -> Result<Partit
 /// (the top-left superblock). This is one of the known TODOs listed in
 /// the crate README.
 fn partition_probs(bsize: u32, keyframe: bool) -> [u8; 3] {
+    // Match block::read_partition — KF_PARTITION_PROBS / PARTITION_PROBS
+    // are laid out 64×64-first, so invert the usual bsl.
     let bsl = match bsize {
         64 => 0usize,
         32 => 1,

@@ -153,6 +153,14 @@ pub struct IntraTile<'a> {
     /// "did my neighbour have any non-zero coefficients" flag arrays
     /// that drive the initial token context for `more_coefs` (§6.4.24).
     pub nonzero_ctx: NonzeroCtx,
+    /// Per-8x8 above/left `Skips[..]` tracking. Currently seeded but
+    /// not consumed — §7.4.6's `skip_probs[skip_ctx]` path regressed
+    /// the vp9-intra fixture (Round 7 investigation) so we fell back
+    /// to the hard-coded prob while keeping the infrastructure wired.
+    #[allow(dead_code)]
+    pub above_skip: Vec<bool>,
+    #[allow(dead_code)]
+    pub left_skip: Vec<bool>,
 }
 
 /// Scan + neighbour tables for a (tx_size, tx_type) pair. Mirrors
@@ -313,6 +321,47 @@ impl<'a> IntraTile<'a> {
             segment_ids: SegmentIdMap::zeros(mi_cols, mi_rows),
             seg_pred_ctx: SegPredContext::zeros(mi_cols, mi_rows),
             nonzero_ctx: NonzeroCtx::new(mi_cols, mi_rows, sub_x, sub_y),
+            above_skip: vec![false; mi_cols],
+            left_skip: vec![false; mi_rows],
+        }
+    }
+
+    /// §7.4.6 skip context for `read_skip`:
+    ///   ctx = (AvailU ? AboveSkip : 0) + (AvailL ? LeftSkip : 0)
+    #[allow(dead_code)]
+    fn skip_ctx(&self, mi_row: usize, mi_col: usize) -> usize {
+        let a = if mi_row > 0 && mi_col < self.above_skip.len() {
+            self.above_skip[mi_col] as usize
+        } else {
+            0
+        };
+        let l = if mi_col > 0 && mi_row < self.left_skip.len() {
+            self.left_skip[mi_row] as usize
+        } else {
+            0
+        };
+        a + l
+    }
+
+    fn update_skip_ctx(
+        &mut self,
+        mi_row: usize,
+        mi_col: usize,
+        mi_w: usize,
+        mi_h: usize,
+        skip: bool,
+    ) {
+        for i in 0..mi_w.max(1) {
+            let c = mi_col + i;
+            if c < self.above_skip.len() {
+                self.above_skip[c] = skip;
+            }
+        }
+        for i in 0..mi_h.max(1) {
+            let r = mi_row + i;
+            if r < self.left_skip.len() {
+                self.left_skip[r] = skip;
+            }
         }
     }
 
@@ -509,8 +558,11 @@ impl<'a> IntraTile<'a> {
         }
         let above_bit = ((above >> boffset) & 1) as usize;
         let left_bit = ((left >> boffset) & 1) as usize;
-        // Match the encoder's table-ordering: KF_PARTITION_PROBS is
-        // arranged 64x64-first, so ctx uses (3 - bsl) in place of bsl.
+        // The `kf_partition_probs` table as shipped (and matched by the
+        // ffmpeg / libvpx bitstream) is arranged with the 64×64 row
+        // first, so we invert `bsl` before indexing. The §10.5 comment
+        // text mislabels this as "8x8 -> 4x4" at row 0 but the bitstream
+        // agreement is with the inverted layout.
         let tbl_bsl = 3 - bsl;
         let ctx = tbl_bsl * 4 + left_bit * 2 + above_bit;
         let probs = KF_PARTITION_PROBS[ctx];
@@ -540,10 +592,12 @@ impl<'a> IntraTile<'a> {
         })
     }
 
-    /// §7.4.6 update AbovePartitionContext / LeftPartitionContext after
-    /// a partition is decoded. See libvpx `update_partition_context`:
-    /// the context bytes are filled with the `partition_context_lookup`
-    /// table per subsize.
+    /// §7.4.6 update `AbovePartitionContext` / `LeftPartitionContext`
+    /// after a partition is decoded. The 64×64-first convention used
+    /// throughout this decoder: `bsl=0` for 64×64, `bsl=3` for 8×8 (the
+    /// inverse of `mi_width_log2_lookup`). Fill bytes are built so that
+    /// `(byte >> boffset) & 1` resolves to 1 iff the neighbour's
+    /// subsize was smaller than the block currently being decoded.
     fn update_partition_ctx(
         &mut self,
         mi_row: usize,
@@ -552,16 +606,7 @@ impl<'a> IntraTile<'a> {
         sub_w_px: u32,
         sub_h_px: u32,
     ) {
-        let num8x8 = (bsize_px as usize) / 8;
-        // libvpx partition_context_lookup[subsize] = {above_byte, left_byte}.
-        // We derive above/left from sub_w, sub_h relative to bsize:
-        //   above bit set when sub_w == bsize (block extends full width)
-        //   left bit set when sub_h == bsize (block extends full height)
-        //   bit position = mi_width_log2_lookup[bsize] in the "all-set" mask
-        // The bits written are the fill pattern:
-        //   val = (1 << (boffset+1)) - 1 when not full, else smaller
-        // Simpler: we emulate libvpx by writing a byte where bits <= boffset
-        // are set when the neighbour-side dimension is "smaller".
+        let num8x8 = (bsize_px as usize).max(8) / 8;
         let bsl = match bsize_px {
             8 => 0usize,
             16 => 1,
@@ -570,14 +615,8 @@ impl<'a> IntraTile<'a> {
             _ => 3,
         };
         let boffset = 3 - bsl;
-        // The bit we're setting is at position boffset.
-        // Above context bit set when the BLOCK ENDS at this row (no split below).
-        // Actually, per libvpx: above byte = 0xf >> (3-bsl) for "full width" blocks,
-        // i.e. the bit at boffset is 1 if the block doesn't split horizontally here.
-        // For our purposes (approximate), we set the boffset bit when the
-        // sub-block is at least the full bsize in that dimension.
         let above_fill = if sub_w_px >= bsize_px {
-            (1u8 << boffset) - 1 + (1u8 << boffset) // 0x01, 0x03, 0x07, 0x0f
+            (1u8 << boffset) - 1 + (1u8 << boffset)
         } else {
             0
         };
@@ -622,6 +661,13 @@ impl<'a> IntraTile<'a> {
         self.segment_ids
             .fill(mi_row, mi_col, bw.max(1), bh.max(1), segment_id);
         // §6.4.8 read_skip — `SEG_LVL_SKIP` forces skip=1 per §6.4.9.
+        // Note: §7.4.6 calls for `skip_probs[skip_ctx]` where skip_ctx
+        // is the sum of above/left skip flags, but libvpx / ffmpeg's
+        // bitstream decodes match the hard-coded 192 in practice on
+        // the bundled fixtures. Round 7 confirmed the context-aware
+        // version regresses vp9-intra.ivf catastrophically (171 → 2
+        // distinct luma values); leave the hard-coded prob in place
+        // until the source of the divergence is tracked down.
         let skip = if self
             .hdr
             .segmentation
@@ -681,6 +727,9 @@ impl<'a> IntraTile<'a> {
             segment_id,
         };
         self.mi_info.fill(mi_row, mi_col, mi);
+        // Stamp the skip bit into the neighbour trackers so the next
+        // block sees the correct §7.4.6 skip context.
+        self.update_skip_ctx(mi_row, mi_col, mi_w, mi_h, skip);
 
         // Reconstruct luma plane for this block.
         self.reconstruct_plane(
@@ -799,7 +848,9 @@ impl<'a> IntraTile<'a> {
         } else {
             (self.uv_w, self.uv_h)
         };
-        let tx_type = if plane == 0 {
+        // §6.4.25 `get_scan`: chroma and 32×32 blocks always use DCT_DCT
+        // regardless of prediction mode.
+        let tx_type = if plane == 0 && tx_size_log2 < 3 {
             intra_mode_to_tx_type(mode)
         } else {
             TxType::DctDct

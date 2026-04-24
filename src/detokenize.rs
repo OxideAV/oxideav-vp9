@@ -131,43 +131,51 @@ fn decode_nonzero(
 ) -> Result<i32> {
     if bd.read(probs[ONE_CONTEXT_NODE])? == 0 {
         token_cache[scan[c] as usize] = 1;
-        return Ok((dqv as i32) >> dq_shift);
+        return Ok(dequant_shift(dqv as i32, dq_shift));
     }
     let p = &PARETO8_FULL[probs[PIVOT_NODE] as usize - 1];
     if bd.read(p[0])? == 0 {
         // TWO / THREE / FOUR
         if bd.read(p[1])? == 0 {
             token_cache[scan[c] as usize] = 2;
-            return Ok((2 * dqv as i32) >> dq_shift);
+            return Ok(dequant_shift(2 * dqv as i32, dq_shift));
         }
         token_cache[scan[c] as usize] = 3;
         let v = (3 + bd.read(p[2])? as i32) * dqv as i32;
-        return Ok(v >> dq_shift);
+        return Ok(dequant_shift(v, dq_shift));
     }
     if bd.read(p[3])? == 0 {
         token_cache[scan[c] as usize] = 4;
         if bd.read(p[4])? == 1 {
             let v = CAT2_MIN_VAL + read_coeff(bd, &CAT2_PROB[..2])?;
-            return Ok((v * dqv as i32) >> dq_shift);
+            return Ok(dequant_shift(v * dqv as i32, dq_shift));
         }
         let v = CAT1_MIN_VAL + read_coeff(bd, &CAT1_PROB[..1])?;
-        return Ok((v * dqv as i32) >> dq_shift);
+        return Ok(dequant_shift(v * dqv as i32, dq_shift));
     }
     token_cache[scan[c] as usize] = 5;
     if bd.read(p[5])? == 1 {
         if bd.read(p[7])? == 1 {
             let v = CAT6_MIN_VAL + read_coeff(bd, &CAT6_PROB[..14])?;
-            return Ok((v * dqv as i32) >> dq_shift);
+            return Ok(dequant_shift(v * dqv as i32, dq_shift));
         }
         let v = CAT5_MIN_VAL + read_coeff(bd, &CAT5_PROB[..5])?;
-        return Ok((v * dqv as i32) >> dq_shift);
+        return Ok(dequant_shift(v * dqv as i32, dq_shift));
     }
     if bd.read(p[6])? == 1 {
         let v = CAT4_MIN_VAL + read_coeff(bd, &CAT4_PROB[..4])?;
-        return Ok((v * dqv as i32) >> dq_shift);
+        return Ok(dequant_shift(v * dqv as i32, dq_shift));
     }
     let v = CAT3_MIN_VAL + read_coeff(bd, &CAT3_PROB[..3])?;
-    Ok((v * dqv as i32) >> dq_shift)
+    Ok(dequant_shift(v * dqv as i32, dq_shift))
+}
+
+/// Apply the 32×32 dequant shift. The returned value is NOT clamped
+/// here — §8.6.2 conformance requires it fit in 16 bits but libvpx's
+/// `wraplow` masks to i16 AT transform entry, not in the detokeniser.
+#[inline]
+fn dequant_shift(v: i32, dq_shift: i32) -> i32 {
+    v >> dq_shift
 }
 
 fn read_coeff(bd: &mut BoolDecoder<'_>, probs: &[u8]) -> Result<i32> {

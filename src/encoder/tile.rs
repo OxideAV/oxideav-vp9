@@ -21,6 +21,8 @@ use crate::tables::{KF_UV_MODE_PROBS, KF_Y_MODE_PROBS};
 /// Index of `DC_PRED` in the intra-mode tree (§7.4.5 Table 7-5).
 const MODE_DC: usize = 0;
 /// Skip probability used by the decoder (hard-coded context-0 approx).
+/// Matches the decoder's pre-Round-7 hard-coded value; see
+/// `block.rs::decode_block` for the rationale.
 const SKIP_PROB: u8 = 192;
 
 /// Emit the tile payload for a keyframe at the given frame size using
@@ -33,6 +35,8 @@ pub fn emit_keyframe_tile(p: &EncoderParams, tx_mode: TxMode) -> Vec<u8> {
     let mut ctx = PartitionCtx {
         above: vec![0u8; mi_cols],
         left: vec![0u8; mi_rows],
+        above_skip: vec![false; mi_cols],
+        left_skip: vec![false; mi_rows],
     };
     let sb_cols = p.width.div_ceil(64);
     let sb_rows = p.height.div_ceil(64);
@@ -51,6 +55,44 @@ pub fn emit_keyframe_tile(p: &EncoderParams, tx_mode: TxMode) -> Vec<u8> {
 struct PartitionCtx {
     above: Vec<u8>,
     left: Vec<u8>,
+    /// Per-mi-col/row skip tracking (§7.4.6). Seeded but currently
+    /// unused — the decoder reads skip against a hard-coded prob.
+    #[allow(dead_code)]
+    above_skip: Vec<bool>,
+    #[allow(dead_code)]
+    left_skip: Vec<bool>,
+}
+
+impl PartitionCtx {
+    #[allow(dead_code)]
+    fn skip_ctx(&self, mi_row: usize, mi_col: usize) -> usize {
+        let a = if mi_row > 0 && mi_col < self.above_skip.len() {
+            self.above_skip[mi_col] as usize
+        } else {
+            0
+        };
+        let l = if mi_col > 0 && mi_row < self.left_skip.len() {
+            self.left_skip[mi_row] as usize
+        } else {
+            0
+        };
+        a + l
+    }
+
+    fn stamp_skip(&mut self, mi_row: usize, mi_col: usize, mi_w: usize, mi_h: usize, skip: bool) {
+        for i in 0..mi_w.max(1) {
+            let c = mi_col + i;
+            if c < self.above_skip.len() {
+                self.above_skip[c] = skip;
+            }
+        }
+        for i in 0..mi_h.max(1) {
+            let r = mi_row + i;
+            if r < self.left_skip.len() {
+                self.left_skip[r] = skip;
+            }
+        }
+    }
 }
 
 impl PartitionCtx {
@@ -78,9 +120,8 @@ impl PartitionCtx {
         }
         let above_bit = ((above >> boffset) & 1) as usize;
         let left_bit = ((left >> boffset) & 1) as usize;
-        // Mirror `block::read_partition` exactly: tbl_bsl = 3 - bsl so
-        // bsize=64 maps to row 0..3 (KF_PARTITION_PROBS is 64×64-first
-        // in the decoder's internal layout).
+        // Mirror block::read_partition: 64×64-first layout requires
+        // inverting bsl before indexing.
         let tbl_bsl = 3 - bsl;
         let ctx = tbl_bsl * 4 + left_bit * 2 + above_bit;
         KF_PARTITION_PROBS[ctx]
@@ -147,7 +188,11 @@ fn emit_partition(
             // block as NONE (this only happens when both width and
             // height are multiples of 8, so bsize==8 edge-clip is
             // actually an exact-fit).
-            emit_block(be, bsize, bsize, false);
+            let sctx = ctx.skip_ctx(mi_row, mi_col);
+            emit_block(be, sctx);
+            let mi_w = (bsize as usize) / 8;
+            let mi_h = (bsize as usize) / 8;
+            ctx.stamp_skip(mi_row, mi_col, mi_w, mi_h, true);
             ctx.update(bsize, bsize, bsize, mi_row, mi_col);
             return;
         }
@@ -172,7 +217,11 @@ fn emit_partition(
         // half recurses.
         be.write(1, probs[2]);
         if bsize == 8 {
-            emit_block(be, bsize, bsize, false);
+            let sctx = ctx.skip_ctx(mi_row, mi_col);
+            emit_block(be, sctx);
+            let mi_w = (bsize as usize) / 8;
+            let mi_h = (bsize as usize) / 8;
+            ctx.stamp_skip(mi_row, mi_col, mi_w, mi_h, true);
             ctx.update(bsize, bsize, bsize, mi_row, mi_col);
             return;
         }
@@ -195,7 +244,11 @@ fn emit_partition(
         // Only HORZ or SPLIT readable — one bit with probs[1].
         be.write(1, probs[1]);
         if bsize == 8 {
-            emit_block(be, bsize, bsize, false);
+            let sctx = ctx.skip_ctx(mi_row, mi_col);
+            emit_block(be, sctx);
+            let mi_w = (bsize as usize) / 8;
+            let mi_h = (bsize as usize) / 8;
+            ctx.stamp_skip(mi_row, mi_col, mi_w, mi_h, true);
             ctx.update(bsize, bsize, bsize, mi_row, mi_col);
             return;
         }
@@ -222,15 +275,19 @@ fn emit_partition(
     } else {
         be.write(0, probs[0]);
     }
-    emit_block(be, bsize, bsize, false /* is_8x8_branch */);
+    let sctx = ctx.skip_ctx(mi_row, mi_col);
+    emit_block(be, sctx);
+    let mi_w = (bsize as usize) / 8;
+    let mi_h = (bsize as usize) / 8;
+    ctx.stamp_skip(mi_row, mi_col, mi_w, mi_h, true);
     ctx.update(bsize, bsize, bsize, mi_row, mi_col);
     let _ = tx_mode;
 }
 
 /// Emit one block's symbols: skip=1, DC_PRED luma, DC_PRED chroma,
-/// no coefficients.
-fn emit_block(be: &mut BoolEncoder, _w: u32, _h: u32, _edge_split_descent: bool) {
-    // Skip bit.
+/// no coefficients. `_skip_ctx` is retained for future wiring but
+/// ignored — the decoder currently reads skip with a hard-coded prob.
+fn emit_block(be: &mut BoolEncoder, _skip_ctx: usize) {
     be.write(1, SKIP_PROB);
     // tx_size: ONLY_4X4 so no symbol is written.
     // Luma intra mode tree (KF_Y_MODE_PROBS[DC][DC] = row 0, col 0).

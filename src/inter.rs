@@ -621,8 +621,8 @@ impl<'a> InterTile<'a> {
         }
         let above_bit = ((above >> boffset) & 1) as usize;
         let left_bit = ((left >> boffset) & 1) as usize;
-        // PARTITION_PROBS is 64x64-first (matches libvpx layout); invert
-        // bsl when indexing.
+        // partition_probs is arranged 64×64-first; invert `bsl` before
+        // indexing. See block.rs::read_partition for the same convention.
         let tbl_bsl = 3 - bsl;
         let ctx = tbl_bsl * 4 + left_bit * 2 + above_bit;
         // §6.3.15: partition_probs come from the per-frame context.

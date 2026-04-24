@@ -35,7 +35,6 @@ pub fn encode_keyframe(p: &EncoderParams) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::decoder::make_decoder;
-    use oxideav_codec::Decoder;
     use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
     #[test]

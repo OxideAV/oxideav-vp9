@@ -377,7 +377,6 @@ mod tests {
         // Exercise the top-level `Vp9Decoder` facade so we know the
         // bitstream survives ingest / receive_frame.
         use crate::decoder::make_decoder;
-        use oxideav_codec::Decoder;
         use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
         let frame = assemble_and_decode(64, 64);

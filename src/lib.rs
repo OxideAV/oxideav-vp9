@@ -67,8 +67,8 @@ pub mod tables;
 pub mod tile;
 pub mod transform;
 
-use oxideav_codec::{CodecInfo, CodecRegistry};
 use oxideav_core::{CodecCapabilities, CodecId, CodecTag};
+use oxideav_core::{CodecInfo, CodecRegistry};
 
 pub const CODEC_ID_STR: &str = "vp9";
 

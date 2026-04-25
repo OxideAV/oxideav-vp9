@@ -15,7 +15,6 @@ categories = ["multimedia::encoding", "multimedia::video"]
 
 [dependencies]
 oxideav-core = "0.1"
-oxideav-codec = "0.1"
 
 # No dev-dependencies on other oxideav crates: previously we pulled in
 # oxideav-mp4 for one codec-id lookup but that crate's published 0.0.3

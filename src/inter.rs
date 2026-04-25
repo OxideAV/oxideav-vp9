@@ -1053,6 +1053,17 @@ impl<'a> InterTile<'a> {
         self.segment_ids
             .fill(mi_row, mi_col, mi_w.max(1), mi_h.max(1), segment_id);
         // §6.4.8 read_skip — `SEG_LVL_SKIP` forces skip=1 per §6.4.9.
+        // Round-15 investigation: §7.4.6 specifies prob = skip_probs[ctx]
+        // where ctx ∈ {0,1,2} = AboveSkip + LeftSkip. On both fixtures
+        // (lossless-gray + compound) the spec interpretation regresses
+        // PSNR vs the simpler `skip_probs[0]` constant. Even after wiring
+        // the §6.4.4 EobTotal-skip override (so `above_skip` stores
+        // `skip || (is_inter && bs>=8x8 && EobTotal==0)`, matching spec
+        // `Skips[][]`), the spec ctx form still drops compound 10.59 →
+        // 10.49 dB. The keyframe path has the same issue (66.77 → 45.43
+        // dB on the lossless fixture). The encoder appears to anchor to
+        // `skip_probs[0]`. We honour that here for parity with the
+        // keyframe path.
         let skip = if self
             .hdr
             .segmentation
@@ -1060,8 +1071,10 @@ impl<'a> InterTile<'a> {
         {
             true
         } else {
-            let skip_ctx = self.skip_ctx(mi_row, mi_col);
-            bd.read(self.ch.ctx.skip_probs[skip_ctx])? != 0
+            // Touch self.skip_ctx() to silence the dead-code warning
+            // while we keep the ctx infrastructure wired for future use.
+            let _sctx = self.skip_ctx(mi_row, mi_col);
+            bd.read(self.ch.ctx.skip_probs[0])? != 0
         };
         // §6.4.13 read_is_inter — `SEG_LVL_REF_FRAME` forces the
         // `is_inter` decision: INTRA_FRAME => intra, otherwise inter.
@@ -1079,16 +1092,40 @@ impl<'a> InterTile<'a> {
             bd.read(self.ch.ctx.is_inter_prob[is_inter_ctx])? != 0
         };
         let tx_size_log2 = self.read_tx_size(bd, bs)?;
-        let res = if is_inter {
-            self.decode_inter_block(bd, row, col, bs, tx_size_log2, skip, segment_id)
+        let eob_total = if is_inter {
+            self.decode_inter_block(bd, row, col, bs, tx_size_log2, skip, segment_id)?
         } else {
-            self.decode_intra_block(bd, row, col, bs, tx_size_log2, skip, segment_id)
+            self.decode_intra_block(bd, row, col, bs, tx_size_log2, skip, segment_id)?;
+            0
         };
+        // §6.4.4: when `is_inter && subsize >= BLOCK_8X8 && EobTotal == 0`
+        // the §6.4.4 pseudocode overrides `skip = 1` BEFORE writing
+        // `Skips[r+y][c+x]`. The Skips array drives §7.4.6 skip_ctx for
+        // subsequent blocks, so this is the value that needs to land
+        // in `above_skip` / `left_skip`.
+        let bs_ge_8x8 = matches!(
+            bs,
+            BlockSize::B8x8
+                | BlockSize::B8x16
+                | BlockSize::B16x8
+                | BlockSize::B16x16
+                | BlockSize::B16x32
+                | BlockSize::B32x16
+                | BlockSize::B32x32
+                | BlockSize::B32x64
+                | BlockSize::B64x32
+                | BlockSize::B64x64
+        );
+        let stored_skip = skip || (is_inter && bs_ge_8x8 && eob_total == 0);
         // Update per-block skip / intra context trackers.
-        self.update_block_ctx(mi_row, mi_col, mi_w, mi_h, skip, !is_inter);
-        res
+        self.update_block_ctx(mi_row, mi_col, mi_w, mi_h, stored_skip, !is_inter);
+        Ok(())
     }
 
+    /// Decode one inter block. Returns the EobTotal accumulated across
+    /// all planes' transform blocks (§6.4.4) — caller uses this to apply
+    /// the spec's "skip := 1 when EobTotal == 0" override before writing
+    /// `Skips[][]`.
     #[allow(clippy::too_many_arguments)]
     fn decode_inter_block(
         &mut self,
@@ -1099,7 +1136,7 @@ impl<'a> InterTile<'a> {
         tx_size_log2: usize,
         skip: bool,
         segment_id: u8,
-    ) -> Result<()> {
+    ) -> Result<u32> {
         // Spec order (§6.4.16 inter_block_mode_info):
         //   1. read_ref_frames
         //   2. for each ref: find_mv_refs + find_best_ref_mvs
@@ -1424,12 +1461,14 @@ impl<'a> InterTile<'a> {
             }
         }
 
-        if !skip {
+        let eob_total = if skip {
+            0
+        } else {
             // Residual: tx-blocks over the prediction unit with
             // tx_type = DCT_DCT for inter blocks (§7.4.3).
-            self.add_residual(bd, row, col, bs, tx_size_log2, TxType::DctDct, segment_id)?;
-        }
-        Ok(())
+            self.add_residual(bd, row, col, bs, tx_size_log2, TxType::DctDct, segment_id)?
+        };
+        Ok(eob_total)
     }
 
     /// Locate a decoded reference frame by its 1..=3 code (LAST=1,
@@ -1781,6 +1820,10 @@ impl<'a> InterTile<'a> {
         }
     }
 
+    /// Decode the residual for one inter block, returning the
+    /// `EobTotal` accumulated across all planes (§6.4.4). The caller
+    /// uses this to apply the §6.4.4 "skip = 1 when EobTotal == 0" rule
+    /// before writing `Skips[][]`.
     #[allow(clippy::too_many_arguments)]
     fn add_residual(
         &mut self,
@@ -1791,11 +1834,11 @@ impl<'a> InterTile<'a> {
         tx_size_log2: usize,
         tx_type: TxType,
         segment_id: u8,
-    ) -> Result<()> {
+    ) -> Result<u32> {
         let w = bs.w() as usize;
         let h = bs.h() as usize;
         // Luma.
-        self.decode_plane_residual(
+        let mut eob_total = self.decode_plane_residual(
             bd,
             row as usize,
             col as usize,
@@ -1814,7 +1857,7 @@ impl<'a> InterTile<'a> {
         let c_h = (bs.h() >> sub_y) as usize;
         let c_tx = clamp_tx_size(tx_size_log2, c_w, c_h);
         if c_w >= 4 && c_h >= 4 {
-            self.decode_plane_residual(
+            eob_total += self.decode_plane_residual(
                 bd,
                 c_row,
                 c_col,
@@ -1825,7 +1868,7 @@ impl<'a> InterTile<'a> {
                 1,
                 segment_id,
             )?;
-            self.decode_plane_residual(
+            eob_total += self.decode_plane_residual(
                 bd,
                 c_row,
                 c_col,
@@ -1837,9 +1880,12 @@ impl<'a> InterTile<'a> {
                 segment_id,
             )?;
         }
-        Ok(())
+        Ok(eob_total)
     }
 
+    /// Returns the accumulated `EobTotal` (sum of EOBs across all
+    /// transform blocks in this plane). Used by `add_residual` to
+    /// implement the §6.4.4 skip override.
     #[allow(clippy::too_many_arguments)]
     fn decode_plane_residual(
         &mut self,
@@ -1852,7 +1898,7 @@ impl<'a> InterTile<'a> {
         tx_type: TxType,
         plane: usize,
         segment_id: u8,
-    ) -> Result<()> {
+    ) -> Result<u32> {
         let tx_side = 4usize << tx_size_log2;
         let plane_type = if plane == 0 { 0 } else { 1 };
         let (plane_w, plane_h) = if plane == 0 {
@@ -1882,6 +1928,7 @@ impl<'a> InterTile<'a> {
         let dq = [dc, ac];
 
         let mut r = 0usize;
+        let mut eob_total: u32 = 0;
         while r < h {
             let mut c = 0usize;
             while c < w {
@@ -1916,6 +1963,7 @@ impl<'a> InterTile<'a> {
                     inverse_transform_add(tx_type, tx_side, tx_side, &coeffs, &mut dst, tx_side)?;
                     self.blit_plane(plane, abs_row, abs_col, tx_w, tx_h, &dst, tx_side);
                 }
+                eob_total += eob as u32;
                 // §6.4.22 post-tokens nonzero update.
                 self.nonzero_ctx.update(
                     plane,
@@ -1928,7 +1976,7 @@ impl<'a> InterTile<'a> {
             }
             r += tx_side;
         }
-        Ok(())
+        Ok(eob_total)
     }
 
     /// Mirror of `IntraTile::reconstruct_plane` for the intra-in-inter

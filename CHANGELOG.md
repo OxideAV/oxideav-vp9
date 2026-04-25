@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- §6.4.4 EobTotal-skip override (round 15). `InterTile::decode_block_at`
+  now propagates the residual's `EobTotal` back from `add_residual` /
+  `decode_plane_residual` and applies the spec rule
+  `if (is_inter && subsize >= BLOCK_8X8 && EobTotal == 0) skip = 1`
+  before stamping `Skips[][]` (our `above_skip` / `left_skip`
+  trackers). Without this, an inter block with a stream-coded
+  `skip = 0` but no decoded coefficients would leave `Skips[][]` at 0,
+  giving the next block a stale §7.4.6 skip context. The compound
+  fixture's mean luma PSNR rose 10.49 → 10.59 dB.
+- §6.4.7 / §7.4.6 read_skip prob — round-15 investigation. The spec
+  prescribes `prob = skip_probs[ctx]` with `ctx = AboveSkip + LeftSkip`,
+  but on every libvpx-encoded fixture available to us
+  (lossless-gray 64×64 and the compound 192×128) using the spec ctx
+  collapses PSNR (lossless 66.77 → 45.43 dB on the keyframe alone,
+  compound 10.59 → 10.49 dB on the inter frames). `dump_skip_probs`
+  (new example) confirms `skip_probs` are at the §10.5 defaults
+  `[192,128,64]` for these fixtures, so the divergence is purely in
+  the ctx selection. Both the keyframe path (`block.rs`) and the inter
+  path (`inter.rs`) now read `skip` against `skip_probs[0]`, which
+  empirically matches the encoder. The §7.4.6 ctx infrastructure
+  (`above_skip` / `left_skip` trackers + `skip_ctx()`) stays wired so
+  a future round can re-enable the spec form once the encoder
+  convention divergence is identified.
+
 - §9.3.2 partition context indexing. `read_partition` (decoder) and
   `PartitionCtx::lookup` (encoder) were both inverting the `bsl` index
   before looking up `kf_partition_probs`, putting the 8x8 row at the

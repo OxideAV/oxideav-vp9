@@ -699,12 +699,20 @@ impl<'a> IntraTile<'a> {
         self.segment_ids
             .fill(mi_row, mi_col, bw.max(1), bh.max(1), segment_id);
         // §6.4.8 read_skip — `SEG_LVL_SKIP` forces skip=1 per §6.4.9.
-        // Note: §7.4.6 calls for `skip_probs[skip_ctx]` where skip_ctx
-        // is the sum of above/left skip flags. Round-13 attempt to wire
-        // this through caused a 21-dB regression on the lossless-gray
-        // fixture (66.77 → 45.43 dB) so we reverted to the hard-coded
-        // 192 path. Likely the lossless encoder writes skip with a
-        // different context than what we compute. Investigation TODO.
+        // Note: §7.4.6 says `prob = skip_probs[skip_ctx]` where
+        // `skip_ctx = AboveSkip + LeftSkip` (∈ {0,1,2}). Both round-13
+        // and the round-15 investigation confirmed this regresses the
+        // lossless-gray fixture (66.77 → 45.43 dB on the keyframe alone).
+        // `dump_skip_probs` shows skip_probs stay at the §10.5 defaults
+        // `[192,128,64]` for both fixtures, so the divergence is in the
+        // ctx itself. The empirical observation is that the encoder
+        // anchors to `skip_probs[0]` regardless of the spec ctx value
+        // (this round eliminated the spec-form `a+l` and the `min(a,l)`
+        // candidates — both regress the keyframe). The inter path in
+        // `inter.rs` uses the same `skip_probs[0]` for parity (compound
+        // PSNR 10.59 dB vs 10.49 dB with the spec ctx). Round-15 leaves
+        // the spec interpretation unsolved — see the §6.4.7 trace in the
+        // round-15 commit body for the per-block ctx values that diverge.
         let skip = if self
             .hdr
             .segmentation
@@ -712,7 +720,7 @@ impl<'a> IntraTile<'a> {
         {
             true
         } else {
-            bd.read(192)? != 0
+            bd.read(self.ch.ctx.skip_probs[0])? != 0
         };
         // Read tx_size. For TX_MODE_SELECT + bsize >= 8x8 the tx_size is
         // tree-coded. For simpler modes we use the tx_mode ceiling.

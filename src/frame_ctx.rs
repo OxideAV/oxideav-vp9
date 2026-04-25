@@ -244,11 +244,12 @@ impl FrameContext {
     }
 }
 
-/// Inverse remap table (§6.3.5). The spec's `inv_map_table[MAX_PROB]`
-/// array maps the 8-bit encoded delta index back into the 1..=254
-/// probability range. Values 0 and 255 are reserved (they would mean
-/// "absolute zero" / "absolute max"), so the table has 254 entries.
-pub const INV_MAP_TABLE: [u8; 254] = [
+/// Inverse remap table (§6.3.5). The spec defines `inv_map_table[MAX_PROB]`
+/// with `MAX_PROB = 255`, i.e. 255 entries indexed 0..=254. The last
+/// two entries (253, 254) are both 253; clamping a delta of 254 to
+/// index 253 (value 253) is therefore identical to indexing 254
+/// directly. We carry all 255 entries to match the spec exactly.
+pub const INV_MAP_TABLE: [u8; 255] = [
     7, 20, 33, 46, 59, 72, 85, 98, 111, 124, 137, 150, 163, 176, 189, 202, 215, 228, 241, 254, 1,
     2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 24, 25, 26, 27, 28,
     29, 30, 31, 32, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 47, 48, 49, 50, 51, 52, 53, 54,
@@ -261,7 +262,7 @@ pub const INV_MAP_TABLE: [u8; 254] = [
     187, 188, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 203, 204, 205, 206, 207,
     208, 209, 210, 211, 212, 213, 214, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227,
     229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 242, 243, 244, 245, 246, 247, 248,
-    249, 250, 251, 252, 253,
+    249, 250, 251, 252, 253, 253,
 ];
 
 /// §6.3.4 `decode_term_subexp` — variable-length delta decode. Reads
@@ -309,7 +310,7 @@ fn inv_remap_prob(delta_prob: u32, prob: u8) -> u8 {
     if prob == 0 {
         return 0;
     }
-    let idx = (delta_prob as usize).min(253);
+    let idx = (delta_prob as usize).min(254);
     let v = INV_MAP_TABLE[idx] as u32;
     let m_minus = (prob as u32) - 1; // spec's `m--`.
     let out = if (m_minus << 1) <= 255 {

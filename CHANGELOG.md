@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- §9.2.1 marker bit was missing from `BoolDecoder::new()` and
+  `BoolEncoder::new()`. The spec requires that `init_bool` perform an
+  `f(8)` priming read followed by a §9.2.2 marker read which must be
+  zero. Without this read the entire compressed-header / tile bool
+  stream was misaligned by one symbol on every real (libvpx-encoded)
+  frame, which caused downstream coefficient / mode reads to drift.
+  Both decoder and encoder now consume / emit the marker bit at
+  `read_bool(128)`. Test fixtures decode with strictly correct prefix
+  symbols now (e.g. a lossless gray 64×64 keyframe emerges as
+  near-uniform luma instead of a DCT-AC-shaped gradient).
+- `INV_MAP_TABLE` (§6.3.5) now carries all 255 spec entries
+  (previously 254). The last two values are identical so the
+  truncation was harmless in practice; aligning with the spec also
+  lifts the `min(253)` clamp to `min(254)`.
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.5...v0.0.6) - 2026-04-25
 
 ### Other

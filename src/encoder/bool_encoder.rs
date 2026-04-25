@@ -48,14 +48,18 @@ impl Default for BoolEncoder {
 
 impl BoolEncoder {
     pub fn new() -> Self {
-        Self {
+        let mut s = Self {
             out: Vec::new(),
             held: None,
             ff_run: 0,
             low: 0,
             range: 255,
             count: -24,
-        }
+        };
+        // §9.2.1 marker bit — must be 0 to satisfy decoder
+        // conformance.
+        s.write(0, 128);
+        s
     }
 
     /// Write one symbol `b` (0 or 1) with `prob = P(b==0)`.

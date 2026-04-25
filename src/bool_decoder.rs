@@ -70,20 +70,37 @@ pub struct BoolDecoder<'a> {
 
 impl<'a> BoolDecoder<'a> {
     /// `init_bool( sz )` from VP9 §9.2.1. Loads the first byte of the
-    /// payload into `BoolValue` and sets `BoolRange` to 255. The §9.2.1
-    /// pseudocode does not consume a marker bit here — the VP8-era
-    /// marker bit check was dropped in VP9.
+    /// payload into `BoolValue`, sets `BoolRange` to 255, then reads a
+    /// marker syntax element via §9.2.2 with `p=128`. The spec
+    /// (§9.2.1) requires:
+    ///
+    /// > "The Boolean decoding process specified in section 9.2.2 is
+    /// > invoked to read a marker syntax element from the bitstream. It
+    /// > is a requirement of bitstream conformance that the value read
+    /// > is equal to 0."
+    ///
+    /// The probability is not given in the text but `p=128` (the
+    /// generic equiprobable case used by `read_literal`) is the
+    /// natural choice and matches what real libvpx-encoded streams
+    /// require. We do **not** enforce the conformance check on the
+    /// returned bit (some encoders may technically violate it).
+    ///
+    /// This marker read is essential: without it every downstream
+    /// boolean read is misaligned and the decoder collapses to noise.
     pub fn new(data: &'a [u8]) -> Result<Self> {
         if data.is_empty() {
             return Err(Error::invalid("vp9 bool decoder: empty payload"));
         }
         let mut pump = BitPump::new(data);
         let value = pump.read_bits(8)?;
-        Ok(Self {
+        let mut bd = Self {
             pump,
             range: 255,
             value,
-        })
+        };
+        // §9.2.1 marker bit — must be 0 per conformance.
+        let _ = bd.read(128)?;
+        Ok(bd)
     }
 
     /// `boolean( p )` — VP9 §9.2.2. Returns the decoded bit (0 or 1) for
@@ -152,9 +169,10 @@ mod tests {
 
     #[test]
     fn init_accepts_any_payload() {
-        // Init only reads f(8) into BoolValue. Unlike VP8, VP9 §9.2.1
-        // does not consume a marker bit, so any non-empty payload is
-        // valid — including ones whose 9th bit is 1.
+        // Init reads f(8) into BoolValue then performs a §9.2.2
+        // marker read at p=128. We don't enforce the conformance
+        // requirement that the marker is zero, so even payloads where
+        // the marker resolves to 1 still construct successfully.
         assert!(BoolDecoder::new(&[0xAB, 0x00, 0xCD]).is_ok());
         assert!(BoolDecoder::new(&[0xAB, 0xFF, 0xCD]).is_ok());
         assert!(BoolDecoder::new(&[]).is_err());

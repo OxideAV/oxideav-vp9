@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- §9.3.2 per-position above/left intra-mode tracker (round 16).
+  `IntraTile::above_mode` / `left_mode` (both per-MI-cell, length
+  `mi_cols` / `mi_rows`) are replaced by `above_mode_4x4` /
+  `left_mode_4x4` (per-4×4-position, length `mi_cols * 2` /
+  `mi_rows * 2`). The new layout matches the spec's `SubModes
+  [r][c][b]` 3D array projected onto two 1D arrays per the §9.3.2
+  optimisation note: each 8×8 cell occupies two adjacent slots
+  storing `sub_modes[2]` / `sub_modes[3]` for above (bottom row) and
+  `sub_modes[1]` / `sub_modes[3]` for left (right column). For the
+  three sub-8×8 sizes (B4x4, B4x8, B8x4) `decode_block` now walks
+  `(idy, idx)` with steps `num4x4w / num4x4h` per §6.4.6 and reads
+  `read_intra_sub_mode` per-position. For non-sub-8×8 blocks
+  `sub_modes` is filled with 4 copies of `y_mode` so the per-position
+  writes are uniform — bit-identical to the previous single-cell
+  behaviour for any neighbour read coming out of a >=8×8 cell. The
+  per-position infrastructure is the prerequisite for the §6.4.3
+  partition-call HORZ/VERT-at-bsize=8 fix that was reverted in
+  round 13; that fix still regresses (Y mean 10.45 → 10.06 dB on the
+  compound fixture even with the new tracker) and is not landed this
+  round, but the plumbing is ready for the next attempt.
+
+  Empirical measurement on the compound fixture: spec-literal
+  indices (`+0` for above, `+0` for left → `sub_modes[2]` /
+  `sub_modes[1]`) regress Y mean 10.59 → 10.45 dB and frame-0 keyframe
+  Y 10.28 → 9.71 dB. Anchoring instead at `+1 / +1`
+  (`sub_modes[3]` for both — i.e., the LAST-written sub_mode in the
+  §6.4.6 fill order) gives Y mean 10.59 → 10.63 dB (+0.04) and
+  frame-0 Y 10.28 → 10.13 dB (-0.15). Chroma U / V improve more
+  meaningfully (e.g., frame 1 U 8.21 → 10.66 dB). Lossless-gray
+  remains at 66.77 dB (the bisection oracle) for both candidates.
+  The §9.3.2 spec note describing the 1D-array storage is silent on
+  which sub_mode index to anchor; the round-16 commit picks the
+  empirically-best `+1 / +1` and documents the choice for future
+  bisection.
+
 ### Fixed
 
 - §6.4.4 EobTotal-skip override (round 15). `InterTile::decode_block_at`

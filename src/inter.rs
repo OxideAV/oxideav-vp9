@@ -252,6 +252,20 @@ enum Partition {
     Split,
 }
 
+/// §6.4.11 neighbour-frame snapshot — feeds the §9.3.2 ref / comp-mode
+/// context derivations. Mirrors the spec's variables 1:1.
+#[derive(Clone, Copy, Debug)]
+struct NeighbourInfo {
+    avail_u: bool,
+    avail_l: bool,
+    above_ref: [u8; 2], // [0]=primary, [1]=second (NONE_FRAME if none)
+    left_ref: [u8; 2],
+    above_intra: bool,
+    left_intra: bool,
+    above_single: bool,
+    left_single: bool,
+}
+
 impl<'a> InterTile<'a> {
     pub fn new(
         hdr: &'a UncompressedHeader,
@@ -362,6 +376,363 @@ impl<'a> InterTile<'a> {
             2 * (intra as usize)
         } else {
             0
+        }
+    }
+
+    /// §6.4.11 NeighbourInfo — shrink-wrap of the spec's `LeftRefFrame /
+    /// AboveRefFrame / Left{Above}{Intra,Single}` quartet. All four
+    /// §9.3.2 inter-ref contexts (`comp_mode`, `comp_ref`,
+    /// `single_ref_p1/p2`) take this shape as input.
+    fn neighbour_info(&self, mi_row: usize, mi_col: usize) -> NeighbourInfo {
+        let avail_u = mi_row > 0;
+        let avail_l = mi_col > 0;
+        // §6.4.11: AvailL/AvailU defaults are (INTRA_FRAME, NONE).
+        let above = if avail_u {
+            let cell = self.mv_grid.get(mi_row - 1, mi_col);
+            // Map our NONE_FRAME(255) sentinel to spec NONE(0) for the
+            // `<= NONE` style comparisons in §9.3.2 — we mirror the spec
+            // by keeping a separate `single` flag instead.
+            (cell.ref_frame[0], cell.ref_frame[1])
+        } else {
+            (INTRA_FRAME, NONE_FRAME)
+        };
+        let left = if avail_l {
+            let cell = self.mv_grid.get(mi_row, mi_col - 1);
+            (cell.ref_frame[0], cell.ref_frame[1])
+        } else {
+            (INTRA_FRAME, NONE_FRAME)
+        };
+        // §6.4.11: LeftIntra = LeftRefFrame[0] <= INTRA_FRAME
+        //          LeftSingle = LeftRefFrame[1] <= NONE
+        // INTRA_FRAME=0 in both spec and our crate; NONE=0 in spec but
+        // 255 in our crate => "single" iff our slot[1] is NONE_FRAME or
+        // INTRA_FRAME. We use NONE_FRAME for both intra blocks (slot 1)
+        // and single-ref inter blocks, so this collapses to "slot[1] is
+        // not a real inter ref code 1..=3".
+        let above_intra = above.0 == INTRA_FRAME;
+        let left_intra = left.0 == INTRA_FRAME;
+        let above_single = above.1 == NONE_FRAME || above.1 == INTRA_FRAME;
+        let left_single = left.1 == NONE_FRAME || left.1 == INTRA_FRAME;
+        NeighbourInfo {
+            avail_u,
+            avail_l,
+            above_ref: [above.0, above.1],
+            left_ref: [left.0, left.1],
+            above_intra,
+            left_intra,
+            above_single,
+            left_single,
+        }
+    }
+
+    /// §9.3.2 comp_mode ctx — neighbour-aware reference-mode prior.
+    fn comp_mode_ctx(n: &NeighbourInfo, comp_fixed_ref: u8) -> usize {
+        let cfr = comp_fixed_ref;
+        if n.avail_u && n.avail_l {
+            if n.above_single && n.left_single {
+                ((n.above_ref[0] == cfr) as usize) ^ ((n.left_ref[0] == cfr) as usize)
+            } else if n.above_single {
+                2 + ((n.above_ref[0] == cfr || n.above_intra) as usize)
+            } else if n.left_single {
+                2 + ((n.left_ref[0] == cfr || n.left_intra) as usize)
+            } else {
+                4
+            }
+        } else if n.avail_u {
+            if n.above_single {
+                (n.above_ref[0] == cfr) as usize
+            } else {
+                3
+            }
+        } else if n.avail_l {
+            if n.left_single {
+                (n.left_ref[0] == cfr) as usize
+            } else {
+                3
+            }
+        } else {
+            1
+        }
+    }
+
+    /// §9.3.2 comp_ref ctx — picks the variable side of compound refs.
+    fn comp_ref_ctx(
+        n: &NeighbourInfo,
+        sign_bias: &[bool; 4],
+        comp_fixed_ref: u8,
+        comp_var_ref: [u8; 2],
+    ) -> usize {
+        let fix_ref_idx = sign_bias[comp_fixed_ref as usize] as usize;
+        let var_ref_idx = 1 - fix_ref_idx;
+        let cvr1 = comp_var_ref[1];
+        if n.avail_u && n.avail_l {
+            if n.above_intra && n.left_intra {
+                2
+            } else if n.left_intra {
+                if n.above_single {
+                    1 + 2 * ((n.above_ref[0] != cvr1) as usize)
+                } else {
+                    1 + 2 * ((n.above_ref[var_ref_idx] != cvr1) as usize)
+                }
+            } else if n.above_intra {
+                if n.left_single {
+                    1 + 2 * ((n.left_ref[0] != cvr1) as usize)
+                } else {
+                    1 + 2 * ((n.left_ref[var_ref_idx] != cvr1) as usize)
+                }
+            } else {
+                let vrfa = if n.above_single {
+                    n.above_ref[0]
+                } else {
+                    n.above_ref[var_ref_idx]
+                };
+                let vrfl = if n.left_single {
+                    n.left_ref[0]
+                } else {
+                    n.left_ref[var_ref_idx]
+                };
+                if vrfa == vrfl && cvr1 == vrfa {
+                    0
+                } else if n.left_single && n.above_single {
+                    let cvr0 = comp_var_ref[0];
+                    if (vrfa == comp_fixed_ref && vrfl == cvr0)
+                        || (vrfl == comp_fixed_ref && vrfa == cvr0)
+                    {
+                        4
+                    } else if vrfa == vrfl {
+                        3
+                    } else {
+                        1
+                    }
+                } else if n.left_single || n.above_single {
+                    let vrfc = if n.left_single { vrfa } else { vrfl };
+                    let rfs = if n.above_single { vrfa } else { vrfl };
+                    if vrfc == cvr1 && rfs != cvr1 {
+                        1
+                    } else if rfs == cvr1 && vrfc != cvr1 {
+                        2
+                    } else {
+                        4
+                    }
+                } else if vrfa == vrfl {
+                    4
+                } else {
+                    2
+                }
+            }
+        } else if n.avail_u {
+            if n.above_intra {
+                2
+            } else if n.above_single {
+                3 * ((n.above_ref[0] != cvr1) as usize)
+            } else {
+                4 * ((n.above_ref[var_ref_idx] != cvr1) as usize)
+            }
+        } else if n.avail_l {
+            if n.left_intra {
+                2
+            } else if n.left_single {
+                3 * ((n.left_ref[0] != cvr1) as usize)
+            } else {
+                4 * ((n.left_ref[var_ref_idx] != cvr1) as usize)
+            }
+        } else {
+            2
+        }
+    }
+
+    /// §9.3.2 single_ref_p1 ctx — first bit of the single-ref tree.
+    fn single_ref_p1_ctx(n: &NeighbourInfo) -> usize {
+        const LAST: u8 = 1;
+        if n.avail_u && n.avail_l {
+            if n.above_intra && n.left_intra {
+                2
+            } else if n.left_intra {
+                if n.above_single {
+                    4 * ((n.above_ref[0] == LAST) as usize)
+                } else {
+                    1 + ((n.above_ref[0] == LAST || n.above_ref[1] == LAST) as usize)
+                }
+            } else if n.above_intra {
+                if n.left_single {
+                    4 * ((n.left_ref[0] == LAST) as usize)
+                } else {
+                    1 + ((n.left_ref[0] == LAST || n.left_ref[1] == LAST) as usize)
+                }
+            } else if n.above_single && n.left_single {
+                2 * ((n.above_ref[0] == LAST) as usize) + 2 * ((n.left_ref[0] == LAST) as usize)
+            } else if !n.above_single && !n.left_single {
+                1 + ((n.above_ref[0] == LAST
+                    || n.above_ref[1] == LAST
+                    || n.left_ref[0] == LAST
+                    || n.left_ref[1] == LAST) as usize)
+            } else {
+                let rfs = if n.above_single {
+                    n.above_ref[0]
+                } else {
+                    n.left_ref[0]
+                };
+                let crf1 = if n.above_single {
+                    n.left_ref[0]
+                } else {
+                    n.above_ref[0]
+                };
+                let crf2 = if n.above_single {
+                    n.left_ref[1]
+                } else {
+                    n.above_ref[1]
+                };
+                if rfs == LAST {
+                    3 + ((crf1 == LAST || crf2 == LAST) as usize)
+                } else {
+                    (crf1 == LAST || crf2 == LAST) as usize
+                }
+            }
+        } else if n.avail_u {
+            if n.above_intra {
+                2
+            } else if n.above_single {
+                4 * ((n.above_ref[0] == LAST) as usize)
+            } else {
+                1 + ((n.above_ref[0] == LAST || n.above_ref[1] == LAST) as usize)
+            }
+        } else if n.avail_l {
+            if n.left_intra {
+                2
+            } else if n.left_single {
+                4 * ((n.left_ref[0] == LAST) as usize)
+            } else {
+                1 + ((n.left_ref[0] == LAST || n.left_ref[1] == LAST) as usize)
+            }
+        } else {
+            2
+        }
+    }
+
+    /// §9.3.2 single_ref_p2 ctx — second bit of the single-ref tree
+    /// (only read when single_ref_p1=1).
+    fn single_ref_p2_ctx(n: &NeighbourInfo) -> usize {
+        const LAST: u8 = 1;
+        const GOLDEN: u8 = 2;
+        const ALTREF: u8 = 3;
+        if n.avail_u && n.avail_l {
+            if n.above_intra && n.left_intra {
+                2
+            } else if n.left_intra {
+                if n.above_single {
+                    if n.above_ref[0] == LAST {
+                        3
+                    } else {
+                        4 * ((n.above_ref[0] == GOLDEN) as usize)
+                    }
+                } else {
+                    1 + 2 * ((n.above_ref[0] == GOLDEN || n.above_ref[1] == GOLDEN) as usize)
+                }
+            } else if n.above_intra {
+                if n.left_single {
+                    if n.left_ref[0] == LAST {
+                        3
+                    } else {
+                        4 * ((n.left_ref[0] == GOLDEN) as usize)
+                    }
+                } else {
+                    1 + 2 * ((n.left_ref[0] == GOLDEN || n.left_ref[1] == GOLDEN) as usize)
+                }
+            } else if n.above_single && n.left_single {
+                if n.above_ref[0] == LAST && n.left_ref[0] == LAST {
+                    3
+                } else if n.above_ref[0] == LAST {
+                    4 * ((n.left_ref[0] == GOLDEN) as usize)
+                } else if n.left_ref[0] == LAST {
+                    4 * ((n.above_ref[0] == GOLDEN) as usize)
+                } else {
+                    2 * ((n.above_ref[0] == GOLDEN) as usize)
+                        + 2 * ((n.left_ref[0] == GOLDEN) as usize)
+                }
+            } else if !n.above_single && !n.left_single {
+                if n.above_ref[0] == n.left_ref[0] && n.above_ref[1] == n.left_ref[1] {
+                    3 * ((n.above_ref[0] == GOLDEN || n.above_ref[1] == GOLDEN) as usize)
+                } else {
+                    2
+                }
+            } else {
+                let rfs = if n.above_single {
+                    n.above_ref[0]
+                } else {
+                    n.left_ref[0]
+                };
+                let crf1 = if n.above_single {
+                    n.left_ref[0]
+                } else {
+                    n.above_ref[0]
+                };
+                let crf2 = if n.above_single {
+                    n.left_ref[1]
+                } else {
+                    n.above_ref[1]
+                };
+                if rfs == GOLDEN {
+                    3 + ((crf1 == GOLDEN || crf2 == GOLDEN) as usize)
+                } else if rfs == ALTREF {
+                    (crf1 == GOLDEN || crf2 == GOLDEN) as usize
+                } else {
+                    1 + 2 * ((crf1 == GOLDEN || crf2 == GOLDEN) as usize)
+                }
+            }
+        } else if n.avail_u {
+            if n.above_intra || (n.above_ref[0] == LAST && n.above_single) {
+                2
+            } else if n.above_single {
+                4 * ((n.above_ref[0] == GOLDEN) as usize)
+            } else {
+                3 * ((n.above_ref[0] == GOLDEN || n.above_ref[1] == GOLDEN) as usize)
+            }
+        } else if n.avail_l {
+            if n.left_intra || (n.left_ref[0] == LAST && n.left_single) {
+                2
+            } else if n.left_single {
+                4 * ((n.left_ref[0] == GOLDEN) as usize)
+            } else {
+                3 * ((n.left_ref[0] == GOLDEN || n.left_ref[1] == GOLDEN) as usize)
+            }
+        } else {
+            2
+        }
+    }
+
+    /// §9.3.2 interp_filter ctx — sentinel `3` means "not an inter
+    /// neighbour / unavailable".
+    fn interp_filter_ctx(&self, mi_row: usize, mi_col: usize) -> usize {
+        let avail_u = mi_row > 0;
+        let avail_l = mi_col > 0;
+        let above_interp = if avail_u {
+            let c = self.mv_grid.get(mi_row - 1, mi_col);
+            if c.ref_frame[0] > INTRA_FRAME {
+                c.interp_filter
+            } else {
+                3
+            }
+        } else {
+            3
+        };
+        let left_interp = if avail_l {
+            let c = self.mv_grid.get(mi_row, mi_col - 1);
+            if c.ref_frame[0] > INTRA_FRAME {
+                c.interp_filter
+            } else {
+                3
+            }
+        } else {
+            3
+        };
+        if left_interp == above_interp {
+            left_interp as usize
+        } else if left_interp == 3 && above_interp != 3 {
+            above_interp as usize
+        } else if left_interp != 3 && above_interp == 3 {
+            left_interp as usize
+        } else {
+            3
         }
     }
 
@@ -741,32 +1112,44 @@ impl<'a> InterTile<'a> {
             .ch
             .reference_mode
             .unwrap_or(ReferenceMode::SingleReference);
-        // §6.4.17 / §9.3.2: comp_mode, single_ref, comp_ref contexts are
-        // neighbour-aware (5 contexts each). Not yet tracked — use
-        // context 0 for now but pull probs from the per-frame table so
-        // the §6.3.13 deltas have an effect.
+        // §6.4.11 / §9.3.2: snapshot the neighbour ref_frame state once;
+        // every comp_mode / comp_ref / single_ref ctx is computed off it.
+        let mi_row_ctx = (row as usize) / 8;
+        let mi_col_ctx = (col as usize) / 8;
+        let nbr = self.neighbour_info(mi_row_ctx, mi_col_ctx);
+        let comp_refs = CompRefs::from_sign_bias(&self.hdr.ref_frame_sign_bias);
         let is_compound = match frame_ref_mode {
             ReferenceMode::SingleReference => false,
             ReferenceMode::CompoundReference => true,
-            ReferenceMode::ReferenceModeSelect => bd.read(self.ch.ctx.comp_mode_prob[0])? != 0,
+            ReferenceMode::ReferenceModeSelect => {
+                let ctx = Self::comp_mode_ctx(&nbr, comp_refs.fixed);
+                bd.read(self.ch.ctx.comp_mode_prob[ctx])? != 0
+            }
         };
 
         // ref_frame_codes[0], ref_frame_codes[1] — LAST=1, GOLDEN=2, ALTREF=3.
         // ref_frame_codes[1] is 0 (NONE) when single.
         let (ref_code_a, ref_code_b) = if is_compound {
-            let comp_refs = CompRefs::from_sign_bias(&self.hdr.ref_frame_sign_bias);
-            let comp_ref_bit = bd.read(self.ch.ctx.comp_ref_prob[0])? as usize;
+            let ctx = Self::comp_ref_ctx(
+                &nbr,
+                &self.hdr.ref_frame_sign_bias,
+                comp_refs.fixed,
+                comp_refs.var,
+            );
+            let comp_ref_bit = bd.read(self.ch.ctx.comp_ref_prob[ctx])? as usize;
             let idx = self.hdr.ref_frame_sign_bias[comp_refs.fixed as usize] as usize;
             let mut refs = [0u8; 2];
             refs[idx] = comp_refs.fixed;
             refs[idx ^ 1] = comp_refs.var[comp_ref_bit];
             (refs[0], refs[1])
         } else {
-            let first = bd.read(self.ch.ctx.single_ref_prob[0][0])?;
+            let p1_ctx = Self::single_ref_p1_ctx(&nbr);
+            let first = bd.read(self.ch.ctx.single_ref_prob[p1_ctx][0])?;
             let code = if first == 0 {
                 1u8 // LAST
             } else {
-                let second = bd.read(self.ch.ctx.single_ref_prob[0][1])?;
+                let p2_ctx = Self::single_ref_p2_ctx(&nbr);
+                let second = bd.read(self.ch.ctx.single_ref_prob[p2_ctx][1])?;
                 if second == 0 {
                     2u8 // GOLDEN
                 } else {
@@ -843,14 +1226,14 @@ impl<'a> InterTile<'a> {
             },
         );
 
-        // Interpolation filter (optionally switchable). §9.3.2 derives
-        // the 4-context id from above / left; we don't track that yet,
-        // so use context 0 — but still source probs from the per-frame
-        // table so the §6.3.10 deltas matter.
+        // Interpolation filter (optionally switchable). §9.3.2 ctx
+        // derived from neighbour interp filters with sentinel 3 for
+        // "intra / unavailable" — see `interp_filter_ctx`.
         let filter = if let Some(f) = self.default_filter {
             f
         } else {
-            read_switchable_filter(bd, self.ch.ctx.interp_filter_probs[0])?
+            let ctx = self.interp_filter_ctx(mi_row_ctx, mi_col_ctx);
+            read_switchable_filter(bd, self.ch.ctx.interp_filter_probs[ctx])?
         };
 
         // §6.4.18 assign_mv.
@@ -882,6 +1265,15 @@ impl<'a> InterTile<'a> {
             InterMode::Nearmv => crate::mvref::Y_MODE_NEARMV,
             InterMode::Zeromv => crate::mvref::Y_MODE_ZEROMV,
             InterMode::Newmv => crate::mvref::Y_MODE_NEWMV,
+        };
+        // §9.3.2 InterpFilters[r][c] — needed by later neighbours'
+        // interp_filter_ctx. Map to 0/1/2 (sentinel 3 reserved for
+        // intra / unavailable — set by InterMiCell::default()).
+        cell.interp_filter = match filter {
+            InterpFilter::EightTap => 0,
+            InterpFilter::EightTapSmooth => 1,
+            InterpFilter::EightTapSharp => 2,
+            InterpFilter::Bilinear => 3,
         };
         self.mv_grid.fill(
             mi_row_units,
@@ -1939,5 +2331,93 @@ mod tests {
         average_into(&mut a, &b);
         // Round2(a + b, 1) = (a + b + 1) >> 1.
         assert_eq!(a, [15, 21, 30, 41]);
+    }
+
+    fn ni(avail_u: bool, avail_l: bool, above_ref: [u8; 2], left_ref: [u8; 2]) -> NeighbourInfo {
+        let above_intra = above_ref[0] == INTRA_FRAME;
+        let left_intra = left_ref[0] == INTRA_FRAME;
+        let above_single = above_ref[1] == NONE_FRAME || above_ref[1] == INTRA_FRAME;
+        let left_single = left_ref[1] == NONE_FRAME || left_ref[1] == INTRA_FRAME;
+        NeighbourInfo {
+            avail_u,
+            avail_l,
+            above_ref,
+            left_ref,
+            above_intra,
+            left_intra,
+            above_single,
+            left_single,
+        }
+    }
+
+    #[test]
+    fn comp_mode_ctx_no_neighbours_is_one() {
+        // §9.3.2 comp_mode: !AvailU && !AvailL → ctx = 1.
+        let n = ni(false, false, [0, 255], [0, 255]);
+        assert_eq!(InterTile::comp_mode_ctx(&n, 3), 1);
+    }
+
+    #[test]
+    fn comp_mode_ctx_both_single_xor() {
+        // Both single, neither is CompFixedRef → 0 ^ 0 = 0.
+        let n = ni(true, true, [1, 255], [2, 255]);
+        assert_eq!(InterTile::comp_mode_ctx(&n, 3), 0);
+        // Both single, both are CompFixedRef → 1 ^ 1 = 0.
+        let n = ni(true, true, [3, 255], [3, 255]);
+        assert_eq!(InterTile::comp_mode_ctx(&n, 3), 0);
+        // One match, one not → 1 ^ 0 = 1.
+        let n = ni(true, true, [3, 255], [1, 255]);
+        assert_eq!(InterTile::comp_mode_ctx(&n, 3), 1);
+    }
+
+    #[test]
+    fn comp_mode_ctx_both_compound_is_four() {
+        // Both compound (slot[1] non-NONE inter ref) → ctx = 4.
+        let n = ni(true, true, [1, 3], [2, 3]);
+        assert_eq!(InterTile::comp_mode_ctx(&n, 3), 4);
+    }
+
+    #[test]
+    fn single_ref_p1_ctx_no_neighbours_is_two() {
+        let n = ni(false, false, [0, 255], [0, 255]);
+        assert_eq!(InterTile::single_ref_p1_ctx(&n), 2);
+    }
+
+    #[test]
+    fn single_ref_p1_ctx_both_intra_is_two() {
+        let n = ni(true, true, [0, 255], [0, 255]);
+        assert_eq!(InterTile::single_ref_p1_ctx(&n), 2);
+    }
+
+    #[test]
+    fn single_ref_p1_ctx_both_single_last() {
+        // Both single, both LAST → 2*1 + 2*1 = 4.
+        let n = ni(true, true, [1, 255], [1, 255]);
+        assert_eq!(InterTile::single_ref_p1_ctx(&n), 4);
+    }
+
+    #[test]
+    fn single_ref_p2_ctx_no_neighbours_is_two() {
+        let n = ni(false, false, [0, 255], [0, 255]);
+        assert_eq!(InterTile::single_ref_p2_ctx(&n), 2);
+    }
+
+    #[test]
+    fn single_ref_p2_ctx_both_single_last_is_three() {
+        // Both single, both LAST → ctx = 3.
+        let n = ni(true, true, [1, 255], [1, 255]);
+        assert_eq!(InterTile::single_ref_p2_ctx(&n), 3);
+    }
+
+    #[test]
+    fn comp_ref_ctx_no_neighbours_is_two() {
+        let n = ni(false, false, [0, 255], [0, 255]);
+        assert_eq!(InterTile::comp_ref_ctx(&n, &[false; 4], 3, [1, 2]), 2);
+    }
+
+    #[test]
+    fn comp_ref_ctx_both_intra_is_two() {
+        let n = ni(true, true, [0, 255], [0, 255]);
+        assert_eq!(InterTile::comp_ref_ctx(&n, &[false; 4], 3, [1, 2]), 2);
     }
 }

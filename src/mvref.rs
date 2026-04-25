@@ -127,6 +127,11 @@ pub struct InterMiCell {
     /// `BOTH_INTRA`, the safe default at frame / tile edges where no
     /// neighbour information is available.
     pub y_mode: u8,
+    /// §9.3.2 `InterpFilters[r][c]` — interpolation filter id used by
+    /// this block (0=EightTap, 1=EightTapSmooth, 2=EightTapSharp).
+    /// Sentinel `3` means "intra / unavailable", matching the spec
+    /// convention used in the `interp_filter` ctx derivation.
+    pub interp_filter: u8,
 }
 
 impl Default for InterMiCell {
@@ -134,7 +139,8 @@ impl Default for InterMiCell {
         Self {
             ref_frame: [INTRA_FRAME, NONE_FRAME],
             mv: [Mv::ZERO, Mv::ZERO],
-            y_mode: 0, // DC_PRED — intra sentinel
+            y_mode: 0,        // DC_PRED — intra sentinel
+            interp_filter: 3, // §9.3.2 sentinel "no filter / intra"
         }
     }
 }
@@ -773,6 +779,7 @@ mod tests {
                 ref_frame: [1, NONE_FRAME],
                 mv: [mv, Mv::ZERO],
                 y_mode: Y_MODE_NEWMV,
+                interp_filter: 0,
             },
         );
         let sb: RefSignBias = [false; 4];
@@ -796,6 +803,7 @@ mod tests {
                 ref_frame: [1, NONE_FRAME],
                 mv: [mv, Mv::ZERO],
                 y_mode: Y_MODE_NEWMV,
+                interp_filter: 0,
             },
         );
         grid.fill(
@@ -807,6 +815,7 @@ mod tests {
                 ref_frame: [1, NONE_FRAME],
                 mv: [mv, Mv::ZERO],
                 y_mode: Y_MODE_NEWMV,
+                interp_filter: 0,
             },
         );
         let sb: RefSignBias = [false; 4];
@@ -827,6 +836,7 @@ mod tests {
                 ref_frame: [2, NONE_FRAME],
                 mv: [Mv::new(20, -10), Mv::ZERO],
                 y_mode: Y_MODE_NEWMV,
+                interp_filter: 0,
             },
         );
         let mut sb: RefSignBias = [false; 4];
@@ -869,6 +879,7 @@ mod tests {
                 ref_frame: [1, NONE_FRAME],
                 mv: [Mv::new(10_000, 10_000), Mv::ZERO],
                 y_mode: Y_MODE_NEWMV,
+                interp_filter: 0,
             },
         );
         let sb: RefSignBias = [false; 4];

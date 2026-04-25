@@ -29,6 +29,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut dec = make_decoder(&params)?;
 
     let mut frame_idx = 0usize;
+    let mut psnr_sum = 0.0f64;
+    let mut psnr_n = 0usize;
+    let ref_yuv_data = std::env::args().nth(2).and_then(|p| std::fs::read(p).ok());
+    let w = hdr.width as usize;
+    let h_ = hdr.height as usize;
+    let y_sz = w * h_;
+    let uv_sz = (w / 2) * (h_ / 2);
+    let fs = y_sz + 2 * uv_sz;
     for f in ivf::iter_frames(&buf)? {
         let f = f?;
         let pkt = Packet::new(0, TimeBase::new(1, 24), f.payload.to_vec());
@@ -38,16 +46,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(Frame::Video(v)) => {
                     let y = &v.planes[0].data;
                     let (m, s, lo, hi) = stats(y);
-                    eprintln!("frame {frame_idx}: Y mean={m:.1} std={s:.2} min={lo} max={hi}");
-                    // Dump a small slice of the top-left pixels
-                    let st = v.planes[0].stride;
-                    eprintln!("  top-left 8x8 luma:");
-                    for r in 0..8.min(v.height as usize) {
-                        eprint!("    ");
-                        for c in 0..8.min(v.width as usize) {
-                            eprint!("{:3} ", y[r * st + c]);
+                    if let Some(rd) = &ref_yuv_data {
+                        let off = frame_idx * fs;
+                        if off + y_sz <= rd.len() {
+                            let st = v.planes[0].stride;
+                            let mut sse: u64 = 0;
+                            for r in 0..h_ {
+                                for c in 0..w {
+                                    let a = y[r * st + c] as i32;
+                                    let b = rd[off + r * w + c] as i32;
+                                    sse += ((a - b) * (a - b)) as u64;
+                                }
+                            }
+                            let psnr = if sse == 0 {
+                                f64::INFINITY
+                            } else {
+                                let mse = sse as f64 / y_sz as f64;
+                                10.0 * (255.0 * 255.0 / mse).log10()
+                            };
+                            eprintln!(
+                                "frame {frame_idx}: Y mean={m:.1} std={s:.2} min={lo} max={hi} PSNR={psnr:.2}"
+                            );
+                            if psnr.is_finite() {
+                                psnr_sum += psnr;
+                                psnr_n += 1;
+                            }
+                        } else {
+                            eprintln!(
+                                "frame {frame_idx}: Y mean={m:.1} std={s:.2} min={lo} max={hi}"
+                            );
                         }
-                        eprintln!();
+                    } else {
+                        eprintln!("frame {frame_idx}: Y mean={m:.1} std={s:.2} min={lo} max={hi}");
                     }
                     frame_idx += 1;
                 }
@@ -61,26 +91,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if let Some(yuv_path) = std::env::args().nth(2) {
-        let yuv = std::fs::read(&yuv_path)?;
-        let y_sz = (hdr.width as usize) * (hdr.height as usize);
-        eprintln!("\n=== reference YUV ===");
-        let n_frames = yuv.len() / (y_sz * 3 / 2);
-        eprintln!("frames: {n_frames}");
-        for i in 0..n_frames {
-            let off = i * (y_sz * 3 / 2);
-            let y = &yuv[off..off + y_sz];
-            let (m, s, lo, hi) = stats(y);
-            eprintln!("ref frame {i}: Y mean={m:.1} std={s:.2} min={lo} max={hi}");
-            eprintln!("  top-left 8x8 luma:");
-            for r in 0..8 {
-                eprint!("    ");
-                for c in 0..8 {
-                    eprint!("{:3} ", y[r * (hdr.width as usize) + c]);
-                }
-                eprintln!();
-            }
-        }
+    if psnr_n > 0 {
+        eprintln!(
+            "mean luma PSNR over {psnr_n} frames: {:.2} dB",
+            psnr_sum / psnr_n as f64
+        );
     }
 
     Ok(())

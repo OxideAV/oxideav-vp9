@@ -500,14 +500,15 @@ impl<'a> IntraTile<'a> {
             }
             Partition::Split => {
                 if bsize == 8 {
-                    // At 8×8, SPLIT means 4×4 leaves.
-                    for (dr, dc) in [(0, 0), (0, 4), (4, 0), (4, 4)] {
-                        let r = row + dr;
-                        let c = col + dc;
-                        if r < self.height as u32 && c < self.width as u32 {
-                            self.decode_block(bd, r, c, BlockSize::B4x4)?;
-                        }
-                    }
+                    // §6.4.3: SPLIT at BLOCK_8X8 → subsize=BLOCK_4X4 which
+                    // satisfies `subsize < BLOCK_8X8`, so the spec calls
+                    // `decode_block(r, c, subsize)` ONCE — not 4 times.
+                    // §6.4.6 intra_frame_mode_info handles the 4 sub-modes
+                    // internally when MiSize<BLOCK_8X8. Calling
+                    // decode_block 4 times here used to read 16 modes
+                    // (4 per call × 4 calls) and skip chroma — major
+                    // bitstream-drift bug uncovered round 13.
+                    self.decode_block(bd, row, col, BlockSize::B4x4)?;
                     self.update_partition_ctx(mi_row, mi_col, bsize, half, half);
                 } else {
                     for (dr, dc) in [(0, 0), (0, half), (half, 0), (half, half)] {
@@ -558,14 +559,44 @@ impl<'a> IntraTile<'a> {
         }
         let above_bit = ((above >> boffset) & 1) as usize;
         let left_bit = ((left >> boffset) & 1) as usize;
-        // §9.3.2 partition: ctx = bsl * 4 + left * 2 + above. The
-        // kf_partition_probs table at §10.4 is ordered small-block first
-        // (8x8→4x4 at index 0..3, 64x64→32x32 at index 12..15), matching
-        // the bsl=0..3 (8x8..64x64) indexing here. (An earlier round
-        // inverted this, which happened to align with one fixture but
-        // misaligns the bool decoder for libvpx-encoded streams.)
         let ctx = bsl * 4 + left_bit * 2 + above_bit;
         let probs = KF_PARTITION_PROBS[ctx];
+        // §6.4.3 / §9.3.1 partition tree selection:
+        //   hasRows = (r + halfBlock8x8) < MiRows
+        //   hasCols = (c + halfBlock8x8) < MiCols
+        //   both    -> partition_tree (NONE/HORZ/VERT/SPLIT)
+        //   cols    -> cols_partition_tree (HORZ vs SPLIT, prob = probs[1])
+        //   rows    -> rows_partition_tree (VERT vs SPLIT, prob = probs[2])
+        //   neither -> SPLIT (no read)
+        let mi_rows = (self.height + 7) / 8;
+        let mi_cols = (self.width + 7) / 8;
+        let half_block8x8 = num8x8 / 2;
+        let has_rows = mi_row + half_block8x8 < mi_rows;
+        let has_cols = mi_col + half_block8x8 < mi_cols;
+        if !has_rows && !has_cols {
+            return Ok(Partition::Split);
+        }
+        if !has_rows {
+            // cols_partition_tree[2] = { -PARTITION_HORZ, -PARTITION_SPLIT }
+            // §9.3.2 selects probs[1] for the single split.
+            let b = bd.read(probs[1])?;
+            return Ok(if b == 0 {
+                Partition::Horz
+            } else {
+                Partition::Split
+            });
+        }
+        if !has_cols {
+            // rows_partition_tree[2] = { -PARTITION_VERT, -PARTITION_SPLIT }
+            let b = bd.read(probs[2])?;
+            return Ok(if b == 0 {
+                Partition::Vert
+            } else {
+                Partition::Split
+            });
+        }
+        // Full partition_tree (3 probs). bsize==8 special-case kept for
+        // clarity but the libvpx tree-walk path produces the same answer.
         if bsize == 8 {
             let b0 = bd.read(probs[0])?;
             if b0 == 0 {
@@ -598,6 +629,10 @@ impl<'a> IntraTile<'a> {
     /// inverse of `mi_width_log2_lookup`). Fill bytes are built so that
     /// `(byte >> boffset) & 1` resolves to 1 iff the neighbour's
     /// subsize was smaller than the block currently being decoded.
+    /// Round-13 note: a spec-literal `15 >> b_width_log2_lookup[subsize]`
+    /// rewrite REGRESSED the libvpx-encoded compound fixture (9.38 →
+    /// 6.94 dB), suggesting the actual encoder uses this in-tree form.
+    /// Restoring the round-12 derivation pending further investigation.
     fn update_partition_ctx(
         &mut self,
         mi_row: usize,
@@ -662,12 +697,11 @@ impl<'a> IntraTile<'a> {
             .fill(mi_row, mi_col, bw.max(1), bh.max(1), segment_id);
         // §6.4.8 read_skip — `SEG_LVL_SKIP` forces skip=1 per §6.4.9.
         // Note: §7.4.6 calls for `skip_probs[skip_ctx]` where skip_ctx
-        // is the sum of above/left skip flags, but libvpx / ffmpeg's
-        // bitstream decodes match the hard-coded 192 in practice on
-        // the bundled fixtures. Round 7 confirmed the context-aware
-        // version regresses vp9-intra.ivf catastrophically (171 → 2
-        // distinct luma values); leave the hard-coded prob in place
-        // until the source of the divergence is tracked down.
+        // is the sum of above/left skip flags. Round-13 attempt to wire
+        // this through caused a 21-dB regression on the lossless-gray
+        // fixture (66.77 → 45.43 dB) so we reverted to the hard-coded
+        // 192 path. Likely the lossless encoder writes skip with a
+        // different context than what we compute. Investigation TODO.
         let skip = if self
             .hdr
             .segmentation
@@ -679,13 +713,29 @@ impl<'a> IntraTile<'a> {
         };
         // Read tx_size. For TX_MODE_SELECT + bsize >= 8x8 the tx_size is
         // tree-coded. For simpler modes we use the tx_mode ceiling.
-        let tx_size_log2 = self.read_tx_size(bd, bs)?;
+        let tx_size_log2 = self.read_tx_size(bd, bs, mi_row, mi_col)?;
 
         // Read luma intra mode using above/left neighbour mode context.
+        // §6.4.6 intra_frame_mode_info: when MiSize < BLOCK_8X8 (B4x4 here)
+        // we read 4 sub_modes — one per 4×4 sub-block in the parent 8×8.
+        // Each sub_mode is decoded against the per-position above/left
+        // neighbour mode context. y_mode is the LAST sub_mode read.
+        let mut sub_modes = [IntraMode::Dc; 4];
         let y_mode = if matches!(bs, BlockSize::B4x4) {
+            // §6.4.6 / §9.3.2 sub-8x8 default_intra_mode: read in (idy,
+            // idx) order, neighbour mode context comes from the same
+            // 8x8's already-decoded sub_modes when idy>0 or idx>0
+            // respectively, otherwise from the parent above/left
+            // trackers. Round-13 fix: previously we used the parent
+            // mi_row/mi_col context for all 4 sub-modes, which gives
+            // the wrong probability distribution for sub_modes[1..3].
             let mut last = IntraMode::Dc;
-            for _ in 0..4 {
-                last = self.read_intra_mode(bd, mi_row, mi_col)?;
+            for idy in 0..2usize {
+                for idx in 0..2usize {
+                    let m = self.read_intra_sub_mode(bd, mi_row, mi_col, idy, idx, &sub_modes)?;
+                    sub_modes[idy * 2 + idx] = m;
+                    last = m;
+                }
             }
             last
         } else {
@@ -732,41 +782,72 @@ impl<'a> IntraTile<'a> {
         self.update_skip_ctx(mi_row, mi_col, mi_w, mi_h, skip);
 
         // Reconstruct luma plane for this block.
-        self.reconstruct_plane(
-            bd,
-            row as usize,
-            col as usize,
-            bs.w() as usize,
-            bs.h() as usize,
-            tx_size_log2,
-            y_mode,
-            0,
-            skip,
-            segment_id,
-        )?;
-        // Chroma (subsampled).
+        // §6.4.21 residual: when MiSize<BLOCK_8X8 (i.e., B4x4) the loop
+        // iterates over the 4 sub-4×4 luma blocks (num4x4w=2, num4x4h=2)
+        // with per-block intra prediction using sub_modes[idy*2+idx].
+        if matches!(bs, BlockSize::B4x4) {
+            for idy in 0..2u32 {
+                for idx in 0..2u32 {
+                    let sm = sub_modes[(idy as usize) * 2 + (idx as usize)];
+                    let r = (row as usize) + (idy as usize) * 4;
+                    let c = (col as usize) + (idx as usize) * 4;
+                    if r < self.height && c < self.width {
+                        self.reconstruct_plane(bd, r, c, 4, 4, 0, sm, 0, skip, segment_id)?;
+                    }
+                }
+            }
+        } else {
+            self.reconstruct_plane(
+                bd,
+                row as usize,
+                col as usize,
+                bs.w() as usize,
+                bs.h() as usize,
+                tx_size_log2,
+                y_mode,
+                0,
+                skip,
+                segment_id,
+            )?;
+        }
+        // Chroma (subsampled). §6.4.22 get_uv_tx_size: when MiSize<BLOCK_8X8
+        // returns TX_4X4 always; otherwise Min(tx_size, max_tx_lookup[uv_size]).
         let sub_x = self.hdr.color_config.subsampling_x as u32;
         let sub_y = self.hdr.color_config.subsampling_y as u32;
         let c_row = (row >> sub_y) as usize;
         let c_col = (col >> sub_x) as usize;
-        let c_w = (bs.w() >> sub_x) as usize;
-        let c_h = (bs.h() >> sub_y) as usize;
-        // Chroma tx_size is `max(tx_size-1, 4x4)` for 4:2:0 when bsize was
-        // >=8x8 — libvpx `vp9_get_uv_tx_size`. We approximate with the
-        // luma tx_size clamped to fit the chroma block.
-        let c_tx_log2 = clamp_tx_size(tx_size_log2, c_w, c_h);
-        if c_w >= 4 && c_h >= 4 {
-            self.reconstruct_plane(
-                bd, c_row, c_col, c_w, c_h, c_tx_log2, uv_mode, 1, skip, segment_id,
-            )?;
-            self.reconstruct_plane(
-                bd, c_row, c_col, c_w, c_h, c_tx_log2, uv_mode, 2, skip, segment_id,
-            )?;
+        if matches!(bs, BlockSize::B4x4) {
+            // Sub-8x8 partition: chroma is decoded as ONE 4×4 block at
+            // the parent 8×8 location (4:2:0 → chroma 4×4). §6.4.22
+            // forces TX_4X4. Spec §6.4.21 still calls predict_intra+
+            // tokens for chroma even though luma is split.
+            if c_row + 4 <= self.uv_h && c_col + 4 <= self.uv_w {
+                self.reconstruct_plane(bd, c_row, c_col, 4, 4, 0, uv_mode, 1, skip, segment_id)?;
+                self.reconstruct_plane(bd, c_row, c_col, 4, 4, 0, uv_mode, 2, skip, segment_id)?;
+            }
+        } else {
+            let c_w = (bs.w() >> sub_x) as usize;
+            let c_h = (bs.h() >> sub_y) as usize;
+            let c_tx_log2 = clamp_tx_size(tx_size_log2, c_w, c_h);
+            if c_w >= 4 && c_h >= 4 {
+                self.reconstruct_plane(
+                    bd, c_row, c_col, c_w, c_h, c_tx_log2, uv_mode, 1, skip, segment_id,
+                )?;
+                self.reconstruct_plane(
+                    bd, c_row, c_col, c_w, c_h, c_tx_log2, uv_mode, 2, skip, segment_id,
+                )?;
+            }
         }
         Ok(())
     }
 
-    fn read_tx_size(&self, bd: &mut BoolDecoder<'a>, bs: BlockSize) -> Result<usize> {
+    fn read_tx_size(
+        &self,
+        bd: &mut BoolDecoder<'a>,
+        bs: BlockSize,
+        mi_row: usize,
+        mi_col: usize,
+    ) -> Result<usize> {
         let max_tx = bs.max_tx_size_log2();
         let tx_mode = self.ch.tx_mode.unwrap_or(TxMode::Only4x4);
         match tx_mode {
@@ -775,15 +856,42 @@ impl<'a> IntraTile<'a> {
             TxMode::Allow16x16 => Ok(max_tx.min(2)),
             TxMode::Allow32x32 => Ok(max_tx.min(3)),
             TxMode::Select => {
-                // libvpx `read_selected_tx_size`. We use context 0 since
-                // neighbour tx tracking is not yet wired, and the default
-                // tx_probs from `default_tx_probs`.
-                let tx_probs = tx_probs_for(max_tx);
-                let mut tx = bd.read(tx_probs[0])? as usize;
+                // §9.3.2 tx_size context:
+                //   above = maxTxSize, left = maxTxSize
+                //   if AvailU && !Skips[r-1][c]: above = TxSizes[r-1][c]
+                //   if AvailL && !Skips[r][c-1]:  left  = TxSizes[r][c-1]
+                //   if !AvailL: left = above
+                //   if !AvailU: above = left
+                //   ctx = (above + left) > maxTxSize
+                let avail_u = mi_row > 0;
+                let avail_l = mi_col > 0;
+                let mut above = max_tx;
+                let mut left = max_tx;
+                if avail_u {
+                    let a = self.mi_info.get(mi_row - 1, mi_col);
+                    if !a.skip {
+                        above = a.tx_size_log2 as usize;
+                    }
+                }
+                if avail_l {
+                    let l = self.mi_info.get(mi_row, mi_col - 1);
+                    if !l.skip {
+                        left = l.tx_size_log2 as usize;
+                    }
+                }
+                if !avail_l {
+                    left = above;
+                }
+                if !avail_u {
+                    above = left;
+                }
+                let ctx = if (above + left) > max_tx { 1 } else { 0 };
+                let probs = tx_probs_for_ctx(self.ch, max_tx, ctx);
+                let mut tx = bd.read(probs[0])? as usize;
                 if tx != 0 && max_tx >= 2 {
-                    tx += bd.read(tx_probs[1])? as usize;
+                    tx += bd.read(probs[1])? as usize;
                     if tx != 1 && max_tx >= 3 {
-                        tx += bd.read(tx_probs[2])? as usize;
+                        tx += bd.read(probs[2])? as usize;
                     }
                 }
                 Ok(tx.min(max_tx))
@@ -797,15 +905,51 @@ impl<'a> IntraTile<'a> {
         mi_row: usize,
         mi_col: usize,
     ) -> Result<IntraMode> {
-        // §7.4.6 default_intra_mode: prob = kf_y_mode_probs[above][left][node].
-        // Above/Left modes come from the last-decoded 8x8 cell on the
-        // boundary. When AvailU / AvailL are false, DC is used.
+        // §7.4.6 default_intra_mode (MiSize >= BLOCK_8X8 path): prob =
+        // kf_y_mode_probs[above][left][node]. Above/Left modes come from
+        // the last-decoded 8x8 cell on the boundary. When AvailU /
+        // AvailL are false, DC is used.
         let above = if mi_row > 0 && mi_col < self.above_mode.len() {
             self.above_mode[mi_col]
         } else {
             IntraMode::Dc
         };
         let left = if mi_col > 0 && mi_row < self.left_mode.len() {
+            self.left_mode[mi_row]
+        } else {
+            IntraMode::Dc
+        };
+        let probs = &KF_Y_MODE_PROBS[above as usize][left as usize];
+        read_intra_mode_tree(bd, probs)
+    }
+
+    /// §9.3.2 default_intra_mode for the sub-8x8 MiSize<BLOCK_8X8 case
+    /// (the explicit `if (idy)` / `if (idx)` neighbour selection in
+    /// §7.4.6's else-branch). `sub_modes_so_far` holds the modes already
+    /// decoded earlier in this 8x8's 2x2 grid (idy*2+idx ordering).
+    /// When idy>0 the abovemode is the same-column sub-block above;
+    /// when idx>0 the leftmode is the same-row sub-block to the left.
+    fn read_intra_sub_mode(
+        &self,
+        bd: &mut BoolDecoder<'a>,
+        mi_row: usize,
+        mi_col: usize,
+        idy: usize,
+        idx: usize,
+        sub_modes_so_far: &[IntraMode; 4],
+    ) -> Result<IntraMode> {
+        let above = if idy > 0 {
+            // Sub-block above within the same 8x8 (column idx).
+            sub_modes_so_far[idx]
+        } else if mi_row > 0 && mi_col < self.above_mode.len() {
+            self.above_mode[mi_col]
+        } else {
+            IntraMode::Dc
+        };
+        let left = if idx > 0 {
+            // Sub-block left within the same 8x8 (row idy).
+            sub_modes_so_far[idy * 2]
+        } else if mi_col > 0 && mi_row < self.left_mode.len() {
             self.left_mode[mi_row]
         } else {
             IntraMode::Dc
@@ -1144,13 +1288,24 @@ fn read_intra_mode_tree(bd: &mut BoolDecoder<'_>, p: &[u8; 9]) -> Result<IntraMo
     }
 }
 
-fn tx_probs_for(max_tx: usize) -> [u8; 3] {
-    // libvpx default_tx_probs (intra context). Layout: [[tx32x32[0..3]],
-    // [tx16x16[0..2]], [tx8x8]]. We pick based on max_tx.
+/// Per-context `tx_probs` lookup matching the §9.3.2 tx_size derivation.
+/// Sources from the per-frame `FrameContext` so probability updates from
+/// §6.3.2 take effect.
+fn tx_probs_for_ctx(ch: &CompressedHeader, max_tx: usize, ctx: usize) -> [u8; 3] {
+    let ctx = ctx.min(1);
     match max_tx {
-        3 => [3, 136, 37], // 32x32 default (intra ctx 0)
-        2 => [20, 152, 0], // 16x16 default
-        1 => [100, 0, 0],  // 8x8 default
+        3 => {
+            let p = ch.ctx.tx_probs_32x32[ctx];
+            [p[0], p[1], p[2]]
+        }
+        2 => {
+            let p = ch.ctx.tx_probs_16x16[ctx];
+            [p[0], p[1], 0]
+        }
+        1 => {
+            let p = ch.ctx.tx_probs_8x8[ctx];
+            [p[0], 0, 0]
+        }
         _ => [128, 128, 128],
     }
 }

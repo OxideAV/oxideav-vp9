@@ -286,7 +286,8 @@ fn emit_partition(
 
 /// Emit one block's symbols: skip=1, DC_PRED luma, DC_PRED chroma,
 /// no coefficients. `_skip_ctx` is retained for future wiring but
-/// ignored — the decoder currently reads skip with a hard-coded prob.
+/// ignored — the decoder reads skip with a hard-coded 192 prob (the
+/// round-13 per-context wiring regressed the lossless-gray fixture).
 fn emit_block(be: &mut BoolEncoder, _skip_ctx: usize) {
     be.write(1, SKIP_PROB);
     // tx_size: ONLY_4X4 so no symbol is written.

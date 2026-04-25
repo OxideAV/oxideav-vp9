@@ -629,10 +629,13 @@ impl<'a> IntraTile<'a> {
     /// inverse of `mi_width_log2_lookup`). Fill bytes are built so that
     /// `(byte >> boffset) & 1` resolves to 1 iff the neighbour's
     /// subsize was smaller than the block currently being decoded.
-    /// Round-13 note: a spec-literal `15 >> b_width_log2_lookup[subsize]`
-    /// rewrite REGRESSED the libvpx-encoded compound fixture (9.38 →
-    /// 6.94 dB), suggesting the actual encoder uses this in-tree form.
-    /// Restoring the round-12 derivation pending further investigation.
+    /// Round-13 / Round-14 note: the spec-literal `15 >>
+    /// b_width_log2_lookup[subsize]` rewrite REGRESSED both the
+    /// libvpx-encoded compound fixture and the lossless-gray fixture
+    /// even when paired with the round-14 partition-call fix —
+    /// libvpx uses this in-tree derivation rather than the literal
+    /// spec form. Restoring the round-12 derivation pending further
+    /// investigation.
     fn update_partition_ctx(
         &mut self,
         mi_row: usize,
@@ -1052,8 +1055,20 @@ impl<'a> IntraTile<'a> {
                 }
                 let tx_w = tx_side.min(plane_w - abs_col);
                 let tx_h = tx_side.min(plane_h - abs_row);
-                // Gather neighbours for prediction.
-                let nb = self.build_neighbours(plane, abs_row, abs_col, tx_side, tx_side);
+                // Gather neighbours for prediction. `not_on_right` is
+                // true iff there is another transform block to the
+                // right WITHIN the parent block (used by §8.5.1 to
+                // gate the aboveRow[size..2*size-1] extension).
+                let not_on_right = (c + tx_side) < w;
+                let nb = self.build_neighbours(
+                    plane,
+                    abs_row,
+                    abs_col,
+                    tx_side,
+                    tx_side,
+                    tx_size_log2,
+                    not_on_right,
+                );
                 // Predict into local buffer.
                 let mut pred = vec![0u8; tx_side * tx_side];
                 predict_intra(mode, &nb, &mut pred, tx_side);
@@ -1122,6 +1137,8 @@ impl<'a> IntraTile<'a> {
         col: usize,
         _tx_w: usize,
         tx_side: usize,
+        tx_size_log2: usize,
+        not_on_right: bool,
     ) -> NeighbourBuf {
         let (buf, stride, plane_w, plane_h) = match plane {
             0 => (&self.y[..], self.y_stride, self.width, self.height),
@@ -1130,13 +1147,31 @@ impl<'a> IntraTile<'a> {
         };
         let have_above = row > 0;
         let have_left = col > 0;
-        let have_aboveright = row > 0 && col + 2 * tx_side <= plane_w;
+        // §8.5.1 (predict_intra) aboveRow[size..2*size-1] extension is
+        // only enabled when `haveAbove && notOnRight && txSz == TX_4X4`.
+        // Otherwise the extension samples are replicated from
+        // aboveRow[size-1]. `notOnRight` is measured INSIDE the parent
+        // block — i.e. there is another transform block to the right
+        // within the same prediction unit. Round-14 fix: previous code
+        // only checked frame-level bounds (col + 2*tx_side <= plane_w)
+        // which over-extends into adjacent (not-yet-decoded for inter,
+        // or wrong-mode-context for intra) regions.
+        let have_aboveright =
+            row > 0 && tx_size_log2 == 0 && not_on_right && col + 2 * tx_side <= plane_w;
 
         let mut above_tmp = vec![0u8; 2 * tx_side];
         let mut above_opt: Option<&[u8]> = None;
         if have_above {
             let start = (row - 1) * stride + col;
-            let n = (2 * tx_side).min(plane_w.saturating_sub(col));
+            // For non-extension cases we still want exactly `tx_side`
+            // samples (positions 0..tx_side-1); the extension is
+            // synthesised via replication later.
+            let n_target = if have_aboveright {
+                2 * tx_side
+            } else {
+                tx_side
+            };
+            let n = n_target.min(plane_w.saturating_sub(col));
             above_tmp[..n].copy_from_slice(&buf[start..start + n]);
             // Replicate trailing samples if short.
             if n > 0 && n < 2 * tx_side {

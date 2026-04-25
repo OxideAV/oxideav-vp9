@@ -1987,7 +1987,15 @@ impl<'a> InterTile<'a> {
                 }
                 let tx_w = tx_side.min(plane_w - abs_col);
                 let tx_h = tx_side.min(plane_h - abs_row);
-                let nb = self.build_neighbours(plane, abs_row, abs_col, tx_side);
+                let not_on_right = (c + tx_side) < w;
+                let nb = self.build_neighbours(
+                    plane,
+                    abs_row,
+                    abs_col,
+                    tx_side,
+                    tx_size_log2,
+                    not_on_right,
+                );
                 let mut pred = vec![0u8; tx_side * tx_side];
                 predict_intra(mode, &nb, &mut pred, tx_side);
                 self.blit_plane(plane, abs_row, abs_col, tx_w, tx_h, &pred, tx_side);
@@ -2044,6 +2052,8 @@ impl<'a> InterTile<'a> {
         row: usize,
         col: usize,
         tx_side: usize,
+        tx_size_log2: usize,
+        not_on_right: bool,
     ) -> NeighbourBuf {
         let (buf, stride, plane_w, plane_h) = match plane {
             0 => (&self.y[..], self.y_stride, self.width, self.height),
@@ -2052,12 +2062,20 @@ impl<'a> InterTile<'a> {
         };
         let have_above = row > 0;
         let have_left = col > 0;
-        let have_aboveright = row > 0 && col + 2 * tx_side <= plane_w;
+        // §8.5.1: aboveRow extension (positions size..2*size-1) only
+        // when `haveAbove && notOnRight && txSz == TX_4X4`.
+        let have_aboveright =
+            row > 0 && tx_size_log2 == 0 && not_on_right && col + 2 * tx_side <= plane_w;
         let mut above_tmp = vec![0u8; 2 * tx_side];
         let mut above_opt: Option<&[u8]> = None;
         if have_above {
             let start = (row - 1) * stride + col;
-            let n = (2 * tx_side).min(plane_w.saturating_sub(col));
+            let n_target = if have_aboveright {
+                2 * tx_side
+            } else {
+                tx_side
+            };
+            let n = n_target.min(plane_w.saturating_sub(col));
             above_tmp[..n].copy_from_slice(&buf[start..start + n]);
             if n > 0 && n < 2 * tx_side {
                 let last = above_tmp[n - 1];

@@ -255,26 +255,19 @@ fn tm_pred(bs: usize, above: &[u8], left: &[u8], above_left: u8, dst: &mut [u8],
 }
 
 fn d45_pred(bs: usize, above: &[u8], dst: &mut [u8], stride: usize) {
-    // libvpx reference: uses above[0..2*bs]. Element bs-1 is "above_right"
-    // for the first row's last pixel.
-    let above_right = above[bs - 1];
-    // First row.
-    {
-        let base = 0;
-        for x in 0..(bs - 1) {
-            dst[base + x] = avg3(above[x], above[x + 1], above[x + 2]);
-        }
-        dst[base + bs - 1] = above_right;
-    }
-    // Subsequent rows: shift each previous row-0 content left by one, fill
-    // the growing right edge with above_right.
-    // libvpx approach: row r is dst[r*stride + c] = dst_row0[c + r] for
-    // c < bs - r - 1, else above_right.
-    // Easier equivalent: produce row r starting at column 0 with avg3 of
-    // the shifted above row. But we need access to *extended* row:
-    // dst[r][c] = avg3(above[r+c], above[r+c+1], above[r+c+2]) for r+c < 2*bs-2,
-    // else above_right.
-    for r in 1..bs {
+    // §8.5.1 D45_PRED:
+    //   pred[i][j] = (i+j+2 < 2*size)
+    //                  ? Round2(above[i+j] + 2*above[i+j+1] + above[i+j+2], 2)
+    //                  : above[2*size - 1]
+    //
+    // Round-14 fix: the boundary value is `above[2*size-1]` per spec,
+    // not `above[size-1]`. This only matters when the §8.5.1 above-row
+    // extension is enabled (txSz==0 && notOnRight): then the extension
+    // holds real pixels and the boundary differs. The first-row
+    // last-pixel was previously short-circuited to the wrong constant;
+    // now it falls through the unified loop.
+    let above_right = above[2 * bs - 1];
+    for r in 0..bs {
         let base = r * stride;
         for c in 0..bs {
             let idx = r + c;

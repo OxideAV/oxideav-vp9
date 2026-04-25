@@ -958,45 +958,55 @@ fn idct32(input: &[i32; 32]) -> [i32; 32] {
 }
 
 // ===== 4x4 WHT (lossless) =====
+//
+// Spec ref: §8.7.1.10 (Inverse Walsh-Hadamard transform process) +
+// §8.7.2 (2D Inverse Transform). The row pass is applied with shift=2
+// (since the encoder pre-multiplies by ac_q[0]=4 in the lossless
+// quantizer), the column pass with shift=0. After the column pass the
+// result is added directly to the predictor (no Round2), per the
+// "If Lossless is equal to 1, set Dequant[i][j] = T[i]" branch in §8.7.2.
+fn wht_1d(t: &mut [i32; 4], shift: u32) {
+    let a = t[0] >> shift;
+    let c = t[1] >> shift;
+    let d = t[2] >> shift;
+    let b = t[3] >> shift;
+    let a = a + c;
+    let d = d - b;
+    let e = (a - d) >> 1;
+    let b = e - b;
+    let c = e - c;
+    let a = a - b;
+    let d = d + c;
+    t[0] = a;
+    t[1] = b;
+    t[2] = c;
+    t[3] = d;
+}
+
 fn iwht4x4_add(input: &[i32], dst: &mut [u8], stride: usize) {
-    // UNIT_QUANT_SHIFT = 2 (libvpx); input is dequantised already here so
-    // we skip the extra shift by 2, matching libvpx's iwht4x4_16_add_c
-    // when input has been pre-shifted.
     let mut tmp = [0i32; 16];
-    // Row pass
+    // Row pass — shift=2 per §8.7.2 first bullet for Lossless.
     for i in 0..4 {
-        let a1 = input[i * 4];
-        let c1 = input[i * 4 + 1];
-        let d1 = input[i * 4 + 2];
-        let b1 = input[i * 4 + 3];
-        let a1p = a1 + c1;
-        let d1p = d1 - b1;
-        let e1 = (a1p - d1p) >> 1;
-        let b1 = e1 - b1;
-        let c1 = e1 - c1;
-        let a1 = a1p - b1;
-        let d1 = d1p + c1;
-        tmp[i * 4] = wraplow(a1);
-        tmp[i * 4 + 1] = wraplow(b1);
-        tmp[i * 4 + 2] = wraplow(c1);
-        tmp[i * 4 + 3] = wraplow(d1);
+        let mut t = [
+            input[i * 4],
+            input[i * 4 + 1],
+            input[i * 4 + 2],
+            input[i * 4 + 3],
+        ];
+        wht_1d(&mut t, 2);
+        tmp[i * 4] = t[0];
+        tmp[i * 4 + 1] = t[1];
+        tmp[i * 4 + 2] = t[2];
+        tmp[i * 4 + 3] = t[3];
     }
-    for i in 0..4 {
-        let a1 = tmp[i];
-        let c1 = tmp[4 + i];
-        let d1 = tmp[8 + i];
-        let b1 = tmp[12 + i];
-        let a1p = a1 + c1;
-        let d1p = d1 - b1;
-        let e1 = (a1p - d1p) >> 1;
-        let b1 = e1 - b1;
-        let c1 = e1 - c1;
-        let a1 = a1p - b1;
-        let d1 = d1p + c1;
-        dst[i] = clip_pixel_add(dst[i], wraplow(a1));
-        dst[stride + i] = clip_pixel_add(dst[stride + i], wraplow(b1));
-        dst[2 * stride + i] = clip_pixel_add(dst[2 * stride + i], wraplow(c1));
-        dst[3 * stride + i] = clip_pixel_add(dst[3 * stride + i], wraplow(d1));
+    // Column pass — shift=0 per §8.7.2. Result is added without Round2.
+    for j in 0..4 {
+        let mut t = [tmp[j], tmp[4 + j], tmp[8 + j], tmp[12 + j]];
+        wht_1d(&mut t, 0);
+        dst[j] = clip_pixel_add(dst[j], t[0]);
+        dst[stride + j] = clip_pixel_add(dst[stride + j], t[1]);
+        dst[2 * stride + j] = clip_pixel_add(dst[2 * stride + j], t[2]);
+        dst[3 * stride + j] = clip_pixel_add(dst[3 * stride + j], t[3]);
     }
 }
 

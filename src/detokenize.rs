@@ -170,12 +170,16 @@ fn decode_nonzero(
     Ok(dequant_shift(v * dqv as i32, dq_shift))
 }
 
-/// Apply the 32×32 dequant shift. The returned value is NOT clamped
-/// here — §8.6.2 conformance requires it fit in 16 bits but libvpx's
-/// `wraplow` masks to i16 AT transform entry, not in the detokeniser.
+/// Apply the 32×32 dequant shift and clamp to i16. Per §8.6.2,
+/// "Dequant array values are representable by a signed integer with
+/// 8 + BitDepth bits", i.e. i16 at 8-bit. We clamp here as a defensive
+/// guard — non-conformant streams can otherwise cause overflow inside
+/// the 1-D transform kernels (each butterfly multiplies by a constant
+/// up to 16384, so unclamped i32 inputs can exceed i32 range).
 #[inline]
 fn dequant_shift(v: i32, dq_shift: i32) -> i32 {
-    v >> dq_shift
+    let v = v >> dq_shift;
+    v.clamp(i16::MIN as i32, i16::MAX as i32)
 }
 
 fn read_coeff(bd: &mut BoolDecoder<'_>, probs: &[u8]) -> Result<i32> {

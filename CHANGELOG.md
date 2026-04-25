@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- §9.3.2 partition context indexing. `read_partition` (decoder) and
+  `PartitionCtx::lookup` (encoder) were both inverting the `bsl` index
+  before looking up `kf_partition_probs`, putting the 8x8 row at the
+  64x64 slot and vice-versa. Per §10.4 the table is small-block first
+  (`8x8→4x4` at index 0..3, `64x64→32x32` at index 12..15) and §9.3.2
+  defines `ctx = bsl * 4 + left * 2 + above`. With the inverted layout
+  every partition tree on a real libvpx-encoded keyframe was decoded
+  against the wrong probabilities, which mis-aligned the bool decoder
+  for the entire rest of the tile (cascading into wrong skip / mode /
+  coef reads). On the lossless 64×64 gray fixture the decoded luma now
+  matches the ffmpeg reference (PSNR 66.77 dB) instead of producing a
+  shifted-by-3 plane (PSNR ~25 dB).
+- §8.7.2 lossless transform dispatch. When `Lossless == 1` the inverse
+  transform must be the Walsh-Hadamard (§8.7.1.10), not the regular
+  iDCT/iADST chosen by the prediction-mode-derived TxType. The scan
+  table also forces DCT_DCT for lossless / inter per §6.4.25.
+  `IntraTile::reconstruct_plane` now selects WHT for the inverse
+  transform whenever the frame's quantization params satisfy
+  Lossless and uses DCT_DCT scan order regardless of the intra mode.
+- §8.7.1.10 inverse WHT. The previous implementation skipped the row-
+  pass shift-by-2 (assuming the encoder pre-scaled the input) and used
+  a different butterfly arrangement than the spec. The new
+  implementation follows the spec verbatim: row pass with `shift=2`,
+  column pass with `shift=0`, no `Round2` at the end (the lossless
+  branch in §8.7.2 stores `Dequant[i][j] = T[i]` directly).
+- §8.6.2 dequant clamp. `decode_coefs` now clamps post-shift dequantised
+  coefficients to `i16::MIN..=i16::MAX` before they enter the 1-D
+  transform kernels, matching the §8.6.2 conformance requirement that
+  the values fit in `8 + BitDepth` bits. Without the clamp,
+  non-conformant streams (e.g. a tile where the partition-context fix
+  exposed a larger CAT6 token) caused i32 multiplication overflow
+  inside `idct4` / `idct8`.
 - §9.2.1 marker bit was missing from `BoolDecoder::new()` and
   `BoolEncoder::new()`. The spec requires that `init_bool` perform an
   `f(8)` priming read followed by a §9.2.2 marker read which must be

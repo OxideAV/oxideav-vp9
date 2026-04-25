@@ -558,13 +558,13 @@ impl<'a> IntraTile<'a> {
         }
         let above_bit = ((above >> boffset) & 1) as usize;
         let left_bit = ((left >> boffset) & 1) as usize;
-        // The `kf_partition_probs` table as shipped (and matched by the
-        // ffmpeg / libvpx bitstream) is arranged with the 64×64 row
-        // first, so we invert `bsl` before indexing. The §10.5 comment
-        // text mislabels this as "8x8 -> 4x4" at row 0 but the bitstream
-        // agreement is with the inverted layout.
-        let tbl_bsl = 3 - bsl;
-        let ctx = tbl_bsl * 4 + left_bit * 2 + above_bit;
+        // §9.3.2 partition: ctx = bsl * 4 + left * 2 + above. The
+        // kf_partition_probs table at §10.4 is ordered small-block first
+        // (8x8→4x4 at index 0..3, 64x64→32x32 at index 12..15), matching
+        // the bsl=0..3 (8x8..64x64) indexing here. (An earlier round
+        // inverted this, which happened to align with one fixture but
+        // misaligns the bool decoder for libvpx-encoded streams.)
+        let ctx = bsl * 4 + left_bit * 2 + above_bit;
         let probs = KF_PARTITION_PROBS[ctx];
         if bsize == 8 {
             let b0 = bd.read(probs[0])?;
@@ -849,13 +849,29 @@ impl<'a> IntraTile<'a> {
             (self.uv_w, self.uv_h)
         };
         // §6.4.25 `get_scan`: chroma and 32×32 blocks always use DCT_DCT
-        // regardless of prediction mode.
-        let tx_type = if plane == 0 && tx_size_log2 < 3 {
-            intra_mode_to_tx_type(mode)
+        // regardless of prediction mode. Per §6.4.25, lossless / inter
+        // also force DCT_DCT for the scan choice. The actual inverse
+        // transform for lossless is WHT (§8.7.2 / §8.7.1.10) and is
+        // dispatched separately below.
+        let lossless = self.hdr.quantization.lossless;
+        let scan_tx_type = if lossless || (plane == 0 && tx_size_log2 < 3) {
+            if lossless {
+                TxType::DctDct
+            } else {
+                intra_mode_to_tx_type(mode)
+            }
         } else {
             TxType::DctDct
         };
-        let scan = get_scan(tx_size_log2, tx_type);
+        let scan = get_scan(tx_size_log2, scan_tx_type);
+        // The inverse-transform dispatch tx_type: lossless → WhtWht
+        // regardless of mode (§8.7.2). Otherwise matches the scan
+        // tx_type above.
+        let xform_tx_type = if lossless {
+            TxType::WhtWht
+        } else {
+            scan_tx_type
+        };
         let probs = coef_probs_from_ctx(self.ch, tx_size_log2, plane_type, 0);
 
         // Quant: base_q_idx; libvpx applies delta_q_y_dc only to luma DC,
@@ -926,7 +942,12 @@ impl<'a> IntraTile<'a> {
                         // already written), clipping to real block.
                         self.read_plane(plane, abs_row, abs_col, tx_w, tx_h, &mut dst, tx_side);
                         inverse_transform_add(
-                            tx_type, tx_side, tx_side, &coeffs, &mut dst, tx_side,
+                            xform_tx_type,
+                            tx_side,
+                            tx_side,
+                            &coeffs,
+                            &mut dst,
+                            tx_side,
                         )?;
                         self.blit_plane(plane, abs_row, abs_col, tx_w, tx_h, &dst, tx_side);
                     }

@@ -120,10 +120,10 @@ impl PartitionCtx {
         }
         let above_bit = ((above >> boffset) & 1) as usize;
         let left_bit = ((left >> boffset) & 1) as usize;
-        // Mirror block::read_partition: 64×64-first layout requires
-        // inverting bsl before indexing.
-        let tbl_bsl = 3 - bsl;
-        let ctx = tbl_bsl * 4 + left_bit * 2 + above_bit;
+        // §9.3.2: ctx = bsl * 4 + left * 2 + above. The
+        // §10.4 kf_partition_probs table is small-block first
+        // (8x8→4x4 at index 0..3, 64x64→32x32 at index 12..15).
+        let ctx = bsl * 4 + left_bit * 2 + above_bit;
         KF_PARTITION_PROBS[ctx]
     }
 
@@ -435,8 +435,8 @@ mod tests {
         // Manually check what symbols we write for a 2-SB stream using
         // the same probs the 64×64 encoder uses.
         let mut be = BoolEncoder::new();
-        // bsize=64 -> bsl=3 -> tbl_bsl=0 -> KF_PARTITION_PROBS[0]=158.
-        let p_part = KF_PARTITION_PROBS[0][0];
+        // bsize=64 -> bsl=3 -> ctx=12 -> KF_PARTITION_PROBS[12]=174.
+        let p_part = KF_PARTITION_PROBS[12][0];
         for _ in 0..2 {
             be.write(0, p_part);
             be.write(1, SKIP_PROB);

@@ -271,11 +271,7 @@ impl Vp9Decoder {
 
         if h.show_frame {
             let frame = VideoFrame {
-                format: pixel_format_from_color_config(&h.color_config),
-                width: h.width,
-                height: h.height,
                 pts: self.pending_pts.take(),
-                time_base: self.current_time_base,
                 planes: vec![
                     VideoPlane {
                         stride: y_stride,

@@ -54,12 +54,11 @@ fn decode_first_keyframe_produces_plausible_luma() {
         Frame::Video(v) => v,
         other => panic!("expected Video, got {other:?}"),
     };
-    assert_eq!(v.width, 128);
-    assert_eq!(v.height, 128);
     assert_eq!(v.planes.len(), 3);
 
     let y_plane = &v.planes[0];
-    assert_eq!(y_plane.data.len(), y_plane.stride * (v.height as usize));
+    assert_eq!(y_plane.stride, 128);
+    assert_eq!(y_plane.data.len(), y_plane.stride * 128);
 
     let sum: u64 = y_plane.data.iter().map(|&b| b as u64).sum();
     let mean = (sum / y_plane.data.len() as u64) as u8;

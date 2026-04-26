@@ -49,9 +49,9 @@ fn decode_keyframe_then_p_frame() {
         Frame::Video(v) => v,
         other => panic!("frame 1: expected Video, got {other:?}"),
     };
-    assert_eq!(frame1.width, 128);
-    assert_eq!(frame1.height, 128);
     assert_eq!(frame1.planes.len(), 3);
+    assert_eq!(frame1.planes[0].stride, 128);
+    assert_eq!(frame1.planes[0].data.len(), 128 * 128);
 
     // Frame 2 (P).
     let f2 = iter.next().expect("frame 2").expect("frame 2 ok");
@@ -61,9 +61,9 @@ fn decode_keyframe_then_p_frame() {
         Frame::Video(v) => v,
         other => panic!("frame 2: expected Video, got {other:?}"),
     };
-    assert_eq!(frame2.width, 128);
-    assert_eq!(frame2.height, 128);
     assert_eq!(frame2.planes.len(), 3);
+    assert_eq!(frame2.planes[0].stride, 128);
+    assert_eq!(frame2.planes[0].data.len(), 128 * 128);
 
     // Pixel-level difference: require >= 1 luma sample to differ. A
     // lenient bar — the P frame might even coincide bit-exact with

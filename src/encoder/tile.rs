@@ -476,8 +476,8 @@ mod tests {
         let f = d.receive_frame().unwrap();
         match f {
             Frame::Video(v) => {
-                assert_eq!(v.width, 64);
-                assert_eq!(v.height, 64);
+                assert_eq!(v.planes[0].stride, 64);
+                assert_eq!(v.planes[0].data.len(), 64 * 64);
                 // Luma plane should be all-128 (DC-chain midgrey).
                 let luma = &v.planes[0].data;
                 for &s in luma {

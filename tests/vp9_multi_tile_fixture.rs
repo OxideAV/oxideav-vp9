@@ -57,9 +57,9 @@ fn decode_multi_tile_keyframe() {
         Frame::Video(v) => v,
         other => panic!("expected Video, got {other:?}"),
     };
-    assert_eq!(frame.width, 640);
-    assert_eq!(frame.height, 360);
+    assert_eq!(frame.planes[0].stride, 640);
     let y = &frame.planes[0].data;
+    assert_eq!(y.len(), frame.planes[0].stride * 360);
     let mn = *y.iter().min().unwrap();
     let mx = *y.iter().max().unwrap();
     assert!(

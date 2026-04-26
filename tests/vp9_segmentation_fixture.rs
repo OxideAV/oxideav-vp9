@@ -101,9 +101,9 @@ fn segmentation_clip_parses_and_decodes() {
             Frame::Video(v) => v,
             other => panic!("frame {i}: expected Video, got {other:?}"),
         };
-        assert_eq!(v.width, 128);
-        assert_eq!(v.height, 128);
         assert_eq!(v.planes.len(), 3);
+        assert_eq!(v.planes[0].stride, 128);
+        assert_eq!(v.planes[0].data.len(), 128 * 128);
         // Luma must not be all the same value — catches the common
         // "segmentation misparse truncated coefficient decode" failure.
         let y = &v.planes[0].data;

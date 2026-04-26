@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Round 17 — measurement audit**. Added
+  `tests/vp9_lossless_pattern.rs`: a non-degenerate lossless-decode
+  test against an `ffmpeg testsrc -lossless 1` reference YUV. The
+  prior `vp9_lossless_gray.rs` test compared against
+  `vec![126; 64*64]` — a constant-gray plane — so any decoder output
+  that's "approximately gray" trivially scored ≥ 60 dB. The new test
+  reveals the true lossless decode quality on real content: **9.69 dB
+  Y, 10.96 dB U, 9.26 dB V** with virtually every byte differing. The
+  bar is currently set just below the round-17 baseline (≥ 8 dB Y) so
+  a future bit-exact fix lifts it dramatically and a regression below
+  the current poor baseline is caught.
+
+  Past-error log entry: rounds 11-16 all reported "Lossless bit-exact
+  (66.77 dB)" against the gray fixture and treated that as a
+  load-bearing invariant. The round-17 audit confirms it was a
+  fixture artefact — the lossless WHT path
+  (`transform::iwht4x4_add` / §8.7.2) does not actually reproduce the
+  ffmpeg reference. The `vp9-lossless-gray` test now functions as a
+  "DC-prediction-doesn't-blow-up" smoke check rather than a
+  bit-exactness gate. README updated to reflect the real numbers.
+
 ### Changed
 
 - §9.3.2 per-position above/left intra-mode tracker (round 16).

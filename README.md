@@ -112,6 +112,33 @@ let mut reg = CodecRegistry::new();
 oxideav_vp9::register(&mut reg);
 ```
 
+## Round-17 measurement audit
+
+Past rounds reported "lossless bit-exact (66.77 dB)" against the
+`vp9-lossless-gray.ivf` fixture. That measurement is **degenerate** —
+the reference plane is a constant `vec![126; 64*64]`, so any decoder
+output that's "approximately gray" scores ≥ 60 dB without being
+bit-exact (DC prediction with no residual already gets there).
+
+The new `tests/vp9_lossless_pattern.rs` test compares our decoder
+against an `ffmpeg testsrc -lossless 1` reference (a real test card —
+colour bars + circle + gradient + clock). Result: **9.69 dB Y, 10.96
+dB U, 9.26 dB V** with virtually every byte differing. Lossy compound
+sits at ~10.6 dB on the `vp9-compound.ivf` fixture for the same
+reason.
+
+The lossless decode pipeline (`TxType::WhtWht` Walsh-Hadamard at 4×4)
+does not currently reproduce ffmpeg's output — both the structural
+mean and per-pixel layout are off. The lossy decode shows recognisable
+shapes (luma std now within 5% of the reference for the keyframe) but
+chroma is severely wrong (test card colours render mostly green). The
+underlying defect is one or more of: §6.4.6 sub-mode tracker indices,
+the per-frame coef-tree probability updates (compressed header §6.3.7
+backward updates not finished), or the chroma reconstruction at
+sub-8x8 partitions. Round 17 confirmed the previous PSNR claim was a
+fixture artefact and added the proper lossless-pattern test as a
+regression gate.
+
 ## Known gaps
 
 Both the intra and inter paths ship, but a handful of accuracy

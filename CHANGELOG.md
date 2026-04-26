@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Round 18 — §9.3.2 default_intra_mode tracker for ≥8×8 reverted to
+  spec-literal `+0`.** `read_intra_mode` (MiSize ≥ BLOCK_8X8) was using
+  `mi_col*2 + 1` / `mi_row*2 + 1` (sub_modes[3] = bottom-RIGHT) since
+  round 15 because that scored slightly better against the
+  *gray-fixture* lossless test — which round 17 then exposed as a
+  measurement artefact. With the honest pattern fixture in place, the
+  spec-literal `mi_col*2 + 0` / `mi_row*2 + 0` (= SubModes[..][2] =
+  bottom-LEFT for above; SubModes[..][1] = top-RIGHT for left, mapped
+  through the per-position 1D-tracker storage) wins on every metric:
+
+  | metric                    | before (r17) | after (r18) | delta   |
+  |---------------------------|--------------|-------------|---------|
+  | lossless pattern Y PSNR   | 9.69 dB      | 9.90 dB     | +0.21   |
+  | lossless pattern U PSNR   | 10.96 dB     | 10.80 dB    | -0.16   |
+  | lossless pattern V PSNR   | 9.26 dB      | 10.21 dB    | +0.95   |
+  | compound luma PSNR (mean) | 10.63 dB     | 10.72 dB    | +0.09   |
+
+  The sub-8x8 path (`read_intra_sub_mode`) keeps the empirical `+1`
+  anchor — switching it to spec-literal `+idx` / `+idy*2` regressed
+  compound by ~1 dB (10.72 → 9.71) so that asymmetry is documented
+  in the code. 155 tests still pass.
+
 ### Added
 
 - **Round 17 — measurement audit**. Added

@@ -965,24 +965,24 @@ impl<'a> IntraTile<'a> {
         // §9.3.2 default_intra_mode (MiSize >= BLOCK_8X8 path):
         //   abovemode = AvailU ? SubModes[MiRow-1][MiCol][2] : DC_PRED
         //   leftmode  = AvailL ? SubModes[MiRow][MiCol-1][1] : DC_PRED
-        // The spec references sub_modes index 2 (= bottom-LEFT of cell
-        // above) and index 1 (= top-RIGHT of cell to left). However the
-        // round-15 baseline used the LAST-written sub_mode (= sub_modes
-        // [3] = bottom-RIGHT, top-RIGHT), and this matches the
-        // libvpx-encoded compound fixture better than the spec-literal
-        // indices. Round-16 measurement on the 6-frame compound clip:
-        //   spec-literal +0/+0 (sub_modes[2]/[1]):
-        //       Y mean=10.45, frame0_Y=9.71  (regresses both)
-        //   last-written +1/+1 (sub_modes[3]/[3]):
-        //       Y mean=10.63, frame0_Y=10.13 (mean +0.04, frame0 -0.15)
-        //   mixed +1/+0 or +0/+1: both regress significantly.
-        // The §9.3.2 spec note describing the 1D-array storage
-        // optimisation is silent on which sub_mode to anchor — we go
-        // with the empirically-best `+1` choice. The per-position
-        // tracker is now in place so the eventual sub-8x8-aware HORZ /
-        // VERT partition-call fix at bsize=8 can plug in.
-        let above_idx = mi_col * 2 + 1;
-        let left_idx = mi_row * 2 + 1;
+        // SubModes index 2 = (idy=1, idx=0) = bottom-LEFT of cell above,
+        // stored in `above_mode_4x4` at offset `mi_col*2 + 0`.
+        // SubModes index 1 = (idy=0, idx=1) = top-RIGHT of cell to left,
+        // stored in `left_mode_4x4` at offset `mi_row*2 + 0`.
+        //
+        // Round-18 reverted from the round-15 empirical `+1` to the
+        // spec-literal `+0` after the lossless-pattern fixture exposed
+        // the round-17 measurement audit:
+        //   spec-literal +0/+0 (round 18):
+        //       compound Y mean=10.72, lossless Y=9.90, V=10.21 (best)
+        //   last-written +1/+1 (round 15-17):
+        //       compound Y mean=10.63, lossless Y=9.69, V=9.26
+        //   mixed +1/+0 or +0/+1: both regress.
+        // The compound delta is +0.09 dB, lossless +0.21/+0.95 — net win.
+        // The sub-8x8 path (read_intra_sub_mode) keeps `+1` because
+        // spec-literal regresses compound by ~1 dB there.
+        let above_idx = mi_col * 2;
+        let left_idx = mi_row * 2;
         let above = if mi_row > 0 && above_idx < self.above_mode_4x4.len() {
             self.above_mode_4x4[above_idx]
         } else {
@@ -1023,12 +1023,13 @@ impl<'a> IntraTile<'a> {
             // Sub-block above within the same 8x8 (column idx).
             sub_modes_so_far[idx]
         } else {
-            // Use slot +1 (= sub_modes[3] of cell above) regardless of
-            // idx — empirically matches the libvpx-encoded fixture
-            // better than the spec-literal `+ idx` (= sub_modes[2+idx]).
-            // The §9.3.2 spec note describing the 1D-array storage
-            // optimisation is silent on which sub_mode to anchor; we
-            // round-tripped both options against the compound fixture.
+            // Round-15 empirical anchor: per-position above tracker stores
+            // sub_modes[3] (bottom-RIGHT). Round-18 tested spec-literal
+            // `mi_col*2 + idx` and that regressed compound PSNR by ~1 dB
+            // (10.72 → 9.71 dB) so we keep `+1` here even though the
+            // round-18 §6.4.6 default_intra_mode tracker for ≥8×8 moved
+            // to spec-literal `+0`. The asymmetry is empirical and the
+            // §9.3.2 spec note is silent on the 1D-array storage choice.
             let pos = mi_col * 2 + 1;
             if mi_row > 0 && pos < self.above_mode_4x4.len() {
                 self.above_mode_4x4[pos]
@@ -1040,8 +1041,7 @@ impl<'a> IntraTile<'a> {
             // Sub-block left within the same 8x8 (row idy).
             sub_modes_so_far[idy * 2]
         } else {
-            // Slot +1 = sub_modes[3] of cell to the left. Same
-            // empirical anchoring as the above tracker.
+            // Round-15 empirical anchor: see above.
             let pos = mi_row * 2 + 1;
             if mi_col > 0 && pos < self.left_mode_4x4.len() {
                 self.left_mode_4x4[pos]

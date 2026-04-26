@@ -483,6 +483,9 @@ impl<'a> IntraTile<'a> {
         let mi_row = (row as usize) / 8;
         let mi_col = (col as usize) / 8;
         let partition = self.read_partition(bd, bsize, mi_row, mi_col)?;
+        if std::env::var("VP9_TRACE").is_ok() {
+            eprintln!("PART r={} c={} bsize={} → {:?}", row, col, bsize, partition);
+        }
         let half = bsize / 2;
         match partition {
             Partition::None => {
@@ -828,6 +831,12 @@ impl<'a> IntraTile<'a> {
             segment_id,
         };
         self.mi_info.fill(mi_row, mi_col, mi);
+        if std::env::var("VP9_TRACE").is_ok() {
+            eprintln!(
+                "BLK r={} c={} bs={}x{} sub8x8={} y_mode={:?} uv_mode={:?} sub_modes={:?} skip={} tx_log2={}",
+                row, col, bs.w(), bs.h(), is_sub8x8, y_mode, uv_mode, sub_modes, skip, tx_size_log2
+            );
+        }
         // Stamp the skip bit into the neighbour trackers so the next
         // block sees the correct §7.4.6 skip context.
         self.update_skip_ctx(mi_row, mi_col, mi_w, mi_h, skip);
@@ -1186,6 +1195,23 @@ impl<'a> IntraTile<'a> {
                         initial_ctx,
                         &mut coeffs,
                     )?;
+                    if std::env::var("VP9_TRACE_COEF").is_ok() {
+                        eprintln!(
+                            "  COEF plane={} r={} c={} side={} eob={} dc={} ac0={} initial_ctx={}",
+                            plane,
+                            abs_row,
+                            abs_col,
+                            tx_side,
+                            eob,
+                            coeffs[0],
+                            if eob > 1 {
+                                coeffs[scan.scan[1] as usize]
+                            } else {
+                                0
+                            },
+                            initial_ctx
+                        );
+                    }
                     if eob > 0 {
                         // Run inverse transform into a local dst, then blit.
                         let mut dst = vec![0u8; tx_side * tx_side];

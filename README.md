@@ -112,7 +112,7 @@ let mut reg = CodecRegistry::new();
 oxideav_vp9::register(&mut reg);
 ```
 
-## Round-17 measurement audit
+## Round-17 measurement audit + round-18 spec-literal nudge
 
 Past rounds reported "lossless bit-exact (66.77 dB)" against the
 `vp9-lossless-gray.ivf` fixture. That measurement is **degenerate** —
@@ -122,10 +122,14 @@ bit-exact (DC prediction with no residual already gets there).
 
 The new `tests/vp9_lossless_pattern.rs` test compares our decoder
 against an `ffmpeg testsrc -lossless 1` reference (a real test card —
-colour bars + circle + gradient + clock). Result: **9.69 dB Y, 10.96
-dB U, 9.26 dB V** with virtually every byte differing. Lossy compound
-sits at ~10.6 dB on the `vp9-compound.ivf` fixture for the same
-reason.
+colour bars + circle + gradient + clock). Round-17 baseline:
+**9.69 dB Y, 10.96 dB U, 9.26 dB V**. Round 18 reverted the
+`read_intra_mode` (MiSize ≥ BLOCK_8X8) tracker from the round-15
+empirical `+1` anchor to the spec-literal `+0`
+(`SubModes[..][2]` for above, `SubModes[..][1]` for left), now at
+**9.90 dB Y, 10.80 dB U, 10.21 dB V** — net win on Y/V (chroma U
+slightly off in exchange). Lossy compound mean luma sits at
+**10.72 dB** on the 6-frame `vp9-compound.ivf` (was 10.63 in r17).
 
 The lossless decode pipeline (`TxType::WhtWht` Walsh-Hadamard at 4×4)
 does not currently reproduce ffmpeg's output — both the structural

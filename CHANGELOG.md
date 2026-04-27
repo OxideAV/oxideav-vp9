@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.6...v0.0.7) - 2026-04-27
+
+### Other
+
+- r19 — lossless reconstruction audit + diagnostic fixture
+- round 19 — env-gated trace points for §8.7.2 lossless audit
+- round 18 — README PSNR refresh
+- round 18 — §9.3.2 default_intra_mode tracker spec-literal +0
+- round 17 — measurement audit, expose true lossless quality
+- adopt slim VideoFrame shape
+- §9.3.2 per-position above/left intra-mode tracker (round 16)
+- §6.4.4 EobTotal-skip override + round-15 skip-ctx investigation
+- §8.5.1 above-row extension gating + D45 boundary value
+- §6.4.3 SPLIT-at-8x8 calls decode_block once + sub-mode neighbours
+- §9.3.2 inter-ref ctx (comp_mode/comp_ref/single_ref/interp_filter)
+- §9.3.2 partition ctx + §8.7.2 lossless WHT dispatch
+- §9.2.1 marker bit + INV_MAP_TABLE size fixes
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - **Round 19 — diagnostic fixture + WHT round-trip unit tests.** Added

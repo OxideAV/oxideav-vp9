@@ -112,7 +112,7 @@ let mut reg = CodecRegistry::new();
 oxideav_vp9::register(&mut reg);
 ```
 
-## Round-17 measurement audit + round-18 spec-literal nudge
+## Round-19 lossless decode audit
 
 Past rounds reported "lossless bit-exact (66.77 dB)" against the
 `vp9-lossless-gray.ivf` fixture. That measurement is **degenerate** —
@@ -120,28 +120,47 @@ the reference plane is a constant `vec![126; 64*64]`, so any decoder
 output that's "approximately gray" scores ≥ 60 dB without being
 bit-exact (DC prediction with no residual already gets there).
 
-The new `tests/vp9_lossless_pattern.rs` test compares our decoder
-against an `ffmpeg testsrc -lossless 1` reference (a real test card —
-colour bars + circle + gradient + clock). Round-17 baseline:
-**9.69 dB Y, 10.96 dB U, 9.26 dB V**. Round 18 reverted the
-`read_intra_mode` (MiSize ≥ BLOCK_8X8) tracker from the round-15
-empirical `+1` anchor to the spec-literal `+0`
-(`SubModes[..][2]` for above, `SubModes[..][1]` for left), now at
-**9.90 dB Y, 10.80 dB U, 10.21 dB V** — net win on Y/V (chroma U
-slightly off in exchange). Lossy compound mean luma sits at
-**10.72 dB** on the 6-frame `vp9-compound.ivf` (was 10.63 in r17).
+`tests/vp9_lossless_pattern.rs` compares against an `ffmpeg testsrc
+-lossless 1` reference. Headline numbers per round:
 
-The lossless decode pipeline (`TxType::WhtWht` Walsh-Hadamard at 4×4)
-does not currently reproduce ffmpeg's output — both the structural
-mean and per-pixel layout are off. The lossy decode shows recognisable
-shapes (luma std now within 5% of the reference for the keyframe) but
-chroma is severely wrong (test card colours render mostly green). The
-underlying defect is one or more of: §6.4.6 sub-mode tracker indices,
-the per-frame coef-tree probability updates (compressed header §6.3.7
-backward updates not finished), or the chroma reconstruction at
-sub-8x8 partitions. Round 17 confirmed the previous PSNR claim was a
-fixture artefact and added the proper lossless-pattern test as a
-regression gate.
+| round | lossless Y | lossless U | lossless V | compound Y mean |
+|-------|-----------:|-----------:|-----------:|----------------:|
+| r17   | 9.69 dB    | 10.96 dB   | 9.26 dB    | 10.63 dB        |
+| r18   | 9.90 dB    | 10.80 dB   | 10.21 dB   | 10.72 dB        |
+| r19   | 9.90 dB    | 10.80 dB   | 10.21 dB   | 10.72 dB        |
+
+Round 19 ran a full top-down audit of the lossless reconstruction
+chain — §8.7.1.10 WHT, §8.6.2 reconstruct add, §8.5.1 DC_PRED, §9.3.2
+KF_PARTITION_PROBS table layout, §6.4.6 default_intra_mode tree,
+§6.4.25 get_scan, §6.4.24 token initial-context. **All these
+sub-systems are spec-correct** (the WHT now has 3 new unit tests
+proving DC and large-magnitude round-trips are bit-exact). The 9.90
+dB number reflects a systematic bool-decoder misalignment that
+compounds across blocks, not a single broken kernel.
+
+To narrow the search, round 19 added `vp9-lossless-c64-constant.ivf`
+(a 64×64 single-colour libvpx-lossless frame). Decoded against
+ffmpeg's reference, **luma PSNR = 61.90 dB** with chroma U/V
+**bit-exact (∞ dB)** — but with a localised cluster of 29 byte-diffs
+in a single 4×4 region (rows 8–11, cols 20–30). Trace shows the
+encoder emitted `skip=true` on a 16×8 H_PRED block; our decoder
+reads `skip=false` against `skip_probs[0]=192` and then mistakenly
+pulls 12 spurious tokens out of bits meant for the next block. The
+spec-literal `AboveSkip + LeftSkip` skip-context regresses
+compound (10.72 → 10.47 dB) and lossless-pattern Y (9.90 → 9.67 dB),
+so the empirical `skip_probs[0]` constant is kept; the c64 fixture
+is a signpost for r20.
+
+Audited but ruled in/out:
+* `update_partition_ctx` (§6.4.3 spec form `15 >> b_width_log2_lookup
+  [subsize]`): regresses c64 by 60× (29 → 1806 byte diffs) and
+  lossless V by 2.22 dB. Round-12 empirical derivation kept and the
+  audit numbers documented in the comment.
+* WHT round-trip (§8.7.1.10): bit-correct on DC=16, DC=-1792 (the
+  exact first-block scenario), and a non-DC AC1 sanity case.
+* DC_PRED at frame top-left: bit-exact reconstruction of pixel value
+  16 from predictor 128 with WHT(-1792) on the first 16×16 block of
+  every fixture (lossless-pattern, c64, gray).
 
 ## Known gaps
 

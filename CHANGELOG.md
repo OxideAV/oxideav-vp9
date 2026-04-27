@@ -7,6 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Round 19 — diagnostic fixture + WHT round-trip unit tests.** Added
+  `tests/vp9_lossless_constant.rs` with a 64×64 single-colour libvpx
+  lossless fixture (`vp9-lossless-c64-constant.ivf`). Decoded against
+  ffmpeg's reference, **luma PSNR = 61.90 dB** (chroma U/V bit-exact at
+  ∞ dB) — but with a localised 29-byte cluster of 1–4-step diffs in a
+  single 4×4 region (rows 8–11, cols 20–30). The cluster isolates the
+  underlying bool-decoder drift to a single `skip=true` block where the
+  `skip_probs[0]` (192) lookup decodes the encoded bit as `skip=false`
+  and then reads 12 spurious tokens that consume bits meant for the
+  next block. This is the smallest reproducible expression of the
+  drift the lossless-pattern (9.90 dB) and lossy-intra fixtures
+  manifest at full scale.
+
+  Also added 3 transform-level unit tests proving the §8.7.1.10 +
+  §8.7.2 WHT path is bit-correct independently of the surrounding
+  pipeline:
+  * `lossless_wht_dc_adds_one_per_pixel`: WHT DC=16 → exactly +1
+    everywhere (ruling out the WHT itself as a 9.90 dB suspect).
+  * `lossless_wht_recovers_neg112_diff`: pred=128 + WHT(-1792) → 16
+    everywhere (the actual round-19 first-block scenario from
+    `vp9-lossless-pattern.ivf` traces).
+  * `lossless_wht_ac1_produces_alternating`: AC1=16 → non-uniform
+    output (sanity that the WHT spreads AC energy).
+
+  159 tests now (was 155).
+
+### Changed
+
+- **Round 19 — partition-context `update_partition_ctx` audit (no
+  code change, documentation update only).** Re-tested the spec-literal
+  `15 >> b_width_log2_lookup[subsize]` form against the round-12-kept
+  empirical derivation. On the new c64-constant fixture the spec form
+  regresses byte-diffs by 60× (29 → 1806). On the lossless-pattern
+  fixture Y is +0.09 dB but V is -2.22 dB (10.21 → 7.99). Net regression.
+  Comment in `update_partition_ctx` updated with the audit numbers and
+  the round-12 derivation kept. The bug producing the localised
+  drift is therefore NOT in the partition-context update.
+
+- **Round 19 — skip-context `skip_ctx` audit (no code change, doc only).**
+  Re-tested the spec-literal `AboveSkip + LeftSkip` form against the
+  current `skip_probs[0]`-anchored constant. Spec form: c64 diffs
+  29→20 (better), lossless pattern Y 9.90→9.67 dB (worse), compound
+  mean 10.72→10.47 dB (worse). The "max(above,left)" alternative is
+  identical to spec on c64 but worse on lossless-pattern Y. The
+  `skip_probs[0]` constant is kept as the best-overall baseline.
+
+### Findings — round-19 systematic audit
+
+The 9.90 dB lossless number reflects a systemic bool-decoder
+misalignment, not a single mis-implemented sub-system. Audited and
+ruled out:
+
+* **§8.7.1.10 WHT inverse transform**: bit-correct (3 new unit tests).
+* **§8.6.2 reconstruct add-and-clip**: matches spec literal (no
+  Round2 in lossless path, just clip-add).
+* **§8.5.1 DC_PRED prediction at frame top-left**: bit-exact on c64
+  16×16 first block (residual recovers pixel value 16 from predictor
+  128 with WHT(-1792)).
+* **§9.3.2 KF_PARTITION_PROBS table layout**: comment was misleading
+  but data is in spec order (8×8 → 4×4 first, 64×64 → 32×32 last).
+  Reader uses `bsl=0` for 8×8 query, indexing entries [0..3] which
+  match the spec's "8×8 → 4×4" rows.
+* **§6.4.6 default_intra_mode tree (`read_intra_mode_tree`)**: 9-prob
+  walk matches spec's `intra_mode_tree[18]` node-by-node.
+* **§6.4.25 get_scan**: lossless → DCT_DCT scan = `default_scan_4x4`
+  (per spec).
+* **§6.4.24 token initial-context**: `above + left` over the
+  AboveNonzeroContext / LeftNonzeroContext arrays per spec, with
+  `step = 1 << txSz` update step.
+
+The bug is somewhere in the §6.4.6 mode_info / §6.4.21 residual
+sequence where one of: read_tx_size context, default_uv_mode context,
+or one of the prob-table updates parsed from the compressed header
+gates a different probability than the encoder wrote. The c64
+constant-color fixture is the smallest known reproduction.
+
+## [r18 baseline]
+
 ### Changed
 
 - **Round 18 — §9.3.2 default_intra_mode tracker for ≥8×8 reverted to

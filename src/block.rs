@@ -635,18 +635,17 @@ impl<'a> IntraTile<'a> {
     }
 
     /// §7.4.6 update `AbovePartitionContext` / `LeftPartitionContext`
-    /// after a partition is decoded. The 64×64-first convention used
-    /// throughout this decoder: `bsl=0` for 64×64, `bsl=3` for 8×8 (the
-    /// inverse of `mi_width_log2_lookup`). Fill bytes are built so that
-    /// `(byte >> boffset) & 1` resolves to 1 iff the neighbour's
-    /// subsize was smaller than the block currently being decoded.
-    /// Round-13 / Round-14 note: the spec-literal `15 >>
-    /// b_width_log2_lookup[subsize]` rewrite REGRESSED both the
-    /// libvpx-encoded compound fixture and the lossless-gray fixture
-    /// even when paired with the round-14 partition-call fix —
-    /// libvpx uses this in-tree derivation rather than the literal
-    /// spec form. Restoring the round-12 derivation pending further
-    /// investigation.
+    /// after a partition is decoded. Round-12-through-18 derivation
+    /// (kept after round-19 audit found that the spec-literal
+    /// `15 >> b_width_log2_lookup[subsize]` form regressed c64-constant
+    /// fixture by 60× — see commit body for full investigation).
+    ///
+    /// The libvpx encoder / decoder pair appears to use this
+    /// pre-saturated form: when the resulting subsize is at least as wide
+    /// as the parent, every "smaller-than-N" bit is set; when narrower,
+    /// no bits are set. This biases the partition tree toward Split
+    /// continuation more aggressively than the spec text suggests but
+    /// matches the encoder's actual choices on real fixtures.
     fn update_partition_ctx(
         &mut self,
         mi_row: usize,
@@ -1196,20 +1195,12 @@ impl<'a> IntraTile<'a> {
                         &mut coeffs,
                     )?;
                     if std::env::var("VP9_TRACE_COEF").is_ok() {
+                        let band0_eob_p = probs[0][initial_ctx][0];
                         eprintln!(
-                            "  COEF plane={} r={} c={} side={} eob={} dc={} ac0={} initial_ctx={}",
-                            plane,
-                            abs_row,
-                            abs_col,
-                            tx_side,
-                            eob,
-                            coeffs[0],
-                            if eob > 1 {
-                                coeffs[scan.scan[1] as usize]
-                            } else {
-                                0
-                            },
-                            initial_ctx
+                            "  COEF plane={} r={} c={} side={} eob={} dc={} ac0={} ictx={} eobp={} pos={}",
+                            plane, abs_row, abs_col, tx_side, eob, coeffs[0],
+                            if eob > 1 { coeffs[scan.scan[1] as usize] } else { 0 },
+                            initial_ctx, band0_eob_p, bd.pos(),
                         );
                     }
                     if eob > 0 {

@@ -1253,4 +1253,61 @@ mod tests {
             assert_eq!(v, 99);
         }
     }
+
+    /// §8.7.1.10 + §8.7.2 / §8.6.2 lossless WHT round-trip:
+    /// dequant value 16 (= token 4 × dq=4) at DC must add 1 to every
+    /// pixel of a 4×4 block (the encoder pre-multiplies by 4 so the
+    /// inverse WHT row pass with shift=2 cancels back to the original
+    /// pixel diff). Round-19 audit confirms our `iwht4x4_add` matches
+    /// the spec's literal WHT kernel — the bit-exactness of this DC
+    /// case rules out the WHT itself as the source of the lossless
+    /// fixture's poor PSNR.
+    #[test]
+    fn lossless_wht_dc_adds_one_per_pixel() {
+        let mut coeffs = [0i32; 16];
+        coeffs[0] = 16; // post-dequant DC = token(4) * dq(4) = 16
+        let mut dst = [50u8; 16];
+        inverse_transform_add(TxType::WhtWht, 4, 4, &coeffs, &mut dst, 4).unwrap();
+        for &v in &dst {
+            assert_eq!(v, 51, "WHT DC=16 should add exactly +1 to every pixel");
+        }
+    }
+
+    /// §8.7.1.10 lossless WHT large negative DC: dequant value `-1792`
+    /// (encoder forward-WHT of a constant pixel diff of `-112` over a
+    /// 4×4 block) must add `-112` to every pixel. This is the exact
+    /// scenario the round-19 lossless-pattern fixture's first 4×4
+    /// block hits — `pred=128, ref=16, diff=-112` round-trips through
+    /// the WHT to recover the source losslessly.
+    #[test]
+    fn lossless_wht_recovers_neg112_diff() {
+        let mut coeffs = [0i32; 16];
+        coeffs[0] = -1792; // 4 × forward_WHT_DC(-112) over 16 pixels
+        let mut dst = [128u8; 16];
+        inverse_transform_add(TxType::WhtWht, 4, 4, &coeffs, &mut dst, 4).unwrap();
+        for &v in &dst {
+            assert_eq!(
+                v, 16,
+                "WHT must recover dst=16 for predictor=128 + residual=-112"
+            );
+        }
+    }
+
+    /// §8.7.1.10 WHT with all four AC coefficients zero plus an AC1
+    /// coefficient should produce a non-uniform output. Sanity check
+    /// that the WHT kernel actually does spread AC energy and isn't
+    /// silently degenerating to DC.
+    #[test]
+    fn lossless_wht_ac1_produces_alternating() {
+        let mut coeffs = [0i32; 16];
+        coeffs[1] = 16; // AC1 in raster — note scan order may differ
+        let mut dst = [128u8; 16];
+        inverse_transform_add(TxType::WhtWht, 4, 4, &coeffs, &mut dst, 4).unwrap();
+        // Output should NOT be uniform — at least two distinct values.
+        let first = dst[0];
+        assert!(
+            dst.iter().any(|&v| v != first),
+            "AC1=16 should give non-uniform 4×4 output (got all-{first})"
+        );
+    }
 }

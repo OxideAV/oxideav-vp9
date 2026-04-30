@@ -20,10 +20,14 @@ use crate::tables::{KF_UV_MODE_PROBS, KF_Y_MODE_PROBS};
 
 /// Index of `DC_PRED` in the intra-mode tree (§7.4.5 Table 7-5).
 const MODE_DC: usize = 0;
-/// Skip probability used by the decoder (hard-coded context-0 approx).
-/// Matches the decoder's pre-Round-7 hard-coded value; see
-/// `block.rs::decode_block` for the rationale.
-const SKIP_PROB: u8 = 192;
+/// Default §10.5 `skip_prob[]` table (3 contexts) used by the decoder
+/// to read `read_skip()` per §6.4.8 / §7.4.6. The encoder must match —
+/// see `block.rs::decode_block` for the matching read side.
+const SKIP_PROBS: [u8; 3] = [192, 128, 64];
+/// Convenience for places where a literal "192" was previously used as
+/// the ctx-0 default (e.g. self-roundtrip helpers).
+#[allow(dead_code)]
+const SKIP_PROB: u8 = SKIP_PROBS[0];
 
 /// Emit the tile payload for a keyframe at the given frame size using
 /// the MVP scheme: every block is 64×64 PARTITION_NONE, skip=1,
@@ -55,16 +59,15 @@ pub fn emit_keyframe_tile(p: &EncoderParams, tx_mode: TxMode) -> Vec<u8> {
 struct PartitionCtx {
     above: Vec<u8>,
     left: Vec<u8>,
-    /// Per-mi-col/row skip tracking (§7.4.6). Seeded but currently
-    /// unused — the decoder reads skip against a hard-coded prob.
-    #[allow(dead_code)]
+    /// Per-mi-col/row skip tracking (§7.4.6). Read by `skip_ctx`,
+    /// updated by `stamp_skip` after every emitted block — the decoder
+    /// computes the same context, so the matching `skip_probs[ctx]`
+    /// resolves to the same bin on both sides.
     above_skip: Vec<bool>,
-    #[allow(dead_code)]
     left_skip: Vec<bool>,
 }
 
 impl PartitionCtx {
-    #[allow(dead_code)]
     fn skip_ctx(&self, mi_row: usize, mi_col: usize) -> usize {
         let a = if mi_row > 0 && mi_col < self.above_skip.len() {
             self.above_skip[mi_col] as usize
@@ -285,11 +288,10 @@ fn emit_partition(
 }
 
 /// Emit one block's symbols: skip=1, DC_PRED luma, DC_PRED chroma,
-/// no coefficients. `_skip_ctx` is retained for future wiring but
-/// ignored — the decoder reads skip with a hard-coded 192 prob (the
-/// round-13 per-context wiring regressed the lossless-gray fixture).
-fn emit_block(be: &mut BoolEncoder, _skip_ctx: usize) {
-    be.write(1, SKIP_PROB);
+/// no coefficients. The skip is emitted using the §7.4.6 per-context
+/// `skip_probs[skip_ctx]` so the decoder can be spec-correct.
+fn emit_block(be: &mut BoolEncoder, skip_ctx: usize) {
+    be.write(1, SKIP_PROBS[skip_ctx.min(2)]);
     // tx_size: ONLY_4X4 so no symbol is written.
     // Luma intra mode tree (KF_Y_MODE_PROBS[DC][DC] = row 0, col 0).
     let p = &KF_Y_MODE_PROBS[MODE_DC][MODE_DC];

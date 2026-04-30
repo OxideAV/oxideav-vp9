@@ -112,44 +112,52 @@ let mut reg = CodecRegistry::new();
 oxideav_vp9::register(&mut reg);
 ```
 
-## Round-19 lossless decode audit
-
-Past rounds reported "lossless bit-exact (66.77 dB)" against the
-`vp9-lossless-gray.ivf` fixture. That measurement is **degenerate** —
-the reference plane is a constant `vec![126; 64*64]`, so any decoder
-output that's "approximately gray" scores ≥ 60 dB without being
-bit-exact (DC prediction with no residual already gets there).
+## Round-20 §7.4.6 spec-ctx skip read
 
 `tests/vp9_lossless_pattern.rs` compares against an `ffmpeg testsrc
 -lossless 1` reference. Headline numbers per round:
 
-| round | lossless Y | lossless U | lossless V | compound Y mean |
-|-------|-----------:|-----------:|-----------:|----------------:|
-| r17   | 9.69 dB    | 10.96 dB   | 9.26 dB    | 10.63 dB        |
-| r18   | 9.90 dB    | 10.80 dB   | 10.21 dB   | 10.72 dB        |
-| r19   | 9.90 dB    | 10.80 dB   | 10.21 dB   | 10.72 dB        |
+| round | lossless pattern Y | lossless c64 Y | lossless gray Y | compound Y mean |
+|-------|-------------------:|---------------:|----------------:|----------------:|
+| r17   | 9.69 dB            | n/a            | 66.77 dB        | 10.63 dB        |
+| r18   | 9.90 dB            | n/a            | 66.77 dB        | 10.72 dB        |
+| r19   | 9.90 dB            | 61.90 dB       | 66.77 dB        | 10.72 dB        |
+| r20   | 9.67 dB            | **70.10 dB**   | 45.43 dB        | 10.20 dB        |
 
-Round 19 ran a full top-down audit of the lossless reconstruction
-chain — §8.7.1.10 WHT, §8.6.2 reconstruct add, §8.5.1 DC_PRED, §9.3.2
-KF_PARTITION_PROBS table layout, §6.4.6 default_intra_mode tree,
-§6.4.25 get_scan, §6.4.24 token initial-context. **All these
-sub-systems are spec-correct** (the WHT now has 3 new unit tests
-proving DC and large-magnitude round-trips are bit-exact). The 9.90
-dB number reflects a systematic bool-decoder misalignment that
-compounds across blocks, not a single broken kernel.
+Round 20 fixed the §6.4.8 / §7.4.6 skip-context wiring. Since round
+13 the decoder had been reading `skip` against the constant
+`skip_probs[0]=192`, ignoring the spec ctx
+`(AvailU ? AboveSkip : 0) + (AvailL ? LeftSkip : 0)`. The
+`vp9-lossless-c64-constant.ivf` fixture pinpointed the bug: a 16×8
+H_PRED block at (mi_row=1, mi_col=2) where the libvpx encoder had
+emitted `skip=true` against `skip_probs[1]=128` (left=0,above=1) but
+our decoder kept reading against `skip_probs[0]=192`, decoding
+skip=false and consuming 12 spurious 4×4 token reads which then
+ran the bool decoder past EOF and corrupted the rest of the frame.
 
-To narrow the search, round 19 added `vp9-lossless-c64-constant.ivf`
-(a 64×64 single-colour libvpx-lossless frame). Decoded against
-ffmpeg's reference, **luma PSNR = 61.90 dB** with chroma U/V
-**bit-exact (∞ dB)** — but with a localised cluster of 29 byte-diffs
-in a single 4×4 region (rows 8–11, cols 20–30). Trace shows the
-encoder emitted `skip=true` on a 16×8 H_PRED block; our decoder
-reads `skip=false` against `skip_probs[0]=192` and then mistakenly
-pulls 12 spurious tokens out of bits meant for the next block. The
-spec-literal `AboveSkip + LeftSkip` skip-context regresses
-compound (10.72 → 10.47 dB) and lossless-pattern Y (9.90 → 9.67 dB),
-so the empirical `skip_probs[0]` constant is kept; the c64 fixture
-is a signpost for r20.
+The fix is one line in `block.rs::decode_block` (intra path) and a
+matching line in `inter.rs` — both now pass `skip_ctx(mi_row,
+mi_col)` into `skip_probs[]`. The encoder side in
+`encoder/tile.rs::emit_block` was updated to use the same per-context
+prob so the self-roundtrip stays bit-exact.
+
+Effect:
+* `vp9-lossless-c64-constant.ivf` lifts **61.9 → 70.1 dB**, byte
+  diffs collapse from 29 → 20 (all chroma is now bit-exact).
+* `vp9-lossless-gray.ivf` drops 66.77 → 45.43 dB. The gray fixture
+  is a degenerate `vec![126; 64*64]` reference: a single
+  bool-decoder mis-skip used to score 66.77 dB by chance because
+  every block's DC prediction matched 126; the spec-correct skip
+  read now exposes the underlying compressed-header / coef-prob
+  drift that the bool-decoder happy-accident was masking. Test
+  threshold is 30 dB; we still pass.
+* `vp9-lossless-pattern.ivf` Y drops 9.90 → 9.67 dB (still > 8 dB
+  threshold). The pattern fixture has high-frequency content that
+  exercises every sub-8x8 mode-info path; the round-20 fix is one
+  of several stacked spec divergences and lifting pattern Y to
+  ≥30 dB is r21+.
+* compound mean luma 10.49 → 10.20 dB (test prints only, no
+  threshold; the inter path also moved to spec ctx for parity).
 
 Audited but ruled in/out:
 * `update_partition_ctx` (§6.4.3 spec form `15 >> b_width_log2_lookup

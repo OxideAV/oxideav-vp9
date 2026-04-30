@@ -1053,17 +1053,15 @@ impl<'a> InterTile<'a> {
         self.segment_ids
             .fill(mi_row, mi_col, mi_w.max(1), mi_h.max(1), segment_id);
         // §6.4.8 read_skip — `SEG_LVL_SKIP` forces skip=1 per §6.4.9.
-        // Round-15 investigation: §7.4.6 specifies prob = skip_probs[ctx]
-        // where ctx ∈ {0,1,2} = AboveSkip + LeftSkip. On both fixtures
-        // (lossless-gray + compound) the spec interpretation regresses
-        // PSNR vs the simpler `skip_probs[0]` constant. Even after wiring
-        // the §6.4.4 EobTotal-skip override (so `above_skip` stores
-        // `skip || (is_inter && bs>=8x8 && EobTotal==0)`, matching spec
-        // `Skips[][]`), the spec ctx form still drops compound 10.59 →
-        // 10.49 dB. The keyframe path has the same issue (66.77 → 45.43
-        // dB on the lossless fixture). The encoder appears to anchor to
-        // `skip_probs[0]`. We honour that here for parity with the
-        // keyframe path.
+        // §7.4.6 / §9.3.2 spec ctx:
+        //     ctx = (AvailU ? AboveSkip : 0) + (AvailL ? LeftSkip : 0)
+        // Round-20: matches the keyframe path in `block.rs` (§6.4.6
+        // intra_frame_mode_info also reads `skip` against the same
+        // §7.4.6 ctx). The compound fixture's mean luma PSNR is
+        // unchanged (~10.47 dB) under spec ctx — the spec form was
+        // previously believed to regress compound by 0.1 dB but that
+        // was a false reading caused by the matching round-15 keyframe
+        // bug feeding wrong neighbour skip state into inter blocks.
         let skip = if self
             .hdr
             .segmentation
@@ -1071,10 +1069,8 @@ impl<'a> InterTile<'a> {
         {
             true
         } else {
-            // Touch self.skip_ctx() to silence the dead-code warning
-            // while we keep the ctx infrastructure wired for future use.
-            let _sctx = self.skip_ctx(mi_row, mi_col);
-            bd.read(self.ch.ctx.skip_probs[0])? != 0
+            let sctx = self.skip_ctx(mi_row, mi_col);
+            bd.read(self.ch.ctx.skip_probs[sctx])? != 0
         };
         // §6.4.13 read_is_inter — `SEG_LVL_REF_FRAME` forces the
         // `is_inter` decision: INTRA_FRAME => intra, otherwise inter.

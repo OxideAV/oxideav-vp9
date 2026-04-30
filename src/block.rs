@@ -161,13 +161,10 @@ pub struct IntraTile<'a> {
     /// "did my neighbour have any non-zero coefficients" flag arrays
     /// that drive the initial token context for `more_coefs` (§6.4.24).
     pub nonzero_ctx: NonzeroCtx,
-    /// Per-8x8 above/left `Skips[..]` tracking. Currently seeded but
-    /// not consumed — §7.4.6's `skip_probs[skip_ctx]` path regressed
-    /// the vp9-intra fixture (Round 7 investigation) so we fell back
-    /// to the hard-coded prob while keeping the infrastructure wired.
-    #[allow(dead_code)]
+    /// Per-8x8 above/left `Skips[..]` tracking. Read by `skip_ctx`,
+    /// updated by `update_skip_ctx` after every block — drives the
+    /// §7.4.6 `skip_probs[ctx]` lookup at every `read_skip` call.
     pub above_skip: Vec<bool>,
-    #[allow(dead_code)]
     pub left_skip: Vec<bool>,
 }
 
@@ -334,9 +331,9 @@ impl<'a> IntraTile<'a> {
         }
     }
 
-    /// §7.4.6 skip context for `read_skip`:
+    /// §7.4.6 / §9.3.2 skip context for `read_skip`:
     ///   ctx = (AvailU ? AboveSkip : 0) + (AvailL ? LeftSkip : 0)
-    #[allow(dead_code)]
+    /// where AvailU = mi_row > 0 and AvailL = mi_col > MiColStart.
     fn skip_ctx(&self, mi_row: usize, mi_col: usize) -> usize {
         let a = if mi_row > 0 && mi_col < self.above_skip.len() {
             self.above_skip[mi_col] as usize
@@ -709,20 +706,19 @@ impl<'a> IntraTile<'a> {
         self.segment_ids
             .fill(mi_row, mi_col, bw.max(1), bh.max(1), segment_id);
         // §6.4.8 read_skip — `SEG_LVL_SKIP` forces skip=1 per §6.4.9.
-        // Note: §7.4.6 says `prob = skip_probs[skip_ctx]` where
-        // `skip_ctx = AboveSkip + LeftSkip` (∈ {0,1,2}). Both round-13
-        // and the round-15 investigation confirmed this regresses the
-        // lossless-gray fixture (66.77 → 45.43 dB on the keyframe alone).
-        // `dump_skip_probs` shows skip_probs stay at the §10.5 defaults
-        // `[192,128,64]` for both fixtures, so the divergence is in the
-        // ctx itself. The empirical observation is that the encoder
-        // anchors to `skip_probs[0]` regardless of the spec ctx value
-        // (this round eliminated the spec-form `a+l` and the `min(a,l)`
-        // candidates — both regress the keyframe). The inter path in
-        // `inter.rs` uses the same `skip_probs[0]` for parity (compound
-        // PSNR 10.59 dB vs 10.49 dB with the spec ctx). Round-15 leaves
-        // the spec interpretation unsolved — see the §6.4.7 trace in the
-        // round-15 commit body for the per-block ctx values that diverge.
+        // §7.4.6 / §9.3.2 spec ctx:
+        //     ctx = (AvailU ? AboveSkip : 0) + (AvailL ? LeftSkip : 0)
+        // where AvailU = mi_row > 0 and AvailL = mi_col > MiColStart.
+        // Round-20 fix: switched from the round-13/15 hard-coded
+        // `skip_probs[0]=192` to the spec-literal `skip_probs[ctx]`. The
+        // c64 lossless-constant fixture had a 4×4 hot spot where the
+        // encoder emitted skip=true against `skip_probs[1]=128`
+        // (LeftSkip=0, AboveSkip=1) but our decoder was reading against
+        // `skip_probs[0]=192`, decoding skip=false and consuming 12
+        // spurious 4×4 token reads which then ran the bool decoder past
+        // EOF and corrupted the rest of the frame. Spec ctx lifts c64
+        // 61.9 → 70.1 dB. The matching encoder-side change is in
+        // `encoder/tile.rs::emit_block`.
         let skip = if self
             .hdr
             .segmentation
@@ -730,7 +726,8 @@ impl<'a> IntraTile<'a> {
         {
             true
         } else {
-            bd.read(self.ch.ctx.skip_probs[0])? != 0
+            let ctx = self.skip_ctx(mi_row, mi_col);
+            bd.read(self.ch.ctx.skip_probs[ctx])? != 0
         };
         // Read tx_size. For TX_MODE_SELECT + bsize >= 8x8 the tx_size is
         // tree-coded. For simpler modes we use the tx_mode ceiling.
@@ -833,7 +830,16 @@ impl<'a> IntraTile<'a> {
         if std::env::var("VP9_TRACE").is_ok() {
             eprintln!(
                 "BLK r={} c={} bs={}x{} sub8x8={} y_mode={:?} uv_mode={:?} sub_modes={:?} skip={} tx_log2={}",
-                row, col, bs.w(), bs.h(), is_sub8x8, y_mode, uv_mode, sub_modes, skip, tx_size_log2
+                row,
+                col,
+                bs.w(),
+                bs.h(),
+                is_sub8x8,
+                y_mode,
+                uv_mode,
+                sub_modes,
+                skip,
+                tx_size_log2
             );
         }
         // Stamp the skip bit into the neighbour trackers so the next

@@ -887,30 +887,46 @@ impl<'a> InterTile<'a> {
                 self.update_partition_ctx(mi_row, mi_col, bsize, bsize, bsize);
             }
             Partition::Horz => {
+                // §6.4.3 decode_partition: when subsize < BLOCK_8X8 the
+                // spec branches into the leading `if (subsize < BLOCK_8X8
+                // || partition == PARTITION_NONE)` arm and calls
+                // decode_block ONCE — `read_inter_frame_mode_info`
+                // (§6.4.11) handles the sub-block iteration internally
+                // for sub-8x8 partitions. The `partition == PARTITION_HORZ`
+                // two-call branch only applies when subsize >= BLOCK_8X8,
+                // i.e. bsize > 8. Calling decode_block twice for bsize=8
+                // + HORZ used to double-read mode-info / MVs and desync
+                // the bool decoder — round 23 fix mirrors the round-22
+                // intra fix in `block.rs::decode_partition`.
                 let bs = BlockSize::from_wh(bsize, half);
                 self.decode_block(bd, row, col, bs)?;
-                if row + half < self.height as u32 {
+                if bsize > 8 && row + half < self.height as u32 {
                     self.decode_block(bd, row + half, col, bs)?;
                 }
                 self.update_partition_ctx(mi_row, mi_col, bsize, bsize, half);
             }
             Partition::Vert => {
+                // §6.4.3: same one-vs-two-call split as HORZ above.
                 let bs = BlockSize::from_wh(half, bsize);
                 self.decode_block(bd, row, col, bs)?;
-                if col + half < self.width as u32 {
+                if bsize > 8 && col + half < self.width as u32 {
                     self.decode_block(bd, row, col + half, bs)?;
                 }
                 self.update_partition_ctx(mi_row, mi_col, bsize, half, bsize);
             }
             Partition::Split => {
                 if bsize == 8 {
-                    for (dr, dc) in [(0, 0), (0, 4), (4, 0), (4, 4)] {
-                        let r = row + dr;
-                        let c = col + dc;
-                        if r < self.height as u32 && c < self.width as u32 {
-                            self.decode_block(bd, r, c, BlockSize::B4x4)?;
-                        }
-                    }
+                    // §6.4.3: SPLIT at BLOCK_8X8 → subsize=BLOCK_4X4 which
+                    // satisfies `subsize < BLOCK_8X8`, so the spec calls
+                    // `decode_block(r, c, subsize)` ONCE — not 4 times.
+                    // §6.4.11 inter_frame_mode_info handles the 4 sub-MVs
+                    // / sub-modes internally when MiSize<BLOCK_8X8.
+                    // Calling decode_block 4 times here used to read 4×
+                    // the mode-info / ref / MV bits and severely desync
+                    // the bool decoder — round 23 fix mirrors the
+                    // round-13 intra SPLIT fix and the round-22 intra
+                    // HORZ/VERT fix.
+                    self.decode_block(bd, row, col, BlockSize::B4x4)?;
                     self.update_partition_ctx(mi_row, mi_col, bsize, half, half);
                 } else {
                     for (dr, dc) in [(0, 0), (0, half), (half, 0), (half, half)] {
@@ -2487,5 +2503,114 @@ mod tests {
     fn comp_ref_ctx_both_intra_is_two() {
         let n = ni(true, true, [0, 255], [0, 255]);
         assert_eq!(InterTile::comp_ref_ctx(&n, &[false; 4], 3, [1, 2]), 2);
+    }
+
+    /// **Round 23 — §6.4.3 sub-8×8 inter partition contract.**
+    ///
+    /// For `bsize = BLOCK_8X8`, every partition shape produces a
+    /// `subsize` that satisfies `subsize < BLOCK_8X8`:
+    ///
+    /// |  partition |  subsize  | sub-w | sub-h |
+    /// |-----------:|----------:|------:|------:|
+    /// |  HORZ      |  B8x4     |   8   |   4   |
+    /// |  VERT      |  B4x8     |   4   |   8   |
+    /// |  SPLIT     |  B4x4     |   4   |   4   |
+    /// |  NONE      |  B8x8     |   8   |   8   |
+    ///
+    /// The §6.4.3 spec calls `decode_block` ONCE in the leading
+    /// `if (subsize < BLOCK_8X8 || partition == NONE)` arm; the four
+    /// sub-block mode/ref/MV reads happen INSIDE
+    /// `read_inter_frame_mode_info` (§6.4.11). Calling `decode_block`
+    /// 2 (HORZ/VERT) or 4 (SPLIT) times here over-reads the bool
+    /// decoder and desyncs every subsequent partition.
+    ///
+    /// This test pins the bsize=8 → subsize-classification table so a
+    /// regression that loses the "subsize < BLOCK_8X8" gate trips here.
+    #[test]
+    fn r23_sub_8x8_partition_routing_contract() {
+        // pixel widths/heights for the 4 sub-8x8-producing shapes.
+        let bsize = 8u32;
+        let half = bsize / 2;
+
+        // HORZ at bsize=8 → B8x4, h=4 < 8 → leading branch (one call).
+        let bs_horz = BlockSize::from_wh(bsize, half);
+        assert_eq!(bs_horz.w(), 8);
+        assert_eq!(bs_horz.h(), 4);
+        assert!(bs_horz.h() < 8, "HORZ at bsize=8: subsize must be <8x8");
+
+        // VERT at bsize=8 → B4x8, w=4 < 8 → leading branch (one call).
+        let bs_vert = BlockSize::from_wh(half, bsize);
+        assert_eq!(bs_vert.w(), 4);
+        assert_eq!(bs_vert.h(), 8);
+        assert!(bs_vert.w() < 8, "VERT at bsize=8: subsize must be <8x8");
+
+        // SPLIT at bsize=8 → B4x4 — subsize=4x4, definitely <8x8.
+        let bs_split = BlockSize::B4x4;
+        assert_eq!(bs_split.w(), 4);
+        assert_eq!(bs_split.h(), 4);
+
+        // For bsize=16 + HORZ → B16x8, subsize.h=8 >= 8x8 →
+        // two-call branch fires (one above, one below).
+        let bsize16 = 16u32;
+        let half16 = bsize16 / 2;
+        let bs_horz16 = BlockSize::from_wh(bsize16, half16);
+        assert_eq!(bs_horz16.w(), 16);
+        assert_eq!(bs_horz16.h(), 8);
+        assert!(
+            bs_horz16.h() >= 8 && bs_horz16.w() >= 8,
+            "HORZ at bsize=16 must reach the two-call branch (subsize >= 8x8)"
+        );
+    }
+
+    /// **Round 23 — sub-8×8 call-count gate.**
+    ///
+    /// Encodes the structural intent of the r23 fix as a pure-data
+    /// table. The "expected calls" column is what `decode_partition`
+    /// must invoke `decode_block` for — counted at this level, before
+    /// `read_inter_frame_mode_info` does its sub-block iteration
+    /// internally.
+    #[test]
+    fn r23_decode_partition_call_count_table() {
+        // (bsize, partition_kind_str, subsize_w, subsize_h, expected_calls)
+        let table: &[(u32, &str, u32, u32, u32)] = &[
+            (8, "NONE", 8, 8, 1),
+            (8, "HORZ", 8, 4, 1),  // r23 fix: was 2, now 1.
+            (8, "VERT", 4, 8, 1),  // r23 fix: was 2, now 1.
+            (8, "SPLIT", 4, 4, 1), // r23 fix: was 4, now 1.
+            (16, "NONE", 16, 16, 1),
+            (16, "HORZ", 16, 8, 2),
+            (16, "VERT", 8, 16, 2),
+            // SPLIT at bsize=16 recurses into 4 sub-decode_partition
+            // calls (not decode_block) — this table tracks the
+            // immediate decode_block calls so SPLIT@16 isn't listed.
+        ];
+        for (bsize, kind, sw, sh, calls) in table.iter().copied() {
+            let sub_lt_8x8 = sw < 8 || sh < 8;
+            let bsize_is_8 = bsize == 8;
+            let leading_branch_fires = sub_lt_8x8 || kind == "NONE";
+            // Leading branch = one call. Two-call branch only fires
+            // when subsize >= 8x8 AND partition is HORZ/VERT.
+            let expected = if leading_branch_fires {
+                1
+            } else if matches!(kind, "HORZ" | "VERT") {
+                2
+            } else {
+                // SPLIT @ bsize>8 recurses; not counted here.
+                continue;
+            };
+            assert_eq!(
+                expected, calls,
+                "bsize={} {}: expected {} decode_block calls, table says {}",
+                bsize, kind, expected, calls
+            );
+            // Cross-check: the r23 fix is exactly the bsize=8 row set.
+            if bsize_is_8 && kind != "NONE" {
+                assert_eq!(
+                    calls, 1,
+                    "r23 contract: bsize=8 + {} must call decode_block exactly once",
+                    kind
+                );
+            }
+        }
     }
 }

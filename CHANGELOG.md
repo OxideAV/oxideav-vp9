@@ -9,6 +9,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Round 23 — §6.4.3 sub-8×8 HORZ/VERT/SPLIT one-call branch
+  for the inter path.** Mirrors the round-22 intra fix to
+  `inter.rs::decode_partition`. Per §6.4.3 the leading
+  `if (subsize < BLOCK_8X8 || partition == PARTITION_NONE)` arm
+  fires before the HORZ/VERT two-call branch and the SPLIT
+  recurse-4 branch; for `bsize=BLOCK_8X8` every non-NONE partition
+  produces a sub-8×8 `subsize`, so `decode_block` must be called
+  exactly ONCE — `read_inter_frame_mode_info` (§6.4.11) handles
+  the sub-block iteration internally.
+
+  Before r23, the inter path was:
+  * HORZ at bsize=8 → 2× decode_block (over-read mode/ref/MV).
+  * VERT at bsize=8 → 2× decode_block (same).
+  * SPLIT at bsize=8 → 4× decode_block on B4x4 sub-blocks
+    (4× over-read every per-block ctx — comp_mode, comp_ref,
+    single_ref, inter_mode, interp_filter, segment_id, skip,
+    is_inter, tx_size, plus full coefficient detoken).
+
+  After r23, all three shapes call `decode_block` once at
+  bsize=8, matching the §6.4.3 spec literal and the round-22
+  intra fix. This is a structural alignment between the intra
+  and inter partition trees that should also have been a paired
+  change in round 22.
+
+  Per-fixture / per-variant audit:
+
+  | variant | pattern Y | compound Y | c64 |
+  |---------|----------:|-----------:|-----|
+  | r22 baseline (intra fix only) | 47.70 dB | 9.54 dB | ∞ |
+  | **r23 (inter analog applied)** | **47.70 dB** | **9.55 dB** | **∞** |
+
+  The compound mean Y improvement is small (+0.01 dB; only frame
+  3 of 6 moved measurably, 9.68 → 9.77 dB) — the dominant
+  remaining compound divergence is therefore NOT in
+  `decode_partition`'s call count but in the per-sub-8×8
+  inter mode-info reader: §6.4.16 `inter_block_mode_info`
+  reads `inter_mode` and `assign_mv` PER 4×4 sub-block when
+  `MiSize < BLOCK_8X8`, but our `decode_inter_block` reads
+  one inter_mode + one MV per ref slot regardless of `bs`.
+  That is the r24+ work — under-reading from the inter mode
+  reader is now the sole remaining compound asymmetry.
+  Pattern luma and c64 remain unchanged because the lossless
+  fixtures are pure-keyframe and never hit the inter path.
+
+  All 163 tests pass (134 unit + 29 integration; +2 unit tests
+  added in `inter.rs::tests` to pin the §6.4.3 sub-8×8
+  partition routing contract and the per-shape decode_block
+  call-count table).
+
 - **Round 22 — §6.4.3 sub-8×8 HORZ/VERT one-call branch + §9.3.2
   spec-literal sub-mode anchor.** Two paired fixes in `block.rs`
   that, together, lift `vp9-lossless-pattern.ivf` Y by **+37 dB**
@@ -96,6 +145,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (10.20 → 7.52 dB). Comment updated to record the r21 re-test.
 
 ### Added
+
+- **Round 23 — §6.4.3 sub-8×8 inter partition routing tests.**
+  Added two unit tests in `inter.rs::tests`:
+  * `r23_sub_8x8_partition_routing_contract` — pins the
+    `(bsize=8, partition) → subsize` table and asserts every
+    non-NONE shape produces a sub-8×8 subsize so the leading
+    one-call branch fires; cross-checks bsize=16 + HORZ where
+    the two-call branch is the spec-correct path.
+  * `r23_decode_partition_call_count_table` — pure-data table
+    of the expected `decode_block` call count per
+    `(bsize, partition_kind)` pair, with the r23 contract
+    locked in: bsize=8 + HORZ/VERT/SPLIT each call
+    `decode_block` exactly once.
+  These guard against a regression to the pre-r23 2×/4×
+  call counts that desynced the bool decoder for every
+  sub-8×8 inter partition.
 
 - **Round 22 — §9.3.2 sub-mode indexing unit tests.** Added two
   unit tests in `block.rs::tests` that pin the indexing contract

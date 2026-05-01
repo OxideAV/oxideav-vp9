@@ -125,6 +125,17 @@ oxideav_vp9::register(&mut reg);
 | r20   | 9.67 dB            | 70.10 dB       | 45.43 dB        | 10.20 dB        |
 | r21   | 10.41 dB           | ∞ (bit-exact) | 45.43 dB        | 9.28 dB         |
 | r22   | **47.70 dB**       | **∞ (bit-exact)** | 45.43 dB     | **9.54 dB**     |
+| r23   | **47.70 dB**       | **∞ (bit-exact)** | 45.43 dB     | **9.55 dB**     |
+
+Round 23 mirrors the round-22 §6.4.3 sub-8×8 one-call fix to the
+inter `decode_partition` (`inter.rs`), eliminating the 2× HORZ/VERT
+and 4× SPLIT over-call at `bsize=BLOCK_8X8`. Lossless fixtures
+remain bit-exact / r22-stable (they're keyframe-only). The compound
+mean Y improvement is small (+0.01 dB) — the dominant remaining
+asymmetry has moved to `decode_inter_block` itself, which reads
+one `inter_mode` + one MV per ref slot regardless of `bs`,
+violating §6.4.16's per-4×4-sub-block read for `MiSize<BLOCK_8X8`.
+That is the round-24+ work.
 
 Round 22 lands two paired §6.4.3 / §9.3.2 fixes that, together,
 unlock a **+37 dB jump** on the lossless-pattern Y plane and lift
@@ -203,14 +214,77 @@ the other produces a desync (`vp9_intra_fixture` luma mean
 collapses from 89 to 6). Spec-correct on both lifts pattern Y from
 9.94 → 47.70 dB and intra fixture mean from 89 → 111.
 
-The 0.74 dB compound regression vs. r21 (10.20 → 9.54) is the
-remaining `inter.rs` divergence — the inter `decode_partition` has
-the same HORZ/VERT double-call shape and a 4-call SPLIT loop at
-`bsize=8` that still need a parallel audit. Handed to r23+.
+The 0.74 dB compound regression vs. r21 (10.20 → 9.54) was
+attributed to the parallel `inter.rs` divergence. Round 23
+(below) confirms only ~0.01 dB of that is the inter
+`decode_partition` call-count bug; the rest is in
+`decode_inter_block` itself, which still under-reads sub-8×8
+inter mode-info per §6.4.16.
 
 `vp9-lossless-pattern.ivf` is now within **337 of 16384 luma
 bytes** of bit-exact (98% of luma matches; both chroma planes
 match 100%).
+
+## Round-23 §6.4.3 sub-8×8 fix on the inter path
+
+Round 23 ports the round-22 `block.rs::decode_partition` HORZ/VERT
+one-call branch to `inter.rs::decode_partition`, and additionally
+collapses the bsize=8 SPLIT 4-call loop down to one
+`decode_block` on `BLOCK_4X4` — both per the same §6.4.3
+"`if (subsize < BLOCK_8X8 || partition == NONE) decode_block(r,c,subsize)`"
+leading branch.
+
+Pre-r23 the inter path was symmetric with the pre-r22 intra path:
+
+| bsize | partition | pre-r23 calls | r23 calls | spec |
+|------:|-----------|--------------:|----------:|------|
+|   8   | NONE      | 1             | 1         | 1    |
+|   8   | HORZ      | 2             | **1**     | 1    |
+|   8   | VERT      | 2             | **1**     | 1    |
+|   8   | SPLIT     | 4             | **1**     | 1    |
+|  16   | HORZ      | 2             | 2         | 2    |
+|  16   | VERT      | 2             | 2         | 2    |
+
+The 4× SPLIT over-call at `bsize=8` was particularly damaging
+because each `decode_block` on a `BLOCK_4X4` inter sub-block
+re-reads `comp_mode_prob`, `comp_ref_prob` /
+`single_ref_prob`, `inter_mode_probs`, `interp_filter_probs`,
+`segment_id`, `skip_probs`, `is_inter_prob`, `tx_size_probs`,
+plus the entire coefficient detoken — 4× of every per-block
+context read where the spec wants 1×.
+
+Effect on `vp9-compound.ivf` (192×128, 6 shown frames):
+
+```
+frame 0: Y=9.23 dB U=10.02 dB V=8.96 dB  (unchanged)
+frame 1: Y=9.56 dB U=10.10 dB V=8.82 dB  (unchanged)
+frame 2: Y=9.66 dB U=10.05 dB V=8.78 dB  (unchanged)
+frame 3: Y=9.77 dB ← was 9.68 dB         (+0.09 dB)
+frame 4: Y=9.25 dB U=10.12 dB V=9.17 dB  (unchanged)
+frame 5: Y=9.86 dB U=10.51 dB V=8.83 dB  (unchanged)
+mean luma PSNR: 9.55 dB  (was 9.54)
+```
+
+Pattern Y stays at 47.70 dB; c64 stays bit-exact (∞ dB). Five of
+six compound frames also stayed put — the bug only fires on
+sub-8×8 inter partitions in frame 3. This validates the
+structural fix as spec-correct but localises the dominant
+compound dB drop to the **inter mode-info reader** (next round).
+
+### r24+ items now exposed
+
+* §6.4.16 `inter_block_mode_info` per-4×4-sub-block iteration:
+  for `MiSize < BLOCK_8X8` the spec runs the inter_mode read
+  and `assign_mv` four times (once per 4×4) before
+  motion-compensating each sub-block independently. Our
+  `decode_inter_block` reads one `inter_mode` + one MV per ref
+  slot, then MCs the whole `bs` as a single block.
+* The pattern of "same-direction asymmetry" between intra and
+  inter sub-mode reads (cf. r19 / r21 audit notes for
+  `read_intra_sub_mode`) probably also exists for inter MVs.
+  Check whether the §9.3.2 sub-MV neighbour anchor needs
+  the same `mi_col*2 + idx` / `mi_row*2 + idy` spec-literal
+  rewrite that r22 landed for intra.
 
 ## Round-20 §7.4.6 spec-ctx skip read
 

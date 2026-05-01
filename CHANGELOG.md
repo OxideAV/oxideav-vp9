@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Round 21 — §6.4.3 spec-ctx `update_partition_ctx` switch.** The
+  decoder (`block.rs::update_partition_ctx`, `inter.rs::update_partition_ctx`)
+  and encoder (`encoder/tile.rs::PartitionCtx::update`) now use the
+  spec-literal form
+  `AbovePartitionContext[c+i] = 15 >> b_width_log2_lookup[subsize]`
+  (and the height variant for the left context) per §6.4.3. The
+  round-12 "pre-saturated" derivation is gone.
+
+  The round-19 audit had ruled this rewrite out because it regressed
+  the c64 fixture by 60×, but the round-19 measurement was taken
+  against a bool-decoder still drifting on the §7.4.6 skip-ctx bug
+  fixed in round 20. With the upstream skip-ctx bug gone, the
+  spec-correct partition write produces the right downstream ctx and
+  the c64 lossless fixture now decodes **bit-exact** (Y=∞ dB,
+  0/4096 byte diffs across all three planes — round 20's residual 20
+  luma bytes are gone).
+
+  Effect summary:
+  * `vp9-lossless-c64-constant.ivf`: 70.10 dB → **∞ dB** (bit-exact).
+  * `vp9-lossless-pattern.ivf`: 9.67 → **10.41 dB** (+0.74 dB Y).
+  * `tests/vp9_compound_psnr.rs`: 10.20 → 9.28 dB mean Y (regression
+    on the multi-frame inter content; the pattern of compound being
+    the odd-one-out matches r19's "spec-literal regresses compound"
+    finding from `read_intra_sub_mode` — the inter mode-info path
+    has its own divergences still to be untangled in r22+).
+
+  All 159 tests pass.
+
+- **Round 21 — `read_intra_sub_mode` re-audit, neighbour anchor kept.**
+  Re-ran the round-18 spec-literal `mi_col*2 + idx` / `mi_row*2 + idy`
+  vs round-15 empirical `+1` measurements with the round-20
+  spec-ctx skip read in place. Same asymmetry as before:
+  spec-literal both directions regresses compound by ~1 dB; either
+  direction alone regresses pattern (9.67 → 8.54 dB) or compound
+  (10.20 → 7.52 dB). Comment updated to record the r21 re-test.
+
 ### Added
 
 - **Round 19 — diagnostic fixture + WHT round-trip unit tests.** Added

@@ -631,18 +631,25 @@ impl<'a> IntraTile<'a> {
         })
     }
 
-    /// §7.4.6 update `AbovePartitionContext` / `LeftPartitionContext`
-    /// after a partition is decoded. Round-12-through-18 derivation
-    /// (kept after round-19 audit found that the spec-literal
-    /// `15 >> b_width_log2_lookup[subsize]` form regressed c64-constant
-    /// fixture by 60× — see commit body for full investigation).
+    /// §6.4.3 update `AbovePartitionContext` / `LeftPartitionContext`
+    /// after a partition is decoded. Spec form:
+    /// ```text
+    ///   AbovePartitionContext[c+i] = 15 >> b_width_log2_lookup[subsize]
+    ///   LeftPartitionContext [r+i] = 15 >> b_height_log2_lookup[subsize]
+    /// ```
+    /// `b_width_log2_lookup[subsize]` is in 4×4 units (4→0, 8→1, 16→2,
+    /// 32→3, 64→4) so the produced bit pattern marks at offset
+    /// `boffset = 3 - bsl` how the subsize compares to BLOCK_64X64.
     ///
-    /// The libvpx encoder / decoder pair appears to use this
-    /// pre-saturated form: when the resulting subsize is at least as wide
-    /// as the parent, every "smaller-than-N" bit is set; when narrower,
-    /// no bits are set. This biases the partition tree toward Split
-    /// continuation more aggressively than the spec text suggests but
-    /// matches the encoder's actual choices on real fixtures.
+    /// Round-21: returned to the spec-literal form. The round-12 / round-19
+    /// "pre-saturated" rationale was based on measurements taken before
+    /// the round-20 §7.4.6 spec-ctx skip read fix; now that the bool
+    /// decoder no longer drifts on the c64 fixture, this form drives
+    /// c64 lossless to **∞ dB (bit-exact)** and lifts the lossless-pattern
+    /// fixture 9.67 → 10.41 dB. The compound fixture regressed
+    /// 10.20 → 9.28 dB — that delta tracks a separate inter mode-info
+    /// divergence still to be untangled, but the spec-correct ctx is the
+    /// right baseline.
     fn update_partition_ctx(
         &mut self,
         mi_row: usize,
@@ -652,24 +659,24 @@ impl<'a> IntraTile<'a> {
         sub_h_px: u32,
     ) {
         let num8x8 = (bsize_px as usize).max(8) / 8;
-        let bsl = match bsize_px {
-            8 => 0usize,
-            16 => 1,
-            32 => 2,
-            64 => 3,
-            _ => 3,
+        let b_w_log2 = match sub_w_px {
+            4 => 0u8,
+            8 => 1,
+            16 => 2,
+            32 => 3,
+            64 => 4,
+            _ => 4,
         };
-        let boffset = 3 - bsl;
-        let above_fill = if sub_w_px >= bsize_px {
-            (1u8 << boffset) - 1 + (1u8 << boffset)
-        } else {
-            0
+        let b_h_log2 = match sub_h_px {
+            4 => 0u8,
+            8 => 1,
+            16 => 2,
+            32 => 3,
+            64 => 4,
+            _ => 4,
         };
-        let left_fill = if sub_h_px >= bsize_px {
-            (1u8 << boffset) - 1 + (1u8 << boffset)
-        } else {
-            0
-        };
+        let above_fill = 15u8 >> b_w_log2;
+        let left_fill = 15u8 >> b_h_log2;
         for i in 0..num8x8 {
             let c = mi_col + i;
             if c < self.above_partition_ctx.len() {
@@ -680,6 +687,7 @@ impl<'a> IntraTile<'a> {
                 self.left_partition_ctx[r] = left_fill;
             }
         }
+        let _ = bsize_px; // kept for caller-side documentation
     }
 
     /// Decode one block (prediction unit). Spec order §6.4.6
@@ -1038,12 +1046,14 @@ impl<'a> IntraTile<'a> {
             sub_modes_so_far[idx]
         } else {
             // Round-15 empirical anchor: per-position above tracker stores
-            // sub_modes[3] (bottom-RIGHT). Round-18 tested spec-literal
-            // `mi_col*2 + idx` and that regressed compound PSNR by ~1 dB
-            // (10.72 → 9.71 dB) so we keep `+1` here even though the
-            // round-18 §6.4.6 default_intra_mode tracker for ≥8×8 moved
-            // to spec-literal `+0`. The asymmetry is empirical and the
-            // §9.3.2 spec note is silent on the 1D-array storage choice.
+            // sub_modes[3] (bottom-RIGHT). Round-18 / round-21 tested
+            // spec-literal `mi_col*2 + idx` and that regressed compound
+            // PSNR by ~1 dB (10.72 → 9.71 dB) so we keep `+1` here even
+            // though the round-18 §6.4.6 default_intra_mode tracker for
+            // ≥8×8 moved to spec-literal `+0`. The asymmetry is empirical
+            // and the §9.3.2 spec note is silent on the 1D-array storage
+            // choice. Round-21 re-confirmed the asymmetry survives the
+            // round-20 §7.4.6 skip-ctx fix.
             let pos = mi_col * 2 + 1;
             if mi_row > 0 && pos < self.above_mode_4x4.len() {
                 self.above_mode_4x4[pos]

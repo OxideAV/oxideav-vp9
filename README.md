@@ -112,7 +112,7 @@ let mut reg = CodecRegistry::new();
 oxideav_vp9::register(&mut reg);
 ```
 
-## Round-20 §7.4.6 spec-ctx skip read
+## Round-21 §6.4.3 spec-ctx partition update
 
 `tests/vp9_lossless_pattern.rs` compares against an `ffmpeg testsrc
 -lossless 1` reference. Headline numbers per round:
@@ -122,7 +122,28 @@ oxideav_vp9::register(&mut reg);
 | r17   | 9.69 dB            | n/a            | 66.77 dB        | 10.63 dB        |
 | r18   | 9.90 dB            | n/a            | 66.77 dB        | 10.72 dB        |
 | r19   | 9.90 dB            | 61.90 dB       | 66.77 dB        | 10.72 dB        |
-| r20   | 9.67 dB            | **70.10 dB**   | 45.43 dB        | 10.20 dB        |
+| r20   | 9.67 dB            | 70.10 dB       | 45.43 dB        | 10.20 dB        |
+| r21   | **10.41 dB**       | **∞ (bit-exact)** | 45.43 dB     | 9.28 dB         |
+
+Round 21 swapped `update_partition_ctx` (decoder + encoder, intra +
+inter) from the round-12 "pre-saturated" derivation to the
+spec-literal `15 >> b_width_log2_lookup[subsize]` form per §6.4.3.
+
+The round-19 audit had ruled this rewrite out because it regressed
+c64 by 60× — but the round-19 measurement was taken against a
+bool-decoder still drifting on the §7.4.6 skip-ctx bug fixed in
+round 20. With the skip-ctx bug gone, the spec-literal partition
+write produces the correct downstream ctx and **the c64 fixture now
+decodes bit-exact** (Y=∞ dB, 0/4096 byte diffs across all three
+planes — the 20 residual luma bytes from r20 are gone too).
+
+The `read_intra_sub_mode` neighbour anchor (round-15 empirical `+1`
+vs spec-literal `+idx`/`+idy`) was re-tested in r21 with the new
+skip-ctx in place and it still regressed compound by ~1 dB and
+pattern by ~1 dB on either-direction-only or both-spec attempts.
+The asymmetry is preserved as a known empirical anchor.
+
+## Round-20 §7.4.6 spec-ctx skip read
 
 Round 20 fixed the §6.4.8 / §7.4.6 skip-context wiring. Since round
 13 the decoder had been reading `skip` against the constant
@@ -160,15 +181,15 @@ Effect:
   threshold; the inter path also moved to spec ctx for parity).
 
 Audited but ruled in/out:
-* `update_partition_ctx` (§6.4.3 spec form `15 >> b_width_log2_lookup
-  [subsize]`): regresses c64 by 60× (29 → 1806 byte diffs) and
-  lossless V by 2.22 dB. Round-12 empirical derivation kept and the
-  audit numbers documented in the comment.
 * WHT round-trip (§8.7.1.10): bit-correct on DC=16, DC=-1792 (the
   exact first-block scenario), and a non-DC AC1 sanity case.
 * DC_PRED at frame top-left: bit-exact reconstruction of pixel value
   16 from predictor 128 with WHT(-1792) on the first 16×16 block of
   every fixture (lossless-pattern, c64, gray).
+* (Note: the r19 audit ruled `update_partition_ctx` spec-literal
+  out — that ruling was overturned in r21 once the r20 skip-ctx
+  fix removed the upstream bool-decoder drift that was tainting
+  the r19 measurement.)
 
 ## Known gaps
 

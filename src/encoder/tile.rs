@@ -131,25 +131,27 @@ impl PartitionCtx {
     }
 
     fn update(&mut self, bsize_px: u32, sub_w: u32, sub_h: u32, mi_row: usize, mi_col: usize) {
+        // §6.4.3 spec-literal form, mirroring `block.rs::update_partition_ctx`.
+        // Both sides MUST agree or the bool decoder drifts via partition_ctx.
         let num8x8 = (bsize_px as usize) / 8;
-        let bsl = match bsize_px {
-            8 => 0usize,
-            16 => 1,
-            32 => 2,
-            64 => 3,
-            _ => 3,
+        let b_w_log2 = match sub_w {
+            4 => 0u8,
+            8 => 1,
+            16 => 2,
+            32 => 3,
+            64 => 4,
+            _ => 4,
         };
-        let boffset = 3 - bsl;
-        let above_fill = if sub_w >= bsize_px {
-            (1u8 << boffset) - 1 + (1u8 << boffset)
-        } else {
-            0
+        let b_h_log2 = match sub_h {
+            4 => 0u8,
+            8 => 1,
+            16 => 2,
+            32 => 3,
+            64 => 4,
+            _ => 4,
         };
-        let left_fill = if sub_h >= bsize_px {
-            (1u8 << boffset) - 1 + (1u8 << boffset)
-        } else {
-            0
-        };
+        let above_fill = 15u8 >> b_w_log2;
+        let left_fill = 15u8 >> b_h_log2;
         for i in 0..num8x8 {
             let c = mi_col + i;
             if c < self.above.len() {
@@ -160,6 +162,7 @@ impl PartitionCtx {
                 self.left[r] = left_fill;
             }
         }
+        let _ = bsize_px;
     }
 }
 

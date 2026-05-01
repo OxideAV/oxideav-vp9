@@ -930,25 +930,30 @@ impl<'a> InterTile<'a> {
         sub_w_px: u32,
         sub_h_px: u32,
     ) {
+        // §6.4.3 spec-literal:
+        //   AbovePartitionContext[c+i] = 15 >> b_width_log2_lookup[subsize]
+        //   LeftPartitionContext [r+i] = 15 >> b_height_log2_lookup[subsize]
+        // Round-21 — matches `block.rs::update_partition_ctx` and
+        // `encoder/tile.rs::PartitionCtx::update`.
         let num8x8 = (bsize_px as usize) / 8;
-        let bsl = match bsize_px {
-            8 => 0usize,
-            16 => 1,
-            32 => 2,
-            64 => 3,
-            _ => 3,
+        let b_w_log2 = match sub_w_px {
+            4 => 0u8,
+            8 => 1,
+            16 => 2,
+            32 => 3,
+            64 => 4,
+            _ => 4,
         };
-        let boffset = 3 - bsl;
-        let above_fill = if sub_w_px >= bsize_px {
-            (1u8 << boffset) - 1 + (1u8 << boffset)
-        } else {
-            0
+        let b_h_log2 = match sub_h_px {
+            4 => 0u8,
+            8 => 1,
+            16 => 2,
+            32 => 3,
+            64 => 4,
+            _ => 4,
         };
-        let left_fill = if sub_h_px >= bsize_px {
-            (1u8 << boffset) - 1 + (1u8 << boffset)
-        } else {
-            0
-        };
+        let above_fill = 15u8 >> b_w_log2;
+        let left_fill = 15u8 >> b_h_log2;
         for i in 0..num8x8 {
             let c = mi_col + i;
             if c < self.above_partition_ctx.len() {
@@ -959,6 +964,7 @@ impl<'a> InterTile<'a> {
                 self.left_partition_ctx[r] = left_fill;
             }
         }
+        let _ = bsize_px;
     }
 
     fn read_partition(

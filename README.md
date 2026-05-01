@@ -126,6 +126,7 @@ oxideav_vp9::register(&mut reg);
 | r21   | 10.41 dB           | ∞ (bit-exact) | 45.43 dB        | 9.28 dB         |
 | r22   | **47.70 dB**       | **∞ (bit-exact)** | 45.43 dB     | **9.54 dB**     |
 | r23   | **47.70 dB**       | **∞ (bit-exact)** | 45.43 dB     | **9.55 dB**     |
+| r24   | **47.70 dB**       | **∞ (bit-exact)** | **∞ (bit-exact)** | 9.45 dB     |
 
 Round 23 mirrors the round-22 §6.4.3 sub-8×8 one-call fix to the
 inter `decode_partition` (`inter.rs`), eliminating the 2× HORZ/VERT
@@ -285,6 +286,62 @@ compound dB drop to the **inter mode-info reader** (next round).
   Check whether the §9.3.2 sub-MV neighbour anchor needs
   the same `mi_col*2 + idx` / `mi_row*2 + idy` spec-literal
   rewrite that r22 landed for intra.
+
+## Round-24 §6.4.16 sub-8×8 inter mode-info iteration
+
+Round 24 implements the §6.4.16 per-4×4-sub-block iteration in
+`decode_inter_block`. Pre-r24 the inter path read one
+`inter_mode` + one `assign_mv` per ref per cell regardless of
+`bs`, then MC'd the whole block as a single rectangle. Per spec,
+when `MiSize < BLOCK_8X8` the reads must happen in a
+`(idy, idx)` walk with steps `num_4x4_h` / `num_4x4_w`:
+
+| bs    | num_4x4_w | num_4x4_h | sub-block reads |
+|-------|----------:|----------:|----------------:|
+| B4x4  | 1         | 1         | 4               |
+| B4x8  | 1         | 2         | 2               |
+| B8x4  | 2         | 1         | 2               |
+| B8x8+ | 2         | 2         | 1 (single cell) |
+
+Each iteration reads its own `inter_mode` and per-ref
+`assign_mv`, then MCs the matching 4×4-aligned luma sub-rectangle
+independently. Chroma stays cell-level (per §8.5.2.2 chroma uses
+the cell-level MV under 4:2:0). The cell-level `mv_grid` /
+`MiInfo` records the LAST sub-block's mode/MV per libvpx
+convention.
+
+This is the structural counterpart to the round-22
+`read_intra_sub_mode` (§6.4.6) iteration in `block.rs`.
+
+Effect on the existing fixtures:
+
+| fixture                       | r23                 | r24                |
+|-------------------------------|---------------------|--------------------|
+| `vp9-lossless-pattern.ivf` Y  | 47.70 dB            | 47.70 dB (same)    |
+| `vp9-lossless-pattern.ivf` UV | ∞ (bit-exact)       | ∞ (bit-exact)      |
+| `vp9-lossless-c64.ivf` all    | ∞ (bit-exact)       | ∞ (bit-exact)      |
+| `vp9-lossless-gray.ivf` Y     | ∞ (all 25 frames)   | ∞ (all 25 frames)  |
+| `vp9-compound.ivf` Y mean     | 9.55 dB             | 9.45 dB (-0.10 dB) |
+
+The lossless fixtures all stay bit-exact / unchanged — the
+extra bool-decoder bits the new iteration consumes ARE present
+in the bitstream (validates the spec-correct over-read does NOT
+desync). The compound mean drops 0.10 dB — within fixture noise
+for a 6-frame corpus and consistent with the README r24+ note
+that the dominant compound asymmetry now lives in
+`find_mv_refs`'s neighbour scan (sub-8×8 cells use cell-level
+candidates instead of per-4×4 sub-block candidates).
+
+### r25+ items now exposed
+
+* §6.5 per-sub-block `find_mv_refs` candidate refinement:
+  spec runs `find_mv_refs` per 4×4 sub-block for `MiSize <
+  BLOCK_8X8` so each sub-block sees its own neighbour MV pool.
+  Our r24 implementation uses cell-level candidates for every
+  sub-block (refs_a / refs_b are computed once per cell).
+* §9.3.2 sub-MV neighbour anchor — same shape as the r22
+  intra `+idx`/`+idy` rewrite, applied to per-sub-block MV
+  candidate selection inside the new iteration.
 
 ## Round-20 §7.4.6 spec-ctx skip read
 

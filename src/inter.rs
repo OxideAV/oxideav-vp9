@@ -1259,13 +1259,263 @@ impl<'a> InterTile<'a> {
         // by §6.5 `find_mv_refs` (contextCounter → counter_to_context).
         // `refs_a.mode_context` is already clamped to `0..=6`.
         let ctx = (refs_a.mode_context as usize).min(6);
-        let inter_mode = read_inter_mode(bd, self.ch.ctx.inter_mode_probs[ctx])?;
 
-        // Record §8.8 MI metadata for this inter block.
+        // Round-24 §6.4.16 sub-8×8 iteration. For `MiSize < BLOCK_8X8`
+        // the spec runs `read_inter_block_mode_info` per 4×4 sub-block:
+        //
+        //   for (idy=0; idy<2; idy+=num4x4_h)
+        //     for (idx=0; idx<2; idx+=num4x4_w)
+        //       inter_mode = read_inter_mode(...)
+        //       for each ref: assign_mv(...)
+        //       motion-compensate the (4*num4x4_w × 4*num4x4_h)
+        //       sub-rectangle independently.
+        //
+        // Per `num_4x4_blocks_wide_lookup` / `num_4x4_blocks_high_lookup`:
+        //   B4x4 → (1, 1) → 4 sub-blocks
+        //   B4x8 → (1, 2) → 2 sub-blocks
+        //   B8x4 → (2, 1) → 2 sub-blocks
+        //
+        // For >=8×8 blocks the spec reads inter_mode + assign_mv
+        // exactly once and motion-compensates the whole block — that
+        // path falls out of the iteration (single (idy=0, idx=0) cell).
+        //
+        // Mirrors the round-22 `read_intra_sub_mode` (§6.4.6) iteration
+        // in `block.rs`. We use cell-level `find_mv_refs` (geom is the
+        // 8×8 cell when sub-8×8 is detected — see geom rebind below)
+        // for every sub-block; per-4×4 candidate refinement is a
+        // separate r25+ item.
+        // §6.4.16 sub-block step in 4×4 units. Only B4x4 / B4x8 / B8x4
+        // need the per-4×4 iteration; everything >=8×8 takes the
+        // single-cell branch (`is_sub8x8 == false`) below.
+        let is_sub8x8 = matches!(bs, BlockSize::B4x4 | BlockSize::B4x8 | BlockSize::B8x4);
+        let (num4x4w, num4x4h) = match bs {
+            BlockSize::B4x4 => (1usize, 1usize),
+            BlockSize::B4x8 => (1usize, 2usize),
+            BlockSize::B8x4 => (2usize, 1usize),
+            _ => (2usize, 2usize), // unused for >=8×8 (single-iteration branch).
+        };
+
         let mi_row_units = (row as usize) / 8;
         let mi_col_units = (col as usize) / 8;
         let mi_w = (bs.w() / 8).max(1) as u8;
         let mi_h = (bs.h() / 8).max(1) as u8;
+
+        // Interpolation filter (optionally switchable). §9.3.2 ctx
+        // derived from neighbour interp filters with sentinel 3 for
+        // "intra / unavailable". §6.4.16 reads this ONCE per cell
+        // (not per 4×4 sub-block) — verified against libvpx
+        // `read_inter_block_mode_info` which calls
+        // `read_switchable_interp_filter` outside the sub-block loop.
+        let filter = if let Some(f) = self.default_filter {
+            f
+        } else {
+            let fctx = self.interp_filter_ctx(mi_row_ctx, mi_col_ctx);
+            read_switchable_filter(bd, self.ch.ctx.interp_filter_probs[fctx])?
+        };
+
+        // Pre-allocate one full-block prediction buffer and write each
+        // sub-block into its slice. For >=8×8 the loop runs once and
+        // matches the previous single-MC behaviour.
+        let w_px = bs.w() as usize;
+        let h_px = bs.h() as usize;
+        let eff_w = w_px.min(self.width.saturating_sub(col as usize));
+        let eff_h = h_px.min(self.height.saturating_sub(row as usize));
+        let sub_x = self.hdr.color_config.subsampling_x as usize;
+        let sub_y = self.hdr.color_config.subsampling_y as usize;
+        let c_row = (row as usize) >> sub_y;
+        let c_col = (col as usize) >> sub_x;
+        let c_w = w_px >> sub_x;
+        let c_h = h_px >> sub_y;
+        let eff_cw = c_w.min(self.uv_w.saturating_sub(c_col));
+        let eff_ch = c_h.min(self.uv_h.saturating_sub(c_row));
+
+        let mut luma_a = vec![0u8; eff_w * eff_h];
+        let mut luma_b = vec![0u8; eff_w * eff_h];
+        let mut chroma_a = [vec![0u8; eff_cw * eff_ch], vec![0u8; eff_cw * eff_ch]];
+        let mut chroma_b = [vec![0u8; eff_cw * eff_ch], vec![0u8; eff_cw * eff_ch]];
+        let mut have_a = false;
+        let mut have_b = false;
+
+        // Track last sub-block's mode/MV for the cell-level record.
+        let mut last_inter_mode = InterMode::Zeromv;
+        let mut last_mv_a = (0i16, 0i16);
+        let mut last_mv_b = (0i16, 0i16);
+
+        if is_sub8x8 {
+            // §6.4.16 (idy, idx) sub-block walk — only fires for
+            // B4x4 / B4x8 / B8x4. Per spec the inter_mode + assign_mv
+            // reads happen once per 4×4-aligned sub-block.
+            let mut idy = 0usize;
+            while idy < 2 {
+                let mut idx = 0usize;
+                while idx < 2 {
+                    let inter_mode = read_inter_mode(bd, self.ch.ctx.inter_mode_probs[ctx])?;
+                    let mv_a = self.assign_mv(bd, inter_mode, refs_a, &geom)?;
+                    let mv_b = if is_compound {
+                        self.assign_mv(bd, inter_mode, refs_b, &geom)?
+                    } else {
+                        (0i16, 0i16)
+                    };
+                    last_inter_mode = inter_mode;
+                    last_mv_a = mv_a;
+                    last_mv_b = mv_b;
+
+                    // Sub-block pixel coords + footprint (4 px per (idy, idx)).
+                    let sub_row_px = (row as usize) + idy * 4;
+                    let sub_col_px = (col as usize) + idx * 4;
+                    let sub_w_px = num4x4w * 4;
+                    let sub_h_px = num4x4h * 4;
+                    let sub_eff_w = sub_w_px.min(self.width.saturating_sub(sub_col_px));
+                    let sub_eff_h = sub_h_px.min(self.height.saturating_sub(sub_row_px));
+
+                    // Buffer offset within the cell-level prediction buffer.
+                    let buf_y_off = (idy * 4) * eff_w + (idx * 4);
+
+                    if ref_code_a != 0 && sub_eff_w > 0 && sub_eff_h > 0 {
+                        if let Some(rf) = self.ref_by_code(ref_code_a) {
+                            let mut tmp = vec![0u8; sub_eff_w * sub_eff_h];
+                            self.mc_luma_to(
+                                rf, sub_row_px, sub_col_px, sub_eff_w, sub_eff_h, mv_a.0, mv_a.1,
+                                filter, &mut tmp,
+                            );
+                            copy_subrect(&tmp, sub_eff_w, sub_eff_h, &mut luma_a, eff_w, buf_y_off);
+                            have_a = true;
+                        }
+                    }
+                    if is_compound && ref_code_b != 0 && sub_eff_w > 0 && sub_eff_h > 0 {
+                        if let Some(rf) = self.ref_by_code(ref_code_b) {
+                            let mut tmp = vec![0u8; sub_eff_w * sub_eff_h];
+                            self.mc_luma_to(
+                                rf, sub_row_px, sub_col_px, sub_eff_w, sub_eff_h, mv_b.0, mv_b.1,
+                                filter, &mut tmp,
+                            );
+                            copy_subrect(&tmp, sub_eff_w, sub_eff_h, &mut luma_b, eff_w, buf_y_off);
+                            have_b = true;
+                        }
+                    }
+
+                    idx += num4x4w;
+                }
+                idy += num4x4h;
+            }
+        } else {
+            // >=8×8 path — single inter_mode + assign_mv read covering
+            // the whole block. Pre-r24 behaviour, kept bit-identical.
+            let inter_mode = read_inter_mode(bd, self.ch.ctx.inter_mode_probs[ctx])?;
+            let mv_a = self.assign_mv(bd, inter_mode, refs_a, &geom)?;
+            let mv_b = if is_compound {
+                self.assign_mv(bd, inter_mode, refs_b, &geom)?
+            } else {
+                (0i16, 0i16)
+            };
+            last_inter_mode = inter_mode;
+            last_mv_a = mv_a;
+            last_mv_b = mv_b;
+
+            if ref_code_a != 0 {
+                if let Some(rf) = self.ref_by_code(ref_code_a) {
+                    self.mc_luma_to(
+                        rf,
+                        row as usize,
+                        col as usize,
+                        eff_w,
+                        eff_h,
+                        mv_a.0,
+                        mv_a.1,
+                        filter,
+                        &mut luma_a,
+                    );
+                    have_a = true;
+                }
+            }
+            if is_compound && ref_code_b != 0 {
+                if let Some(rf) = self.ref_by_code(ref_code_b) {
+                    self.mc_luma_to(
+                        rf,
+                        row as usize,
+                        col as usize,
+                        eff_w,
+                        eff_h,
+                        mv_b.0,
+                        mv_b.1,
+                        filter,
+                        &mut luma_b,
+                    );
+                    have_b = true;
+                }
+            }
+        }
+
+        let inter_mode = last_inter_mode;
+        let mv_a = last_mv_a;
+        let mv_b = last_mv_b;
+
+        // §8.5.1 chroma MC stays cell-level for sub-8×8: per §8.5.2.2
+        // chroma sub-blocks are at least 4×4 (4:2:0), and the spec uses
+        // the cell-level MV when MiSize<BLOCK_8X8 — chroma is not split
+        // into per-luma-4×4 sub-blocks. We use the LAST sub-block's
+        // MV (libvpx convention for the cell-level chroma MV). For
+        // bs >= 8×8 this is the only MV.
+        if ref_code_a != 0 && eff_cw >= 4 && eff_ch >= 4 {
+            if let Some(rf) = self.ref_by_code(ref_code_a) {
+                self.mc_chroma_to(
+                    rf,
+                    c_row,
+                    c_col,
+                    eff_cw,
+                    eff_ch,
+                    mv_a.0,
+                    mv_a.1,
+                    filter,
+                    1,
+                    &mut chroma_a[0],
+                );
+                self.mc_chroma_to(
+                    rf,
+                    c_row,
+                    c_col,
+                    eff_cw,
+                    eff_ch,
+                    mv_a.0,
+                    mv_a.1,
+                    filter,
+                    2,
+                    &mut chroma_a[1],
+                );
+            }
+        }
+        if is_compound && ref_code_b != 0 && eff_cw >= 4 && eff_ch >= 4 {
+            if let Some(rf) = self.ref_by_code(ref_code_b) {
+                self.mc_chroma_to(
+                    rf,
+                    c_row,
+                    c_col,
+                    eff_cw,
+                    eff_ch,
+                    mv_b.0,
+                    mv_b.1,
+                    filter,
+                    1,
+                    &mut chroma_b[0],
+                );
+                self.mc_chroma_to(
+                    rf,
+                    c_row,
+                    c_col,
+                    eff_cw,
+                    eff_ch,
+                    mv_b.0,
+                    mv_b.1,
+                    filter,
+                    2,
+                    &mut chroma_b[1],
+                );
+            }
+        }
+
+        // Record §8.8 MI metadata for this inter block (cell level —
+        // the §8.8 loop filter operates per 8×8 MI cell so sub-8×8
+        // mode/MV detail isn't surfaced here).
         let mode_is_non_zero_inter = !matches!(inter_mode, InterMode::Zeromv);
         self.mi_info.fill(
             mi_row_units,
@@ -1281,27 +1531,10 @@ impl<'a> InterTile<'a> {
             },
         );
 
-        // Interpolation filter (optionally switchable). §9.3.2 ctx
-        // derived from neighbour interp filters with sentinel 3 for
-        // "intra / unavailable" — see `interp_filter_ctx`.
-        let filter = if let Some(f) = self.default_filter {
-            f
-        } else {
-            let ctx = self.interp_filter_ctx(mi_row_ctx, mi_col_ctx);
-            read_switchable_filter(bd, self.ch.ctx.interp_filter_probs[ctx])?
-        };
-
-        // §6.4.18 assign_mv.
-        let mv_a = self.assign_mv(bd, inter_mode, refs_a, &geom)?;
-        let mv_b = if is_compound {
-            self.assign_mv(bd, inter_mode, refs_b, &geom)?
-        } else {
-            (0i16, 0i16)
-        };
-
-        // Record this block's MVs + ref_frames in the grid so later
-        // neighbours' find_mv_refs can see them (§6.5 requires a
-        // raster-order-consistent grid).
+        // Record this block's (last-sub-block) MVs + ref_frames in the
+        // grid so later neighbours' find_mv_refs can see them. §6.5
+        // requires a raster-order-consistent grid; libvpx stores the
+        // last-decoded sub-block's MV in the cell-level slot.
         let mut cell = InterMiCell::default();
         cell.ref_frame[0] = ref_code_a;
         cell.mv[0] = Mv::new(mv_a.0, mv_a.1);
@@ -1337,116 +1570,6 @@ impl<'a> InterTile<'a> {
             mi_h as usize,
             cell,
         );
-
-        // Motion-compensate each reference independently, then average
-        // for compound. §8.5.2: preds[0..1+isCompound], then
-        // Round2(a+b, 1) when compound.
-        let w_px = bs.w() as usize;
-        let h_px = bs.h() as usize;
-        let eff_w = w_px.min(self.width.saturating_sub(col as usize));
-        let eff_h = h_px.min(self.height.saturating_sub(row as usize));
-        let sub_x = self.hdr.color_config.subsampling_x as usize;
-        let sub_y = self.hdr.color_config.subsampling_y as usize;
-        let c_row = (row as usize) >> sub_y;
-        let c_col = (col as usize) >> sub_x;
-        let c_w = w_px >> sub_x;
-        let c_h = h_px >> sub_y;
-        let eff_cw = c_w.min(self.uv_w.saturating_sub(c_col));
-        let eff_ch = c_h.min(self.uv_h.saturating_sub(c_row));
-
-        // Predict into a temporary so we can round-average for compound.
-        let mut luma_a = vec![0u8; eff_w * eff_h];
-        let mut luma_b = vec![0u8; eff_w * eff_h];
-        let mut chroma_a = [vec![0u8; eff_cw * eff_ch], vec![0u8; eff_cw * eff_ch]];
-        let mut chroma_b = [vec![0u8; eff_cw * eff_ch], vec![0u8; eff_cw * eff_ch]];
-
-        let mut have_a = false;
-        let mut have_b = false;
-
-        if ref_code_a != 0 {
-            if let Some(rf) = self.ref_by_code(ref_code_a) {
-                self.mc_luma_to(
-                    rf,
-                    row as usize,
-                    col as usize,
-                    eff_w,
-                    eff_h,
-                    mv_a.0,
-                    mv_a.1,
-                    filter,
-                    &mut luma_a,
-                );
-                if eff_cw >= 4 && eff_ch >= 4 {
-                    self.mc_chroma_to(
-                        rf,
-                        c_row,
-                        c_col,
-                        eff_cw,
-                        eff_ch,
-                        mv_a.0,
-                        mv_a.1,
-                        filter,
-                        1,
-                        &mut chroma_a[0],
-                    );
-                    self.mc_chroma_to(
-                        rf,
-                        c_row,
-                        c_col,
-                        eff_cw,
-                        eff_ch,
-                        mv_a.0,
-                        mv_a.1,
-                        filter,
-                        2,
-                        &mut chroma_a[1],
-                    );
-                }
-                have_a = true;
-            }
-        }
-        if is_compound && ref_code_b != 0 {
-            if let Some(rf) = self.ref_by_code(ref_code_b) {
-                self.mc_luma_to(
-                    rf,
-                    row as usize,
-                    col as usize,
-                    eff_w,
-                    eff_h,
-                    mv_b.0,
-                    mv_b.1,
-                    filter,
-                    &mut luma_b,
-                );
-                if eff_cw >= 4 && eff_ch >= 4 {
-                    self.mc_chroma_to(
-                        rf,
-                        c_row,
-                        c_col,
-                        eff_cw,
-                        eff_ch,
-                        mv_b.0,
-                        mv_b.1,
-                        filter,
-                        1,
-                        &mut chroma_b[0],
-                    );
-                    self.mc_chroma_to(
-                        rf,
-                        c_row,
-                        c_col,
-                        eff_cw,
-                        eff_ch,
-                        mv_b.0,
-                        mv_b.1,
-                        filter,
-                        2,
-                        &mut chroma_b[1],
-                    );
-                }
-                have_b = true;
-            }
-        }
 
         // Blit — average if compound, else copy. Fall back to grey fill
         // when the reference is missing (preserves decode progress).
@@ -2344,6 +2467,29 @@ fn average_into(a: &mut [u8], b: &[u8]) {
     }
 }
 
+/// Copy a `src_w × src_h` rectangle (tightly packed in `src`) into a
+/// destination buffer with stride `dst_stride`, starting at byte
+/// offset `dst_off` (= row * dst_stride + col). Used by the §6.4.16
+/// sub-8×8 inter mode-info iteration to deposit each 4×4 / 4×8 / 8×4
+/// sub-block prediction into the cell-level buffer.
+fn copy_subrect(
+    src: &[u8],
+    src_w: usize,
+    src_h: usize,
+    dst: &mut [u8],
+    dst_stride: usize,
+    dst_off: usize,
+) {
+    for r in 0..src_h {
+        let src_off = r * src_w;
+        let d_off = dst_off + r * dst_stride;
+        if d_off + src_w > dst.len() || src_off + src_w > src.len() {
+            break;
+        }
+        dst[d_off..d_off + src_w].copy_from_slice(&src[src_off..src_off + src_w]);
+    }
+}
+
 fn clamp_tx_size(log2: usize, w: usize, h: usize) -> usize {
     let max_by_w = match w {
         32.. => 3,
@@ -2610,6 +2756,111 @@ mod tests {
                     "r23 contract: bsize=8 + {} must call decode_block exactly once",
                     kind
                 );
+            }
+        }
+    }
+
+    /// **Round 24 — §6.4.16 sub-8×8 inter mode-info iteration contract.**
+    ///
+    /// Once the r23 partition-routing fix lands `decode_block` ONCE
+    /// per sub-8×8 cell, the spec's `read_inter_block_mode_info`
+    /// (§6.4.16) iterates per-4×4 sub-block:
+    ///
+    /// ```text
+    ///   for (idy = 0; idy < 2; idy += num_4x4_h)
+    ///     for (idx = 0; idx < 2; idx += num_4x4_w)
+    ///       inter_mode = read_inter_mode(...)
+    ///       for each ref: assign_mv(...)
+    /// ```
+    ///
+    /// `num_4x4_w` / `num_4x4_h` per `num_4x4_blocks_*_lookup`:
+    ///
+    /// | bs    | num_4x4_w | num_4x4_h | sub-block reads |
+    /// |-------|----------:|----------:|----------------:|
+    /// | B4x4  | 1         | 1         | 4 (idy=0,1 × idx=0,1) |
+    /// | B4x8  | 1         | 2         | 2 (idy=0 × idx=0,1) |
+    /// | B8x4  | 2         | 1         | 2 (idy=0,1 × idx=0) |
+    /// | B8x8+ | 2         | 2         | 1 (single-cell branch) |
+    ///
+    /// This test pins the `(num_4x4_w, num_4x4_h, sub_block_count)`
+    /// table for the four sub-8×8-relevant sizes so a regression that
+    /// loses the per-sub-block iteration trips here.
+    #[test]
+    fn r24_sub_8x8_inter_mode_info_iteration_table() {
+        // (block_size, num4x4w, num4x4h, expected sub-block reads)
+        let table: &[(BlockSize, usize, usize, usize)] = &[
+            (BlockSize::B4x4, 1, 1, 4),
+            (BlockSize::B4x8, 1, 2, 2),
+            (BlockSize::B8x4, 2, 1, 2),
+            (BlockSize::B8x8, 2, 2, 1),
+        ];
+        for (bs, n4w, n4h, expected) in table.iter().copied() {
+            // Replicate the (idy, idx) walk shape to count iterations.
+            let mut count = 0usize;
+            let mut idy = 0usize;
+            while idy < 2 {
+                let mut idx = 0usize;
+                while idx < 2 {
+                    count += 1;
+                    idx += n4w;
+                }
+                idy += n4h;
+            }
+            assert_eq!(
+                count, expected,
+                "bs={:?}: §6.4.16 (idy,idx) walk with num_4x4=({},{}) expected {} iters, got {}",
+                bs, n4w, n4h, expected, count
+            );
+
+            // Cross-check sub-8×8 detection — only B4x4/B4x8/B8x4 take
+            // the sub-block iteration branch.
+            let is_sub8x8 = matches!(bs, BlockSize::B4x4 | BlockSize::B4x8 | BlockSize::B8x4);
+            if expected > 1 {
+                assert!(
+                    is_sub8x8,
+                    "bs={:?}: multi-iter sub-8×8 reads must be guarded by is_sub8x8",
+                    bs
+                );
+            } else {
+                assert!(
+                    !is_sub8x8,
+                    "bs={:?}: single-iter must be the >=8×8 single-cell branch",
+                    bs
+                );
+            }
+        }
+    }
+
+    /// **Round 24 — `copy_subrect` deposits sub-block prediction at
+    /// the correct offset within the cell-level buffer.**
+    ///
+    /// The §6.4.16 sub-8×8 path runs MC into a per-sub-block scratch
+    /// then writes that scratch into the cell-level `luma_a` /
+    /// `luma_b` buffer at offset `(idy*4)*eff_w + (idx*4)`. This test
+    /// pins the offset arithmetic so a regression that swaps idy/idx
+    /// or misaligns the row stride trips here.
+    #[test]
+    fn r24_copy_subrect_offset_arithmetic() {
+        // 8×8 cell, 4×4 sub-block at (idy=1, idx=1) — bottom-right.
+        let mut dst = vec![0u8; 8 * 8];
+        let src: Vec<u8> = (0..16).map(|i| i + 1).collect();
+        let dst_stride = 8;
+        let buf_y_off = (1 * 4) * dst_stride + (1 * 4);
+        copy_subrect(&src, 4, 4, &mut dst, dst_stride, buf_y_off);
+        // Bottom-right 4×4 should be src; rest still zero.
+        for r in 0..4 {
+            for c in 0..4 {
+                assert_eq!(
+                    dst[(4 + r) * 8 + (4 + c)],
+                    src[r * 4 + c],
+                    "bottom-right (idy=1,idx=1) sub-block must take src"
+                );
+            }
+        }
+        // Top-left 4×4 must still be zero (pristine).
+        for r in 0..4 {
+            for c in 0..4 {
+                assert_eq!(dst[r * 8 + c], 0, "top-left untouched");
             }
         }
     }

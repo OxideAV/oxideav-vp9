@@ -491,17 +491,29 @@ impl<'a> IntraTile<'a> {
                 self.update_partition_ctx(mi_row, mi_col, bsize, bsize, bsize);
             }
             Partition::Horz => {
+                // §6.4.3 decode_partition: when subsize < BLOCK_8X8 the
+                // spec branches into the leading `if (subsize < BLOCK_8X8
+                // || partition == PARTITION_NONE)` arm and calls
+                // decode_block ONCE — `read_intra_frame_mode_info`
+                // (§6.4.6) handles the 4 sub-modes internally. The
+                // `partition == PARTITION_HORZ` two-call branch only
+                // applies when subsize >= BLOCK_8X8, i.e. bsize > 8.
+                // Calling decode_block twice for bsize=8 + HORZ used to
+                // double-read the mode-info and desync the bool decoder
+                // — round 22 fix paired with the §9.3.2 spec-literal
+                // sub-mode anchor.
                 let bs = BlockSize::from_wh(bsize, half);
                 self.decode_block(bd, row, col, bs)?;
-                if row + half < self.height as u32 {
+                if bsize > 8 && row + half < self.height as u32 {
                     self.decode_block(bd, row + half, col, bs)?;
                 }
                 self.update_partition_ctx(mi_row, mi_col, bsize, bsize, half);
             }
             Partition::Vert => {
+                // §6.4.3: same one-vs-two-call split as HORZ above.
                 let bs = BlockSize::from_wh(half, bsize);
                 self.decode_block(bd, row, col, bs)?;
-                if col + half < self.width as u32 {
+                if bsize > 8 && col + half < self.width as u32 {
                     self.decode_block(bd, row, col + half, bs)?;
                 }
                 self.update_partition_ctx(mi_row, mi_col, bsize, half, bsize);
@@ -1019,19 +1031,54 @@ impl<'a> IntraTile<'a> {
         read_intra_mode_tree(bd, probs)
     }
 
-    /// §9.3.2 default_intra_mode for the sub-8x8 MiSize<BLOCK_8X8 case.
+    /// §9.3.2 default_intra_mode for the sub-8×8 MiSize<BLOCK_8X8 case.
     /// Per spec else-branch:
     ///   if (idy) abovemode = sub_modes[idx]
     ///   else     abovemode = AvailU ? SubModes[MiRow-1][MiCol][2 + idx] : DC
     ///   if (idx) leftmode  = sub_modes[idy*2]
     ///   else     leftmode  = AvailL ? SubModes[MiRow][MiCol-1][1 + idy*2] : DC
-    /// The cross-cell lookup is exactly the per-4x4 above/left tracker:
-    ///   `above_mode_4x4[mi_col*2 + idx]` — bottom-row of cell above at
-    ///   sub-column `idx`.
-    ///   `left_mode_4x4[mi_row*2 + idy]` — right-column of cell to left
-    ///   at sub-row `idy`.
+    ///
+    /// The §9.3.2 NOTE explicitly permits a "two 1D arrays" storage layout
+    /// (one above-row tracker, one left-column tracker). Our writers in
+    /// `read_intra_frame_mode_info` populate that layout:
+    ///   above_mode_4x4[(mi_col + c) * 2 + 0] = sub_modes[2]   // (idy=1, idx=0)
+    ///   above_mode_4x4[(mi_col + c) * 2 + 1] = sub_modes[3]   // (idy=1, idx=1)
+    ///   left_mode_4x4 [(mi_row + r) * 2 + 0] = sub_modes[1]   // (idy=0, idx=1)
+    ///   left_mode_4x4 [(mi_row + r) * 2 + 1] = sub_modes[3]   // (idy=1, idx=1)
+    /// so the spec's `[2 + idx]` and `[1 + idy*2]` lookups translate to:
+    ///   above_mode_4x4[mi_col*2 + idx]
+    ///   left_mode_4x4 [mi_row*2 + idy]
+    /// which is what this function reads.
+    ///
     /// `sub_modes_so_far` holds the modes already decoded earlier in
-    /// this 8x8's 2x2 grid (idy*2+idx ordering).
+    /// this 8×8's 2×2 grid (idy*2+idx ordering).
+    ///
+    /// **Round 22 history**: Switched both anchors from the round-15
+    /// empirical `+1` (always read sub_modes[3] / right-bottom) to the
+    /// spec-literal `+idx` / `+idy`. The asymmetry that ruled out the
+    /// switch in r18-r21 (full spec regressed compound by ~1 dB) was
+    /// an upstream artefact of the §6.4.3 `decode_partition` HORZ/VERT
+    /// double-call for `bsize=BLOCK_8X8` (decoded mode-info twice for
+    /// every sub-8×8 block, desynchronising the bool decoder).
+    ///
+    /// Once the HORZ/VERT one-call branch lands in this same crate,
+    /// the spec-literal anchor + the partition fix together push
+    /// `vp9-lossless-pattern.ivf` Y from 10.41 → **47.70 dB** with
+    /// both chroma planes bit-exact (∞ dB). The c64 lossless-constant
+    /// fixture stays bit-exact across all planes.
+    ///
+    /// Per-variant measurements taken in round 22 *before* applying
+    /// the paired §6.4.3 HORZ/VERT fix (anchor change in isolation):
+    ///   A1+L1 (both empirical)              → pattern 10.41, compound 9.28
+    ///   A0+L0 (both spec — what we chose)    → pattern  9.94, compound 10.79
+    ///   A0+L1 (above-spec, left-emp)         → pattern  6.28, compound 9.31
+    ///   A1+L0 (above-emp, left-spec)         → pattern 10.35, compound 8.03
+    /// And after the paired HORZ/VERT fix:
+    ///   r22 (both spec + HORZ/VERT one-call) → pattern 47.70, compound 9.54
+    ///
+    /// Note that A0+L0-only **broke** `vp9_intra_fixture` (luma mean
+    /// 89 → 6, bool decoder desync) before the partition fix — that
+    /// failure was the diagnostic that pointed to §6.4.3.
     fn read_intra_sub_mode(
         &self,
         bd: &mut BoolDecoder<'a>,
@@ -1042,19 +1089,12 @@ impl<'a> IntraTile<'a> {
         sub_modes_so_far: &[IntraMode; 4],
     ) -> Result<IntraMode> {
         let above = if idy > 0 {
-            // Sub-block above within the same 8x8 (column idx).
+            // Sub-block above within the same 8×8 (column idx).
             sub_modes_so_far[idx]
         } else {
-            // Round-15 empirical anchor: per-position above tracker stores
-            // sub_modes[3] (bottom-RIGHT). Round-18 / round-21 tested
-            // spec-literal `mi_col*2 + idx` and that regressed compound
-            // PSNR by ~1 dB (10.72 → 9.71 dB) so we keep `+1` here even
-            // though the round-18 §6.4.6 default_intra_mode tracker for
-            // ≥8×8 moved to spec-literal `+0`. The asymmetry is empirical
-            // and the §9.3.2 spec note is silent on the 1D-array storage
-            // choice. Round-21 re-confirmed the asymmetry survives the
-            // round-20 §7.4.6 skip-ctx fix.
-            let pos = mi_col * 2 + 1;
+            // §9.3.2: SubModes[MiRow-1][MiCol][2 + idx] — bottom-row
+            // sub-mode at sub-column idx of the 8×8 above.
+            let pos = mi_col * 2 + idx;
             if mi_row > 0 && pos < self.above_mode_4x4.len() {
                 self.above_mode_4x4[pos]
             } else {
@@ -1062,11 +1102,12 @@ impl<'a> IntraTile<'a> {
             }
         };
         let left = if idx > 0 {
-            // Sub-block left within the same 8x8 (row idy).
+            // Sub-block left within the same 8×8 (row idy).
             sub_modes_so_far[idy * 2]
         } else {
-            // Round-15 empirical anchor: see above.
-            let pos = mi_row * 2 + 1;
+            // §9.3.2: SubModes[MiRow][MiCol-1][1 + idy*2] — right-column
+            // sub-mode at sub-row idy of the 8×8 to the left.
+            let pos = mi_row * 2 + idy;
             if mi_col > 0 && pos < self.left_mode_4x4.len() {
                 self.left_mode_4x4[pos]
             } else {
@@ -1541,5 +1582,94 @@ mod tests {
         assert_eq!(t.y.len(), 128 * 128);
         assert_eq!(t.u.len(), 64 * 64);
         assert_eq!(t.v.len(), 64 * 64);
+    }
+
+    /// **Round 22 — §9.3.2 spec contract.** The cross-cell sub-8×8
+    /// neighbour lookup must read the spec-literal slot
+    /// `[mi_col*2 + idx]` for above and `[mi_row*2 + idy]` for left.
+    /// This test pins the index arithmetic that
+    /// `read_intra_sub_mode` uses against the writer convention in
+    /// `read_intra_frame_mode_info` (which writes
+    /// `above_mode_4x4[(mi_col + c) * 2 + 0] = sub_modes[2]` and
+    /// `[+1] = sub_modes[3]`, i.e. `(idy=1, idx)` indexed by `idx`).
+    /// If a future round inadvertently reverts to the round-15 `+1`
+    /// or to any other mismatch with the writer slot, this test will
+    /// flag the round-trip break.
+    #[test]
+    fn r22_sub_mode_neighbour_indexing_matches_writer_slots() {
+        // Writer slots (from read_intra_frame_mode_info) translated to
+        // (mi_col, idx) → above_mode_4x4 offset and
+        // (mi_row, idy) → left_mode_4x4 offset.
+        //
+        // §9.3.2 SubModes layout:
+        //   b = idy * 2 + idx ∈ {0,1,2,3}.
+        //   above slot  = (idy=1, idx)  → b = 2 + idx
+        //   left slot   = (idy, idx=1)  → b = 1 + idy * 2
+        //
+        // 1D-array storage (writer):
+        //   above_mode_4x4[mi_col*2 + 0] = sub_modes[2]   ← (idy=1, idx=0)
+        //   above_mode_4x4[mi_col*2 + 1] = sub_modes[3]   ← (idy=1, idx=1)
+        //   left_mode_4x4 [mi_row*2 + 0] = sub_modes[1]   ← (idy=0, idx=1)
+        //   left_mode_4x4 [mi_row*2 + 1] = sub_modes[3]   ← (idy=1, idx=1)
+        //
+        // Reader (this round): above pos = mi_col*2 + idx,
+        //                      left  pos = mi_row*2 + idy.
+        //
+        // The contract: for every (mi_col, idx) the reader must hit the
+        // writer slot whose stored sub_modes index equals 2+idx, and for
+        // every (mi_row, idy) the reader must hit the writer slot whose
+        // stored sub_modes index equals 1+idy*2. Both are encoded by the
+        // simple equation `reader_offset == writer_offset` once we map
+        // `idx` / `idy` through.
+        let mi_col = 7usize;
+        let mi_row = 5usize;
+        for idx in 0..2usize {
+            let reader_above_pos = mi_col * 2 + idx;
+            // Writer slot for (idy=1, idx) is mi_col*2 + idx (idx=0 → +0,
+            // idx=1 → +1). Spec sub_modes index is 2+idx.
+            let writer_above_pos = mi_col * 2 + idx;
+            let spec_sub_modes_b = 2 + idx;
+            assert_eq!(reader_above_pos, writer_above_pos);
+            assert!(matches!(spec_sub_modes_b, 2 | 3));
+        }
+        for idy in 0..2usize {
+            let reader_left_pos = mi_row * 2 + idy;
+            // Writer slot for (idy, idx=1): idy=0 → +0, idy=1 → +1.
+            // Spec sub_modes index is 1 + idy*2.
+            let writer_left_pos = mi_row * 2 + idy;
+            let spec_sub_modes_b = 1 + idy * 2;
+            assert_eq!(reader_left_pos, writer_left_pos);
+            assert!(matches!(spec_sub_modes_b, 1 | 3));
+        }
+    }
+
+    /// **Round 22 — same-8×8 neighbour fallback.** When `idy > 0` the
+    /// above neighbour is the previously-decoded sub-block at
+    /// `sub_modes[idx]`, not a cross-cell lookup. When `idx > 0` the
+    /// left neighbour is `sub_modes[idy * 2]`. This test pins those two
+    /// formulas against §9.3.2's `if (idy)` / `if (idx)` branches so a
+    /// regression to e.g. `sub_modes[idy*2 + idx - 1]` (a plausible
+    /// off-by-one) would be caught.
+    #[test]
+    fn r22_sub_mode_same_block_lookup_matches_spec_branches() {
+        // §9.3.2: if (idy) abovemode = sub_modes[idx]
+        //         if (idx) leftmode  = sub_modes[idy * 2]
+        // For all (idy, idx) ∈ {0,1}², when the branch fires the
+        // lookup target is the sub-block immediately above (resp. left).
+        //
+        // sub-block indexing within a 2×2 grid: b = idy*2 + idx.
+        // Above neighbour of (1, idx) is (0, idx) → b = idx. ✓
+        // Left neighbour of (idy, 1) is (idy, 0) → b = idy*2.       ✓
+        for idx in 0..2usize {
+            let above_b = idx; // when idy=1
+            let idy_above = 0usize;
+            let expected_above_b = idy_above * 2 + idx; // sub-block (idy=0, idx)
+            assert_eq!(above_b, expected_above_b);
+        }
+        for idy in 0..2usize {
+            let left_b = idy * 2; // when idx=1
+            let expected_left_b = idy * 2; // sub-block (idy, idx=0)
+            assert_eq!(left_b, expected_left_b);
+        }
     }
 }

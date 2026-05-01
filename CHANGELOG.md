@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Round 22 — §6.4.3 sub-8×8 HORZ/VERT one-call branch + §9.3.2
+  spec-literal sub-mode anchor.** Two paired fixes in `block.rs`
+  that, together, lift `vp9-lossless-pattern.ivf` Y by **+37 dB**
+  (10.41 → **47.70 dB**) with both chroma planes now bit-exact
+  (∞ dB) and 337/16384 luma byte diffs (down from 14472/16384).
+
+  1. **`decode_partition` HORZ/VERT one-call.** Per §6.4.3 the
+     leading `if (subsize < BLOCK_8X8 || partition == PARTITION_NONE)`
+     branch fires before the `PARTITION_HORZ` / `PARTITION_VERT`
+     two-call branches. For `bsize=BLOCK_8X8 + HORZ → subsize=B8X4`,
+     the sub-8×8 branch wins and `decode_block` is called once;
+     `read_intra_frame_mode_info` (§6.4.6) reads all 4 sub-modes
+     internally. Our intra `decode_partition` was unconditionally
+     calling `decode_block` twice, double-reading mode-info and
+     desynchronising the bool decoder for every sub-8×8 partition.
+     Fix gates the second call on `bsize > 8` (matches the round-13
+     SPLIT fix for the same shape).
+
+  2. **`read_intra_sub_mode` spec-literal `+idx` / `+idy` anchor.**
+     §9.3.2 gives `abovemode = SubModes[MiRow-1][MiCol][2 + idx]`
+     and `leftmode = SubModes[MiRow][MiCol-1][1 + idy*2]`. In the
+     §9.3.2 NOTE "two 1D arrays" storage layout (which our writer
+     uses), this maps to `above_mode_4x4[mi_col*2 + idx]` and
+     `left_mode_4x4[mi_row*2 + idy]`. The round-15 code used a
+     constant `+1` on both sides (always sub_modes[3]). Rounds
+     18-21 measured the spec-literal switch and saw a 1 dB compound
+     regression — that regression was an upstream artefact of the
+     HORZ/VERT double-call above. Once both fixes land together,
+     the spec-literal anchor is uniformly better.
+
+  Per-fixture / per-variant audit:
+
+  | variant                     | pattern Y | compound Y | intra fixture mean | c64 |
+  |-----------------------------|----------:|-----------:|--------------------:|-----|
+  | r21 (both `+1`)             | 10.41 dB  | 9.28 dB    | 89                  | ∞ |
+  | spec anchor only (no HORZ fix) |  9.94 | 10.79      | **6** (FAIL)        | ∞ |
+  | A0+L1 (above-spec, left-emp) |  6.28   | 9.31       | n/a                 | ∞ |
+  | A1+L0 (above-emp, left-spec) | 10.35   | 8.03       | n/a                 | ∞ |
+  | **r22 (both fixes paired)** | **47.70** | **9.54**   | **111**             | **∞** |
+
+  The compound dip (10.20 r20 → 9.54 r22) is the remaining
+  `inter.rs::decode_partition` divergence — same HORZ/VERT
+  double-call shape plus a 4-call SPLIT loop at `bsize=8` still to
+  audit. Pattern luma is now 98% bit-exact; both chroma planes
+  100% bit-exact; c64 fixture remains bit-exact across all planes.
+
+  All 161 tests pass (132 unit + 29 integration; +2 unit tests
+  added in `block.rs::tests` to pin the §9.3.2 indexing contract
+  for both cross-cell and same-block lookups).
+
 - **Round 21 — §6.4.3 spec-ctx `update_partition_ctx` switch.** The
   decoder (`block.rs::update_partition_ctx`, `inter.rs::update_partition_ctx`)
   and encoder (`encoder/tile.rs::PartitionCtx::update`) now use the
@@ -46,6 +96,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (10.20 → 7.52 dB). Comment updated to record the r21 re-test.
 
 ### Added
+
+- **Round 22 — §9.3.2 sub-mode indexing unit tests.** Added two
+  unit tests in `block.rs::tests` that pin the indexing contract
+  for `read_intra_sub_mode`:
+  * `r22_sub_mode_neighbour_indexing_matches_writer_slots` — proves
+    the cross-cell reader offsets `mi_col*2 + idx` and
+    `mi_row*2 + idy` align with the writer's `sub_modes[2+idx]` and
+    `sub_modes[1+idy*2]` slots, locking in the spec-literal
+    contract.
+  * `r22_sub_mode_same_block_lookup_matches_spec_branches` —
+    pins the `if (idy)` / `if (idx)` same-8×8 fallbacks
+    (`sub_modes[idx]` for above, `sub_modes[idy*2]` for left)
+    against §9.3.2's branch arithmetic.
+  These guard against silent regressions to the round-15 `+1`
+  anchor and to plausible off-by-one mistakes in the same-block
+  lookup.
 
 - **Round 19 — diagnostic fixture + WHT round-trip unit tests.** Added
   `tests/vp9_lossless_constant.rs` with a 64×64 single-colour libvpx

@@ -112,7 +112,7 @@ let mut reg = CodecRegistry::new();
 oxideav_vp9::register(&mut reg);
 ```
 
-## Round-21 §6.4.3 spec-ctx partition update
+## Round-22 §6.4.3 HORZ/VERT sub-8×8 fix + §9.3.2 spec-literal sub-mode anchor
 
 `tests/vp9_lossless_pattern.rs` compares against an `ffmpeg testsrc
 -lossless 1` reference. Headline numbers per round:
@@ -123,25 +123,94 @@ oxideav_vp9::register(&mut reg);
 | r18   | 9.90 dB            | n/a            | 66.77 dB        | 10.72 dB        |
 | r19   | 9.90 dB            | 61.90 dB       | 66.77 dB        | 10.72 dB        |
 | r20   | 9.67 dB            | 70.10 dB       | 45.43 dB        | 10.20 dB        |
-| r21   | **10.41 dB**       | **∞ (bit-exact)** | 45.43 dB     | 9.28 dB         |
+| r21   | 10.41 dB           | ∞ (bit-exact) | 45.43 dB        | 9.28 dB         |
+| r22   | **47.70 dB**       | **∞ (bit-exact)** | 45.43 dB     | **9.54 dB**     |
 
-Round 21 swapped `update_partition_ctx` (decoder + encoder, intra +
-inter) from the round-12 "pre-saturated" derivation to the
-spec-literal `15 >> b_width_log2_lookup[subsize]` form per §6.4.3.
+Round 22 lands two paired §6.4.3 / §9.3.2 fixes that, together,
+unlock a **+37 dB jump** on the lossless-pattern Y plane and lift
+both chroma planes to **bit-exact**.
 
-The round-19 audit had ruled this rewrite out because it regressed
-c64 by 60× — but the round-19 measurement was taken against a
-bool-decoder still drifting on the §7.4.6 skip-ctx bug fixed in
-round 20. With the skip-ctx bug gone, the spec-literal partition
-write produces the correct downstream ctx and **the c64 fixture now
-decodes bit-exact** (Y=∞ dB, 0/4096 byte diffs across all three
-planes — the 20 residual luma bytes from r20 are gone too).
+### `decode_partition` HORZ/VERT one-call branch (`block.rs`)
 
-The `read_intra_sub_mode` neighbour anchor (round-15 empirical `+1`
-vs spec-literal `+idx`/`+idy`) was re-tested in r21 with the new
-skip-ctx in place and it still regressed compound by ~1 dB and
-pattern by ~1 dB on either-direction-only or both-spec attempts.
-The asymmetry is preserved as a known empirical anchor.
+`§6.4.3 decode_partition`:
+
+```text
+if ( subsize < BLOCK_8X8 || partition == PARTITION_NONE )
+    decode_block( r, c, subsize )
+else if ( partition == PARTITION_HORZ ) {
+    decode_block( r, c, subsize )
+    if ( hasRows ) decode_block( r + halfBlock8x8, c, subsize )
+} ...
+```
+
+The leading branch fires **first** when `subsize < BLOCK_8X8`. For
+`bsize=BLOCK_8X8 + PARTITION_HORZ → subsize=BLOCK_8X4`, the
+sub-8×8 branch wins and `decode_block` is called **once** —
+`§6.4.6 read_intra_frame_mode_info` then reads the 4 sub-modes
+internally. The same applies to `BLOCK_8X8 + PARTITION_VERT →
+BLOCK_4X8`.
+
+Our intra `decode_partition` was unconditionally calling
+`decode_block` twice for HORZ/VERT, double-reading mode-info and
+desynchronising the bool decoder for every sub-8×8 partition. The
+fix gates the second call on `bsize > 8`. Same shape as the
+round-13 SPLIT fix.
+
+### `read_intra_sub_mode` spec-literal neighbour anchor (`block.rs`)
+
+§9.3.2 default_intra_mode for `MiSize < BLOCK_8X8`:
+
+```text
+if (idy) abovemode = sub_modes[idx]
+else     abovemode = AvailU ? SubModes[MiRow-1][MiCol][2 + idx] : DC
+if (idx) leftmode  = sub_modes[idy*2]
+else     leftmode  = AvailL ? SubModes[MiRow][MiCol-1][1 + idy*2] : DC
+```
+
+In the §9.3.2 NOTE "two 1D arrays" layout (which our decoder uses):
+
+* `above_mode_4x4[mi_col*2 + 0] = sub_modes[2]` (writer for cell
+  above, position `(idy=1, idx=0)`)
+* `above_mode_4x4[mi_col*2 + 1] = sub_modes[3]` (`(idy=1, idx=1)`)
+* `left_mode_4x4 [mi_row*2 + 0] = sub_modes[1]` (`(idy=0, idx=1)`)
+* `left_mode_4x4 [mi_row*2 + 1] = sub_modes[3]` (`(idy=1, idx=1)`)
+
+The reader index that picks the spec-literal slot is therefore
+`above_mode_4x4[mi_col*2 + idx]` and
+`left_mode_4x4 [mi_row*2 + idy]`.
+
+The round-15 code used a constant `+1` on both sides (always
+sub_modes[3], the bottom-right). Rounds 18-21 measured the
+spec-literal switch and saw a 1 dB compound regression — but that
+regression was an artefact of the upstream HORZ/VERT double-call
+(see above). Once both fixes land together, the spec-literal
+anchor is uniformly better.
+
+### Per-fixture / per-variant audit (round 22)
+
+Pre-fix baseline = r21 anchor (both `+1`):
+
+| variant                     | pattern Y | compound Y | intra fixture mean | c64 |
+|-----------------------------|----------:|-----------:|--------------------:|-----|
+| r21 (both `+1`)             | 10.41 dB  | 9.28 dB    | 89                  | ∞ |
+| spec-A0+L0 only             |  9.94 dB  | 10.79 dB   | **6** (FAIL)        | ∞ |
+| HORZ/VERT fix only          | (not measured separately — pairs with anchor) ||||
+| **r22 (both fixes paired)** | **47.70 dB** | **9.54 dB** | **111**          | **∞** |
+
+The "spec-A0+L0 only" row is the lesson: the two §6.4.3 / §9.3.2
+divergences were masking each other. Spec-correct on one but not
+the other produces a desync (`vp9_intra_fixture` luma mean
+collapses from 89 to 6). Spec-correct on both lifts pattern Y from
+9.94 → 47.70 dB and intra fixture mean from 89 → 111.
+
+The 0.74 dB compound regression vs. r21 (10.20 → 9.54) is the
+remaining `inter.rs` divergence — the inter `decode_partition` has
+the same HORZ/VERT double-call shape and a 4-call SPLIT loop at
+`bsize=8` that still need a parallel audit. Handed to r23+.
+
+`vp9-lossless-pattern.ivf` is now within **337 of 16384 luma
+bytes** of bit-exact (98% of luma matches; both chroma planes
+match 100%).
 
 ## Round-20 §7.4.6 spec-ctx skip read
 

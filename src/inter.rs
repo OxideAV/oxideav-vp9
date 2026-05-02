@@ -39,8 +39,8 @@ use crate::loopfilter::{LoopFilter, MiInfo, MiInfoPlane, INTRA_FRAME};
 use crate::mcfilter::{mc_block_scaled, InterpFilter, RefSampler};
 use crate::mv::{read_mv_component, read_mv_joint, Mv, MvComponentProbs};
 use crate::mvref::{
-    clamp_mv_pair, find_best_ref_mvs, find_mv_refs_geom, use_mv_hp, BlockGeom, InterMiCell,
-    InterMiGrid, BORDERINPIXELS, INTERP_EXTEND, NONE_FRAME,
+    append_sub8x8_mvs, clamp_mv_pair, find_best_ref_mvs, find_mv_refs_geom, use_mv_hp, BlockGeom,
+    InterMiCell, InterMiGrid, MvRefs, BORDERINPIXELS, INTERP_EXTEND, NONE_FRAME,
 };
 use crate::nonzero_ctx::NonzeroCtx;
 use crate::probs::read_partition_from_tree;
@@ -1341,6 +1341,15 @@ impl<'a> InterTile<'a> {
         let mut last_mv_a = (0i16, 0i16);
         let mut last_mv_b = (0i16, 0i16);
 
+        // §6.5.14 BlockMvs[refList][block] — MV chosen by `assign_mv`
+        // for each prior sub-block of this MB, indexed by spec block
+        // index `block = idy*2 + idx` in 4×4 raster order. Used by
+        // `append_sub8x8_mvs` to refine the per-sub-block (Nearest, Near)
+        // candidates for NEARESTMV / NEARMV reads. BestMv (NEWMV) keeps
+        // the cell-level RefListMv[0] per spec.
+        let mut block_mvs_a: [Mv; 4] = [Mv::ZERO; 4];
+        let mut block_mvs_b: [Mv; 4] = [Mv::ZERO; 4];
+
         if is_sub8x8 {
             // §6.4.16 (idy, idx) sub-block walk — only fires for
             // B4x4 / B4x8 / B8x4. Per spec the inter_mode + assign_mv
@@ -1350,15 +1359,34 @@ impl<'a> InterTile<'a> {
                 let mut idx = 0usize;
                 while idx < 2 {
                     let inter_mode = read_inter_mode(bd, self.ch.ctx.inter_mode_probs[ctx])?;
-                    let mv_a = self.assign_mv(bd, inter_mode, refs_a, &geom)?;
+                    let block_idx = idy * 2 + idx;
+                    // §6.5.14 — refine (Nearest, Near) for NEARESTMV /
+                    // NEARMV using prior sub-block MVs of this MB.
+                    // For block 0 the helper returns the cell-level
+                    // (Nearest, Near) unchanged — bit-identical to r24.
+                    let sub_refs_a = self.sub8x8_refined_refs(&refs_a, &block_mvs_a, block_idx);
+                    let mv_a = self.assign_mv(bd, inter_mode, sub_refs_a, &geom)?;
                     let mv_b = if is_compound {
-                        self.assign_mv(bd, inter_mode, refs_b, &geom)?
+                        let sub_refs_b = self.sub8x8_refined_refs(&refs_b, &block_mvs_b, block_idx);
+                        self.assign_mv(bd, inter_mode, sub_refs_b, &geom)?
                     } else {
                         (0i16, 0i16)
                     };
                     last_inter_mode = inter_mode;
                     last_mv_a = mv_a;
                     last_mv_b = mv_b;
+                    // §6.5.14 BlockMvs[refList][block] write-back —
+                    // every 4×4 cell in the sub-block footprint shares
+                    // this MV (per spec BlockMvs[refList][(idy+y2)*2+idx+x2]).
+                    for y2 in 0..num4x4h {
+                        for x2 in 0..num4x4w {
+                            let bi = (idy + y2) * 2 + (idx + x2);
+                            block_mvs_a[bi] = Mv::new(mv_a.0, mv_a.1);
+                            if is_compound {
+                                block_mvs_b[bi] = Mv::new(mv_b.0, mv_b.1);
+                            }
+                        }
+                    }
 
                     // Sub-block pixel coords + footprint (4 px per (idy, idx)).
                     let sub_row_px = (row as usize) + idy * 4;
@@ -1617,6 +1645,37 @@ impl<'a> InterTile<'a> {
     fn ref_by_code(&self, code: u8) -> Option<&'a RefFrame> {
         let slot = CompRefs::slot_of(code);
         self.refs.get(slot).copied().flatten()
+    }
+
+    /// §6.5.14 per-sub-block refinement of the cell-level `MvRefs` for
+    /// a sub-8×8 inter MB. Returns a fresh `MvRefs` whose
+    /// `nearest_mv()` / `near_mv()` come from `append_sub8x8_mvs(block)`
+    /// (mixing prior-sub-block MVs of this MB into the candidate list)
+    /// and whose `best_mv()` is the cell-level `RefListMv[0]` (per
+    /// spec — only NEARESTMV / NEARMV are refined, BestMv used by
+    /// NEWMV stays). `mode_context` is preserved from the cell-level
+    /// scan since it drives the inter_mode tree probability lookup
+    /// which is per-cell (the §6.4.16 (idy, idx) loop reads
+    /// `inter_mode` against the same `ctx` for every sub-block).
+    ///
+    /// For `block == 0` this is bit-identical to the cell-level
+    /// `cell_refs` (the helper short-circuits to the cell list).
+    fn sub8x8_refined_refs(
+        &self,
+        cell_refs: &MvRefs,
+        block_mvs: &[Mv; 4],
+        block_idx: usize,
+    ) -> MvRefs {
+        let (nearest, near) = append_sub8x8_mvs(cell_refs, block_mvs, block_idx);
+        MvRefs {
+            list: [nearest, near],
+            count: 2,
+            mode_context: cell_refs.mode_context,
+            // §6.5.14: BestMv stays the cell-level RefListMv[0] for
+            // NEWMV use. NEAREST/NEAR pull from `list[0]`/`list[1]`
+            // which are now the §6.5.14 sub-block-refined values.
+            best_mv_override: Some(cell_refs.list[0]),
+        }
     }
 
     /// §6.4.18 assign_mv — produce the (row, col) MV for one ref slot.

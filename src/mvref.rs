@@ -32,9 +32,12 @@
 //!   dropped. This is a real bit-accuracy gap on frames where the
 //!   previous frame's MI grid was preserved; measurable as a small PSNR
 //!   drop in long GOPs.
-//! * `block` parameter is always `-1` — sub-8x8 partition MV search
-//!   uses the whole-block MV. §6.5.14 `append_sub8x8_mvs` is not yet
-//!   wired; callers only invoke `find_mv_refs` with whole blocks.
+//! * `block` parameter to `find_mv_refs` is always `-1` — the
+//!   per-4×4-sub-block neighbour `SubMvs[r][c][refList][idx]` lookup
+//!   from §6.5.11 `get_sub_block_mv` is not yet wired (the cell-level
+//!   neighbour MV is used regardless of the requesting sub-block). The
+//!   §6.5.14 `append_sub8x8_mvs` mixing of *prior-sub-block-within-MB*
+//!   MVs into `(NearestMv, NearMv)` IS wired — see [`append_sub8x8_mvs`].
 
 use crate::mv::Mv;
 
@@ -360,13 +363,20 @@ pub struct MvRefs {
     /// lands on an `INVALID_CASE` slot — those combinations are ruled
     /// out by the accumulation rule but clamping keeps lookups safe).
     pub mode_context: u8,
+    /// Optional override for `BestMv` (used by NEWMV — §6.4.18). Set
+    /// only by sub-8×8 per-sub-block refinement (§6.5.14
+    /// `append_sub8x8_mvs`): on those cells `NearestMv` / `NearMv` are
+    /// rebuilt from prior-sub-block MVs, but `BestMv` stays the
+    /// cell-level `RefListMv[0]` per spec. When `None`, `best_mv()`
+    /// returns `list[0]` — the default for cell-level callers.
+    pub best_mv_override: Option<Mv>,
 }
 
 impl MvRefs {
     /// Raw list accessors — used by §6.5.12 `find_best_ref_mvs` to
     /// produce `NearestMv` / `NearMv` / `BestMv`.
     pub fn best_mv(&self) -> Mv {
-        self.list[0]
+        self.best_mv_override.unwrap_or(self.list[0])
     }
     pub fn nearest_mv(&self) -> Mv {
         self.list[0]
@@ -697,6 +707,91 @@ pub fn find_best_ref_mvs(refs: &mut MvRefs, allow_high_precision_mv: bool, geom:
     }
 }
 
+/// §6.5.14 `append_sub8x8_mvs` — produce the per-sub-block
+/// `(NearestMv, NearMv)` pair for sub-block index `block` (0..=3 in
+/// raster order) inside an `MiSize < BLOCK_8X8` inter MB.
+///
+/// Spec pseudo-code (from §6.5.14):
+/// ```text
+/// find_mv_refs(refFrame, block)        // -> RefListMv[0..=1]
+/// dst = 0
+/// if block == 0:
+///     for i in 0..2: sub8x8Mvs[dst++] = RefListMv[i]
+/// else if block <= 2:
+///     sub8x8Mvs[dst++] = BlockMvs[refList][0]
+/// else: // block == 3
+///     sub8x8Mvs[dst++] = BlockMvs[refList][2]
+///     for idx in [1, 0] while dst < 2:
+///         if BlockMvs[refList][idx] != sub8x8Mvs[0]:
+///             sub8x8Mvs[dst++] = BlockMvs[refList][idx]
+/// for n in 0..2 while dst < 2:
+///     if RefListMv[n] != sub8x8Mvs[0]:
+///         sub8x8Mvs[dst++] = RefListMv[n]
+/// if dst < 2: sub8x8Mvs[dst++] = ZeroMv
+/// NearestMv[refList] = sub8x8Mvs[0]
+/// NearMv[refList]    = sub8x8Mvs[1]
+/// ```
+///
+/// `cell_refs` is the result of the cell-level `find_mv_refs` +
+/// `find_best_ref_mvs` (i.e. it stands in for `RefListMv[]`).
+/// `block_mvs[0..block]` are the MVs already chosen for prior
+/// sub-blocks of the *same* MB by `assign_mv` (per spec invariant
+/// `BlockMvs[refList][k]` is set after `assign_mv` for sub-block `k`).
+///
+/// Returns the new `(NearestMv, NearMv)` pair — `NearestMv` lands at
+/// `MvRefs::list[0]` / `nearest_mv()` and `NearMv` at `list[1]` /
+/// `near_mv()`. `BestMv` (used by `NEWMV`) is **not** affected by this
+/// helper (it stays the cell-level `RefListMv[0]` per spec).
+///
+/// For `block == 0` the result is `(cell_refs.list[0], cell_refs.list[1])`
+/// — i.e. unchanged from the cell-level scan. The within-MB asymmetry
+/// only fires for blocks 1..=3.
+pub fn append_sub8x8_mvs(cell_refs: &MvRefs, block_mvs: &[Mv], block: usize) -> (Mv, Mv) {
+    let ref_list_mv = [cell_refs.list[0], cell_refs.list[1]];
+    let mut sub = [Mv::ZERO; 2];
+    let mut dst: usize = 0;
+    if block == 0 {
+        sub[0] = ref_list_mv[0];
+        sub[1] = ref_list_mv[1];
+        return (sub[0], sub[1]);
+    } else if block <= 2 {
+        // Sub-blocks 1 and 2 anchor on sub-block 0's MV.
+        sub[dst] = block_mvs[0];
+        dst += 1;
+    } else {
+        // block == 3: anchor on sub-block 2, then try sub-blocks 1 then 0
+        // (note the spec's `for idx = 1; idx >= 0` walks 1 then 0, NOT
+        // raster order — this matches §6.5.14 verbatim).
+        sub[dst] = block_mvs[2];
+        dst += 1;
+        for idx in [1usize, 0usize] {
+            if dst >= 2 {
+                break;
+            }
+            if block_mvs[idx] != sub[0] {
+                sub[dst] = block_mvs[idx];
+                dst += 1;
+            }
+        }
+    }
+    // Fill remaining slot(s) from the cell-level neighbour list, dedup
+    // against sub[0].
+    for n in 0..2 {
+        if dst >= 2 {
+            break;
+        }
+        if ref_list_mv[n] != sub[0] {
+            sub[dst] = ref_list_mv[n];
+            dst += 1;
+        }
+    }
+    if dst < 2 {
+        sub[dst] = Mv::ZERO;
+        // dst += 1; // unused after this point
+    }
+    (sub[0], sub[1])
+}
+
 /// §6.5.12 body: when HP is not usable, force the low bit to 0 by
 /// rounding "away from zero" by one: `if (v & 1) v += (v > 0 ? -1 : 1)`.
 fn round_hp_off(v: i16) -> i16 {
@@ -898,6 +993,7 @@ mod tests {
             list: [Mv::new(17, -21), Mv::ZERO],
             count: 1,
             mode_context: 0,
+            best_mv_override: None,
         };
         let g = geom(4, 4, 2, 2, 16, 16);
         find_best_ref_mvs(&mut refs, false, &g);
@@ -921,6 +1017,7 @@ mod tests {
             list: [Mv::new(5, 7), Mv::ZERO],
             count: 1,
             mode_context: 0,
+            best_mv_override: None,
         };
         let g = geom(4, 4, 2, 2, 16, 16);
         find_best_ref_mvs(&mut refs, true, &g);
@@ -934,6 +1031,7 @@ mod tests {
             list: [Mv::new(513, 3), Mv::ZERO],
             count: 1,
             mode_context: 0,
+            best_mv_override: None,
         };
         let g = geom(4, 4, 2, 2, 16, 16);
         find_best_ref_mvs(&mut refs, true, &g);
@@ -1029,5 +1127,108 @@ mod tests {
         let sb: RefSignBias = [false; 4];
         let r = find_mv_refs_geom(&grid, &sb, 1, 6, geom(0, 0, 2, 2, 4, 4), 0, 4);
         assert_eq!(r.mode_context, 2);
+    }
+
+    // §6.5.14 `append_sub8x8_mvs` — per-sub-block (Nearest, Near)
+    // refinement using prior-sub-block MVs of the same MB.
+
+    fn refs_with(list0: Mv, list1: Mv) -> MvRefs {
+        MvRefs {
+            list: [list0, list1],
+            count: 2,
+            mode_context: 0,
+            best_mv_override: None,
+        }
+    }
+
+    #[test]
+    fn append_sub8x8_block0_returns_cell_pair_unchanged() {
+        let cell = refs_with(Mv::new(10, 20), Mv::new(30, 40));
+        let block_mvs = [Mv::ZERO; 4];
+        let (n, m) = append_sub8x8_mvs(&cell, &block_mvs, 0);
+        assert_eq!(n, Mv::new(10, 20));
+        assert_eq!(m, Mv::new(30, 40));
+    }
+
+    #[test]
+    fn append_sub8x8_block1_anchors_on_block0_mv() {
+        // sub-block 1 (idy=0, idx=1): nearest = BlockMvs[0], near falls
+        // through to RefListMv[0] (deduped vs sub[0]).
+        let cell = refs_with(Mv::new(100, 100), Mv::new(200, 200));
+        let mut block_mvs = [Mv::ZERO; 4];
+        block_mvs[0] = Mv::new(7, 9);
+        let (n, m) = append_sub8x8_mvs(&cell, &block_mvs, 1);
+        assert_eq!(n, Mv::new(7, 9), "nearest = BlockMvs[0]");
+        // sub[0]=BlockMvs[0]=(7,9). RefListMv[0]=(100,100) != sub[0] → take it.
+        assert_eq!(m, Mv::new(100, 100));
+    }
+
+    #[test]
+    fn append_sub8x8_block2_anchors_on_block0_mv() {
+        // sub-block 2 (idy=1, idx=0): same anchor as block 1 per spec.
+        let cell = refs_with(Mv::new(50, 60), Mv::new(70, 80));
+        let mut block_mvs = [Mv::ZERO; 4];
+        block_mvs[0] = Mv::new(11, 13);
+        let (n, m) = append_sub8x8_mvs(&cell, &block_mvs, 2);
+        assert_eq!(n, Mv::new(11, 13));
+        assert_eq!(m, Mv::new(50, 60));
+    }
+
+    #[test]
+    fn append_sub8x8_block3_walks_block2_then_1_then_0_per_spec() {
+        // sub-block 3: sub[0] = BlockMvs[2], then idx walks 1 then 0.
+        let cell = refs_with(Mv::new(99, 99), Mv::new(88, 88));
+        let mut block_mvs = [Mv::ZERO; 4];
+        block_mvs[0] = Mv::new(1, 1);
+        block_mvs[1] = Mv::new(2, 2);
+        block_mvs[2] = Mv::new(3, 3);
+        let (n, m) = append_sub8x8_mvs(&cell, &block_mvs, 3);
+        assert_eq!(n, Mv::new(3, 3), "block 3 anchors on BlockMvs[2]");
+        // Walk idx=1 first: BlockMvs[1]=(2,2) != (3,3) → take. dst=2 → stop.
+        assert_eq!(m, Mv::new(2, 2));
+    }
+
+    #[test]
+    fn append_sub8x8_block3_skips_duplicate_block_mvs() {
+        // BlockMvs[1] == BlockMvs[2] → skip; fall through to BlockMvs[0].
+        let cell = refs_with(Mv::ZERO, Mv::ZERO);
+        let mut block_mvs = [Mv::ZERO; 4];
+        block_mvs[0] = Mv::new(5, 5);
+        block_mvs[1] = Mv::new(7, 7); // same as block_mvs[2]
+        block_mvs[2] = Mv::new(7, 7);
+        let (n, m) = append_sub8x8_mvs(&cell, &block_mvs, 3);
+        assert_eq!(n, Mv::new(7, 7));
+        // idx=1: BlockMvs[1]=(7,7) == sub[0] → skip.
+        // idx=0: BlockMvs[0]=(5,5) != sub[0] → take.
+        assert_eq!(m, Mv::new(5, 5));
+    }
+
+    #[test]
+    fn append_sub8x8_block_dedups_against_cell_refs_then_falls_back_to_zero() {
+        // sub-block 1 with BlockMvs[0] == cell list[0] → fallback chain
+        // walks cell list[0] (skipped — dup), cell list[1] (could be
+        // taken), then ZeroMv.
+        let cell = refs_with(Mv::new(4, 4), Mv::new(4, 4)); // cell list[1] also dup
+        let mut block_mvs = [Mv::ZERO; 4];
+        block_mvs[0] = Mv::new(4, 4); // == cell list[0]
+        let (n, m) = append_sub8x8_mvs(&cell, &block_mvs, 1);
+        assert_eq!(n, Mv::new(4, 4));
+        // Both cell list entries dup → dst still 1 → fill with ZeroMv.
+        assert_eq!(m, Mv::ZERO);
+    }
+
+    #[test]
+    fn mvrefs_best_mv_uses_override_when_present() {
+        // Verifies the BestMv-stays-cell-level invariant for sub-8×8
+        // refined MvRefs (NEWMV must use the cell-level BestMv even when
+        // NEAREST/NEAR have been rebuilt from BlockMvs).
+        let mut refs = refs_with(Mv::new(50, 60), Mv::new(70, 80));
+        // Without override, best_mv() == list[0].
+        assert_eq!(refs.best_mv(), Mv::new(50, 60));
+        refs.best_mv_override = Some(Mv::new(123, 456));
+        assert_eq!(refs.best_mv(), Mv::new(123, 456));
+        // nearest_mv()/near_mv() unaffected by the override.
+        assert_eq!(refs.nearest_mv(), Mv::new(50, 60));
+        assert_eq!(refs.near_mv(), Mv::new(70, 80));
     }
 }

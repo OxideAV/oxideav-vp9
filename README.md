@@ -127,6 +127,7 @@ oxideav_vp9::register(&mut reg);
 | r22   | **47.70 dB**       | **∞ (bit-exact)** | 45.43 dB     | **9.54 dB**     |
 | r23   | **47.70 dB**       | **∞ (bit-exact)** | 45.43 dB     | **9.55 dB**     |
 | r24   | **47.70 dB**       | **∞ (bit-exact)** | **∞ (bit-exact)** | 9.45 dB     |
+| r25   | **47.70 dB**       | **∞ (bit-exact)** | **∞ (bit-exact)** | 9.45 dB     |
 
 Round 23 mirrors the round-22 §6.4.3 sub-8×8 one-call fix to the
 inter `decode_partition` (`inter.rs`), eliminating the 2× HORZ/VERT
@@ -342,6 +343,89 @@ candidates instead of per-4×4 sub-block candidates).
 * §9.3.2 sub-MV neighbour anchor — same shape as the r22
   intra `+idx`/`+idy` rewrite, applied to per-sub-block MV
   candidate selection inside the new iteration.
+
+## Round-25 §6.5.14 within-MB sub-block MV mixing (`append_sub8x8_mvs`)
+
+Round 25 partially closes the r24+ "per-sub-block `find_mv_refs`"
+gap by wiring up the §6.5.14 `append_sub8x8_mvs` path. For the
+sub-8×8 inter MBs (B4x4 / B4x8 / B8x4) the §6.4.16 (idy, idx) loop
+now refines the `(NearestMv, NearMv)` pair per-sub-block by
+mixing in the MVs that `assign_mv` already chose for prior
+sub-blocks of the *same* MB:
+
+```text
+append_sub8x8_mvs(block, refList) {
+    find_mv_refs(refFrame, block)       // RefListMv[] (cell-level)
+    if block == 0:
+        sub8x8Mvs = RefListMv[0..2]
+    else if block <= 2:
+        sub8x8Mvs[0] = BlockMvs[refList][0]    // sub-block 0's MV
+    else:                                       // block == 3
+        sub8x8Mvs[0] = BlockMvs[refList][2]    // sub-block 2's MV
+        // then walk idx=1, 0 (skip dups vs sub8x8Mvs[0])
+    // pad with cell-level RefListMv entries (skip dups), then ZeroMv
+    NearestMv = sub8x8Mvs[0]
+    NearMv    = sub8x8Mvs[1]
+}
+```
+
+The cell-level `BestMv` (= `RefListMv[0]`) is preserved by a new
+`MvRefs::best_mv_override` field that lets the per-sub-block
+refined `MvRefs` pin BestMv (used by NEWMV) to the cell value
+while NEAREST/NEAR pull from the rebuilt `list[0..2]` — matching
+the spec invariant that only NEAREST/NEAR are refined per
+sub-block.
+
+The remaining gap (the *neighbour* per-4×4 `SubMvs[r][c][refList][idx]`
+lookup from §6.5.11 `get_sub_block_mv`, which would let prior
+neighbour-MB sub-block MVs be selected based on the requesting
+sub-block's `(mv_ref_search[i][1])` column delta) is still
+cell-level. That path requires a `SubMvs` table on `InterMiCell`
+which is r26+.
+
+Effect on the existing fixtures:
+
+| fixture                       | r24                | r25                |
+|-------------------------------|--------------------|--------------------|
+| `vp9-lossless-pattern.ivf` Y  | 47.70 dB / 337 px  | 47.70 dB / 337 px  |
+| `vp9-lossless-pattern.ivf` UV | ∞ (bit-exact)      | ∞ (bit-exact)      |
+| `vp9-lossless-c64.ivf` all    | ∞ (bit-exact)      | ∞ (bit-exact)      |
+| `vp9-lossless-gray.ivf` Y     | ∞ (all 25 frames)  | ∞ (all 25 frames)  |
+| `vp9-inter` f1↔f2 luma diffs  | 4795 px            | 4795 px            |
+| `vp9-compound` shown frames   | 6 / 6              | 6 / 6              |
+
+All keyframe-only fixtures stay bit-exact (the change only fires
+on sub-8×8 inter MBs, and the lossless fixtures don't have any).
+The `vp9-inter` and `vp9-compound` fixtures stay byte-identical
+at the visible level because their P-frames don't contain a
+sub-8×8 inter MB whose §6.4.16 read path actually selects
+NEAREST/NEAR with a non-block-0 sub-block — for those streams
+the cell-level (Nearest, Near) match the §6.5.14-refined values
+or the fixture's `inter_mode` lands on ZEROMV/NEWMV (where the
+refinement is a no-op). The wiring is structurally spec-correct
+and lifts the residual asymmetry flagged in the r24 README; we
+expect a measurable PSNR delta on a denser sub-8×8 inter
+fixture (r26+ — needs a `vp9-sub8x8-inter` fixture or a
+compound clip with `partition_split` denser than the r6
+6-frame reference).
+
+Tests added (under `mvref::tests`):
+* `append_sub8x8_block0_returns_cell_pair_unchanged`
+* `append_sub8x8_block1_anchors_on_block0_mv`
+* `append_sub8x8_block2_anchors_on_block0_mv`
+* `append_sub8x8_block3_walks_block2_then_1_then_0_per_spec`
+* `append_sub8x8_block3_skips_duplicate_block_mvs`
+* `append_sub8x8_block_dedups_against_cell_refs_then_falls_back_to_zero`
+* `mvrefs_best_mv_uses_override_when_present`
+
+### r26+ items still open
+
+* §6.5.11 `get_sub_block_mv` per-4×4 neighbour MV table — needs
+  a `SubMvs[r][c][refList][idx]` field on `InterMiCell` and a
+  per-sub-block writer in `decode_inter_block`. Once landed,
+  the `find_mv_refs(refFrame, block)` call inside r25's
+  `append_sub8x8_mvs` will see neighbour MVs that vary by the
+  requesting sub-block's column delta.
 
 ## Round-20 §7.4.6 spec-ctx skip read
 

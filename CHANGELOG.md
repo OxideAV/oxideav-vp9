@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Round 25 — §6.5.14 within-MB sub-block MV mixing.**
+  Wires up `append_sub8x8_mvs` per spec for the sub-8×8 inter
+  MBs (B4x4 / B4x8 / B8x4) inside the §6.4.16 (idy, idx) loop.
+  For each sub-block `block = idy*2 + idx > 0`, the per-sub-block
+  `(NearestMv, NearMv)` pair is now rebuilt from the MVs that
+  `assign_mv` chose for prior sub-blocks of the *same* MB
+  (`BlockMvs[refList][0..block]`), rather than reusing the
+  cell-level `find_mv_refs` candidates verbatim. `BestMv` (used
+  by NEWMV) stays the cell-level `RefListMv[0]` per spec — a new
+  `MvRefs::best_mv_override` field pins it on the per-sub-block
+  refined `MvRefs`. Adds 7 unit tests covering all four block
+  indices, the dedup rules, and the BestMv-override invariant.
+  Lossless / inter / compound fixtures stay byte-identical to
+  r24 (the existing fixtures' P-frames don't trigger a
+  non-block-0 NEAREST/NEAR sub-block read), but the structural
+  asymmetry flagged in the r24 README is now closed for the
+  within-MB axis. The remaining axis (per-4×4
+  *neighbour* MVs via §6.5.11 `get_sub_block_mv` against a
+  `SubMvs[r][c][refList][idx]` table on `InterMiCell`) is r26+.
+
 - **Round 23 — §6.4.3 sub-8×8 HORZ/VERT/SPLIT one-call branch
   for the inter path.** Mirrors the round-22 intra fix to
   `inter.rs::decode_partition`. Per §6.4.3 the leading

@@ -32,12 +32,16 @@
 //!   dropped. This is a real bit-accuracy gap on frames where the
 //!   previous frame's MI grid was preserved; measurable as a small PSNR
 //!   drop in long GOPs.
-//! * `block` parameter to `find_mv_refs` is always `-1` — the
-//!   per-4×4-sub-block neighbour `SubMvs[r][c][refList][idx]` lookup
-//!   from §6.5.11 `get_sub_block_mv` is not yet wired (the cell-level
-//!   neighbour MV is used regardless of the requesting sub-block). The
-//!   §6.5.14 `append_sub8x8_mvs` mixing of *prior-sub-block-within-MB*
-//!   MVs into `(NearestMv, NearMv)` IS wired — see [`append_sub8x8_mvs`].
+//!
+//! Round 26 / #190 update: §6.5.11 `get_sub_block_mv` is now wired up.
+//! `find_mv_refs_geom_block` accepts a sub-block index `block` (`-1`
+//! for the cell-level call, `0..=3` for sub-8×8 per-sub-block calls).
+//! When set, the first-two-neighbour loop reads
+//! `SubMvs[r][c][refList][idx]` (with `idx` chosen by §6.5.11's
+//! `idx_n_column_to_subblock[block][deltaCol == 0]`) instead of the
+//! bare cell MV. The §6.5.14 `append_sub8x8_mvs` mixing of
+//! *prior-sub-block-within-MB* MVs is layered on top — see
+//! [`append_sub8x8_mvs`].
 
 use crate::mv::Mv;
 
@@ -121,8 +125,19 @@ pub struct InterMiCell {
     /// First (and possibly only) reference-frame code. `INTRA_FRAME`
     /// means the block was decoded intra.
     pub ref_frame: [u8; 2],
-    /// MV for each ref_frame slot.
+    /// MV for each ref_frame slot. Equal to `BlockMvs[refList][3]`
+    /// per spec §6.4.4 line 2420 — the last-decoded sub-block MV for
+    /// sub-8×8 cells, else the single block MV.
     pub mv: [Mv; 2],
+    /// §6.4.4 `SubMvs[r][c][refList][b]` — per-4×4 sub-block MVs.
+    /// For >=8×8 cells all four `b` slots equal `mv[refList]` per spec
+    /// §6.4.16 line 2700 (`for block in 0..4: BlockMvs[refList][block]
+    /// = Mv[refList]`). For sub-8×8 cells (B4x4 / B4x8 / B8x4) the
+    /// four slots hold the distinct per-sub-block MVs. Read by
+    /// §6.5.11 `get_sub_block_mv` during a neighbour scan in
+    /// `find_mv_refs_geom_block` when the requesting block has a
+    /// sub-block index `>= 0`.
+    pub sub_mvs: [[Mv; 4]; 2],
     /// `y_mode` of this block in spec encoding (see constants above).
     /// Used to drive §6.5 `contextCounter` accumulation. Defaults to
     /// `DC_PRED` (0) so uninitialised cells look like intra neighbours
@@ -142,10 +157,35 @@ impl Default for InterMiCell {
         Self {
             ref_frame: [INTRA_FRAME, NONE_FRAME],
             mv: [Mv::ZERO, Mv::ZERO],
+            sub_mvs: [[Mv::ZERO; 4]; 2],
             y_mode: 0,        // DC_PRED — intra sentinel
             interp_filter: 3, // §9.3.2 sentinel "no filter / intra"
         }
     }
+}
+
+/// §6.5.11 `idx_n_column_to_subblock[block][deltaCol == 0]` — selects
+/// the SubMvs index for a neighbour-cell sub-block lookup. Indexed
+/// first by the requesting current-block sub-block index (0..=3) and
+/// second by `(neighbour_delta_col == 0)` as a 0/1 boolean (1 when
+/// the neighbour is directly above, 0 when it is to the left or
+/// diagonally left).
+pub const IDX_N_COLUMN_TO_SUBBLOCK: [[u8; 2]; 4] = [[1, 2], [1, 3], [3, 2], [3, 3]];
+
+/// §6.5.11 `get_sub_block_mv(candidateR, candidateC, refList, deltaCol,
+/// block)` — pick the per-4×4 sub-block MV from a neighbour cell.
+/// `block < 0` (cell-level call) selects index `3` per spec, which
+/// equals the cell-level MV by construction (see [`InterMiCell`]).
+#[inline]
+pub fn get_sub_block_mv(cell: &InterMiCell, ref_list: usize, delta_col: i32, block: i32) -> Mv {
+    let idx = if block >= 0 {
+        let b = (block as usize).min(3);
+        IDX_N_COLUMN_TO_SUBBLOCK[b][(delta_col == 0) as usize] as usize
+    } else {
+        3
+    };
+    let r = ref_list.min(1);
+    cell.sub_mvs[r][idx.min(3)]
 }
 
 /// 8x8 mi-grid of inter metadata for the current frame. Written by
@@ -474,7 +514,9 @@ pub fn find_mv_refs(
 
 /// Same as `find_mv_refs` but takes a fully populated [`BlockGeom`].
 /// Preferred entrypoint — supplies accurate `mi_cols` for the
-/// `clamp_mv_col` right-edge computation.
+/// `clamp_mv_col` right-edge computation. Defaults `block = -1` for
+/// the cell-level scan; sub-8×8 callers should use
+/// [`find_mv_refs_geom_block`] with the active sub-block index.
 pub fn find_mv_refs_geom(
     grid: &InterMiGrid,
     sign_bias: &RefSignBias,
@@ -483,6 +525,36 @@ pub fn find_mv_refs_geom(
     geom: BlockGeom,
     mi_col_start: i32,
     mi_col_end: i32,
+) -> MvRefs {
+    find_mv_refs_geom_block(
+        grid,
+        sign_bias,
+        ref_frame,
+        block_size_code,
+        geom,
+        mi_col_start,
+        mi_col_end,
+        -1,
+    )
+}
+
+/// §6.5.1 `find_mv_refs(refFrame, block)` — block-aware variant. When
+/// `block >= 0` (sub-8×8 caller) the first-two-neighbour loop reads
+/// neighbour MVs through §6.5.11 [`get_sub_block_mv`] so that the
+/// neighbour's per-sub-block MV (selected by the requesting sub-block's
+/// `(block, delta_col)`) is picked instead of the neighbour's cell
+/// anchor. The other neighbour scans (§6.5.7 / §6.5.8) are unchanged
+/// per spec — only the first two slots use the SubMvs lookup.
+#[allow(clippy::too_many_arguments)]
+pub fn find_mv_refs_geom_block(
+    grid: &InterMiGrid,
+    sign_bias: &RefSignBias,
+    ref_frame: u8,
+    block_size_code: usize,
+    geom: BlockGeom,
+    mi_col_start: i32,
+    mi_col_end: i32,
+    block: i32,
 ) -> MvRefs {
     let bsize = block_size_code.min(12);
     let searches = &MV_REF_BLOCKS[bsize];
@@ -510,7 +582,15 @@ pub fn find_mv_refs_geom(
         context_counter = context_counter.saturating_add(MODE_2_COUNTER[ym]);
         for j in 0..2 {
             if cell.ref_frame[j] == ref_frame {
-                add_mv_ref_list(&mut out, cell.mv[j]);
+                // §6.5.1 line 3071:
+                //   get_sub_block_mv(candidateR, candidateC, j,
+                //                    mv_ref_search[i][1], block)
+                // For `block < 0` (cell-level call) this returns
+                // `cell.sub_mvs[j][3]` which equals `cell.mv[j]` by
+                // §6.4.4 invariant, so the cell-level path stays
+                // bit-identical to pre-#190 behaviour.
+                let mv = get_sub_block_mv(&cell, j, dc, block);
+                add_mv_ref_list(&mut out, mv);
                 break;
             }
         }
@@ -852,6 +932,29 @@ mod tests {
         }
     }
 
+    /// Test helper: produce an `InterMiCell` whose `sub_mvs` slot for
+    /// `ref_frame[0]` is uniformly populated with `mv0` — matching the
+    /// spec invariant for >=8×8 cells (`BlockMvs[refList][b] = Mv[refList]`
+    /// for all b in 0..4). Mirrors what `inter.rs` does for non-sub-8×8
+    /// inter blocks. `ref1` / `mv1` populate the second slot; pass
+    /// `(NONE_FRAME, Mv::ZERO)` for single-ref cells.
+    fn cell_with(
+        ref0: u8,
+        mv0: Mv,
+        ref1: u8,
+        mv1: Mv,
+        y_mode: u8,
+        interp_filter: u8,
+    ) -> InterMiCell {
+        InterMiCell {
+            ref_frame: [ref0, ref1],
+            mv: [mv0, mv1],
+            sub_mvs: [[mv0; 4], [mv1; 4]],
+            y_mode,
+            interp_filter,
+        }
+    }
+
     #[test]
     fn empty_grid_returns_zero_candidates() {
         let grid = InterMiGrid::new(4, 4);
@@ -870,12 +973,7 @@ mod tests {
             1,
             1,
             1,
-            InterMiCell {
-                ref_frame: [1, NONE_FRAME],
-                mv: [mv, Mv::ZERO],
-                y_mode: Y_MODE_NEWMV,
-                interp_filter: 0,
-            },
+            cell_with(1, mv, NONE_FRAME, Mv::ZERO, Y_MODE_NEWMV, 0),
         );
         let sb: RefSignBias = [false; 4];
         // 16x16 block at (mi_row=2, mi_col=1) — (-1,0) neighbour is (1,1).
@@ -894,24 +992,14 @@ mod tests {
             1,
             1,
             1,
-            InterMiCell {
-                ref_frame: [1, NONE_FRAME],
-                mv: [mv, Mv::ZERO],
-                y_mode: Y_MODE_NEWMV,
-                interp_filter: 0,
-            },
+            cell_with(1, mv, NONE_FRAME, Mv::ZERO, Y_MODE_NEWMV, 0),
         );
         grid.fill(
             2,
             1,
             1,
             1,
-            InterMiCell {
-                ref_frame: [1, NONE_FRAME],
-                mv: [mv, Mv::ZERO],
-                y_mode: Y_MODE_NEWMV,
-                interp_filter: 0,
-            },
+            cell_with(1, mv, NONE_FRAME, Mv::ZERO, Y_MODE_NEWMV, 0),
         );
         let sb: RefSignBias = [false; 4];
         let r = find_mv_refs(&grid, &sb, 1, 6, 2, 2, 0, 4, 4);
@@ -927,12 +1015,7 @@ mod tests {
             1,
             1,
             1,
-            InterMiCell {
-                ref_frame: [2, NONE_FRAME],
-                mv: [Mv::new(20, -10), Mv::ZERO],
-                y_mode: Y_MODE_NEWMV,
-                interp_filter: 0,
-            },
+            cell_with(2, Mv::new(20, -10), NONE_FRAME, Mv::ZERO, Y_MODE_NEWMV, 0),
         );
         let mut sb: RefSignBias = [false; 4];
         sb[2] = true;
@@ -970,12 +1053,14 @@ mod tests {
             1,
             1,
             1,
-            InterMiCell {
-                ref_frame: [1, NONE_FRAME],
-                mv: [Mv::new(10_000, 10_000), Mv::ZERO],
-                y_mode: Y_MODE_NEWMV,
-                interp_filter: 0,
-            },
+            cell_with(
+                1,
+                Mv::new(10_000, 10_000),
+                NONE_FRAME,
+                Mv::ZERO,
+                Y_MODE_NEWMV,
+                0,
+            ),
         );
         let sb: RefSignBias = [false; 4];
         // 16x16 at (mi_row=2, mi_col=2), mi_rows=4, mi_cols=4 passed
@@ -1230,5 +1315,149 @@ mod tests {
         // nearest_mv()/near_mv() unaffected by the override.
         assert_eq!(refs.nearest_mv(), Mv::new(50, 60));
         assert_eq!(refs.near_mv(), Mv::new(70, 80));
+    }
+
+    // #190 / §6.5.11 `get_sub_block_mv` — per-sub-block neighbour MV
+    // lookup. The receiver's `block` index plus the neighbour's
+    // `delta_col == 0` flag select an entry in
+    // `idx_n_column_to_subblock` to index into `cell.sub_mvs`.
+
+    fn sub_cell(sub0: [Mv; 4]) -> InterMiCell {
+        // §6.4.4 invariant: cell-level anchor MV equals sub_mvs[0][3].
+        InterMiCell {
+            ref_frame: [1, NONE_FRAME],
+            mv: [sub0[3], Mv::ZERO],
+            sub_mvs: [sub0, [Mv::ZERO; 4]],
+            y_mode: Y_MODE_NEWMV,
+            interp_filter: 0,
+        }
+    }
+
+    #[test]
+    fn get_sub_block_mv_cell_level_picks_index_3() {
+        // block = -1 (cell-level call) → idx = 3 unconditionally per
+        // spec; equals cell.mv per §6.4.4 invariant.
+        let s = [
+            Mv::new(10, 11),
+            Mv::new(20, 21),
+            Mv::new(30, 31),
+            Mv::new(40, 41),
+        ];
+        let cell = sub_cell(s);
+        // delta_col is irrelevant at block = -1.
+        assert_eq!(get_sub_block_mv(&cell, 0, -1, -1), Mv::new(40, 41));
+        assert_eq!(get_sub_block_mv(&cell, 0, 0, -1), Mv::new(40, 41));
+        assert_eq!(get_sub_block_mv(&cell, 0, 1, -1), Mv::new(40, 41));
+    }
+
+    #[test]
+    fn get_sub_block_mv_indexes_per_idx_n_column_to_subblock_table() {
+        // §6.5.11 idx_n_column_to_subblock = [[1,2],[1,3],[3,2],[3,3]].
+        // Column index = (delta_col == 0) as usize.
+        //  block=0, dc≠0 → idx 1; block=0, dc==0 → idx 2.
+        //  block=1, dc≠0 → idx 1; block=1, dc==0 → idx 3.
+        //  block=2, dc≠0 → idx 3; block=2, dc==0 → idx 2.
+        //  block=3, dc≠0 → idx 3; block=3, dc==0 → idx 3.
+        let s = [
+            Mv::new(0, 0),
+            Mv::new(11, 11),
+            Mv::new(22, 22),
+            Mv::new(33, 33),
+        ];
+        let cell = sub_cell(s);
+        assert_eq!(get_sub_block_mv(&cell, 0, -1, 0), Mv::new(11, 11));
+        assert_eq!(get_sub_block_mv(&cell, 0, 0, 0), Mv::new(22, 22));
+        assert_eq!(get_sub_block_mv(&cell, 0, -1, 1), Mv::new(11, 11));
+        assert_eq!(get_sub_block_mv(&cell, 0, 0, 1), Mv::new(33, 33));
+        assert_eq!(get_sub_block_mv(&cell, 0, -1, 2), Mv::new(33, 33));
+        assert_eq!(get_sub_block_mv(&cell, 0, 0, 2), Mv::new(22, 22));
+        assert_eq!(get_sub_block_mv(&cell, 0, -1, 3), Mv::new(33, 33));
+        assert_eq!(get_sub_block_mv(&cell, 0, 0, 3), Mv::new(33, 33));
+    }
+
+    #[test]
+    fn find_mv_refs_block_minus_one_matches_cell_level_path() {
+        // For a >=8×8 neighbour cell, sub_mvs[*][3] equals cell.mv (per
+        // the writer in inter.rs), so find_mv_refs_geom_block(-1) must
+        // produce the same RefListMv as the legacy find_mv_refs_geom.
+        let mut grid = InterMiGrid::new(4, 4);
+        let mv = Mv::new(8, 24);
+        grid.fill(
+            1,
+            1,
+            1,
+            1,
+            cell_with(1, mv, NONE_FRAME, Mv::ZERO, Y_MODE_NEWMV, 0),
+        );
+        let sb: RefSignBias = [false; 4];
+        let g = geom(2, 1, 2, 2, 4, 4);
+        let r_legacy = find_mv_refs_geom(&grid, &sb, 1, 6, g, 0, 4);
+        let r_block_minus_1 = find_mv_refs_geom_block(&grid, &sb, 1, 6, g, 0, 4, -1);
+        assert_eq!(r_legacy.list, r_block_minus_1.list);
+        assert_eq!(r_legacy.count, r_block_minus_1.count);
+    }
+
+    #[test]
+    fn find_mv_refs_block_picks_neighbour_sub_mv_per_spec() {
+        // Build a sub-8×8 NEIGHBOUR whose four SubMvs differ. Place
+        // it at (1, 1) so it's the (-1, 0) neighbour (above) of a
+        // 16×16 block at (mi_row=2, mi_col=1). For the above neighbour,
+        // delta_col = 0; for receiver block_idx in {0,1,2,3} the spec
+        // table picks SubMvs[2], [3], [2], [3] respectively.
+        let mut grid = InterMiGrid::new(4, 4);
+        let nbr = sub_cell([
+            Mv::new(10, 0),
+            Mv::new(20, 0),
+            Mv::new(30, 0),
+            Mv::new(40, 0),
+        ]);
+        grid.fill(1, 1, 1, 1, nbr);
+        let sb: RefSignBias = [false; 4];
+        let g = geom(2, 1, 2, 2, 4, 4);
+        // block 0 → idx[0][1] = 2 → SubMvs[0][2] = (30,0)
+        let r0 = find_mv_refs_geom_block(&grid, &sb, 1, 6, g, 0, 4, 0);
+        assert_eq!(r0.count, 1);
+        assert_eq!(r0.list[0], Mv::new(30, 0));
+        // block 1 → idx[1][1] = 3 → SubMvs[0][3] = (40,0)
+        let r1 = find_mv_refs_geom_block(&grid, &sb, 1, 6, g, 0, 4, 1);
+        assert_eq!(r1.list[0], Mv::new(40, 0));
+        // block 2 → idx[2][1] = 2 → SubMvs[0][2] = (30,0)
+        let r2 = find_mv_refs_geom_block(&grid, &sb, 1, 6, g, 0, 4, 2);
+        assert_eq!(r2.list[0], Mv::new(30, 0));
+        // block 3 → idx[3][1] = 3 → SubMvs[0][3] = (40,0)
+        let r3 = find_mv_refs_geom_block(&grid, &sb, 1, 6, g, 0, 4, 3);
+        assert_eq!(r3.list[0], Mv::new(40, 0));
+    }
+
+    #[test]
+    fn find_mv_refs_block_left_neighbour_uses_dc_neq_0_column() {
+        // Place a sub-8×8 NEIGHBOUR at (2, 0) so it's the (0, -1)
+        // neighbour (to the LEFT) of a 16×16 block at
+        // (mi_row=2, mi_col=1). For the left neighbour, delta_col = -1
+        // (≠ 0). Receiver block_idx 0 → idx[0][0] = 1; 1 → idx[1][0] = 1;
+        // 2 → idx[2][0] = 3; 3 → idx[3][0] = 3.
+        let mut grid = InterMiGrid::new(4, 4);
+        let nbr = sub_cell([
+            Mv::new(0, 10),
+            Mv::new(0, 20),
+            Mv::new(0, 30),
+            Mv::new(0, 40),
+        ]);
+        grid.fill(2, 0, 1, 1, nbr);
+        let sb: RefSignBias = [false; 4];
+        // Use a block_size_code whose first two neighbours land on
+        // (0,-1) only (so the result is unambiguous). For BLOCK_16X16
+        // (code 6) searches[0]=(-1,0), searches[1]=(0,-1). The above
+        // neighbour at (1,1) is empty (default INTRA), so only the
+        // left neighbour contributes. (Above contributes y_mode=DC_PRED
+        // to the counter but no MV since ref_frame doesn't match.)
+        let g = geom(2, 1, 2, 2, 4, 4);
+        // block 0 → SubMvs[0][1] = (0,20)
+        let r0 = find_mv_refs_geom_block(&grid, &sb, 1, 6, g, 0, 4, 0);
+        assert_eq!(r0.count, 1);
+        assert_eq!(r0.list[0], Mv::new(0, 20));
+        // block 2 → SubMvs[0][3] = (0,40)
+        let r2 = find_mv_refs_geom_block(&grid, &sb, 1, 6, g, 0, 4, 2);
+        assert_eq!(r2.list[0], Mv::new(0, 40));
     }
 }

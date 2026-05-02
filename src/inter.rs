@@ -39,8 +39,9 @@ use crate::loopfilter::{LoopFilter, MiInfo, MiInfoPlane, INTRA_FRAME};
 use crate::mcfilter::{mc_block_scaled, InterpFilter, RefSampler};
 use crate::mv::{read_mv_component, read_mv_joint, Mv, MvComponentProbs};
 use crate::mvref::{
-    append_sub8x8_mvs, clamp_mv_pair, find_best_ref_mvs, find_mv_refs_geom, use_mv_hp, BlockGeom,
-    InterMiCell, InterMiGrid, MvRefs, BORDERINPIXELS, INTERP_EXTEND, NONE_FRAME,
+    append_sub8x8_mvs, clamp_mv_pair, find_best_ref_mvs, find_mv_refs_geom,
+    find_mv_refs_geom_block, use_mv_hp, BlockGeom, InterMiCell, InterMiGrid, MvRefs,
+    BORDERINPIXELS, INTERP_EXTEND, NONE_FRAME,
 };
 use crate::nonzero_ctx::NonzeroCtx;
 use crate::probs::read_partition_from_tree;
@@ -1360,14 +1361,40 @@ impl<'a> InterTile<'a> {
                 while idx < 2 {
                     let inter_mode = read_inter_mode(bd, self.ch.ctx.inter_mode_probs[ctx])?;
                     let block_idx = idy * 2 + idx;
-                    // §6.5.14 — refine (Nearest, Near) for NEARESTMV /
-                    // NEARMV using prior sub-block MVs of this MB.
-                    // For block 0 the helper returns the cell-level
-                    // (Nearest, Near) unchanged — bit-identical to r24.
-                    let sub_refs_a = self.sub8x8_refined_refs(&refs_a, &block_mvs_a, block_idx);
+                    // #190 / §6.5.11 — re-run find_mv_refs with the
+                    // sub-block index so the first-two-neighbour loop
+                    // pulls neighbour MVs through `get_sub_block_mv`
+                    // (per-4×4 SubMvs[r][c][refList][idx], where idx is
+                    // chosen by `idx_n_column_to_subblock[block_idx]
+                    // [delta_col == 0]`). For sub-block 0 the resulting
+                    // RefListMv may differ from the cell-level scan when
+                    // the relevant neighbour is itself a sub-8×8 MB
+                    // whose right-edge / bottom-edge sub-block MV
+                    // diverges from its cell anchor. The result then
+                    // feeds `append_sub8x8_mvs` (§6.5.14), which mixes
+                    // in the within-MB BlockMvs.
+                    let sub_cell_refs_a =
+                        self.find_subblock_mv_refs(ref_code_a, bsize_code, geom, block_idx as i32);
+                    let sub_refs_a = self.sub8x8_refined_refs(
+                        &sub_cell_refs_a,
+                        &refs_a,
+                        &block_mvs_a,
+                        block_idx,
+                    );
                     let mv_a = self.assign_mv(bd, inter_mode, sub_refs_a, &geom)?;
                     let mv_b = if is_compound {
-                        let sub_refs_b = self.sub8x8_refined_refs(&refs_b, &block_mvs_b, block_idx);
+                        let sub_cell_refs_b = self.find_subblock_mv_refs(
+                            ref_code_b,
+                            bsize_code,
+                            geom,
+                            block_idx as i32,
+                        );
+                        let sub_refs_b = self.sub8x8_refined_refs(
+                            &sub_cell_refs_b,
+                            &refs_b,
+                            &block_mvs_b,
+                            block_idx,
+                        );
                         self.assign_mv(bd, inter_mode, sub_refs_b, &geom)?
                     } else {
                         (0i16, 0i16)
@@ -1573,6 +1600,23 @@ impl<'a> InterTile<'a> {
             cell.ref_frame[1] = NONE_FRAME;
             cell.mv[1] = Mv::ZERO;
         }
+        // §6.4.4 line 2422: SubMvs[r+y][c+x][refList][b] =
+        //   BlockMvs[refList][b]. For sub-8×8 the loop above filled
+        //   `block_mvs_a` / `block_mvs_b` with the per-sub-block MVs;
+        //   for >=8×8 (single-iteration branch) BlockMvs[refList][b]
+        //   is the same MV for all b (per §6.4.16 line 2700), so
+        //   uniformly populate the four slots from the cell-level MV.
+        if is_sub8x8 {
+            cell.sub_mvs[0] = block_mvs_a;
+            if is_compound {
+                cell.sub_mvs[1] = block_mvs_b;
+            }
+        } else {
+            cell.sub_mvs[0] = [cell.mv[0]; 4];
+            if is_compound {
+                cell.sub_mvs[1] = [cell.mv[1]; 4];
+            }
+        }
         // §6.5 `YModes[row][col]` — spec encoding: NEARESTMV=10,
         // NEARMV=11, ZEROMV=12, NEWMV=13. This drives the neighbour
         // contextCounter of later blocks in raster order.
@@ -1647,34 +1691,68 @@ impl<'a> InterTile<'a> {
         self.refs.get(slot).copied().flatten()
     }
 
+    /// #190 / §6.5.11 — per-sub-block `find_mv_refs` + `find_best_ref_mvs`
+    /// for the sub-8×8 inter path. Re-runs the §6.5.1 neighbour scan
+    /// with `block = sub_block_idx` so the first-two-neighbour loop
+    /// reads `SubMvs[r][c][refList][idx]` (via `get_sub_block_mv`)
+    /// instead of the bare cell anchor MV. Then applies §6.5.12
+    /// rounding + wider clamp so the result is directly comparable
+    /// to the cell-level RefListMv that the spec uses inside
+    /// `append_sub8x8_mvs`.
+    fn find_subblock_mv_refs(
+        &self,
+        ref_code: u8,
+        bsize_code: usize,
+        geom: BlockGeom,
+        block: i32,
+    ) -> MvRefs {
+        let mut refs = find_mv_refs_geom_block(
+            &self.mv_grid,
+            &self.hdr.ref_frame_sign_bias,
+            ref_code,
+            bsize_code,
+            geom,
+            self.tile_mi_col_start,
+            self.tile_mi_col_end,
+            block,
+        );
+        find_best_ref_mvs(&mut refs, self.hdr.allow_high_precision_mv, &geom);
+        refs
+    }
+
     /// §6.5.14 per-sub-block refinement of the cell-level `MvRefs` for
     /// a sub-8×8 inter MB. Returns a fresh `MvRefs` whose
     /// `nearest_mv()` / `near_mv()` come from `append_sub8x8_mvs(block)`
     /// (mixing prior-sub-block MVs of this MB into the candidate list)
-    /// and whose `best_mv()` is the cell-level `RefListMv[0]` (per
-    /// spec — only NEARESTMV / NEARMV are refined, BestMv used by
-    /// NEWMV stays). `mode_context` is preserved from the cell-level
+    /// and whose `best_mv()` is pinned to the cell-level `RefListMv[0]`
+    /// per §6.4.16 spec (NEWMV reads BestMv from the OUTER
+    /// `find_best_ref_mvs` result, which doesn't iterate per
+    /// sub-block). `mode_context` is preserved from the cell-level
     /// scan since it drives the inter_mode tree probability lookup
-    /// which is per-cell (the §6.4.16 (idy, idx) loop reads
-    /// `inter_mode` against the same `ctx` for every sub-block).
+    /// which is per-cell.
     ///
-    /// For `block == 0` this is bit-identical to the cell-level
-    /// `cell_refs` (the helper short-circuits to the cell list).
+    /// Two `MvRefs` inputs:
+    /// * `subblock_refs`: result of #190 §6.5.11 `find_mv_refs_geom_block`
+    ///   for the requesting `block_idx` — its `list[0..1]` are the
+    ///   per-sub-block RefListMv that feed `append_sub8x8_mvs`.
+    /// * `cell_refs_best`: cell-level `find_best_ref_mvs` output. Its
+    ///   `list[0]` becomes the pinned `best_mv_override`.
     fn sub8x8_refined_refs(
         &self,
-        cell_refs: &MvRefs,
+        subblock_refs: &MvRefs,
+        cell_refs_best: &MvRefs,
         block_mvs: &[Mv; 4],
         block_idx: usize,
     ) -> MvRefs {
-        let (nearest, near) = append_sub8x8_mvs(cell_refs, block_mvs, block_idx);
+        let (nearest, near) = append_sub8x8_mvs(subblock_refs, block_mvs, block_idx);
         MvRefs {
             list: [nearest, near],
             count: 2,
-            mode_context: cell_refs.mode_context,
-            // §6.5.14: BestMv stays the cell-level RefListMv[0] for
+            mode_context: cell_refs_best.mode_context,
+            // §6.4.16: BestMv stays the cell-level RefListMv[0] for
             // NEWMV use. NEAREST/NEAR pull from `list[0]`/`list[1]`
             // which are now the §6.5.14 sub-block-refined values.
-            best_mv_override: Some(cell_refs.list[0]),
+            best_mv_override: Some(cell_refs_best.list[0]),
         }
     }
 

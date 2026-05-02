@@ -420,12 +420,68 @@ Tests added (under `mvref::tests`):
 
 ### r26+ items still open
 
-* §6.5.11 `get_sub_block_mv` per-4×4 neighbour MV table — needs
-  a `SubMvs[r][c][refList][idx]` field on `InterMiCell` and a
-  per-sub-block writer in `decode_inter_block`. Once landed,
-  the `find_mv_refs(refFrame, block)` call inside r25's
-  `append_sub8x8_mvs` will see neighbour MVs that vary by the
-  requesting sub-block's column delta.
+(All resolved in round 26 below.)
+
+## Round-26 §6.5.11 between-MB sub-block MV lookup (`get_sub_block_mv`)
+
+Round 26 (#190) closes the second axis flagged in round 25 — the
+*neighbour* per-4×4 `SubMvs[r][c][refList][idx]` lookup from
+§6.5.11 `get_sub_block_mv`. With this in, the sub-8×8 inter
+NEAREST/NEAR refinement now consults *both* asymmetries the spec
+calls for:
+
+1. Within the current MB: prior-sub-block `BlockMvs` are mixed
+   into `(NearestMv, NearMv)` via §6.5.14 `append_sub8x8_mvs`
+   (round 25, #180).
+2. Between MBs: when the current sub-block looks up its
+   first-two-neighbour candidates, the neighbour cell's
+   `SubMvs[refList][idx]` is selected — `idx` chosen by
+   `idx_n_column_to_subblock[block][delta_col == 0]` — instead
+   of the neighbour's cell anchor MV. (Round 26, this round.)
+
+Concretely, three changes:
+
+* **Storage.** `InterMiCell` gains `sub_mvs: [[Mv; 4]; 2]`. The
+  inter writer in `inter.rs::decode_inter_block` populates it
+  from `block_mvs_a` / `block_mvs_b` for sub-8×8 blocks (the
+  per-sub-block MVs already collected by the round-25 §6.4.16
+  loop) and from the cell-level MV repeated four times for
+  >=8×8 blocks (per §6.4.16 line 2700:
+  `for block in 0..4: BlockMvs[refList][block] = Mv[refList]`).
+  This matches §6.4.4 line 2422 verbatim:
+  `SubMvs[r+y][c+x][refList][b] = BlockMvs[refList][b]`.
+* **Lookup.** `mvref::get_sub_block_mv(cell, refList, deltaCol,
+  block)` mirrors §6.5.11. For the cell-level `block = -1`
+  call it returns `cell.sub_mvs[refList][3]` (= `cell.mv` per
+  the §6.4.4 invariant) so the legacy path stays bit-identical.
+  For `block ∈ 0..=3` it picks via
+  `IDX_N_COLUMN_TO_SUBBLOCK[block][delta_col == 0]`, the
+  4×2 table from the spec (`{1,2}, {1,3}, {3,2}, {3,3}`).
+* **Wiring.** `find_mv_refs_geom_block(..., block)` is the new
+  block-aware entrypoint. The first-two-neighbour loop now reads
+  `get_sub_block_mv(&cell, j, dc, block)` instead of
+  `cell.mv[j]`; subsequent neighbour scans (§6.5.7 / §6.5.8) are
+  unchanged per spec. The sub-8×8 inter path
+  (`InterTile::find_subblock_mv_refs`) calls this for each
+  `block_idx ∈ 0..=3` and threads the result into
+  `sub8x8_refined_refs`, which still pins `BestMv` to the
+  cell-level `RefListMv[0]` per §6.4.16 (NEWMV must use the
+  outer `find_best_ref_mvs` result).
+
+The pre-existing fixtures stay byte-identical at the visible
+level for the same reason r25's within-MB axis didn't shift
+PSNR: their P-frames don't contain a sub-8×8 inter MB whose
+first-two-neighbour cell is itself sub-8×8 with diverging
+`SubMvs[0..3]`. Together the two axes lift the structural
+asymmetry flagged across r24 and r25 and unblock a
+B4x4-heavy inter PSNR gain on a denser future fixture.
+
+Tests added (under `mvref::tests`):
+* `get_sub_block_mv_cell_level_picks_index_3`
+* `get_sub_block_mv_indexes_per_idx_n_column_to_subblock_table`
+* `find_mv_refs_block_minus_one_matches_cell_level_path`
+* `find_mv_refs_block_picks_neighbour_sub_mv_per_spec`
+* `find_mv_refs_block_left_neighbour_uses_dc_neq_0_column`
 
 ## Round-20 §7.4.6 spec-ctx skip read
 

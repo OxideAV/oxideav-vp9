@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Round 26 / #190 — §6.5.11 between-MB sub-block MV lookup
+  (`get_sub_block_mv`).** Closes the second axis flagged by round 25
+  — the *neighbour* per-4×4 `SubMvs[r][c][refList][idx]` lookup. Adds
+  `InterMiCell::sub_mvs: [[Mv; 4]; 2]` (populated by `decode_inter_block`
+  from the round-25 `block_mvs_a` / `block_mvs_b` for sub-8×8, and from
+  the cell-level MV repeated four times for >=8×8 per §6.4.16 line 2700),
+  plus `mvref::IDX_N_COLUMN_TO_SUBBLOCK` and the spec-faithful
+  `mvref::get_sub_block_mv`. New `find_mv_refs_geom_block(..., block)`
+  is the block-aware entrypoint; the legacy `find_mv_refs_geom` calls it
+  with `block = -1` (which returns `sub_mvs[refList][3]` = `cell.mv`,
+  preserving bit-identity for the cell-level path). The sub-8×8 inter
+  path now calls `find_subblock_mv_refs(block_idx)` per sub-block and
+  feeds the result into `sub8x8_refined_refs` alongside the cell-level
+  refs (still used to pin `best_mv_override` for NEWMV per §6.4.16).
+  Pre-existing fixtures stay byte-identical at the visible level — the
+  P-frames in `vp9-inter`, `vp9-compound`, `vp9-segmentation` don't
+  contain a sub-8×8 inter MB whose first-two-neighbour cell is itself
+  sub-8×8 with diverging `SubMvs`. The structural gap is now closed
+  on both within-MB (#180) and between-MB (#190) axes. Adds 5 unit
+  tests covering the cell-level `block=-1` invariant, the spec table
+  lookup, and the per-block neighbour selection for above + left
+  neighbours.
+
 - **Round 25 — §6.5.14 within-MB sub-block MV mixing.**
   Wires up `append_sub8x8_mvs` per spec for the sub-8×8 inter
   MBs (B4x4 / B4x8 / B8x4) inside the §6.4.16 (idy, idx) loop.

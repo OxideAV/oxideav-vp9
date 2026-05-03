@@ -126,7 +126,11 @@ impl PixFmt {
     /// Bytes per source sample in the reference `expected.yuv`. 1 for
     /// 8-bit, 2 for 10/12-bit.
     fn ref_bytes_per_sample(&self) -> usize {
-        if self.bit_depth() == 8 { 1 } else { 2 }
+        if self.bit_depth() == 8 {
+            1
+        } else {
+            2
+        }
     }
 
     /// Per-plane (width, height) for plane index `p`, in samples (NOT
@@ -461,8 +465,14 @@ fn evaluate(case: &CorpusCase) {
                 eprintln!(
                     "  frame {i}: Y {}/{} exact (max diff {}, ~PSNR {:.2} dB), \
                      UV {}/{} exact (max diff {}, ~PSNR {:.2} dB), pct={:.2}%",
-                    d.y_exact, d.y_total, d.y_max, d.psnr_y(),
-                    d.uv_exact, d.uv_total, d.uv_max, d.psnr_uv(),
+                    d.y_exact,
+                    d.y_total,
+                    d.y_max,
+                    d.psnr_y(),
+                    d.uv_exact,
+                    d.uv_total,
+                    d.uv_max,
+                    d.psnr_uv(),
                     d.pct()
                 );
                 agg.merge(d);

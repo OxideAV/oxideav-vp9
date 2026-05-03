@@ -2982,7 +2982,7 @@ mod tests {
         let mut dst = vec![0u8; 8 * 8];
         let src: Vec<u8> = (0..16).map(|i| i + 1).collect();
         let dst_stride = 8;
-        let buf_y_off = (1 * 4) * dst_stride + (1 * 4);
+        let buf_y_off = 4 * dst_stride + 4;
         copy_subrect(&src, 4, 4, &mut dst, dst_stride, buf_y_off);
         // Bottom-right 4×4 should be src; rest still zero.
         for r in 0..4 {

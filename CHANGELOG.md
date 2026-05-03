@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.7...v0.0.8) - 2026-05-03
+
+### Other
+
+- emit per-profile PixelFormat + widen HBD planes to LE u16 (task #265)
+- rustfmt the docs_corpus driver (no behaviour change)
+- wire docs/video/vp9 fixture corpus as integration tests
+
 ### Added
 
 - `pixel_format_from_color_config` now maps the full VP9 §6.2.1

@@ -12,7 +12,11 @@
 //! §6.4 tile / superblock / partition walk + §6.4.23 coefficient decode +
 //! §8.5.1 intra prediction (all 10 modes) + §8.7.1 inverse transforms
 //! (4/8/16/32, DCT + ADST combos, 4×4 WHT) + clip-add reconstruction,
-//! producing a `Yuv420P` `VideoFrame` from any 8-bit 4:2:0 VP9 keyframe.
+//! producing a `VideoFrame` whose `PixelFormat` matches the bitstream's
+//! profile (`Yuv420P` / `Yuv422P` / `Yuv444P` and the `Yuv*P10Le` /
+//! `Yuv*P12Le` HBD variants — see `pixel_format_from_color_config`).
+//! The internal pipeline still reconstructs in 8-bit space, so HBD
+//! samples are widened by left-shift to fit the LE u16 plane layout.
 //!
 //! On top of that it keeps the 8-slot reference buffer (§6.2) and runs
 //! inter prediction (§8.5 / §8.6) with full §6.4.19 MV decode + §8.5.1

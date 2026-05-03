@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `pixel_format_from_color_config` now maps the full VP9 §6.2.1
+  (bit_depth, subsampling, color_space) matrix to the matching
+  `oxideav_core::PixelFormat`: `Yuv420P` / `Yuv422P` / `Yuv444P` for
+  8-bit, the `Yuv*P10Le` family for 10-bit, the `Yuv*P12Le` family for
+  12-bit. sRGB / GBR-planar surfaces as `Yuv444P*` (core has no
+  GBR-planar variant today). Closes the hard-coded `Yuv420P` fallback
+  flagged by task #265.
+- `Vp9Decoder` now emits HBD output at the bitstream's declared bit
+  depth: each reconstructed u8 sample is widened to a little-endian
+  `u16` by `(byte as u16) << (bit_depth - 8)` so the active bits land
+  in the top of the bit-depth window. Stride doubles for HBD planes.
+  This matches the `Yuv*P10Le` / `Yuv*P12Le` plane layouts documented
+  on `oxideav_core::PixelFormat` and lets the docs corpus driver
+  compare HBD fixtures plane-to-plane (Profile 1 4:4:4, Profile 2/3
+  HBD, GBR 10-bit) instead of bailing with `plane size mismatch`.
+  Internal reconstruction is still 8-bit; the widening is a left-shift
+  so a downstream `>> shift` recovers the original byte exactly.
+
 ## [0.0.7](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.6...v0.0.7) - 2026-05-03
 
 ### Other

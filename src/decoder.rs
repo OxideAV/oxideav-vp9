@@ -19,7 +19,9 @@ use crate::bool_decoder::BoolDecoder;
 use crate::compressed_header::parse_compressed_header_with_seed;
 use crate::dpb::{Dpb, RefFrame};
 use crate::frame_ctx::FrameContext;
-use crate::headers::{parse_uncompressed_header, ColorConfig, FrameType, UncompressedHeader};
+use crate::headers::{
+    parse_uncompressed_header, ColorConfig, ColorSpace, FrameType, UncompressedHeader,
+};
 use crate::inter::InterTile;
 
 /// Build a `CodecParameters` from a parsed uncompressed header.
@@ -31,14 +33,48 @@ pub fn codec_parameters_from_header(h: &UncompressedHeader) -> CodecParameters {
     params
 }
 
-/// Map VP9 color_config (subsampling + bit depth) to the closest oxideav
-/// `PixelFormat`. We only have unsubsampled / 4:2:0 in core today, so
-/// 4:2:2 / 4:4:4 / 10-bit / 12-bit fall back to `Yuv420P` until core
-/// gains the missing variants.
+/// Map a VP9 `color_config` (§6.2.1: `bit_depth`, `color_space`,
+/// `subsampling_x`, `subsampling_y`) to the matching
+/// [`oxideav_core::PixelFormat`].
+///
+/// VP9 enumerates one of three bit depths (8 / 10 / 12) and three
+/// chroma layouts (4:2:0 = both subsampled, 4:2:2 = horizontal only,
+/// 4:4:4 = full-res). When `color_space == Srgb` (§6.2.1 the spec also
+/// pins `subsampling_x = subsampling_y = 0`) the planes carry G/B/R at
+/// full resolution; we surface that as a `Yuv444P*` variant since
+/// `oxideav_core::PixelFormat` has no dedicated GBR-planar variant
+/// today (RGB is only available packed: `Rgb24`, `Rgb48Le`, …).
+/// Higher layers can read `color_space` from the codec parameters' raw
+/// header (or the bitstream itself) when they need to distinguish a
+/// YUV 4:4:4 plane from a GBR-planar one.
+///
+/// 4:2:2 falls under the catch-all default — VP9's `parse_color_config`
+/// (§6.2.1) does allow `(subsampling_x, subsampling_y) = (1, 0)` for
+/// non-sRGB profile 1/3 streams, and we map that pair to the
+/// `Yuv422P*` family.
 pub fn pixel_format_from_color_config(cc: &ColorConfig) -> PixelFormat {
-    // Only 8-bit 4:2:0 maps cleanly today.
-    let _ = cc;
-    PixelFormat::Yuv420P
+    let chroma = (cc.subsampling_x, cc.subsampling_y);
+    match (cc.bit_depth, chroma, cc.color_space) {
+        // sRGB: planes are GBR full-res. No GBRP variant in core, so
+        // surface as the matching 4:4:4 family at the right bit depth.
+        (8, _, ColorSpace::Srgb) => PixelFormat::Yuv444P,
+        (10, _, ColorSpace::Srgb) => PixelFormat::Yuv444P10Le,
+        (12, _, ColorSpace::Srgb) => PixelFormat::Yuv444P12Le,
+        // Non-sRGB: pick by (chroma layout, bit depth).
+        (8, (true, true), _) => PixelFormat::Yuv420P,
+        (8, (true, false), _) => PixelFormat::Yuv422P,
+        (8, (false, false), _) => PixelFormat::Yuv444P,
+        (10, (true, true), _) => PixelFormat::Yuv420P10Le,
+        (10, (true, false), _) => PixelFormat::Yuv422P10Le,
+        (10, (false, false), _) => PixelFormat::Yuv444P10Le,
+        (12, (true, true), _) => PixelFormat::Yuv420P12Le,
+        (12, (true, false), _) => PixelFormat::Yuv422P12Le,
+        (12, (false, false), _) => PixelFormat::Yuv444P12Le,
+        // VP9 forbids `(subsampling_x, subsampling_y) = (false, true)`
+        // (§6.2.1: 4:4:0 is not a profile). Default to the closest
+        // 4:2:0 variant rather than panicking on a malformed header.
+        (_, _, _) => PixelFormat::Yuv420P,
+    }
 }
 
 /// Factory used by the codec registry.
@@ -270,20 +306,38 @@ impl Vp9Decoder {
         self.dpb.refresh(h.refresh_frame_flags, &rf);
 
         if h.show_frame {
+            // Widen each reconstructed sample to the bitstream's
+            // declared bit depth. The in-tree pipeline reconstructs in
+            // 8-bit space today, so for >8-bit profiles we promote each
+            // u8 to a `u16` LE container by left-shifting into the top
+            // of the bit-depth window: `(byte as u16) << (bit_depth-8)`.
+            // The resulting plane layout is two bytes per sample with
+            // the active bits in `[bit_depth-1 .. bit_depth-8]` —
+            // matching the `Yuv*P10Le` / `Yuv*P12Le` plane shapes
+            // documented on `oxideav_core::PixelFormat`. The h264
+            // sibling crate's `picture_to_video_frame` (task #259)
+            // adopts the same convention. Once the VP9 pipeline grows
+            // a real HBD reconstruction path (qlookup-12 / mcfilter
+            // i32, etc.) this widening will simply pack the already-
+            // wide samples instead of left-shifting u8s.
+            let bit_depth = h.color_config.bit_depth as u32;
+            let (y_data, y_out_stride) = widen_plane(&y, y_stride, bit_depth);
+            let (u_data, uv_out_stride) = widen_plane(&u, uv_stride, bit_depth);
+            let (v_data, _) = widen_plane(&v, uv_stride, bit_depth);
             let frame = VideoFrame {
                 pts: self.pending_pts.take(),
                 planes: vec![
                     VideoPlane {
-                        stride: y_stride,
-                        data: y,
+                        stride: y_out_stride,
+                        data: y_data,
                     },
                     VideoPlane {
-                        stride: uv_stride,
-                        data: u,
+                        stride: uv_out_stride,
+                        data: u_data,
                     },
                     VideoPlane {
-                        stride: uv_stride,
-                        data: v,
+                        stride: uv_out_stride,
+                        data: v_data,
                     },
                 ],
             };
@@ -447,6 +501,27 @@ fn get_tile_offset(tile_num: u32, mis: u32, tile_sz_log2: u32) -> u32 {
     offset.min(mis)
 }
 
+/// Widen one reconstructed plane to the bitstream's declared bit
+/// depth. For 8-bit the input bytes are returned as-is. For 10/12-bit,
+/// each input byte is promoted to a `u16` little-endian container by
+/// `(byte as u16) << (bit_depth - 8)` — the active bits land in the top
+/// of the bit-depth window so that a downstream `>> shift` narrows
+/// losslessly back to the original byte. The returned `out_stride` is
+/// `in_stride` for 8-bit and `in_stride * 2` for >8-bit, matching the
+/// `Yuv*P10Le` / `Yuv*P12Le` two-bytes-per-sample plane layout.
+fn widen_plane(plane: &[u8], in_stride: usize, bit_depth: u32) -> (Vec<u8>, usize) {
+    if bit_depth <= 8 {
+        return (plane.to_vec(), in_stride);
+    }
+    let shift = bit_depth - 8;
+    let mut out = Vec::with_capacity(plane.len() * 2);
+    for &b in plane {
+        let v = (b as u16) << shift;
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    (out, in_stride * 2)
+}
+
 /// Helper that returns frame_rate from container-supplied stream timing
 /// when available — VP9 itself doesn't carry frame_rate in-band.
 pub fn frame_rate_from_container(num: i64, den: i64) -> Option<Rational> {
@@ -563,6 +638,125 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0], &frame_a[..]);
         assert_eq!(out[1], &frame_b[..]);
+    }
+
+    fn cc(bit_depth: u8, sub_x: bool, sub_y: bool, cs: ColorSpace) -> ColorConfig {
+        ColorConfig {
+            bit_depth,
+            color_space: cs,
+            color_range: false,
+            subsampling_x: sub_x,
+            subsampling_y: sub_y,
+        }
+    }
+
+    /// `pixel_format_from_color_config` covers VP9's full
+    /// (bit_depth, chroma layout, color_space) matrix per §6.2.1.
+    /// Each profile column maps to a distinct `oxideav_core::PixelFormat`.
+    #[test]
+    fn pixel_format_from_color_config_matrix() {
+        // Profile 0 (4:2:0, 8-bit), non-sRGB.
+        assert_eq!(
+            pixel_format_from_color_config(&cc(8, true, true, ColorSpace::Bt709)),
+            PixelFormat::Yuv420P
+        );
+        // Profile 1: 4:4:4, 8-bit.
+        assert_eq!(
+            pixel_format_from_color_config(&cc(8, false, false, ColorSpace::Bt709)),
+            PixelFormat::Yuv444P
+        );
+        // Profile 1: 4:2:2, 8-bit (sub_x=1, sub_y=0).
+        assert_eq!(
+            pixel_format_from_color_config(&cc(8, true, false, ColorSpace::Bt709)),
+            PixelFormat::Yuv422P
+        );
+        // Profile 2: 4:2:0, 10-bit.
+        assert_eq!(
+            pixel_format_from_color_config(&cc(10, true, true, ColorSpace::Bt709)),
+            PixelFormat::Yuv420P10Le
+        );
+        // Profile 2: 4:2:2, 10-bit.
+        assert_eq!(
+            pixel_format_from_color_config(&cc(10, true, false, ColorSpace::Bt709)),
+            PixelFormat::Yuv422P10Le
+        );
+        // Profile 3: 4:4:4, 10-bit.
+        assert_eq!(
+            pixel_format_from_color_config(&cc(10, false, false, ColorSpace::Bt709)),
+            PixelFormat::Yuv444P10Le
+        );
+        // Profile 2: 4:2:0, 12-bit.
+        assert_eq!(
+            pixel_format_from_color_config(&cc(12, true, true, ColorSpace::Bt709)),
+            PixelFormat::Yuv420P12Le
+        );
+        // Profile 3: 4:4:4, 12-bit.
+        assert_eq!(
+            pixel_format_from_color_config(&cc(12, false, false, ColorSpace::Bt709)),
+            PixelFormat::Yuv444P12Le
+        );
+        // sRGB / GBR planar at 8 / 10 / 12-bit (subsampling pinned to
+        // 0/0 by §6.2.1 — but we tolerate other subsampling fields too).
+        assert_eq!(
+            pixel_format_from_color_config(&cc(8, false, false, ColorSpace::Srgb)),
+            PixelFormat::Yuv444P
+        );
+        assert_eq!(
+            pixel_format_from_color_config(&cc(10, false, false, ColorSpace::Srgb)),
+            PixelFormat::Yuv444P10Le
+        );
+        assert_eq!(
+            pixel_format_from_color_config(&cc(12, false, false, ColorSpace::Srgb)),
+            PixelFormat::Yuv444P12Le
+        );
+    }
+
+    /// 8-bit `widen_plane` must pass bytes through unchanged and keep
+    /// the input stride. 10/12-bit must emit two LE bytes per input
+    /// byte with the input bits shifted to the top of the bit-depth
+    /// window — and double the stride.
+    #[test]
+    fn widen_plane_8bit_passthrough() {
+        let plane = vec![0x00u8, 0x42, 0xff];
+        let (out, stride) = widen_plane(&plane, 3, 8);
+        assert_eq!(out, plane);
+        assert_eq!(stride, 3);
+    }
+
+    #[test]
+    fn widen_plane_10bit_left_shifts_by_two() {
+        // Each input byte b → ((b as u16) << 2) packed LE.
+        let plane = vec![0x00u8, 0x42, 0xff];
+        let (out, stride) = widen_plane(&plane, 3, 10);
+        // 0x00 → 0x0000, 0x42 → 0x0108, 0xff → 0x03fc
+        assert_eq!(out, vec![0x00, 0x00, 0x08, 0x01, 0xfc, 0x03]);
+        assert_eq!(stride, 6);
+    }
+
+    #[test]
+    fn widen_plane_12bit_left_shifts_by_four() {
+        let plane = vec![0x00u8, 0x42, 0xff];
+        let (out, stride) = widen_plane(&plane, 3, 12);
+        // 0x00 → 0x0000, 0x42 → 0x0420, 0xff → 0x0ff0
+        assert_eq!(out, vec![0x00, 0x00, 0x20, 0x04, 0xf0, 0x0f]);
+        assert_eq!(stride, 6);
+    }
+
+    /// The widened HBD bytes round-trip back to the original plane via
+    /// `>> shift` — that's the contract `tests/docs_corpus.rs` relies
+    /// on for u16-vs-u16 comparison.
+    #[test]
+    fn widen_plane_round_trip_via_shift() {
+        for &bd in &[10u32, 12u32] {
+            let shift = bd - 8;
+            let plane: Vec<u8> = (0u8..=255).collect();
+            let (wide, _) = widen_plane(&plane, plane.len(), bd);
+            let back: Vec<u8> = wide
+                .chunks_exact(2)
+                .map(|c| (u16::from_le_bytes([c[0], c[1]]) >> shift).min(255) as u8)
+                .collect();
+            assert_eq!(back, plane, "bit_depth {bd} round-trip");
+        }
     }
 
     /// Synthetic keyframe with an empty compressed header triggers the

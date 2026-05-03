@@ -46,14 +46,16 @@
 //!
 //! libvpx emits the reference `expected.yuv` in the bitstream's native
 //! shape: 4:2:0 / 4:4:4 / GBR planar at 8/10/12 bits, little-endian
-//! u16 containers for HBD. The in-tree decoder currently always
-//! surfaces `Yuv420P` 8-bit `VideoFrame`s regardless of profile (see
-//! `pixel_format_from_color_config`), so for non-yuv420p-8bit
-//! fixtures the per-plane sizes will not match the reference. We
-//! still load and size-check those fixtures; the per-frame diff is
-//! recorded as a `plane size mismatch` error and the fixture stays
-//! ReportOnly. Promote when the decoder grows the wider pixel-format
-//! support.
+//! u16 containers for HBD. As of task #265 the in-tree decoder reports
+//! the matching `oxideav_core::PixelFormat` (`Yuv420P` / `Yuv422P` /
+//! `Yuv444P` / `Yuv*P10Le` / `Yuv*P12Le`) and emits planes at the
+//! bitstream's native plane sizes — including 4:4:4 full-res chroma
+//! and HBD two-bytes-per-sample LE u16. The internal pipeline still
+//! reconstructs in 8-bit space so HBD output is widened by a left-
+//! shift (`Vp9Decoder::widen_plane`); `diff_plane` therefore narrows
+//! both sides by `>> shift` and compares in 8-bit space, which keeps
+//! the match-pct comparable across bit depths until real HBD
+//! reconstruction lands.
 
 use std::fs;
 use std::path::PathBuf;
@@ -217,12 +219,20 @@ fn psnr_from_max_scaled(max: f64, n: usize) -> f64 {
     }
 }
 
-/// Compare a single plane of our (u8) output against the reference.
-/// For 8-bit reference data we compare byte-for-byte. For HBD
-/// reference data we read u16-LE, narrow to u8 by `>> shift`, and
-/// then compare — match-pct is therefore measured in 8-bit space; HBD
-/// round-tripping is always lossy by 2-4 bits and would be invisible
-/// if we compared in u16 space without a narrowing.
+/// Compare a single plane of our output against the reference.
+///
+/// For 8-bit reference data we compare byte-for-byte. For HBD reference
+/// data both `our` and `refp` carry samples as little-endian u16, two
+/// bytes per sample, with the active bits in the top of the bit-depth
+/// window — see `Vp9Decoder::widen_plane` and the `Yuv*P10Le` /
+/// `Yuv*P12Le` `oxideav_core::PixelFormat` documentation. We narrow
+/// both sides to u8 via `>> shift` and compare in 8-bit space — that
+/// keeps the match-pct directly comparable across 8 / 10 / 12-bit
+/// fixtures while the in-tree pipeline still reconstructs in 8-bit
+/// (the widening at `Vp9Decoder` output time is just a left-shift, so
+/// `our_u16 >> shift` round-trips losslessly back to the reconstructed
+/// byte). When real HBD reconstruction lands, drop the narrowing and
+/// compare u16-vs-u16 directly.
 fn diff_plane(our: &[u8], refp: &[u8], bit_depth: u32) -> (usize, usize, i32) {
     let mut ex = 0usize;
     let mut max = 0i32;
@@ -240,13 +250,12 @@ fn diff_plane(our: &[u8], refp: &[u8], bit_depth: u32) -> (usize, usize, i32) {
         (n, ex, max)
     } else {
         let shift = bit_depth - 8;
-        let n_samples = (refp.len() / 2).min(our.len());
+        let n_samples = (refp.len() / 2).min(our.len() / 2);
         for i in 0..n_samples {
-            let lo = refp[i * 2];
-            let hi = refp[i * 2 + 1];
-            let r16 = u16::from_le_bytes([lo, hi]);
+            let r16 = u16::from_le_bytes([refp[i * 2], refp[i * 2 + 1]]);
+            let o16 = u16::from_le_bytes([our[i * 2], our[i * 2 + 1]]);
             let r8 = (r16 >> shift).min(255) as i32;
-            let o8 = our[i] as i32;
+            let o8 = (o16 >> shift).min(255) as i32;
             let d = (o8 - r8).abs();
             if d == 0 {
                 ex += 1;
@@ -391,18 +400,17 @@ fn decode_fixture(case: &CorpusCase) -> Option<DecodeReport> {
                                 break;
                             }
                         };
-                        let expected_our_len = pw * ph;
+                        // Per `Vp9Decoder::widen_plane`, our HBD planes
+                        // are also 2 bytes/sample LE u16 — so the
+                        // expected output length equals the reference
+                        // plane length in bytes for every supported
+                        // pixel format.
+                        let expected_our_len = pw * ph * bps;
                         if our_plane.len() != expected_our_len {
-                            // The decoder emits the bitstream's
-                            // native plane sizes for 4:2:0 8-bit but
-                            // narrows everything else to 4:2:0 today.
-                            // Record a per-frame "plane size mismatch"
-                            // error so the gap is visible without
-                            // tripping the BitExact assertion.
                             size_mismatch = Some(format!(
                                 "visible {visible_idx} plane {p}: our len {}, \
-                                 expected {} samples ({pw}x{ph}); reference \
-                                 was {plane_bytes} bytes ({} bpp)",
+                                 expected {} bytes ({pw}x{ph}, {bps} bpp); \
+                                 reference plane was {plane_bytes} bytes ({} bit_depth)",
                                 our_plane.len(),
                                 expected_our_len,
                                 case.pix_fmt.bit_depth()

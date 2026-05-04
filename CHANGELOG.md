@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- §6.2.2.1 `frame_size_with_refs` `found_ref` early-break. The parser
+  was unconditionally consuming all three `found_ref` bits per
+  inter-frame header; per spec the loop must `break` at the first
+  `found_ref == 1`. The over-read by 0..2 bits desynced the remainder
+  of the uncompressed header on every libvpx stream where the encoder
+  actually picked ref index 0 or 1, decoding `header_size` from a
+  16-bit window straddling the next bytes (e.g. 16255 in a 1342-byte
+  frame) and tripping the "compressed header missing or truncated"
+  guard on every non-keyframe whose `header_size` happened to land
+  beyond the frame end. Affected fixtures: `superframe-2` (was 9/16
+  visible frames produced, now 16/16; aggregate exact bytes
+  3302 → 4378), `show-existing-frame` (was 18/24, now 20/24).
+  Adds `parse_inter_frame_with_found_ref_zero` regression test that
+  pins the `header_size` value through a synthetic inter header with
+  found_ref = 1 in slot 0.
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.7...v0.0.8) - 2026-05-03
 
 ### Other

@@ -508,17 +508,29 @@ fn parse_frame_size_and_render(
 fn parse_frame_size_with_refs(
     br: &mut BitReader<'_>,
 ) -> Result<(u32, u32, Option<u32>, Option<u32>)> {
-    // §6.2.2.1 frame_size_with_refs: 3 ref-found bits followed by either
-    // "use that ref's frame size" or an inline frame_size + render_size.
+    // §6.2.2.1 frame_size_with_refs:
+    //   for i in 0..3:
+    //     found_ref f(1)
+    //     if found_ref == 1: break    // <-- spec STOPS at the first match
+    //   if found_ref == 0: frame_size()
+    //   render_size()
     //
-    // We don't carry ref-frame dimensions in the parser yet, so we
-    // approximate: any "found_ref" is treated as 0×0 (downstream decode is
-    // Unsupported anyway). When all three flags are clear, we parse the
-    // inline frame_size like a key frame.
+    // We don't carry ref-frame dimensions in this parser, so when a ref
+    // is found we return 0×0 and let the decoder patch the dimensions in
+    // from the chosen DPB slot (see `Vp9Decoder::ingest_one`).
+    //
+    // Pre-fix the parser unconditionally consumed all three found_ref
+    // bits, which over-read 0..2 bits whenever the encoder actually
+    // chose ref index 0 or 1. Those extra bits then desynced the
+    // remainder of the uncompressed header and corrupted `header_size`
+    // (e.g. 16255 in a 1342-byte frame), tripping the "compressed
+    // header missing or truncated" guard on every libvpx-encoded
+    // stream with hidden alt-refs (superframe-2, show-existing-frame).
     let mut found_ref = false;
     for _ in 0..3 {
         if br.bit()? {
             found_ref = true;
+            break;
         }
     }
     if found_ref {
@@ -837,6 +849,89 @@ mod tests {
             self.out.extend_from_slice(&[0u8; 4]);
             self.out
         }
+    }
+
+    /// §6.2.2.1 regression: with `frame_size_with_refs` we MUST stop
+    /// reading `found_ref` bits at the first 1, not consume all three.
+    /// Pre-fix the parser unconditionally read 3 bits, over-reading
+    /// 0..2 bits whenever the encoder's chosen ref index was 0 or 1.
+    /// This test builds a minimal NonKey inter-frame header where the
+    /// refresh path picks ref 0 (`found_ref` = 1, 0, 0 in the wrong
+    /// reading vs. 1 then break in the right) and asserts the
+    /// downstream `header_size` decodes to the inserted value rather
+    /// than to a garbage 16-bit window straddling the next bytes.
+    #[test]
+    fn parse_inter_frame_with_found_ref_zero() {
+        let mut bw = BitWriter::new();
+        // First byte: marker(2)=2, profile(1)=0, profile(1)=0,
+        // show_existing(1)=0, frame_type(1)=1, show_frame(1)=1,
+        // error_resilient(1)=0 -> 1000_0110 = 0x86
+        bw.write(2, 2);
+        bw.write(0, 1);
+        bw.write(0, 1);
+        bw.write(0, 1);
+        bw.write(1, 1); // NonKey
+        bw.write(1, 1); // show_frame
+        bw.write(0, 1); // error_resilient
+                        // (show_frame=1 so intra_only is NOT read; reset_frame_context=2 bits because !error_resilient)
+        bw.write(0, 2); // reset_frame_context
+                        // refresh_frame_flags(8)
+        bw.write(0x01, 8);
+        // 3x (ref_frame_idx(3) + ref_frame_sign_bias(1)) = 3*4 = 12 bits
+        for _ in 0..3 {
+            bw.write(0, 3);
+            bw.write(0, 1);
+        }
+        // frame_size_with_refs: found_ref bit-0 = 1 -> spec STOPS here.
+        bw.write(1, 1);
+        // render_and_frame_size_different = 0 (no inline render_size)
+        bw.write(0, 1);
+        // allow_high_precision_mv (1) + interpolation_filter
+        // (read_interpolation_filter: is_filter_switchable=1 -> SWITCHABLE)
+        bw.write(0, 1);
+        bw.write(1, 1);
+        // refresh_frame_context (1) + frame_parallel_decoding_mode (1) + frame_context_idx (2)
+        bw.write(0, 1);
+        bw.write(0, 1);
+        bw.write(0, 2);
+        // loop_filter: level(6)=0, sharpness(3)=0, mode_ref_delta_enabled(1)=0
+        bw.write(0, 6);
+        bw.write(0, 3);
+        bw.write(0, 1);
+        // quantization
+        bw.write(60, 8);
+        bw.write(0, 1);
+        bw.write(0, 1);
+        bw.write(0, 1);
+        // segmentation enabled = 0
+        bw.write(0, 1);
+        // tile_info: prev frame width = 64 (single tile col, no inc bit), tile_rows bit = 0
+        // BUT: at parse time we don't know the prev frame width. The parser
+        // uses the frame's own `width` value, which is 0 here because
+        // found_ref was set. With width=0, sb_cols=1, max_log2=0, no inc.
+        bw.write(0, 1); // log2_tile_rows = 0
+                        // header_size(16) = 0xBEEF — known marker to verify byte alignment
+        bw.write(0xBEEF, 16);
+        let bytes = bw.finish();
+        let prev_color = Some(ColorConfig {
+            bit_depth: 8,
+            color_space: ColorSpace::Bt601,
+            color_range: false,
+            subsampling_x: true,
+            subsampling_y: true,
+        });
+        let h = parse_uncompressed_header(&bytes, prev_color).expect("parse");
+        assert_eq!(h.frame_type, FrameType::NonKey);
+        assert!(!h.intra_only);
+        assert_eq!(h.refresh_frame_flags, 0x01);
+        // The test's distinguishing assertion: header_size decoded to the
+        // exact value we wrote, proving we consumed exactly one found_ref
+        // bit (not three) before the render_size / interp_filter chain.
+        assert_eq!(h.header_size, 0xBEEF);
+        // width/height stay at 0 (the §6.2.2.1 found_ref scaffold —
+        // Vp9Decoder::ingest_one fills these in from the chosen DPB slot).
+        assert_eq!(h.width, 0);
+        assert_eq!(h.height, 0);
     }
 
     #[test]

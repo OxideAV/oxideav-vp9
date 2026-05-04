@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- VP9 encoder round 1 — profile 0, 4:2:0 8-bit, single-tile keyframe
+  with `tx_mode = ONLY_4X4`, every block emitted as `PARTITION_NONE`
+  with `skip = 1` and `DC_PRED` luma + chroma. Loop-filter level 0.
+  ffmpeg 8.1 cross-decodes the resulting IVF without errors and the
+  reconstructed samples land at midgrey 128 in every plane (DC chain
+  with no neighbours yields the spec's mid-grey predictor). New
+  black-box hard gate `tests/vp9_encoder_ffmpeg.rs ::
+  ffmpeg_cross_decode_psnr_smooth_fixture` encodes a 64×64 smooth
+  gradient (luma drift ±4 around 128, chroma uniform 128), pipes
+  through ffmpeg, and asserts per-plane PSNR ≥ 30 dB. Achieved on
+  current code: Y = 45.87 dB, U = V = ∞ dB.
+  Public API additions: `encoder::encode_keyframe_yuv(&EncoderParams,
+  &YuvFrame)` reserves the round-2 entry-point shape (the source
+  pixels are accepted today but ignored — the body still emits the
+  skip=1 / DC_PRED stream). `encoder::encode_keyframe(&EncoderParams)`
+  remains for callers that don't have a `YuvFrame` yet.
+  Round 2 will replace the body with forward-DCT + token-coded
+  residual so non-smooth content also clears the PSNR target.
+
 ### Changed
 
 - `tests/docs_corpus.rs` `corpus_tiny_i_only_16x16` promoted from

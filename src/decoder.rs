@@ -158,6 +158,29 @@ impl Vp9Decoder {
     fn ingest_one(&mut self, frame_data: &[u8]) -> Result<()> {
         let mut h = parse_uncompressed_header(frame_data, self.last_color_config)?;
         if h.show_existing_frame {
+            // §6.2 / §8.2: emit the existing frame from
+            // `frame_to_show_map_idx`. This is a pure pass-through —
+            // header_size == 0, refresh_frame_flags == 0, no compressed
+            // header / tile / loopfilter parsing. The DPB stays
+            // unchanged; the previously-decoded reference is copied to
+            // output.
+            let idx = h.existing_frame_to_show;
+            if let Some(rf) = self.dpb.get(idx) {
+                // VP9 inherits color_config from the most recent
+                // key/intra_only frame (§6.2.1). `last_color_config`
+                // tracks that; fall back to 8-bit on the unlikely path
+                // where show_existing_frame is the very first packet.
+                let bit_depth = self
+                    .last_color_config
+                    .map(|c| c.bit_depth as u32)
+                    .unwrap_or(8);
+                let frame = build_video_frame_from_ref(rf, bit_depth, self.pending_pts.take());
+                self.ready_frames.push_back(frame);
+            } else {
+                return Err(Error::invalid(format!(
+                    "vp9 show_existing_frame: slot {idx} is empty"
+                )));
+            }
             self.last_header = Some(h);
             return Ok(());
         }
@@ -522,6 +545,34 @@ fn widen_plane(plane: &[u8], in_stride: usize, bit_depth: u32) -> (Vec<u8>, usiz
     (out, in_stride * 2)
 }
 
+/// Build an output `VideoFrame` from a `RefFrame` already in the DPB,
+/// applying the same `widen_plane` HBD packing as the live decode
+/// path. Used by the §8.2 `show_existing_frame` pass-through and by
+/// any future dispatch that needs to surface a previously-decoded
+/// reference as output.
+fn build_video_frame_from_ref(rf: &RefFrame, bit_depth: u32, pts: Option<i64>) -> VideoFrame {
+    let (y_data, y_out_stride) = widen_plane(&rf.y, rf.y_stride, bit_depth);
+    let (u_data, uv_out_stride) = widen_plane(&rf.u, rf.uv_stride, bit_depth);
+    let (v_data, _) = widen_plane(&rf.v, rf.uv_stride, bit_depth);
+    VideoFrame {
+        pts,
+        planes: vec![
+            VideoPlane {
+                stride: y_out_stride,
+                data: y_data,
+            },
+            VideoPlane {
+                stride: uv_out_stride,
+                data: u_data,
+            },
+            VideoPlane {
+                stride: uv_out_stride,
+                data: v_data,
+            },
+        ],
+    }
+}
+
 /// Helper that returns frame_rate from container-supplied stream timing
 /// when available — VP9 itself doesn't carry frame_rate in-band.
 pub fn frame_rate_from_container(num: i64, den: i64) -> Option<Rational> {
@@ -756,6 +807,80 @@ mod tests {
                 .map(|c| (u16::from_le_bytes([c[0], c[1]]) >> shift).min(255) as u8)
                 .collect();
             assert_eq!(back, plane, "bit_depth {bd} round-trip");
+        }
+    }
+
+    /// §6.2 / §8.2 `show_existing_frame`: a packet whose first 5 bits
+    /// are `1010_1` (frame_marker=2, profile=00, show_existing=1)
+    /// followed by 3 bits of `frame_to_show_map_idx` MUST surface the
+    /// referenced DPB slot as a new visible frame, with no compressed
+    /// header / tile decode required. Pre-fix this path silently
+    /// dropped the frame, leaving the consumer with an apparent gap.
+    /// Also asserts the DPB stays unchanged (refresh_frame_flags == 0
+    /// per the spec for this case).
+    #[test]
+    fn show_existing_frame_emits_dpb_slot_as_new_frame() {
+        // Build a synthetic "previous" decoded frame and stuff it
+        // directly into DPB slot 3 (skip the parse path so this test
+        // stays focused on the show_existing dispatch).
+        let mut dec = Vp9Decoder::new(CodecId::new(crate::CODEC_ID_STR));
+        let rf = RefFrame {
+            y: vec![0xA5; 64 * 64],
+            y_stride: 64,
+            u: vec![0x33; 32 * 32],
+            v: vec![0xCC; 32 * 32],
+            uv_stride: 32,
+            width: 64,
+            height: 64,
+            uv_width: 32,
+            uv_height: 32,
+            subsampling_x: 1,
+            subsampling_y: 1,
+            segment_ids: None,
+        };
+        dec.dpb.refresh(1u8 << 3, &rf);
+        // Set last_color_config so build_video_frame_from_ref picks
+        // 8-bit (no widening) — matches a profile-0 stream.
+        dec.last_color_config = Some(cc(8, true, true, ColorSpace::Bt601));
+
+        // Synth show_existing_frame packet. All 8 bits of byte 0:
+        //   marker(2)=10, profile_low=0, profile_high=0,
+        //   show_existing=1, frame_to_show_map_idx(3)=011 (= 3)
+        //   -> "10001011" = 0x8B
+        let pkt_bytes = vec![0x8B, 0x00];
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), pkt_bytes).with_pts(42);
+        dec.send_packet(&pkt).expect("send_packet ok");
+
+        // The decoder must surface a visible frame on receive_frame.
+        let frame = dec.receive_frame().expect("receive_frame");
+        let Frame::Video(vf) = frame else {
+            panic!("expected video frame")
+        };
+        assert_eq!(vf.pts, Some(42));
+        assert_eq!(vf.planes.len(), 3);
+        assert_eq!(vf.planes[0].data.len(), 64 * 64);
+        assert_eq!(vf.planes[1].data.len(), 32 * 32);
+        // First sample of each plane matches the DPB slot we set up.
+        assert_eq!(vf.planes[0].data[0], 0xA5);
+        assert_eq!(vf.planes[1].data[0], 0x33);
+        assert_eq!(vf.planes[2].data[0], 0xCC);
+    }
+
+    /// `show_existing_frame` referencing an empty DPB slot must surface
+    /// a clean InvalidData error (rather than silently emitting a
+    /// black frame or panicking).
+    #[test]
+    fn show_existing_frame_empty_slot_errors() {
+        let mut dec = Vp9Decoder::new(CodecId::new(crate::CODEC_ID_STR));
+        dec.last_color_config = Some(cc(8, true, true, ColorSpace::Bt601));
+        // frame_to_show_map_idx = 5; slot 5 is empty.
+        // First byte: "10001101" = 0x8D (idx low 3 bits = "101").
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), vec![0x8D, 0x00]);
+        match dec.send_packet(&pkt) {
+            Err(Error::InvalidData(msg)) => {
+                assert!(msg.contains("show_existing_frame"), "msg = {msg}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
         }
     }
 

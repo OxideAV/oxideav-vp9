@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- §6.2 / §8.2 `show_existing_frame` dispatch. Pre-fix, `Vp9Decoder`
+  parsed the `show_existing_frame` flag + `frame_to_show_map_idx`
+  from the uncompressed header but then silently dropped the packet
+  (no `Frame::Video` queued). The fix copies the referenced DPB slot
+  through `build_video_frame_from_ref`, applying the same HBD widening
+  used by the live decode path, so the consumer sees a visible frame
+  for every `show_existing_frame` packet — matches the spec's
+  "header_size = 0; refresh_frame_flags = 0; loop_filter_level = 0;
+  return" behaviour. Errors cleanly with `InvalidData` when the
+  referenced slot is empty.
+  Effect on the docs corpus driver:
+  * `show-existing-frame`: 18/24 → **24/24** visible frames produced.
+  Adds two new unit tests in `decoder::tests`:
+  `show_existing_frame_emits_dpb_slot_as_new_frame` and
+  `show_existing_frame_empty_slot_errors`.
+
 ### Fixed
 
 - §6.2.2.1 `frame_size_with_refs` `found_ref` early-break. The parser

@@ -558,6 +558,15 @@ fn evaluate(case: &CorpusCase) {
 /// Smallest possible VP9 bitstream: 16x16 keyframe in profile 0,
 /// `loop_filter_level=0`, single 64x64 SB partitioned down to 8x8.
 /// Trace: docs/video/vp9/fixtures/tiny-i-only-16x16/trace.txt
+///
+/// Promoted to `BitExact` 2026-05: this fixture decodes to a 100%
+/// byte-for-byte match against the libvpx reference. Locks in
+/// regression protection for the smallest-possible-frame path
+/// (single 64×64 SB partitioned to 8×8 across the 16×16 active
+/// area; the rest of the SB is the §6.4.2 implicit "out-of-frame"
+/// partition split chain). Any future change to the partition
+/// walk, intra prediction, transform, dequant, or pixel-reconstruct
+/// chain that breaks this fixture is a real bug.
 #[test]
 fn corpus_tiny_i_only_16x16() {
     evaluate(&CorpusCase {
@@ -566,7 +575,7 @@ fn corpus_tiny_i_only_16x16() {
         height: 16,
         n_frames: 1,
         pix_fmt: PixFmt::Yuv420P8,
-        tier: Tier::ReportOnly,
+        tier: Tier::BitExact,
     });
 }
 

@@ -557,9 +557,11 @@ bit-for-bit:
 * **4:2:2 and 4:4:4 subsampling (profiles 1 / 3)**: the parser
   handles the header bits but the output format stays `Yuv420P`.
 * **`B` / reordered frames**: VP9 can emit no-show altref frames
-  (`show_frame=0`). These flow through the DPB correctly but are not
-  emitted as `Frame::Video` until a later `show_existing_frame`
-  references them.
+  (`show_frame=0`). These flow through the DPB correctly and a later
+  `show_existing_frame` packet now surfaces the referenced DPB slot
+  as a visible `Frame::Video` (§6.2 / §8.2), matching the spec's
+  pure pass-through dispatch (no compressed header / tile decode for
+  the show-existing packet itself).
 
 None of the above prevent the crate from decoding a standard
 `libvpx-vp9 -g N` 8-bit 4:2:0 IPPP stream into frames the caller can

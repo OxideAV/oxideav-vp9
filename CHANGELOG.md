@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `tests/docs_corpus.rs` `corpus_tiny_i_only_16x16` promoted from
+  `Tier::ReportOnly` to `Tier::BitExact`. The fixture has been at
+  100% byte-for-byte match against the libvpx reference through
+  multiple rounds; pinning it as a hard gate locks in regression
+  protection for the smallest-possible-frame path (single 64×64 SB
+  partitioned to 8×8 across the 16×16 active area, with the rest of
+  the SB walking the §6.4.2 implicit "out-of-frame" partition split
+  chain). Any future change that re-introduces a single-byte
+  divergence on this fixture is now a CI red.
+
 ### Added
 
 - §6.2 / §8.2 `show_existing_frame` dispatch. Pre-fix, `Vp9Decoder`

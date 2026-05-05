@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.8...v0.0.9) - 2026-05-04
+
+### Other
+
+- add encode_keyframe_yuv API + ffmpeg PSNR cross-decode gate (round 1)
+- promote tiny-i-only-16x16 to BitExact + README correctness pass
+- emit DPB slot for show_existing_frame packets
+- §6.2.2.1 found_ref must break at first match
+
 ### Added
 
 - VP9 encoder round 1 — profile 0, 4:2:0 8-bit, single-tile keyframe

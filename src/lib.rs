@@ -81,7 +81,10 @@ pub const CODEC_ID_STR: &str = "vp9";
 /// The factory returns a decoder which will currently fail with
 /// `Error::Unsupported` at frame-pull time — but parses headers and
 /// populates parameters successfully.
-pub fn register(reg: &mut CodecRegistry) {
+///
+/// Prefer the unified [`register`] entry point when you have a
+/// [`oxideav_core::RuntimeContext`] in hand.
+pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("vp9_sw")
         .with_lossy(true)
         .with_intra_only(false)
@@ -95,6 +98,12 @@ pub fn register(reg: &mut CodecRegistry) {
     );
 }
 
+/// Unified registration entry point — installs VP9 into the codec
+/// sub-registry of the supplied [`oxideav_core::RuntimeContext`].
+pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
+    register_codecs(&mut ctx.codecs);
+}
+
 pub use compressed_header::{parse_compressed_header, CompressedHeader, ReferenceMode, TxMode};
 pub use decoder::{
     codec_parameters_from_header, frame_rate_from_container, make_decoder,
@@ -105,3 +114,19 @@ pub use headers::{
     QuantizationParams, RefFrame, SegmentationParams, TileInfo, UncompressedHeader, SEG_LVL_ALT_L,
     SEG_LVL_ALT_Q, SEG_LVL_REF_FRAME, SEG_LVL_SKIP,
 };
+
+#[cfg(test)]
+mod register_tests {
+    use super::*;
+
+    #[test]
+    fn register_via_runtime_context_installs_codec_factory() {
+        let mut ctx = oxideav_core::RuntimeContext::new();
+        register(&mut ctx);
+        let id = CodecId::new(CODEC_ID_STR);
+        assert!(
+            ctx.codecs.has_decoder(&id),
+            "decoder factory not installed via RuntimeContext"
+        );
+    }
+}

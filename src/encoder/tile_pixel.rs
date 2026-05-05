@@ -135,10 +135,10 @@ pub fn emit_pixel_tile(
 #[allow(clippy::too_many_arguments)]
 fn emit_sb(
     be: &mut BoolEncoder,
-    part_above: &mut Vec<u8>,
-    part_left: &mut Vec<u8>,
-    skip_above: &mut Vec<bool>,
-    skip_left: &mut Vec<bool>,
+    part_above: &mut [u8],
+    part_left: &mut [u8],
+    skip_above: &mut [bool],
+    skip_left: &mut [bool],
     row: u32,
     col: u32,
     bsize: u32,
@@ -156,17 +156,17 @@ fn emit_sb(
     uv_h: usize,
     dq_dc: i16,
     dq_ac: i16,
-    recon_y: &mut Vec<u8>,
+    recon_y: &mut [u8],
     recon_yw: usize,
-    recon_u: &mut Vec<u8>,
-    recon_v: &mut Vec<u8>,
+    recon_u: &mut [u8],
+    recon_v: &mut [u8],
     recon_uvw: usize,
-    above_nz_y: &mut Vec<u8>,
-    above_nz_u: &mut Vec<u8>,
-    above_nz_v: &mut Vec<u8>,
-    left_nz_y: &mut Vec<u8>,
-    left_nz_u: &mut Vec<u8>,
-    left_nz_v: &mut Vec<u8>,
+    above_nz_y: &mut [u8],
+    above_nz_u: &mut [u8],
+    above_nz_v: &mut [u8],
+    left_nz_y: &mut [u8],
+    left_nz_u: &mut [u8],
+    left_nz_v: &mut [u8],
 ) {
     if row >= frame_h || col >= frame_w {
         return;
@@ -590,8 +590,8 @@ fn lookup_partition(
 }
 
 fn update_partition_ctx(
-    above: &mut Vec<u8>,
-    left: &mut Vec<u8>,
+    above: &mut [u8],
+    left: &mut [u8],
     bsize_px: u32,
     sub_w: u32,
     sub_h: u32,
@@ -637,8 +637,8 @@ fn update_partition_ctx(
 #[allow(clippy::too_many_arguments)]
 fn emit_block_at(
     be: &mut BoolEncoder,
-    skip_above: &mut Vec<bool>,
-    skip_left: &mut Vec<bool>,
+    skip_above: &mut [bool],
+    skip_left: &mut [bool],
     mi_row: usize,
     mi_col: usize,
     bsize_px: u32,
@@ -653,17 +653,17 @@ fn emit_block_at(
     uv_h: usize,
     dq_dc: i16,
     dq_ac: i16,
-    recon_y: &mut Vec<u8>,
+    recon_y: &mut [u8],
     recon_yw: usize,
-    recon_u: &mut Vec<u8>,
-    recon_v: &mut Vec<u8>,
+    recon_u: &mut [u8],
+    recon_v: &mut [u8],
     recon_uvw: usize,
-    above_nz_y: &mut Vec<u8>,
-    above_nz_u: &mut Vec<u8>,
-    above_nz_v: &mut Vec<u8>,
-    left_nz_y: &mut Vec<u8>,
-    left_nz_u: &mut Vec<u8>,
-    left_nz_v: &mut Vec<u8>,
+    above_nz_y: &mut [u8],
+    above_nz_u: &mut [u8],
+    above_nz_v: &mut [u8],
+    left_nz_y: &mut [u8],
+    left_nz_u: &mut [u8],
+    left_nz_v: &mut [u8],
 ) {
     let bs = bsize_px as usize;
     let px_col = mi_col * 8;
@@ -837,10 +837,10 @@ fn encode_4x4_block(
     by: usize,
     dq_dc: i16,
     dq_ac: i16,
-    recon: &mut Vec<u8>,
+    recon: &mut [u8],
     recon_w: usize,
-    above_nz: &mut Vec<u8>,
-    left_nz: &mut Vec<u8>,
+    above_nz: &mut [u8],
+    left_nz: &mut [u8],
 ) -> (Vec<i32>, usize, usize) {
     // Compute initial_ctx from above+left BEFORE this block's update.
     // Mirrors NonzeroCtx::token_ctx: ctx = above_nz[x4] + left_nz[y4].

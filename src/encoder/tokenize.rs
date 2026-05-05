@@ -106,7 +106,7 @@ fn encode_nonzero(
     probs: &[u8; 3],
     qcoef: i32,
     scan: &[i16],
-    token_cache: &mut Vec<u8>,
+    token_cache: &mut [u8],
     c: usize,
 ) {
     let abs_v = qcoef.unsigned_abs() as i32;

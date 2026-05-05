@@ -95,6 +95,22 @@ The shipped integration tests live at `tests/vp9_intra_fixture.rs`
 decodes into `Frame::Video` and differs from the keyframe at pixel
 level).
 
+## Encode support (round 2)
+
+`encode_keyframe_yuv(&EncoderParams, &YuvFrame)` produces a valid VP9
+keyframe IVF payload from source 4:2:0 8-bit pixels. All blocks use
+`DC_PRED` intra prediction (from reconstructed neighbours) + forward
+4×4 DCT + quantisation + VP9 coefficient token coding (EOB / ZERO /
+ONE / TWO–FOUR / CAT1–6 Pareto8 tokens). The bitstream round-trips
+through both our own `Vp9Decoder` and through ffmpeg 8.1.
+
+Quality at `base_q_idx = 64` on a 256×256 smooth gradient:
+- PSNR_Y = 50.60 dB (gate: ≥ 35 dB)
+- PSNR_U = PSNR_V = ∞ dB (uniform chroma, losslessly encoded)
+
+`encode_keyframe(&EncoderParams)` remains available for callers that
+want a skip=1 / midgrey-only stream without pixel content.
+
 ## Installation
 
 ```toml

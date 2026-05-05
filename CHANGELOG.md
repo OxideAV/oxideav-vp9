@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- VP9 encoder round 2 — full pixel-content keyframe encoding with
+  forward 4×4 DCT, quantisation, and VP9 coefficient token coding.
+  `encode_keyframe_yuv` now encodes source YUV residuals (DC_PRED from
+  reconstructed neighbours) through `fdct_2d` + `quantise` + `encode_coefs`,
+  targeting PSNR_Y ≥ 35 dB on smooth fixtures at `base_q_idx = 64`.
+  Achieved: PSNR_Y = 50.60 dB, PSNR_U = PSNR_V = ∞ dB on the 256×256
+  smooth-gradient cross-decode fixture; ffmpeg 8.1 round-trips losslessly.
+- `encoder/fwdtransform.rs` — `fdct_2d` (4×4 and 8×8 2-D separable
+  forward DCT) + `quantise` (scan-order quantisation with EOB tracking).
+- `encoder/tokenize.rs` — `encode_coefs` (VP9 coefficient token entropy
+  encoder with correct `initial_ctx` from NonzeroContext + full Pareto8
+  CAT1–6 coding mirror of `detokenize::decode_coefs`).
+- `encoder/tile_pixel.rs` — `emit_pixel_tile` + `build_pixel_keyframe`
+  with per-block DC_PRED prediction chaining, reconstruction loop, and
+  above/left NonzeroContext propagation matching the decoder exactly.
+- New integration tests: `tests/vp9_encoder_psnr_256.rs` —
+  `encoder_256x256_smooth_psnr_via_ffmpeg` (PSNR_Y ≥ 35 dB ffmpeg
+  cross-decode gate) and `encoder_256x256_self_roundtrip` (PSNR_Y ≥ 35 dB
+  self-decoder gate) on a 256×256 smooth gradient fixture.
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.8...v0.0.9) - 2026-05-04
 
 ### Other

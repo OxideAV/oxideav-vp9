@@ -15,8 +15,11 @@ pub mod bitwriter;
 pub mod bool_encoder;
 pub mod compressed_header;
 pub mod frame;
+pub mod fwdtransform;
 pub mod params;
 pub mod tile;
+pub mod tile_pixel;
+pub mod tokenize;
 pub mod uncompressed_header;
 
 pub use bitwriter::BitWriter;

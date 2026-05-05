@@ -100,9 +100,16 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
 
 /// Unified registration entry point — installs VP9 into the codec
 /// sub-registry of the supplied [`oxideav_core::RuntimeContext`].
+///
+/// Also auto-registered into [`oxideav_core::REGISTRARS`] via the
+/// [`oxideav_core::register!`] macro below so consumers calling
+/// [`oxideav_core::RuntimeContext::with_all_features`] pick VP9 up
+/// without any explicit umbrella plumbing.
 pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
     register_codecs(&mut ctx.codecs);
 }
+
+oxideav_core::register!("vp9", register);
 
 pub use compressed_header::{parse_compressed_header, CompressedHeader, ReferenceMode, TxMode};
 pub use decoder::{

@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- VP9 encoder round 40 — per-block luma intra-mode RDO across
+  `{DC_PRED, V_PRED, H_PRED, TM_PRED}` plus QP-derived loop-filter
+  level. The picker uses `reconintra::NeighbourBuf::build` to evaluate
+  candidates against decoder-shape (127/129-padded) neighbour buffers
+  on a 4×4 footprint at the block's top-left corner, then applies the
+  chosen mode at every 4×4 TX sub-block via `reconintra::predict`.
+  Above/left intra-mode trackers (`above_mode_4x4` / `left_mode_4x4`)
+  mirror `IntraTile`'s state so `KF_Y_MODE_PROBS[a][l]` resolves to
+  the same row on both encode and decode. `EncoderParams::keyframe`
+  now seeds `loop_filter_level` from `base_q_idx` via a libvpx-shape
+  `q*0.45 + 1` heuristic clamped to `[0, 63]`; lossless (`q == 0`)
+  keeps the filter disabled. New regression tests:
+  `pick_intra_mode_top_left_returns_dc`,
+  `pick_intra_mode_picks_v_when_columns_match_above`,
+  `pick_intra_mode_picks_h_when_rows_match_left`,
+  `mode_to_index_matches_spec_numbering`,
+  `default_filter_level_*` / `keyframe_default_picks_nonzero_filter_at_q64`,
+  and `encoder_256x256_horizontal_stripes_self_roundtrip`. The
+  256×256 smooth-gradient self-roundtrip lifts 50.60 → 53.06 dB
+  (deblocking gain on quantisation noise); the new horizontal-stripes
+  fixture lands at 47.62 dB (mode-RDO actively picks V/H/TM). All
+  186+ existing tests stay green.
 - VP9 encoder round 2 — full pixel-content keyframe encoding with
   forward 4×4 DCT, quantisation, and VP9 coefficient token coding.
   `encode_keyframe_yuv` now encodes source YUV residuals (DC_PRED from

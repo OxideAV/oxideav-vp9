@@ -1,25 +1,38 @@
-//! VP9 keyframe tile encoder — pixel-encoding path (round 2).
+//! VP9 keyframe tile encoder — pixel-encoding path (round 2 + round 40).
 //!
 //! Encodes source YUV pixels into a valid VP9 keyframe tile payload.
-//! Strategy per 4×4 block:
-//! 1. DC_PRED intra prediction from already-encoded neighbours.
-//! 2. Compute residual = source − prediction.
-//! 3. Forward 4×4 DCT → quantise → token-encode residual.
+//! Strategy per 8×8 block (one MI cell, four 4×4 TX units):
+//! 1. **Round 40**: pick the best luma intra mode from a candidate
+//!    set ({DC_PRED, V_PRED, H_PRED, TM_PRED}) by minimising the
+//!    8×8 source-vs-predictor sum-of-squared-errors (SSE) computed
+//!    against the reconstructed neighbour samples.
+//! 2. Apply that mode to all four 4×4 TX units, computing residuals.
+//! 3. Forward 4×4 DCT → quantise → token-encode each residual.
 //! 4. Emit skip=0 if any nonzero coefficients, skip=1 otherwise.
 //!
 //! The compressed header is fixed (tx_mode=ONLY_4X4, no prob updates),
 //! so the decoder consumes the §10.5 default coefficient probabilities.
 //!
 //! The partition tree is the same as the MVP (PARTITION_NONE at every
-//! 64×64 superblock, split at edges). The intra mode is DC_PRED for
-//! every block, using the above-row / left-column chain seeded from
-//! the reconstructed buffer.
+//! 64×64 superblock, split at edges). For >=8×8 blocks `read_intra_frame_mode_info`
+//! reads ONE luma mode that gets stamped into all four sub_modes
+//! positions, so the encoder also writes ONE mode per block.
+//!
+//! Above/left intra-mode tracker arrays mirror the decoder's
+//! `IntraTile::above_mode_4x4` / `left_mode_4x4` so the
+//! `KF_Y_MODE_PROBS[above][left]` lookup picks the same probability
+//! row on both sides.
+//!
+//! Round-40 fixes the README "all-DC_PRED" bullet — non-smooth content
+//! (edges, oriented gradients) now picks V/H/TM and gets a substantially
+//! lower residual energy budget.
 
 use crate::compressed_header::TxMode;
 use crate::encoder::bool_encoder::BoolEncoder;
 use crate::encoder::fwdtransform::{fdct_2d, quantise};
 use crate::encoder::params::EncoderParams;
 use crate::encoder::tokenize::encode_coefs;
+use crate::intra::IntraMode;
 use crate::probs::KF_PARTITION_PROBS;
 use crate::tables::{
     AC_QLOOKUP, COEFBAND_TRANS_4X4, COEF_PROBS_4X4, DC_QLOOKUP, DEFAULT_SCAN_4X4,
@@ -28,6 +41,15 @@ use crate::tables::{
 
 const MODE_DC: usize = 0;
 const SKIP_PROBS: [u8; 3] = [192, 128, 64];
+
+/// Candidate luma intra modes evaluated per 8×8 block.
+///
+/// We restrict to the four non-directional modes the decoder side fully
+/// implements (`DC_PRED`, `V_PRED`, `H_PRED`, `TM_PRED`) — the six
+/// directional `D*_PRED` modes are spec-supported in the decoder but
+/// expensive to evaluate per-block and rarely win on the smooth /
+/// edge-y test corpus. Adding directionals is a future round.
+const CAND_MODES: [IntraMode; 4] = [IntraMode::Dc, IntraMode::V, IntraMode::H, IntraMode::Tm];
 
 /// Emit a pixel-encoding keyframe tile for one 4:2:0 8-bit frame.
 ///
@@ -79,6 +101,14 @@ pub fn emit_pixel_tile(
     let mut skip_above = vec![false; mi_cols];
     let mut skip_left = vec![false; mi_rows];
 
+    // §9.3.2 above/left intra-mode trackers — mirrors `IntraTile::above_mode_4x4`
+    // / `left_mode_4x4` so the encoder picks the same `KF_Y_MODE_PROBS[above][left]`
+    // row the decoder will resolve. Indexed at 4×4 granularity (`mi_col*2`,
+    // `mi_row*2`). Initialised to DC_PRED so the top-left blocks see the
+    // same `(DC, DC)` row as the decoder's `mi_row==0` / `mi_col==0` defaults.
+    let mut above_mode_4x4 = vec![IntraMode::Dc; mi_cols * 2];
+    let mut left_mode_4x4 = vec![IntraMode::Dc; mi_rows * 2];
+
     let sb_cols = p.width.div_ceil(64) as usize;
     let sb_rows = p.height.div_ceil(64) as usize;
 
@@ -125,6 +155,8 @@ pub fn emit_pixel_tile(
                 &mut left_nz_y,
                 &mut left_nz_u,
                 &mut left_nz_v,
+                &mut above_mode_4x4,
+                &mut left_mode_4x4,
             );
         }
     }
@@ -167,6 +199,8 @@ fn emit_sb(
     left_nz_y: &mut [u8],
     left_nz_u: &mut [u8],
     left_nz_v: &mut [u8],
+    above_mode_4x4: &mut [IntraMode],
+    left_mode_4x4: &mut [IntraMode],
 ) {
     if row >= frame_h || col >= frame_w {
         return;
@@ -183,19 +217,75 @@ fn emit_sb(
         if bsize == 8 {
             // Leaf block at corner.
             emit_block_at(
-                be, skip_above, skip_left, mi_row, mi_col, bsize, y_src, y_stride, u_src, v_src,
-                uv_stride, width, height, uv_w, uv_h, dq_dc, dq_ac, recon_y, recon_yw, recon_u,
-                recon_v, recon_uvw, above_nz_y, above_nz_u, above_nz_v, left_nz_y, left_nz_u,
+                be,
+                skip_above,
+                skip_left,
+                mi_row,
+                mi_col,
+                bsize,
+                y_src,
+                y_stride,
+                u_src,
+                v_src,
+                uv_stride,
+                width,
+                height,
+                uv_w,
+                uv_h,
+                dq_dc,
+                dq_ac,
+                recon_y,
+                recon_yw,
+                recon_u,
+                recon_v,
+                recon_uvw,
+                above_nz_y,
+                above_nz_u,
+                above_nz_v,
+                left_nz_y,
+                left_nz_u,
                 left_nz_v,
+                above_mode_4x4,
+                left_mode_4x4,
             );
             update_partition_ctx(part_above, part_left, bsize, bsize, bsize, mi_row, mi_col);
             return;
         }
         emit_sb(
-            be, part_above, part_left, skip_above, skip_left, row, col, half, frame_w, frame_h,
-            y_src, y_stride, u_src, v_src, uv_stride, width, height, uv_w, uv_h, dq_dc, dq_ac,
-            recon_y, recon_yw, recon_u, recon_v, recon_uvw, above_nz_y, above_nz_u, above_nz_v,
-            left_nz_y, left_nz_u, left_nz_v,
+            be,
+            part_above,
+            part_left,
+            skip_above,
+            skip_left,
+            row,
+            col,
+            half,
+            frame_w,
+            frame_h,
+            y_src,
+            y_stride,
+            u_src,
+            v_src,
+            uv_stride,
+            width,
+            height,
+            uv_w,
+            uv_h,
+            dq_dc,
+            dq_ac,
+            recon_y,
+            recon_yw,
+            recon_u,
+            recon_v,
+            recon_uvw,
+            above_nz_y,
+            above_nz_u,
+            above_nz_v,
+            left_nz_y,
+            left_nz_u,
+            left_nz_v,
+            above_mode_4x4,
+            left_mode_4x4,
         );
         emit_sb(
             be,
@@ -230,6 +320,8 @@ fn emit_sb(
             left_nz_y,
             left_nz_u,
             left_nz_v,
+            above_mode_4x4,
+            left_mode_4x4,
         );
         emit_sb(
             be,
@@ -264,6 +356,8 @@ fn emit_sb(
             left_nz_y,
             left_nz_u,
             left_nz_v,
+            above_mode_4x4,
+            left_mode_4x4,
         );
         emit_sb(
             be,
@@ -298,6 +392,8 @@ fn emit_sb(
             left_nz_y,
             left_nz_u,
             left_nz_v,
+            above_mode_4x4,
+            left_mode_4x4,
         );
         return;
     }
@@ -305,19 +401,75 @@ fn emit_sb(
         be.write(1, probs[2]);
         if bsize == 8 {
             emit_block_at(
-                be, skip_above, skip_left, mi_row, mi_col, bsize, y_src, y_stride, u_src, v_src,
-                uv_stride, width, height, uv_w, uv_h, dq_dc, dq_ac, recon_y, recon_yw, recon_u,
-                recon_v, recon_uvw, above_nz_y, above_nz_u, above_nz_v, left_nz_y, left_nz_u,
+                be,
+                skip_above,
+                skip_left,
+                mi_row,
+                mi_col,
+                bsize,
+                y_src,
+                y_stride,
+                u_src,
+                v_src,
+                uv_stride,
+                width,
+                height,
+                uv_w,
+                uv_h,
+                dq_dc,
+                dq_ac,
+                recon_y,
+                recon_yw,
+                recon_u,
+                recon_v,
+                recon_uvw,
+                above_nz_y,
+                above_nz_u,
+                above_nz_v,
+                left_nz_y,
+                left_nz_u,
                 left_nz_v,
+                above_mode_4x4,
+                left_mode_4x4,
             );
             update_partition_ctx(part_above, part_left, bsize, bsize, bsize, mi_row, mi_col);
             return;
         }
         emit_sb(
-            be, part_above, part_left, skip_above, skip_left, row, col, half, frame_w, frame_h,
-            y_src, y_stride, u_src, v_src, uv_stride, width, height, uv_w, uv_h, dq_dc, dq_ac,
-            recon_y, recon_yw, recon_u, recon_v, recon_uvw, above_nz_y, above_nz_u, above_nz_v,
-            left_nz_y, left_nz_u, left_nz_v,
+            be,
+            part_above,
+            part_left,
+            skip_above,
+            skip_left,
+            row,
+            col,
+            half,
+            frame_w,
+            frame_h,
+            y_src,
+            y_stride,
+            u_src,
+            v_src,
+            uv_stride,
+            width,
+            height,
+            uv_w,
+            uv_h,
+            dq_dc,
+            dq_ac,
+            recon_y,
+            recon_yw,
+            recon_u,
+            recon_v,
+            recon_uvw,
+            above_nz_y,
+            above_nz_u,
+            above_nz_v,
+            left_nz_y,
+            left_nz_u,
+            left_nz_v,
+            above_mode_4x4,
+            left_mode_4x4,
         );
         emit_sb(
             be,
@@ -352,6 +504,8 @@ fn emit_sb(
             left_nz_y,
             left_nz_u,
             left_nz_v,
+            above_mode_4x4,
+            left_mode_4x4,
         );
         emit_sb(
             be,
@@ -386,6 +540,8 @@ fn emit_sb(
             left_nz_y,
             left_nz_u,
             left_nz_v,
+            above_mode_4x4,
+            left_mode_4x4,
         );
         emit_sb(
             be,
@@ -420,6 +576,8 @@ fn emit_sb(
             left_nz_y,
             left_nz_u,
             left_nz_v,
+            above_mode_4x4,
+            left_mode_4x4,
         );
         return;
     }
@@ -427,19 +585,75 @@ fn emit_sb(
         be.write(1, probs[1]);
         if bsize == 8 {
             emit_block_at(
-                be, skip_above, skip_left, mi_row, mi_col, bsize, y_src, y_stride, u_src, v_src,
-                uv_stride, width, height, uv_w, uv_h, dq_dc, dq_ac, recon_y, recon_yw, recon_u,
-                recon_v, recon_uvw, above_nz_y, above_nz_u, above_nz_v, left_nz_y, left_nz_u,
+                be,
+                skip_above,
+                skip_left,
+                mi_row,
+                mi_col,
+                bsize,
+                y_src,
+                y_stride,
+                u_src,
+                v_src,
+                uv_stride,
+                width,
+                height,
+                uv_w,
+                uv_h,
+                dq_dc,
+                dq_ac,
+                recon_y,
+                recon_yw,
+                recon_u,
+                recon_v,
+                recon_uvw,
+                above_nz_y,
+                above_nz_u,
+                above_nz_v,
+                left_nz_y,
+                left_nz_u,
                 left_nz_v,
+                above_mode_4x4,
+                left_mode_4x4,
             );
             update_partition_ctx(part_above, part_left, bsize, bsize, bsize, mi_row, mi_col);
             return;
         }
         emit_sb(
-            be, part_above, part_left, skip_above, skip_left, row, col, half, frame_w, frame_h,
-            y_src, y_stride, u_src, v_src, uv_stride, width, height, uv_w, uv_h, dq_dc, dq_ac,
-            recon_y, recon_yw, recon_u, recon_v, recon_uvw, above_nz_y, above_nz_u, above_nz_v,
-            left_nz_y, left_nz_u, left_nz_v,
+            be,
+            part_above,
+            part_left,
+            skip_above,
+            skip_left,
+            row,
+            col,
+            half,
+            frame_w,
+            frame_h,
+            y_src,
+            y_stride,
+            u_src,
+            v_src,
+            uv_stride,
+            width,
+            height,
+            uv_w,
+            uv_h,
+            dq_dc,
+            dq_ac,
+            recon_y,
+            recon_yw,
+            recon_u,
+            recon_v,
+            recon_uvw,
+            above_nz_y,
+            above_nz_u,
+            above_nz_v,
+            left_nz_y,
+            left_nz_u,
+            left_nz_v,
+            above_mode_4x4,
+            left_mode_4x4,
         );
         emit_sb(
             be,
@@ -474,6 +688,8 @@ fn emit_sb(
             left_nz_y,
             left_nz_u,
             left_nz_v,
+            above_mode_4x4,
+            left_mode_4x4,
         );
         emit_sb(
             be,
@@ -508,6 +724,8 @@ fn emit_sb(
             left_nz_y,
             left_nz_u,
             left_nz_v,
+            above_mode_4x4,
+            left_mode_4x4,
         );
         emit_sb(
             be,
@@ -542,15 +760,44 @@ fn emit_sb(
             left_nz_y,
             left_nz_u,
             left_nz_v,
+            above_mode_4x4,
+            left_mode_4x4,
         );
         return;
     }
     // Interior PARTITION_NONE.
     be.write(0, probs[0]);
     emit_block_at(
-        be, skip_above, skip_left, mi_row, mi_col, bsize, y_src, y_stride, u_src, v_src, uv_stride,
-        width, height, uv_w, uv_h, dq_dc, dq_ac, recon_y, recon_yw, recon_u, recon_v, recon_uvw,
-        above_nz_y, above_nz_u, above_nz_v, left_nz_y, left_nz_u, left_nz_v,
+        be,
+        skip_above,
+        skip_left,
+        mi_row,
+        mi_col,
+        bsize,
+        y_src,
+        y_stride,
+        u_src,
+        v_src,
+        uv_stride,
+        width,
+        height,
+        uv_w,
+        uv_h,
+        dq_dc,
+        dq_ac,
+        recon_y,
+        recon_yw,
+        recon_u,
+        recon_v,
+        recon_uvw,
+        above_nz_y,
+        above_nz_u,
+        above_nz_v,
+        left_nz_y,
+        left_nz_u,
+        left_nz_v,
+        above_mode_4x4,
+        left_mode_4x4,
     );
     update_partition_ctx(part_above, part_left, bsize, bsize, bsize, mi_row, mi_col);
 }
@@ -634,6 +881,14 @@ fn update_partition_ctx(
 /// For ONLY_4X4, the prediction block matches the block size, but the
 /// TX unit is always 4×4. For bsize=64 that's 16×16=256 4×4 TX units;
 /// for bsize=8 that's 4 4×4 TX units.
+///
+/// Round-40: per-block luma intra-mode RDO. We evaluate a small mode
+/// candidate set ({DC, V, H, TM} from `CAND_MODES`) on the entire
+/// `bsize × bsize` luma block by predicting from the *current* recon
+/// buffer (which holds neighbours from previously-encoded blocks),
+/// computing the source-vs-predictor SSE, and picking the lowest.
+/// The picked mode is then re-applied for actual encoding (re-uses
+/// the per-4x4 DCT+quant+token+reconstruct chain).
 #[allow(clippy::too_many_arguments)]
 fn emit_block_at(
     be: &mut BoolEncoder,
@@ -664,29 +919,63 @@ fn emit_block_at(
     left_nz_y: &mut [u8],
     left_nz_u: &mut [u8],
     left_nz_v: &mut [u8],
+    above_mode_4x4: &mut [IntraMode],
+    left_mode_4x4: &mut [IntraMode],
 ) {
     let bs = bsize_px as usize;
     let px_col = mi_col * 8;
     let px_row = mi_row * 8;
 
-    // Compute skip context and whether this block is skip (all-zero residual).
-    // First, compute all residuals and check if any are nonzero.
-    // For simplicity, compute residuals for all 4×4 sub-blocks and check eob.
+    // §9.3.2 above/left mode lookup (round 40). For >=8×8 the decoder
+    // uses `above_mode_4x4[mi_col*2]` / `left_mode_4x4[mi_row*2]`.
+    let above_idx = mi_col * 2;
+    let left_idx = mi_row * 2;
+    let above_mode = if mi_row > 0 && above_idx < above_mode_4x4.len() {
+        above_mode_4x4[above_idx]
+    } else {
+        IntraMode::Dc
+    };
+    let left_mode = if mi_col > 0 && left_idx < left_mode_4x4.len() {
+        left_mode_4x4[left_idx]
+    } else {
+        IntraMode::Dc
+    };
 
-    // Luma 4×4 sub-blocks.
-    let n4 = bs / 4; // number of 4×4 blocks per dimension
+    // Round-40: pick the best luma intra mode on the full bsize block
+    // by SSE against the recon-buffer-derived predictor. The recon
+    // buffer at this point still holds the already-encoded neighbour
+    // pixels above/left of this block — exactly what the decoder
+    // would see when running the predictor.
+    let picked_y_mode = pick_intra_mode_block(
+        y_src, y_stride, width, height, recon_y, recon_yw, px_col, px_row, bs,
+    );
+    let mode_idx = mode_to_index(picked_y_mode);
+
+    // Luma 4×4 sub-blocks. Use the picked mode at each sub-block.
+    let n4 = bs / 4;
     let mut all_skip = true;
-    let mut luma_coefs: Vec<Vec<i32>> = Vec::new(); // scan-order quantised for each 4×4
+    let mut luma_coefs: Vec<Vec<i32>> = Vec::new();
     let mut luma_eobs: Vec<usize> = Vec::new();
-    let mut luma_ictx: Vec<usize> = Vec::new(); // initial_ctx per block
+    let mut luma_ictx: Vec<usize> = Vec::new();
 
     for ty in 0..n4 {
         for tx in 0..n4 {
             let bx = px_col + tx * 4;
             let by = px_row + ty * 4;
-            let (coefs_scan, eob, ictx) = encode_4x4_block(
-                y_src, y_stride, width, height, bx, by, dq_dc, dq_ac, recon_y, recon_yw,
-                above_nz_y, left_nz_y,
+            let (coefs_scan, eob, ictx) = encode_4x4_block_mode(
+                picked_y_mode,
+                y_src,
+                y_stride,
+                width,
+                height,
+                bx,
+                by,
+                dq_dc,
+                dq_ac,
+                recon_y,
+                recon_yw,
+                above_nz_y,
+                left_nz_y,
             );
             if eob > 0 {
                 all_skip = false;
@@ -697,8 +986,10 @@ fn emit_block_at(
         }
     }
 
-    // Chroma sub-blocks (one 4×4 per 8×8 luma, i.e. n4/2 per dimension for 4:2:0).
-    let n4_uv = (bs / 2) / 4; // chroma 4×4 per dimension
+    // Chroma sub-blocks (4:2:0). Always DC_PRED for now — the decoder's
+    // KF_UV_MODE_PROBS row depends on the luma mode, which we honour
+    // when emitting the UV mode tree below.
+    let n4_uv = (bs / 2) / 4;
     let mut u_coefs: Vec<Vec<i32>> = Vec::new();
     let mut u_eobs: Vec<usize> = Vec::new();
     let mut u_ictx: Vec<usize> = Vec::new();
@@ -710,12 +1001,34 @@ fn emit_block_at(
         for tx in 0..n4_uv.max(1) {
             let bx = px_col / 2 + tx * 4;
             let by = px_row / 2 + ty * 4;
-            let (cu, eu, icu) = encode_4x4_block(
-                u_src, uv_stride, uv_w, uv_h, bx, by, dq_dc, dq_ac, recon_u, recon_uvw, above_nz_u,
+            let (cu, eu, icu) = encode_4x4_block_mode(
+                IntraMode::Dc,
+                u_src,
+                uv_stride,
+                uv_w,
+                uv_h,
+                bx,
+                by,
+                dq_dc,
+                dq_ac,
+                recon_u,
+                recon_uvw,
+                above_nz_u,
                 left_nz_u,
             );
-            let (cv, ev, icv) = encode_4x4_block(
-                v_src, uv_stride, uv_w, uv_h, bx, by, dq_dc, dq_ac, recon_v, recon_uvw, above_nz_v,
+            let (cv, ev, icv) = encode_4x4_block_mode(
+                IntraMode::Dc,
+                v_src,
+                uv_stride,
+                uv_w,
+                uv_h,
+                bx,
+                by,
+                dq_dc,
+                dq_ac,
+                recon_v,
+                recon_uvw,
+                above_nz_v,
                 left_nz_v,
             );
             if eu > 0 || ev > 0 {
@@ -762,20 +1075,44 @@ fn emit_block_at(
         }
     }
 
-    // Emit luma mode (DC_PRED).
-    let p = &KF_Y_MODE_PROBS[MODE_DC][MODE_DC];
-    emit_intra_mode_tree(be, p, MODE_DC);
+    // Emit luma mode against the spec-correct KF_Y_MODE_PROBS row.
+    let py = &KF_Y_MODE_PROBS[above_mode as usize][left_mode as usize];
+    emit_intra_mode_tree(be, py, mode_idx);
 
-    // Emit UV mode (DC_PRED).
-    let puv = &KF_UV_MODE_PROBS[MODE_DC];
+    // Emit UV mode (DC_PRED) — KF_UV_MODE_PROBS is keyed by the luma
+    // mode we just emitted.
+    let puv = &KF_UV_MODE_PROBS[mode_idx];
     emit_intra_mode_tree(be, puv, MODE_DC);
+
+    // Update above/left mode trackers for downstream blocks. >=8×8
+    // case: stamp picked mode at every sub_modes position.
+    let span_w = mi_w.max(1);
+    let span_h = mi_h.max(1);
+    for c in 0..span_w {
+        let cc = (mi_col + c) * 2;
+        if cc < above_mode_4x4.len() {
+            above_mode_4x4[cc] = picked_y_mode;
+        }
+        if cc + 1 < above_mode_4x4.len() {
+            above_mode_4x4[cc + 1] = picked_y_mode;
+        }
+    }
+    for r in 0..span_h {
+        let rr = (mi_row + r) * 2;
+        if rr < left_mode_4x4.len() {
+            left_mode_4x4[rr] = picked_y_mode;
+        }
+        if rr + 1 < left_mode_4x4.len() {
+            left_mode_4x4[rr + 1] = picked_y_mode;
+        }
+    }
 
     if all_skip {
         return;
     }
 
     // Emit luma coefficients.
-    let coef_probs = &COEF_PROBS_4X4[0][0]; // intra, Y-plane
+    let coef_probs = &COEF_PROBS_4X4[0][0];
     for ((coefs, eob), ictx) in luma_coefs
         .iter()
         .zip(luma_eobs.iter())
@@ -794,8 +1131,7 @@ fn emit_block_at(
     }
 
     // Emit chroma coefficients.
-    // plane_type=1 for UV (not Y=0), ref_type=0 for intra.
-    let coef_probs_uv = &COEF_PROBS_4X4[1][0]; // UV-plane, intra
+    let coef_probs_uv = &COEF_PROBS_4X4[1][0];
     for ((coefs, eob), ictx) in u_coefs.iter().zip(u_eobs.iter()).zip(u_ictx.iter()) {
         encode_coefs(
             be,
@@ -822,13 +1158,173 @@ fn emit_block_at(
     }
 }
 
-/// Encode one 4×4 block of a plane.
+/// Map an `IntraMode` enum value to the spec's 0..9 index used by the
+/// tree-encoded mode bin.
+fn mode_to_index(m: IntraMode) -> usize {
+    match m {
+        IntraMode::Dc => 0,
+        IntraMode::V => 1,
+        IntraMode::H => 2,
+        IntraMode::D45 => 3,
+        IntraMode::D135 => 4,
+        IntraMode::D117 => 5,
+        IntraMode::D153 => 6,
+        IntraMode::D207 => 7,
+        IntraMode::D63 => 8,
+        IntraMode::Tm => 9,
+    }
+}
+
+/// Round-40 mode picker. Evaluates `CAND_MODES` over a representative
+/// 4×4 footprint at the block's top-left corner and returns the lowest-SSE
+/// mode. The picked mode then applies to all 4×4 TX sub-blocks of the
+/// `bsize × bsize` parent (each running its own 4×4 predictor against
+/// local neighbours, matching the decoder's TX-walk).
 ///
-/// Performs DC_PRED from `recon` buffer, computes residual, forward DCT,
-/// quantises, and reconstructs in `recon`. Returns scan-order quantised
-/// coefficients, eob count, and the initial_ctx for coefficient entropy
-/// coding (derived from above/left NonzeroContext BEFORE this block updates them).
-fn encode_4x4_block(
+/// `bs` is the parent block size (8/16/32/64); we evaluate at 4×4 because:
+/// 1. The decoder walks TX blocks at 4×4 in ONLY_4X4 tx_mode, so per-TX
+///    neighbours dominate the actual prediction error budget.
+/// 2. `reconintra::NeighbourBuf::build` debug-asserts `bs <= 32` — a
+///    full 64×64 evaluation would need to be split anyway.
+/// 3. SSE on a 4×4 stamp at (bx, by) is a sound rank proxy for which
+///    mode tracks the local luminance trend, which is what mode-RDO buys.
+fn pick_intra_mode_block(
+    src: &[u8],
+    src_stride: usize,
+    src_w: usize,
+    src_h: usize,
+    recon: &[u8],
+    recon_w: usize,
+    bx: usize,
+    by: usize,
+    _bs: usize,
+) -> IntraMode {
+    const PICK_BS: usize = 4;
+    // Gather source 4×4 block (edge-clamp).
+    let mut src_block = [0u8; PICK_BS * PICK_BS];
+    for r in 0..PICK_BS {
+        for c in 0..PICK_BS {
+            let px = (bx + c).min(src_w - 1);
+            let py = (by + r).min(src_h - 1);
+            src_block[r * PICK_BS + c] = src[py * src_stride + px];
+        }
+    }
+
+    let nb = build_recon_neighbours(recon, recon_w, bx, by, PICK_BS);
+
+    // Evaluate each candidate mode using the spec-correct decoder predictor.
+    let mut best_mode = IntraMode::Dc;
+    let mut best_sse = u64::MAX;
+    let mut pred_buf = [0u8; PICK_BS * PICK_BS];
+    for &mode in &CAND_MODES {
+        if mode == IntraMode::V && !nb.have_above {
+            continue;
+        }
+        if mode == IntraMode::H && !nb.have_left {
+            continue;
+        }
+        crate::reconintra::predict(mode, &nb, &mut pred_buf, PICK_BS);
+        let mut sse: u64 = 0;
+        for i in 0..PICK_BS * PICK_BS {
+            let d = src_block[i] as i32 - pred_buf[i] as i32;
+            sse += (d * d) as u64;
+        }
+        if sse < best_sse {
+            best_sse = sse;
+            best_mode = mode;
+        }
+    }
+    best_mode
+}
+
+/// Build a decoder-compatible NeighbourBuf for a `bs × bs` block at
+/// `(bx, by)` in the recon buffer. Mirrors `IntraTile::build_neighbours`
+/// — same 127/129 padding for missing neighbours, same above-left
+/// derivation rules. We do NOT enable the above-right extension; the
+/// candidate set is DC / V / H / TM which never read above[bs..2*bs].
+fn build_recon_neighbours(
+    recon: &[u8],
+    recon_w: usize,
+    bx: usize,
+    by: usize,
+    bs: usize,
+) -> crate::reconintra::NeighbourBuf {
+    let recon_h = recon.len() / recon_w;
+    let have_above = by > 0;
+    let have_left = bx > 0;
+
+    let above_tmp: Vec<u8> = if have_above {
+        let n = bs.min(recon_w.saturating_sub(bx));
+        let mut v = vec![0u8; bs];
+        for c in 0..n {
+            v[c] = recon[(by - 1) * recon_w + bx + c];
+        }
+        if n > 0 && n < bs {
+            let last = v[n - 1];
+            for b in &mut v[n..] {
+                *b = last;
+            }
+        }
+        v
+    } else {
+        vec![]
+    };
+    let left_tmp: Vec<u8> = if have_left {
+        let nh = bs.min(recon_h.saturating_sub(by));
+        let mut v = vec![0u8; bs];
+        for r in 0..nh {
+            v[r] = recon[(by + r) * recon_w + bx - 1];
+        }
+        if nh > 0 && nh < bs {
+            let last = v[nh - 1];
+            for b in &mut v[nh..] {
+                *b = last;
+            }
+        }
+        v
+    } else {
+        vec![]
+    };
+    let above_left = if have_above && have_left {
+        Some(recon[(by - 1) * recon_w + bx - 1])
+    } else if have_above {
+        Some(127)
+    } else if have_left {
+        Some(129)
+    } else {
+        None
+    };
+
+    crate::reconintra::NeighbourBuf::build(
+        bs,
+        0,
+        have_above,
+        have_left,
+        false, // no above-right extension for our 4-mode candidate set
+        if above_tmp.is_empty() {
+            None
+        } else {
+            Some(&above_tmp[..])
+        },
+        if left_tmp.is_empty() {
+            None
+        } else {
+            Some(&left_tmp[..])
+        },
+        above_left,
+    )
+}
+
+/// Encode one 4×4 block of a plane with the given intra mode (round 40).
+///
+/// Generalisation of the previous `encode_4x4_block` (DC-only): runs the
+/// requested `mode`'s predictor against the recon buffer, computes the
+/// residual, forward-DCTs, quantises, and reconstructs back into `recon`
+/// for downstream-block prediction chaining. Returns scan-order quantised
+/// coefficients, eob, and the initial_ctx for entropy coding.
+#[allow(clippy::too_many_arguments)]
+fn encode_4x4_block_mode(
+    mode: IntraMode,
     src: &[u8],
     src_stride: usize,
     src_w: usize,
@@ -842,8 +1338,6 @@ fn encode_4x4_block(
     above_nz: &mut [u8],
     left_nz: &mut [u8],
 ) -> (Vec<i32>, usize, usize) {
-    // Compute initial_ctx from above+left BEFORE this block's update.
-    // Mirrors NonzeroCtx::token_ctx: ctx = above_nz[x4] + left_nz[y4].
     let x4 = bx / 4;
     let y4 = by / 4;
     let above = if x4 < above_nz.len() {
@@ -858,17 +1352,25 @@ fn encode_4x4_block(
     };
     let initial_ctx = (above + left).min(2);
 
-    // DC prediction from recon buffer.
-    let pred = dc_pred_4x4(recon, recon_w, bx, by);
+    // Build per-4×4 predictor by running the chosen mode against the
+    // recon buffer for this exact 4×4 footprint. Falls back to DC if
+    // a directional mode's neighbour isn't available.
+    let mut pred_block = [0u8; 16];
+    let recon_h = recon.len() / recon_w;
+    if !run_predictor_4x4(mode, recon, recon_w, recon_h, bx, by, &mut pred_block) {
+        // Fallback to DC mean if the requested mode can't run here.
+        let dc = dc_pred_4x4(recon, recon_w, bx, by);
+        pred_block.fill(dc);
+    }
 
-    // Gather source 4×4 block.
+    // Gather source 4×4 block and compute per-sample residual.
     let mut residual = [0i16; 16];
     for r in 0..4 {
         for c in 0..4 {
             let px = (bx + c).min(src_w - 1);
             let py = (by + r).min(src_h - 1);
             let s = src[py * src_stride + px] as i16;
-            residual[r * 4 + c] = s - pred as i16;
+            residual[r * 4 + c] = s - pred_block[r * 4 + c] as i16;
         }
     }
 
@@ -876,13 +1378,12 @@ fn encode_4x4_block(
     let mut coeffs_raster = [0i32; 16];
     fdct_2d(&residual, 4, &mut coeffs_raster);
 
-    // Quantise (in-place, scan order).
+    // Quantise.
     let mut coeffs_scan = vec![0i32; 16];
     coeffs_scan.copy_from_slice(&coeffs_raster);
     let eob = quantise(&mut coeffs_scan, &DEFAULT_SCAN_4X4, dq_dc, dq_ac);
 
-    // Reconstruct into recon buffer for next-block prediction chaining.
-    // Dequantise and inverse DCT.
+    // Dequantise + inverse DCT to reconstruct.
     let mut dequant = [0i32; 16];
     for (i, &scan_idx) in DEFAULT_SCAN_4X4.iter().enumerate() {
         let q = coeffs_scan[i];
@@ -890,20 +1391,20 @@ fn encode_4x4_block(
         dequant[scan_idx as usize] = q * dq;
     }
     use crate::transform::{inverse_transform_add, TxType};
-    let mut recon_u8 = [pred; 16];
+    // recon_u8 starts as the predictor block; idct adds residual onto it.
+    let mut recon_u8 = pred_block;
     inverse_transform_add(TxType::DctDct, 4, 4, &dequant, &mut recon_u8, 4).ok();
-    // Copy back into recon buffer.
+
     for r in 0..4 {
         for c in 0..4 {
             let rx = bx + c;
             let ry = by + r;
-            if rx < recon_w && ry < (recon.len() / recon_w) {
+            if rx < recon_w && ry < recon_h {
                 recon[ry * recon_w + rx] = recon_u8[r * 4 + c];
             }
         }
     }
 
-    // Update NonzeroContext AFTER reconstruction so downstream blocks see it.
     let nz = if eob > 0 { 1u8 } else { 0u8 };
     if x4 < above_nz.len() {
         above_nz[x4] = nz;
@@ -913,6 +1414,31 @@ fn encode_4x4_block(
     }
 
     (coeffs_scan, eob, initial_ctx)
+}
+
+/// Run the requested 4×4 intra predictor by gathering neighbours from
+/// the recon buffer using the *decoder's* `NeighbourBuf::build` policy
+/// (127/129 padding for missing rows/columns). Returns false if a
+/// directional mode's neighbour isn't available (caller falls back
+/// to DC).
+fn run_predictor_4x4(
+    mode: IntraMode,
+    recon: &[u8],
+    recon_w: usize,
+    _recon_h: usize,
+    bx: usize,
+    by: usize,
+    out: &mut [u8; 16],
+) -> bool {
+    let nb = build_recon_neighbours(recon, recon_w, bx, by, 4);
+    if mode == IntraMode::V && !nb.have_above {
+        return false;
+    }
+    if mode == IntraMode::H && !nb.have_left {
+        return false;
+    }
+    crate::reconintra::predict(mode, &nb, out, 4);
+    true
 }
 
 /// DC prediction for a 4×4 block from the recon buffer.
@@ -1041,4 +1567,86 @@ pub fn build_pixel_keyframe(
     out.extend_from_slice(&ch);
     out.extend_from_slice(&tile);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Top-left 4×4 block has no above and no left available — picker
+    /// must fall back to DC even for sources that would prefer V/H/TM.
+    #[test]
+    fn pick_intra_mode_top_left_returns_dc() {
+        let src = vec![100u8; 64 * 64];
+        let recon = vec![128u8; 64 * 64];
+        let mode = pick_intra_mode_block(&src, 64, 64, 64, &recon, 64, 0, 0, 8);
+        assert_eq!(mode, IntraMode::Dc);
+    }
+
+    /// V_PRED tracks columns: if the source's column structure matches
+    /// the above row, V wins over DC (which averages to one value).
+    /// We construct a case where above row has column variation that
+    /// matches what the source extends downward.
+    #[test]
+    fn pick_intra_mode_picks_v_when_columns_match_above() {
+        // Recon: row 7 has column gradient 0..63. Below rows zeroed.
+        let mut recon = vec![0u8; 64 * 64];
+        for c in 0..64 {
+            recon[7 * 64 + c] = (c * 4) as u8;
+        }
+        // Source at block (bx=0, by=8): same column gradient persists.
+        let mut src = vec![0u8; 64 * 64];
+        for r in 8..64 {
+            for c in 0..64 {
+                src[r * 64 + c] = (c * 4) as u8;
+            }
+        }
+        let mode = pick_intra_mode_block(&src, 64, 64, 64, &recon, 64, 0, 8, 8);
+        // V_PRED copies column gradient → exact match. DC averages → single value.
+        assert_eq!(
+            mode,
+            IntraMode::V,
+            "expected V_PRED when above row's column gradient matches source"
+        );
+    }
+
+    /// Symmetric H_PRED case: source repeats left col across all cols.
+    #[test]
+    fn pick_intra_mode_picks_h_when_rows_match_left() {
+        // Recon: column 7 has row gradient. Other columns zeroed.
+        let mut recon = vec![0u8; 64 * 64];
+        for r in 0..64 {
+            recon[r * 64 + 7] = (r * 4) as u8;
+        }
+        // Source at block (bx=8, by=0): row values from left col extend right.
+        let mut src = vec![0u8; 64 * 64];
+        for r in 0..64 {
+            for c in 8..64 {
+                src[r * 64 + c] = (r * 4) as u8;
+            }
+        }
+        let mode = pick_intra_mode_block(&src, 64, 64, 64, &recon, 64, 8, 0, 8);
+        assert_eq!(
+            mode,
+            IntraMode::H,
+            "expected H_PRED when left col's row gradient matches source"
+        );
+    }
+
+    /// `mode_to_index` round-trip: every IntraMode value maps to its
+    /// spec-defined integer (§7.4.5 Table 7-5) so the bool-encoded tree
+    /// path matches what `read_intra_mode_tree` decodes to.
+    #[test]
+    fn mode_to_index_matches_spec_numbering() {
+        assert_eq!(mode_to_index(IntraMode::Dc), 0);
+        assert_eq!(mode_to_index(IntraMode::V), 1);
+        assert_eq!(mode_to_index(IntraMode::H), 2);
+        assert_eq!(mode_to_index(IntraMode::D45), 3);
+        assert_eq!(mode_to_index(IntraMode::D135), 4);
+        assert_eq!(mode_to_index(IntraMode::D117), 5);
+        assert_eq!(mode_to_index(IntraMode::D153), 6);
+        assert_eq!(mode_to_index(IntraMode::D207), 7);
+        assert_eq!(mode_to_index(IntraMode::D63), 8);
+        assert_eq!(mode_to_index(IntraMode::Tm), 9);
+    }
 }

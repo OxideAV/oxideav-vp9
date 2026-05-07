@@ -130,6 +130,64 @@ fn encoder_256x256_smooth_psnr_via_ffmpeg() {
     );
 }
 
+/// Round-40 mode-RDO benefit gate: a 256×256 horizontal-stripe pattern
+/// (every row is constant, rows differ) is the canonical V_PRED shape —
+/// V_PRED copies the above row down, so its residual is the row-to-row
+/// luminance step (small) versus DC's full-row magnitude (large). The
+/// mode-RDO picker should select V_PRED at most non-top-row blocks and
+/// pull PSNR_Y substantially above the all-DC baseline.
+fn horizontal_stripes_256x256() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let mut y = vec![0u8; 256 * 256];
+    for r in 0..256usize {
+        // Smooth row gradient. Each row is constant across columns.
+        let v = (16 + (r as i32 * 224) / 256) as u8;
+        for c in 0..256usize {
+            y[r * 256 + c] = v;
+        }
+    }
+    let u = vec![128u8; 128 * 128];
+    let v = vec![128u8; 128 * 128];
+    (y, u, v)
+}
+
+#[test]
+fn encoder_256x256_horizontal_stripes_self_roundtrip() {
+    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
+    use oxideav_vp9::{make_decoder, CODEC_ID_STR};
+
+    let (y, u, v) = horizontal_stripes_256x256();
+    let src = YuvFrame {
+        y: &y,
+        y_stride: 256,
+        u: &u,
+        v: &v,
+        uv_stride: 128,
+        width: 256,
+        height: 256,
+    };
+    let p = EncoderParams::keyframe(256, 256);
+    let frame_bytes = encode_keyframe_yuv(&p, &src);
+
+    let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+    let mut dec = make_decoder(&params).unwrap();
+    let pkt = Packet::new(0, TimeBase::new(1, 30), frame_bytes);
+    dec.send_packet(&pkt).unwrap();
+    let f = dec.receive_frame().unwrap();
+    let vf = match f {
+        Frame::Video(v) => v,
+        other => panic!("expected Video, got {other:?}"),
+    };
+    let decoded_y = &vf.planes[0].data;
+    let y_psnr = psnr(&y, decoded_y);
+    eprintln!("256×256 horizontal-stripes PSNR_Y = {y_psnr:.2} dB");
+    // Mode-RDO should beat all-DC easily on a row-constant signal where
+    // V_PRED tracks the single inter-row step exactly.
+    assert!(
+        y_psnr >= 40.0,
+        "stripes PSNR_Y {y_psnr:.2} dB < 40 dB target (mode-RDO regression?)"
+    );
+}
+
 /// Self-roundtrip via our own decoder — confirms the pixel-encoded
 /// stream decodes back to a VideoFrame without errors.
 #[test]

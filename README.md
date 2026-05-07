@@ -95,18 +95,43 @@ The shipped integration tests live at `tests/vp9_intra_fixture.rs`
 decodes into `Frame::Video` and differs from the keyframe at pixel
 level).
 
-## Encode support (round 2)
+## Encode support (round 40)
 
 `encode_keyframe_yuv(&EncoderParams, &YuvFrame)` produces a valid VP9
-keyframe IVF payload from source 4:2:0 8-bit pixels. All blocks use
-`DC_PRED` intra prediction (from reconstructed neighbours) + forward
-4×4 DCT + quantisation + VP9 coefficient token coding (EOB / ZERO /
-ONE / TWO–FOUR / CAT1–6 Pareto8 tokens). The bitstream round-trips
-through both our own `Vp9Decoder` and through ffmpeg 8.1.
+keyframe IVF payload from source 4:2:0 8-bit pixels.
 
-Quality at `base_q_idx = 64` on a 256×256 smooth gradient:
-- PSNR_Y = 50.60 dB (gate: ≥ 35 dB)
-- PSNR_U = PSNR_V = ∞ dB (uniform chroma, losslessly encoded)
+* **Per-block luma intra-mode RDO** (round 40). Every 8×8+ block runs
+  a 4-mode SSE-pick across `{DC_PRED, V_PRED, H_PRED, TM_PRED}` against
+  decoder-shape neighbour buffers (`reconintra::NeighbourBuf::build`,
+  127/129 padding, same as the decoder reads). The picked mode applies
+  to every 4×4 TX sub-block. Mode trackers (`above_mode_4x4` /
+  `left_mode_4x4`) mirror `IntraTile`'s state so `KF_Y_MODE_PROBS[a][l]`
+  resolves to the same row on both sides.
+* **Forward 4×4 DCT + quantise + token-code** the residual with VP9
+  EOB / ZERO / ONE / TWO–FOUR / CAT1–6 Pareto8 tokens.
+* **QP-derived loop-filter level** (round 40). `EncoderParams::keyframe`
+  now seeds `loop_filter_level` from `base_q_idx` via a libvpx-shape
+  `q*0.45 + 1` heuristic clamped to `[0, 63]`. Lossless (`q == 0`) keeps
+  the filter disabled. At `q = 64` the level lands at 29 (vs. the
+  previous fixed-zero), which lets §8.8 deblocking smooth out residual
+  block edges.
+
+The bitstream round-trips through both our own `Vp9Decoder` and through
+ffmpeg 8.1.
+
+Quality at `base_q_idx = 64`:
+
+| fixture                     | r2 (DC-only, lf=0) | round 40 (RDO + lf=29) |
+|-----------------------------|---------------------:|------------------------:|
+| 256×256 smooth gradient Y   | 50.60 dB             | **53.06 dB**            |
+| 256×256 horizontal stripes Y |  n/a (new)          | **47.62 dB**            |
+| 256×256 chroma (uniform)    | ∞ dB                 | ∞ dB                   |
+
+The smooth-gradient gain (+2.46 dB) is from QP-derived deblocking; the
+DC mode wins the SSE picker on a perfectly smooth signal so the
+mode-RDO path is a no-op there. The mode-RDO path lights up on the
+horizontal-stripes fixture, where V_PRED tracks the row-to-row step
+exactly and DC's row-average baseline would lose meaningfully.
 
 `encode_keyframe(&EncoderParams)` remains available for callers that
 want a skip=1 / midgrey-only stream without pixel content.
@@ -583,43 +608,50 @@ None of the above prevent the crate from decoding a standard
 `libvpx-vp9 -g N` 8-bit 4:2:0 IPPP stream into frames the caller can
 render.
 
-## Encoder (experimental — keyframe MVP)
+## Encoder (experimental — round 40)
 
 The `encoder` module produces a valid VP9 keyframe bitstream accepted
 by ffmpeg / libvpx and round-trippable through this crate's decoder.
 
 Scope today:
-* Profile 0, 4:2:0 8-bit, single tile, loop-filter disabled.
+* Profile 0, 4:2:0 8-bit, single tile.
 * Emits the full §6.2 uncompressed header, §6.3 compressed header
   (tx_mode, coef_probs-update flags, skip_prob-update flags) and the
   tile / partition / block symbols per §6.4.
-* Per-block strategy: `PARTITION_NONE` at 64×64 (SPLIT at edges for
-  non-multiple-of-64 frames), `skip=1` (no coefficient residual),
-  `DC_PRED` luma + chroma intra modes.
-* Partition-context and intra-mode-context trackers mirror the
-  decoder's §7.4.6 state exactly so second-and-later blocks resolve
-  to the correct probability row.
+* Per-block luma intra-mode RDO across `{DC, V, H, TM}` (round 40);
+  `DC_PRED` chroma; forward 4×4 DCT + quantise + token-coded residual.
+* QP-derived loop filter level (round 40) — `EncoderParams::keyframe`
+  picks a non-zero deblocking strength via `default_filter_level`.
+* Partition / intra-mode / skip-context / nonzero-context trackers
+  mirror the decoder's §7.4.6 state exactly so probability rows
+  resolve identically on encode and decode sides.
 * `BoolEncoder` is the inverse of `BoolDecoder` — standard binary
   range coder with pending-byte carry propagation. Roundtrip-tested
   against the decoder with mixed / skewed / equal / carry-forcing
   probs and 2048-symbol PRNG streams.
 
 Self-roundtrip: the produced bitstream decodes through
-`Vp9Decoder::send_packet` → `receive_frame` to a uniform 128 (midgrey)
-4:2:0 frame.
+`Vp9Decoder::send_packet` → `receive_frame` and yields ≥ 50 dB PSNR_Y
+on smooth content at `base_q_idx = 64`.
 
 ffmpeg-acceptance: `tests/vp9_encoder_ffmpeg.rs` decodes the frame
 with the system `ffmpeg` binary and confirms zero decode errors.
 
 Deferred to follow-up work:
-* Forward 4×4/8×8 DCT + ADST (inverse of the decoder's §8.7.1).
-* Forward quantisation at a fixed QP.
-* Token encoding against the §10.5 coef tree probabilities.
-* Per-block skip-context / is_inter / reference-mode / intra-mode
-  decision making based on RD / SAD of the source YUV.
+* P-frame / inter encode — the decoder side ships a full inter path
+  (single + compound ref, sub-pel MC, scaled refs, MV decode) but the
+  encoder currently produces keyframes only.
+* Multi-tile output — the decoder reads multi-tile bitstreams; encode
+  emits a single tile.
+* Two-pass ABR (collect first-pass stats, distribute QP per second-pass).
+* Directional intra modes (`D45 / D135 / D117 / D153 / D207 / D63`)
+  as additional RDO candidates.
+* RDO across (mode, partition, tx_size) instead of fixed 8×8/4×4.
+* Per-segment QP / loop-filter delta encoding.
 
-Entry points: `encoder::encode_keyframe(&EncoderParams)` yields the
-final byte buffer ready for IVF-muxing or `Vp9Decoder::send_packet`.
+Entry points: `encoder::encode_keyframe(&EncoderParams)` yields a
+midgrey skip=1 frame; `encoder::encode_keyframe_yuv(&EncoderParams,
+&YuvFrame)` encodes source 4:2:0 pixels.
 
 ## Codec / container IDs
 

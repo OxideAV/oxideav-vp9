@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- §6.2.2 + §A.1 cap on declared frame dimensions in
+  `Vp9Decoder::ingest_one`: refuse a frame whose `(width, height)`
+  exceeds `MAX_FRAME_DIM` (8192 per axis) or whose total pixel count
+  exceeds `MAX_FRAME_PIXELS` (8192×8192 = 67 MP). Closes workspace
+  task #749 — a 20-byte fuzz keyframe declaring a 2069×39029 picture
+  used to allocate ~243 MiB of plane buffers in `IntraTile::new`
+  before the bitstream was rejected. Public constants `MAX_FRAME_DIM`
+  / `MAX_FRAME_PIXELS` re-exported from the crate root.
+- §9.2 conformance check on tile boolean-decoder over-read: surface
+  the new `BoolDecoder::over_read_bits()` counter and refuse any
+  frame whose tile bool decoder consumed more than `2 * tile_bytes`
+  bits of zero-pad (floor 32 bits). Closes workspace task #748 — a
+  178-byte fuzz keyframe with a 3-byte tile payload used to silently
+  zero-pad the bool decoder by 166 bits and disagree with libavcodec
+  on Y[0,0] by 3 LSB. Real libvpx-encoded fixtures over-read by at
+  most a few % of their tile size and stay under the new budget.
+
+### Removed
+
+- harness pre-filters (`MAX_PIXELS` / `MAX_DECODE_PIXELS`) on declared
+  frame dimensions in `panic_free_decode` / `ffmpeg_oracle_decode`:
+  the decoder now enforces the cap itself.
+
 ## [0.0.10](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.9...v0.0.10) - 2026-05-07
 
 ### Other

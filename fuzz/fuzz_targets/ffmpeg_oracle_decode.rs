@@ -21,15 +21,10 @@
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 use oxideav_vp9::decoder::{make_decoder, pixel_format_from_color_config};
-use oxideav_vp9::headers::parse_uncompressed_header;
 use oxideav_vp9_fuzz::libavcodec::{self, DecodedFrame};
 use std::sync::OnceLock;
 
 const PIXEL_TOL: i32 = 1;
-/// Mirror of `panic_free_decode::MAX_PIXELS`. Until oxideav-vp9
-/// adds bounds-checking on declared frame dimensions, we cap the
-/// fuzz harness at 256 KP per frame to keep iter density high.
-const MAX_DECODE_PIXELS: u32 = 1 << 18;
 
 fuzz_target!(|data: &[u8]| {
     if !oracle_available() {
@@ -40,22 +35,11 @@ fuzz_target!(|data: &[u8]| {
     if data.is_empty() || data.len() > 1 << 22 {
         return;
     }
-
-    // Sanity probe: parse the uncompressed header (with no prior
-    // color_config — fine since the harness mostly sees keyframes).
-    // The header parser will reject anything that isn't really VP9,
-    // and libavcodec doing the same is the expected outcome.
-    //
-    // We also cap declared dimensions at 1 MP per frame: oxideav-vp9
-    // does not yet bound its allocations on the declared width/height
-    // (a separate decoder bug — see panic_free_decode for tracking),
-    // so a fuzz mutation that declares a 65535×65535 keyframe will
-    // OOM the harness before any cross-decode comparison even runs.
-    if let Ok(h) = parse_uncompressed_header(data, None) {
-        if h.width.saturating_mul(h.height) > MAX_DECODE_PIXELS {
-            return;
-        }
-    }
+    // Note: oxideav-vp9 enforces `MAX_FRAME_PIXELS` (8192×8192) inside
+    // `Vp9Decoder::ingest_one`. A fuzz mutation that declares a
+    // 65535×65535 keyframe is refused with `Error::InvalidData`
+    // before any plane buffers are allocated — no harness pre-filter
+    // needed.
 
     // Decode via libavcodec.
     let oracle = match libavcodec::decode_vp9(data) {

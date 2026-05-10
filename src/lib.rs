@@ -112,7 +112,7 @@ oxideav_core::register!("vp9", register);
 pub use compressed_header::{parse_compressed_header, CompressedHeader, ReferenceMode, TxMode};
 pub use decoder::{
     codec_parameters_from_header, frame_rate_from_container, make_decoder,
-    pixel_format_from_color_config, Vp9Decoder,
+    pixel_format_from_color_config, Vp9Decoder, MAX_FRAME_DIM, MAX_FRAME_PIXELS,
 };
 pub use headers::{
     parse_uncompressed_header, ColorConfig, ColorSpace, FrameType, LoopFilterParams,

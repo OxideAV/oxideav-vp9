@@ -21,6 +21,19 @@ struct BitPump<'a> {
     bits_left: u32,
     /// Current byte buffered (low 8 bits).
     cur: u32,
+    /// Number of bits consumed past the end of `data`. The bits
+    /// returned in over-read territory are 0 (zero-pad per §9.2
+    /// wording), but the consumer can use this counter to fail-fast on
+    /// inputs that depend heavily on padding bits — §9.2 states "It is
+    /// a requirement of bitstream conformance that this never
+    /// happens", and continuing to decode against zero-padded garbage
+    /// produces output that diverges arbitrarily from the encoder's
+    /// intent (see workspace task #748: 178-byte fuzz input with
+    /// 3-byte tile payload, our decoder vs libavcodec disagree on
+    /// Y[0,0] by 3 LSB because each side interprets the zero-pad bits
+    /// differently). Real libvpx-encoded streams leave a few bits of
+    /// margin: callers compare `over_read_bits()` against a budget.
+    over_read_bits: u32,
 }
 
 impl<'a> BitPump<'a> {
@@ -30,13 +43,19 @@ impl<'a> BitPump<'a> {
             byte_pos: 0,
             bits_left: 0,
             cur: 0,
+            over_read_bits: 0,
         }
     }
 
     fn read_bit(&mut self) -> Result<u32> {
         if self.bits_left == 0 {
             if self.byte_pos >= self.data.len() {
-                // §9.2 final paragraph: zero-pad past end.
+                // §9.2 final paragraph: zero-pad past end. Tally the
+                // over-read so the tile decoder can reject the frame
+                // with `Error::InvalidData` rather than silently
+                // producing output that disagrees with any other
+                // conformant decoder (§9.2 conformance requirement).
+                self.over_read_bits = self.over_read_bits.saturating_add(1);
                 return Ok(0);
             }
             self.cur = self.data[self.byte_pos] as u32;
@@ -160,6 +179,21 @@ impl<'a> BoolDecoder<'a> {
     /// Number of bytes consumed from the input so far.
     pub fn pos(&self) -> usize {
         self.pump.pos()
+    }
+
+    /// Number of bits the bit pump has consumed past the end of the
+    /// input (i.e. zero-padded). VP9 §9.2 requires the bitstream to
+    /// provide enough bits for every `read_bool`; an over-read
+    /// indicates a non-conformant bitstream whose decoded pixels are
+    /// arbitrary (different decoders fill the padding region with
+    /// different garbage, which manifested as the workspace task #748
+    /// cross-decode Y[0,0] divergence). Callers compare this against a
+    /// per-frame budget — real libvpx-encoded streams routinely use a
+    /// handful of zero-pad bits at the very end of a tile, so a strict
+    /// "any over-read = reject" rule false-positives every multi-frame
+    /// fixture in this crate's test suite.
+    pub fn over_read_bits(&self) -> u32 {
+        self.pump.over_read_bits
     }
 }
 

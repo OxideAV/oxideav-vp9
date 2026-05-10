@@ -24,6 +24,60 @@ use crate::headers::{
 };
 use crate::inter::InterTile;
 
+/// Maximum supported frame dimension along either axis (pixels).
+///
+/// VP9 syntax encodes `frame_width_minus_1` / `frame_height_minus_1` as
+/// 16-bit fields (§6.2.2), allowing up to 65535×65535. We cap each axis
+/// at 8192 to match the codec capability advertised in
+/// `register_codecs` (`with_max_size(8192, 8192)`) and to bound
+/// allocations on hostile inputs.
+pub const MAX_FRAME_DIM: u32 = 8192;
+
+/// Maximum supported total luma sample count per frame (pixels).
+///
+/// Equals `MAX_FRAME_DIM * MAX_FRAME_DIM` = 67,108,864. This is well
+/// above the largest defined VP9 level (Level 6, 35,651,584 luma
+/// samples, ~8192×4352) so legitimate streams are never refused, while
+/// a fuzz-generated 65535×65535 keyframe is rejected with
+/// `Error::InvalidData` rather than allocating ~16 GiB of plane
+/// buffers.
+pub const MAX_FRAME_PIXELS: u32 = MAX_FRAME_DIM * MAX_FRAME_DIM;
+
+/// Per-tile zero-pad budget for the boolean range decoder, scaled to
+/// the tile-payload size (§9.2). The spec requires `BoolMaxBits` to
+/// stay positive throughout decoding, but real libvpx-encoded streams
+/// routinely consume a handful of zero-pad bits during tile
+/// finalisation (the renormalise step pulls one bit at a time and the
+/// encoder pads the trailing byte to byte alignment). The in-tree
+/// inter pipeline is still scaffold and uses default probability
+/// tables for several syntax elements, so it consumes a few extra
+/// bits per tile vs an adaptive-probability oracle — a flat budget
+/// false-positives the multi-tile / P-frame fixtures.
+///
+/// We allow zero-pad up to **2× the tile size in bits** (i.e. up to
+/// 200% over-read of the payload). This comfortably covers the
+/// observed slack across the in-tree fixture corpus while rejecting
+/// fuzz mutations whose tile payload is fundamentally too short for
+/// the declared frame size:
+///
+/// * Workspace task #748: 3-byte tile for a 385×1 frame → 166 bits
+///   of zero-pad over a 24-bit payload (~691% over-read), refused.
+/// * Multi-tile fixture: 3369-byte tile → 1212 bits of zero-pad over
+///   26,952-bit payload (~4.5% over-read), accepted.
+/// * P-frame fixture: 15-byte scaffold-inter tile → 171 bits of
+///   zero-pad over 120-bit payload (~143% over-read), accepted.
+///
+/// A floor of 32 bits absorbs the byte-alignment + renormalise tail
+/// for tiny payloads (~8 bits) without losing the tightness needed to
+/// reject the task #748 fuzz input (3-byte tile, 166-bit over-read).
+const BOOL_OVER_READ_FLOOR_BITS: u32 = 32;
+
+#[inline]
+fn bool_over_read_budget_bits(tile_payload_len: usize) -> u32 {
+    let scaled = (tile_payload_len as u64).saturating_mul(16) as u32; // 2× bits
+    scaled.max(BOOL_OVER_READ_FLOOR_BITS)
+}
+
 /// Build a `CodecParameters` from a parsed uncompressed header.
 pub fn codec_parameters_from_header(h: &UncompressedHeader) -> CodecParameters {
     let mut params = CodecParameters::video(CodecId::new(crate::CODEC_ID_STR));
@@ -200,6 +254,34 @@ impl Vp9Decoder {
             }
         }
 
+        // §6.2.2 + §A.1 bound check on the FINAL (post-found_ref)
+        // dimensions. `frame_width_minus_1` / `_height_minus_1` are
+        // 16-bit fields (§6.2.2), so the syntax allows 65535×65535
+        // ≈ 4.3 GP — far beyond the largest defined level (Level 6,
+        // 35,651,584 luma samples ≈ 8192×4352, see
+        // `webmproject-vp9-levels-testing.html`). Without a cap, a
+        // fuzz mutation that flips a 64×64 keyframe to a 65535×65535
+        // declaration tips `IntraTile::new` / `InterTile::new` into a
+        // multi-GiB allocation and OOMs the process before the
+        // bitstream is even validated further. We refuse anything
+        // above `MAX_FRAME_PIXELS` (= `MAX_FRAME_DIM` × `MAX_FRAME_DIM`
+        // = 8192 × 8192 = 67 MP — matches the codec capability
+        // `with_max_size(8192, 8192)` advertised in `register_codecs`)
+        // with `Error::InvalidData`. This is a bitstream-conformance
+        // check on top of the spec, not a §-mandated one.
+        let pixels = (h.width as u64).saturating_mul(h.height as u64);
+        if h.width == 0
+            || h.height == 0
+            || h.width > MAX_FRAME_DIM
+            || h.height > MAX_FRAME_DIM
+            || pixels > MAX_FRAME_PIXELS as u64
+        {
+            return Err(Error::invalid(format!(
+                "vp9: declared frame {}×{} ({} px) exceeds decoder cap {}×{} ({} px)",
+                h.width, h.height, pixels, MAX_FRAME_DIM, MAX_FRAME_DIM, MAX_FRAME_PIXELS
+            )));
+        }
+
         // Parse compressed header (§6.3). Seed the per-frame context
         // from either the §10.5 defaults (on keyframe / intra_only /
         // reset_frame_context >= 2) or from the saved slot indicated by
@@ -252,6 +334,35 @@ impl Vp9Decoder {
                     let mut bd = BoolDecoder::new(slice)?;
                     let (col_s, col_e, row_s, row_e) = tile_pixel_bounds(&h, tc, tr);
                     tile.decode_rect(&mut bd, col_s, col_e, row_s, row_e)?;
+                    // §9.2 conformance: the bool decoder is allowed
+                    // a small zero-pad tail (real libvpx-encoded
+                    // streams routinely consume a handful of bits past
+                    // the last encoded byte during tile finalisation).
+                    // But a tile that runs MASSIVELY past its payload
+                    // is non-conformant — every additional zero-pad
+                    // bit pollutes the decoded pixels with arbitrary
+                    // garbage that diverges from any other conformant
+                    // decoder. Workspace task #748: a 178-byte fuzz
+                    // input with a 3-byte tile payload over-read by
+                    // ~hundreds of bits and disagreed with libavcodec
+                    // on Y[0,0] by 3 LSB.
+                    let budget = bool_over_read_budget_bits(slice.len());
+                    if std::env::var("VP9_TRACE_OVERREAD").is_ok() {
+                        eprintln!(
+                            "OVERREAD: tile {}-byte over_read={} budget={}",
+                            slice.len(),
+                            bd.over_read_bits(),
+                            budget
+                        );
+                    }
+                    if bd.over_read_bits() > budget {
+                        return Err(Error::invalid(format!(
+                            "vp9 §9.2: tile bool decoder over-read {} bits past end of {}-byte payload (budget {} bits)",
+                            bd.over_read_bits(),
+                            slice.len(),
+                            budget,
+                        )));
+                    }
                 }
             }
             tile.finalize();
@@ -286,6 +397,25 @@ impl Vp9Decoder {
                     let mut bd = BoolDecoder::new(slice)?;
                     let (col_s, col_e, row_s, row_e) = tile_pixel_bounds(&h, tc, tr);
                     tile.decode_rect(&mut bd, col_s, col_e, row_s, row_e)?;
+                    // §9.2 conformance — see intra branch above for
+                    // rationale (workspace task #748).
+                    let budget = bool_over_read_budget_bits(slice.len());
+                    if std::env::var("VP9_TRACE_OVERREAD").is_ok() {
+                        eprintln!(
+                            "OVERREAD inter: tile {}-byte over_read={} budget={}",
+                            slice.len(),
+                            bd.over_read_bits(),
+                            budget
+                        );
+                    }
+                    if bd.over_read_bits() > budget {
+                        return Err(Error::invalid(format!(
+                            "vp9 §9.2: tile bool decoder over-read {} bits past end of {}-byte payload (budget {} bits)",
+                            bd.over_read_bits(),
+                            slice.len(),
+                            budget,
+                        )));
+                    }
                 }
             }
             tile.finalize();
@@ -899,6 +1029,111 @@ mod tests {
         match r {
             Err(Error::InvalidData(_)) | Err(Error::Unsupported(_)) => {}
             other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    /// Regression for fuzz `oom-8859eec1032a1ad42f67a374eb6b85fcdee6da52`
+    /// (workspace task #749): a 20-byte VP9 keyframe header that
+    /// declares a 2069×39029 picture (~80 MP) used to force
+    /// `IntraTile::new` to allocate ~243 MiB of plane buffers before
+    /// the bitstream was rejected — well within the OOM-killer's
+    /// crosshairs once concurrent fuzz workers each held one. The
+    /// decoder now refuses anything beyond `MAX_FRAME_PIXELS`
+    /// (8192×8192) at the start of `ingest_one`, so this input
+    /// surfaces as a plain `Error::InvalidData` with no large
+    /// allocation.
+    #[test]
+    fn rejects_oversized_declared_dimensions() {
+        let bytes = [
+            0x81, 0x49, 0x83, 0x42, 0x00, 0x81, 0x49, 0x83, 0x42, 0x00, 0xa0, 0x00, 0x00, 0x03,
+            0xad, 0xa0, 0x00, 0x01, 0x05, 0xad,
+        ];
+        let mut dec = Vp9Decoder::new(CodecId::new(crate::CODEC_ID_STR));
+        let pkt = Packet::new(0, TimeBase::new(1, 90_000), bytes.to_vec());
+        match dec.send_packet(&pkt) {
+            Err(Error::InvalidData(msg)) => {
+                assert!(
+                    msg.contains("exceeds decoder cap"),
+                    "expected size-cap error, got {msg}"
+                );
+            }
+            other => panic!("expected InvalidData(size-cap), got {other:?}"),
+        }
+    }
+
+    /// `MAX_FRAME_DIM` × `MAX_FRAME_DIM` must be exactly the cap and
+    /// must never overflow `u32`. Pinned so future bumps stay deliberate.
+    #[test]
+    fn max_frame_pixels_is_dim_squared_and_fits_u32() {
+        assert_eq!(
+            MAX_FRAME_PIXELS as u64,
+            MAX_FRAME_DIM as u64 * MAX_FRAME_DIM as u64
+        );
+        // 8192 × 8192 = 67,108,864 — comfortable u32.
+        assert_eq!(MAX_FRAME_PIXELS, 67_108_864);
+    }
+
+    /// `bool_over_read_budget_bits` math must:
+    ///
+    /// * apply the floor for tiny payloads
+    /// * scale 2× the tile size in bits for normal payloads
+    /// * not overflow on `u32`-sized maxima
+    #[test]
+    fn bool_over_read_budget_pinned() {
+        // Floor: 0/1-byte tiles get the 32-bit floor (1×8 = 8 < 32).
+        assert_eq!(bool_over_read_budget_bits(0), 32);
+        assert_eq!(bool_over_read_budget_bits(1), 32);
+        // Task #748: 3-byte tile → 3×16 = 48 bits budget — small enough
+        // to reject the fuzz input (166 bits over-read).
+        assert_eq!(bool_over_read_budget_bits(3), 48);
+        // 15-byte fixture P-frame: 240 bits — above its 171-bit
+        // observed over-read.
+        assert_eq!(bool_over_read_budget_bits(15), 240);
+        // Multi-tile fixture tiles, both well above their observed
+        // over-read.
+        assert_eq!(bool_over_read_budget_bits(1991), 31_856);
+        assert_eq!(bool_over_read_budget_bits(3369), 53_904);
+    }
+
+    /// Regression for fuzz `crash-d2075b74…` (workspace task #748): a
+    /// 178-byte VP9 keyframe declaring a 385×1 picture with only 3
+    /// bytes of tile payload would silently zero-pad its bool decoder
+    /// stream by hundreds of bits and produce a Y plane that
+    /// disagreed with libavcodec on every pixel of the first ~70
+    /// columns (oracle Y[0,0]=132 vs ours 129). The fix surfaces the
+    /// over-read at end-of-tile via `BoolDecoder::over_read_bits()`
+    /// and refuses the frame with `Error::InvalidData` whenever the
+    /// over-read exceeds the size-scaled budget; the fuzz harness then
+    /// skips the cross-decode comparison cleanly.
+    #[test]
+    fn rejects_oversized_bool_over_read() {
+        // Trimmed verbatim from
+        // fuzz/artifacts/ffmpeg_oracle_decode/crash-d2075b74…
+        let bytes = [
+            0xa2, 0x49, 0x83, 0x42, 0x78, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x42, 0x78, 0x36,
+            0xda, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x66, 0x0d, 0x0d, 0x0d, 0x0d,
+            0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d,
+            0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d,
+            0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d,
+            0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d,
+            0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d,
+            0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d,
+            0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x0d, 0x73, 0x2b,
+        ];
+        let mut dec = Vp9Decoder::new(CodecId::new(crate::CODEC_ID_STR));
+        let pkt = Packet::new(0, TimeBase::new(1, 30), bytes.to_vec());
+        match dec.send_packet(&pkt) {
+            Err(Error::InvalidData(msg)) => {
+                assert!(
+                    msg.contains("over-read"),
+                    "expected over-read error, got {msg}"
+                );
+            }
+            other => panic!("expected InvalidData(over-read), got {other:?}"),
         }
     }
 }

@@ -221,4 +221,33 @@ mod tests {
             bd.read(128).unwrap();
         }
     }
+
+    /// `over_read_bits()` is 0 when the input is large enough, and
+    /// monotonically increases once the bit pump exhausts `data`.
+    /// Workspace task #748 regression: this counter is the only way
+    /// `Vp9Decoder::ingest_one` can distinguish "decoded against zero
+    /// pad" (= non-conformant per §9.2, divergent across decoders)
+    /// from "decoded against real bits" (= comparable to oracles).
+    #[test]
+    fn over_read_bits_tracks_padding() {
+        // Plenty of input — never pads.
+        let big = [0u8; 64];
+        let mut bd = BoolDecoder::new(&big).unwrap();
+        for _ in 0..64 {
+            bd.read(128).unwrap();
+        }
+        assert_eq!(bd.over_read_bits(), 0);
+        // Single-byte input — exhausts immediately and pads on every
+        // subsequent renormalise. Each `read(128)` typically consumes
+        // ~1 bit; 64 reads forces well past the 8 bits of input.
+        let tiny = [0xFFu8];
+        let mut bd = BoolDecoder::new(&tiny).unwrap();
+        for _ in 0..64 {
+            bd.read(128).unwrap();
+        }
+        assert!(
+            bd.over_read_bits() > 0,
+            "expected non-zero over-read after exhausting 1-byte input"
+        );
+    }
 }

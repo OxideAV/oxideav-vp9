@@ -1,0 +1,9 @@
+# cargo-fuzz state — corpus is cached by CI via actions/cache, and
+# artifacts (crash inputs) get re-discovered on every run. We do
+# commit Cargo.lock for the fuzz crate (the lib's own .gitignore
+# excludes Cargo.lock; the fuzz harness gets its own per the
+# workspace policy on lockfiles in lib vs bin crates).
+target/
+corpus/
+artifacts/
+coverage/

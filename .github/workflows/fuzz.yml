@@ -1,0 +1,32 @@
+name: Fuzz
+
+# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. Splits the
+# 30-minute total budget across the 3 targets (~10 min each):
+#
+#   * panic_free_decode — pure panic-surface fuzz against Vp9Decoder.
+#     No oracle; just feeds arbitrary bytes through the trait API.
+#   * roundtrip — encoder (encode_keyframe_yuv) → decoder; sanity-
+#     checks plane sizes + Y MAE within a generous lossy bound.
+#   * ffmpeg_oracle_decode — cross-decode against libavcodec
+#     (AV_CODEC_ID_VP9 = 167), dlopen'd at runtime via libloading.
+#     When libavcodec accepts the input, ours must too with matching
+#     frame count + dims + chroma + ±1 LSB pixel match.
+#
+# The oracle harness dlopens libavcodec at runtime; the CI runner
+# needs `ffmpeg` (which apt installs alongside libavcodec.so.NN) so
+# the oracle actually validates instead of silently skipping. No
+# `#[ignore]` — the harness eprintln's `[oracle skip]` and returns
+# early when the library can't be loaded.
+
+on:
+  schedule:
+    - cron: "37 6 * * *"   # daily 06:37 UTC, jittered off the hour
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      extra_packages_apt: "ffmpeg"
+      time_budget_seconds: 1800
+    secrets: inherit

@@ -1,0 +1,67 @@
+[package]
+name = "oxideav-vp9-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+# libloading is the only libavcodec interop: the cross-decode oracle
+# `dlopen`s the system-installed shared library at startup. No `*-sys`
+# crate, no libavcodec source pulled into the dep tree. The harness
+# skips silently (eprintln, no `#[ignore]`) when libavcodec isn't
+# installed (see fuzz/src/lib.rs). Workspace policy bars vendoring
+# libavcodec / libvpx source — we only reference the public C API
+# headers (<libavcodec/avcodec.h>, <libavcodec/packet.h>) for function
+# signatures + opaque pointer typedefs.
+libloading = "0.8"
+
+[dependencies.oxideav-vp9]
+path = ".."
+
+[lib]
+name = "oxideav_vp9_fuzz"
+path = "src/lib.rs"
+
+# Prevent this from interfering with the umbrella workspace.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+# ------------------------------------------------------------------
+# Fuzz targets.
+# ------------------------------------------------------------------
+
+# Target 1: panic-freedom — feed arbitrary bytes through Vp9Decoder
+# and assert it returns a Result rather than panicking.
+[[bin]]
+name = "panic_free_decode"
+path = "fuzz_targets/panic_free_decode.rs"
+test = false
+doc = false
+
+# Target 2: oxideav-vp9 self-roundtrip — keyframe-only encoder
+# (encode_keyframe_yuv) → Vp9Decoder. Asserts plane dimensions match
+# and Y MAE stays within a generous lossy bound (the encoder is QP=64
+# fixed-quant lossy on arbitrary content; PSNR ~35 dB+ on smooth).
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
+
+# Target 3: ffmpeg/libavcodec oracle — decode the same superframe
+# bytes through both Vp9Decoder and libavcodec's VP9 decoder; when
+# libavcodec accepts the bitstream, ours must too with matching frame
+# count + dimensions + chroma format, and YUV pixels within ±1 LSB.
+[[bin]]
+name = "ffmpeg_oracle_decode"
+path = "fuzz_targets/ffmpeg_oracle_decode.rs"
+test = false
+doc = false

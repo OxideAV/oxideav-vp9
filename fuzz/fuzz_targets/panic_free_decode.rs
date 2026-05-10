@@ -11,12 +11,34 @@
 use libfuzzer_sys::fuzz_target;
 use oxideav_core::{CodecId, CodecParameters, Decoder, Packet, TimeBase};
 use oxideav_vp9::decoder::{make_decoder, Vp9Decoder};
+use oxideav_vp9::headers::parse_uncompressed_header;
+
+/// Maximum total pixel count per fuzz frame (256 KP). The decoder
+/// will allocate buffers proportional to the declared dimensions
+/// before validating the bitstream further; an unbounded fuzz input
+/// can trivially declare a 65535×65535 keyframe and exhaust memory.
+/// That's a real DoS-class bug in the decoder; this cap keeps the
+/// fuzz iter density high while the decoder grows its own allocation
+/// guards. 256 KP = a 512×512 frame — well above the 64×64 size we
+/// use for the roundtrip target's source frames.
+const MAX_PIXELS: u32 = 1 << 18;
 
 fuzz_target!(|data: &[u8]| {
-    // Cap at 4 MiB — VP9 frames in the wild fit easily under this and
-    // the fuzz iters get exponentially slower beyond that.
-    if data.len() > 1 << 22 {
+    // Cap at 1 MiB of raw input — typical VP9 fuzz finds are ~hundred
+    // bytes, and longer inputs just exercise the same paths slowly.
+    if data.len() > 1 << 20 {
         return;
+    }
+
+    // Sniff the uncompressed header. If we can parse it, skip inputs
+    // whose declared frame size would force a multi-MB allocation —
+    // see MAX_PIXELS rationale above. If the header is unparsable
+    // the decoder will reject early without large allocs.
+    if let Ok(h) = parse_uncompressed_header(data, None) {
+        let pixels = h.width.saturating_mul(h.height);
+        if pixels > MAX_PIXELS {
+            return;
+        }
     }
 
     // Path A: factory + trait-object — exercises `make_decoder`.

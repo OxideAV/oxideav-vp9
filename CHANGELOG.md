@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.9...v0.0.10) - 2026-05-07
+
+### Other
+
+- round 40 — per-block intra-mode RDO + QP-derived loop filter level
+- drop stale REGISTRARS / with_all_features intra-doc links
+- drop dead `linkme` dep
+- fix clippy ptr_arg — &mut Vec → &mut [_] in tile_pixel + tokenize
+- round 2 — forward DCT + token coding, PSNR_Y ≥ 35 dB (256×256 smooth gradient = 50.60 dB)
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+- unify entry point on register(&mut RuntimeContext) ([#502](https://github.com/OxideAV/oxideav-vp9/pull/502))
+
 ### Added
 
 - VP9 encoder round 40 — per-block luma intra-mode RDO across

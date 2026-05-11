@@ -363,6 +363,29 @@ mod oracle_tests {
     }
 
     #[test]
+    fn chroma_uniform_fill_detection_on_u_plane() {
+        // Reproduces the run-25690387209 CI failure shape: oracle Y
+        // carries real content but oracle U is uniform-128 (the
+        // chroma "neutral" mid-gray libavcodec 60.x error-conceals
+        // to). Pre-fix this fell through the Y-only uniform check
+        // and tripped the envelope panic. The fuzz target now
+        // applies `is_uniform_plane` to U and V as well, so this
+        // case never reaches the envelope evaluator.
+        let mut oracle_y = vec![0u8; 64 * 64];
+        // Fill Y with a gradient so it's NOT uniform.
+        for (i, v) in oracle_y.iter_mut().enumerate() {
+            *v = (i & 0xff) as u8;
+        }
+        // Chroma planes uniform at the 4:2:0 neutral mid-gray.
+        let oracle_u = vec![128u8; 32 * 32];
+        let oracle_v = vec![128u8; 32 * 32];
+        // Y not uniform; U/V uniform → the per-plane check fires.
+        assert!(!is_uniform_plane(&oracle_y, 1));
+        assert!(is_uniform_plane(&oracle_u, 1));
+        assert!(is_uniform_plane(&oracle_v, 1));
+    }
+
+    #[test]
     fn hbd_envelope_uses_wider_threshold() {
         // 10-bit; oracle has texture (so uniform check returns
         // false); ours diverges by HBD-scale magnitudes.

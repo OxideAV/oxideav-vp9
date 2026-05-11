@@ -22,13 +22,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   New oracle strategy (bilateral-rejection envelope):
 
-  1. **Uniform-fill detection** — if the oracle Y plane is constant,
-     it's almost certainly libavcodec's error-conceal output rather
-     than a real decode. Skip pixel comparison; keep structural
-     (frame-count / dimensions / chroma geometry) checks. The detector
-     is value-agnostic (does not hardcode the `1 << (bd-1)` mid-gray)
-     so it catches every flavour of placeholder including all-0 / all-
-     255 / all-`U16_MAX` shapes that some libavcodec builds emit.
+  1. **Uniform-fill detection (per-plane).** If ANY of the oracle's
+     Y / U / V planes is constant, it's almost certainly libavcodec's
+     error-conceal output rather than a real decode. Skip pixel
+     comparison; keep structural (frame-count / dimensions / chroma
+     geometry) checks. The detector is value-agnostic (does not
+     hardcode the `1 << (bd-1)` mid-gray) so it catches every flavour
+     of placeholder including all-0 / all-255 / all-`U16_MAX` shapes
+     that some libavcodec builds emit. Per-plane (not per-frame)
+     because libavcodec 60.x+ is observed to partially fill chroma
+     planes with the neutral mid-gray (128 / 512 / 2048) even when
+     Y carries real content — caught the first time the rebuilt
+     fuzz workflow tripped (run 25690387209: oracle U[*]=128, ours
+     U[*]=0, libavcodec 60.31.102).
   2. **Divergence fraction + magnitude envelope** — when the oracle
      plane has real texture, the harness counts the fraction of
      samples that differ by more than 1 LSB and the worst-case

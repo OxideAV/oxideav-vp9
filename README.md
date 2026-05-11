@@ -653,6 +653,23 @@ Entry points: `encoder::encode_keyframe(&EncoderParams)` yields a
 midgrey skip=1 frame; `encoder::encode_keyframe_yuv(&EncoderParams,
 &YuvFrame)` encodes source 4:2:0 pixels.
 
+## Fuzz oracle
+
+`fuzz/fuzz_targets/ffmpeg_oracle_decode.rs` cross-decodes arbitrary
+VP9 superframe bytes through both `Vp9Decoder` and libavcodec
+(dlopen'd at runtime via `libloading`; no `*-sys` crate, no
+vendored libavcodec / libvpx source). The oracle is **version-
+robust**: different libavcodec majors emit different error-conceal
+placeholders for the same adversarial fuzz input (typically a
+uniform mid-gray plane on 61.x+, partial frames on 58.x), so the
+harness applies a bilateral-rejection envelope — uniform-fill
+oracle frames are dropped to structural-only comparison, and per-
+sample divergence trips loudly only when BOTH the divergence
+fraction (>0.5%) AND the worst-case absolute diff (>8 LSB at
+8-bit, >32 at 10/12-bit) are blown. The diagnostic tag in failure
+panics carries the loaded `(major.minor.micro)`. See `[Unreleased]`
+in CHANGELOG for the spec basis (VP9 §8 / §8.6.2).
+
 ## Codec / container IDs
 
 * Codec: `"vp9"`; maps from MP4's `vp09` sample entry.

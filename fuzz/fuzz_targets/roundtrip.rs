@@ -106,7 +106,11 @@ fuzz_target!(|data: &[u8]| {
 
 /// Carve fuzz bytes into (width, height, Y, U, V) for an 8-bit 4:2:0
 /// frame. Width/height land on a multiple of 8 (VP9 min transform) and
-/// cap at MAX_DIM. Returns None if the input is too short.
+/// cap at MAX_DIM. Returns None if the input is too short. The tuple
+/// shape is local to this fuzz target — no public API surface or
+/// inter-crate type sharing — so the clippy complexity lint isn't
+/// load-bearing here.
+#[allow(clippy::type_complexity)]
 fn yuv420_from_fuzz_input(data: &[u8]) -> Option<(u32, u32, Vec<u8>, Vec<u8>, Vec<u8>)> {
     let (&shape_w, rest) = data.split_first()?;
     let (&shape_h, rest) = rest.split_first()?;

@@ -331,7 +331,7 @@ impl Vp9Decoder {
             for tr in 0..tile_rows {
                 for tc in 0..tile_cols {
                     let slice = tile_slices[(tr * tile_cols + tc) as usize];
-                    let mut bd = BoolDecoder::new(slice)?;
+                    let mut bd = BoolDecoder::new_with_marker_strict(slice, true)?;
                     let (col_s, col_e, row_s, row_e) = tile_pixel_bounds(&h, tc, tr);
                     tile.decode_rect(&mut bd, col_s, col_e, row_s, row_e)?;
                     // §9.2 conformance: the bool decoder is allowed
@@ -394,7 +394,7 @@ impl Vp9Decoder {
             for tr in 0..tile_rows {
                 for tc in 0..tile_cols {
                     let slice = tile_slices[(tr * tile_cols + tc) as usize];
-                    let mut bd = BoolDecoder::new(slice)?;
+                    let mut bd = BoolDecoder::new_with_marker_strict(slice, true)?;
                     let (col_s, col_e, row_s, row_e) = tile_pixel_bounds(&h, tc, tr);
                     tile.decode_rect(&mut bd, col_s, col_e, row_s, row_e)?;
                     // §9.2 conformance — see intra branch above for
@@ -1134,6 +1134,52 @@ mod tests {
                 );
             }
             other => panic!("expected InvalidData(over-read), got {other:?}"),
+        }
+    }
+
+    /// Regression for fuzz `crash-6e3a445f…` (workspace task #769): a
+    /// 98-byte VP9 keyframe declaring a 385×1 picture with a
+    /// near-zero compressed header and a 62-byte tile payload whose
+    /// first byte (`0x80`) deterministically forces the §9.2.1
+    /// marker bit to read as 1 instead of the spec-required 0.
+    /// Pre-fix, the marker non-conformance was tolerated and decode
+    /// continued against a permanently-misaligned bool stream that
+    /// diverged from libavcodec on coefficient tokens around SB
+    /// col=192 (Y[0,204] off by 3 LSB, plus 6 other > 1-LSB drifts
+    /// out of 178 total Y diffs). The fuzz harness `PIXEL_TOL = 1`
+    /// flagged the divergence loudly. The fix opts the tile bool
+    /// decoder into spec-strict marker-bit checking via
+    /// `BoolDecoder::new_with_marker_strict(_, true)` so this
+    /// non-conformant input is refused with `Error::InvalidData`
+    /// at the bool init step (before any pixel reconstruction
+    /// happens), which the fuzz harness then skips cleanly via the
+    /// `send_rc.is_err()` short-circuit. The compressed-header bool
+    /// decoder keeps `strict=false` (real-world libvpx encoders have
+    /// been observed to violate the marker requirement there while
+    /// still producing decodable output).
+    #[test]
+    fn rejects_tile_marker_bit_one() {
+        // Verbatim from
+        // fuzz/artifacts/ffmpeg_oracle_decode/crash-6e3a445fb92e2a4a20f8687c7ada787bae98fa09.
+        let bytes = [
+            0xa2, 0x49, 0x83, 0x42, 0x78, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5b, 0x00, 0x00,
+            0x0a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x42,
+            0x78, 0x35, 0xda, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x66, 0x73, 0x2b,
+        ];
+        let mut dec = Vp9Decoder::new(CodecId::new(crate::CODEC_ID_STR));
+        let pkt = Packet::new(0, TimeBase::new(1, 30), bytes.to_vec());
+        match dec.send_packet(&pkt) {
+            Err(Error::InvalidData(msg)) => {
+                assert!(
+                    msg.contains("marker bit"),
+                    "expected marker-bit error, got {msg}"
+                );
+            }
+            other => panic!("expected InvalidData(marker bit), got {other:?}"),
         }
     }
 }

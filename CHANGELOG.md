@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- §9.2.1 conformance check on the tile boolean-decoder marker bit:
+  the spec requires the post-init marker (read at p=128) to be 0;
+  pre-fix we discarded the bit, which let adversarial fuzz inputs
+  whose tile-payload first byte forces the marker to 1
+  (`value = 0x80 ≥ split = 128 → bit = 1`) decode against a
+  permanently-misaligned bool stream that diverged from libavcodec
+  on coefficient tokens several superblocks deep into the frame.
+  Closes workspace task #769 — a 98-byte 385×1 keyframe whose
+  62-byte tile payload starts with `0x80` and triggered a 3-LSB
+  Y[0,204] divergence. The new
+  `BoolDecoder::new_with_marker_strict(_, true)` path is opt-in
+  (the compressed-header bool stream keeps the permissive default
+  because real-world libvpx encoders are observed to violate the
+  marker requirement there while still producing decodable output).
 - §6.2.2 + §A.1 cap on declared frame dimensions in
   `Vp9Decoder::ingest_one`: refuse a frame whose `(width, height)`
   exceeds `MAX_FRAME_DIM` (8192 per axis) or whose total pixel count

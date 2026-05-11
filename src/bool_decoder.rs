@@ -107,6 +107,29 @@ impl<'a> BoolDecoder<'a> {
     /// This marker read is essential: without it every downstream
     /// boolean read is misaligned and the decoder collapses to noise.
     pub fn new(data: &'a [u8]) -> Result<Self> {
+        Self::new_with_marker_strict(data, false)
+    }
+
+    /// Like [`Self::new`] but with an opt-in conformance check on the
+    /// §9.2.1 marker bit. Spec text:
+    ///
+    /// > It is a requirement of bitstream conformance that the value
+    /// > read is equal to 0.
+    ///
+    /// We don't enforce this for the compressed-header bool stream
+    /// (some real-world encoders have been observed to violate it
+    /// while still producing decodable output across libvpx /
+    /// libavcodec), but tile-payload bool streams use `strict=true`
+    /// so adversarial fuzz inputs whose tile-payload first byte
+    /// would force the marker to read as 1 are refused with
+    /// `Error::InvalidData`. Workspace task #769: a 62-byte tile
+    /// whose first byte is `0x80` reads marker bit=1 (split=128,
+    /// value=128 ≥ split), then proceeds to decode against a
+    /// permanently-misaligned bool stream that diverges from
+    /// libavcodec on coefficient tokens at SB col=192 (Y[0,204] off
+    /// by 3 LSB). Rejecting the frame at the marker check avoids
+    /// the divergent pixel output cleanly.
+    pub fn new_with_marker_strict(data: &'a [u8], strict: bool) -> Result<Self> {
         if data.is_empty() {
             return Err(Error::invalid("vp9 bool decoder: empty payload"));
         }
@@ -118,7 +141,12 @@ impl<'a> BoolDecoder<'a> {
             value,
         };
         // §9.2.1 marker bit — must be 0 per conformance.
-        let _ = bd.read(128)?;
+        let marker = bd.read(128)?;
+        if strict && marker != 0 {
+            return Err(Error::invalid(
+                "vp9 §9.2.1: tile bool-decoder marker bit is 1 (spec requires 0)",
+            ));
+        }
         Ok(bd)
     }
 
@@ -210,6 +238,32 @@ mod tests {
         assert!(BoolDecoder::new(&[0xAB, 0x00, 0xCD]).is_ok());
         assert!(BoolDecoder::new(&[0xAB, 0xFF, 0xCD]).is_ok());
         assert!(BoolDecoder::new(&[]).is_err());
+    }
+
+    /// `new_with_marker_strict(_, true)` rejects payloads whose first
+    /// byte forces the §9.2.1 marker bit to read as 1. Workspace
+    /// task #769: every 0x80-prefixed tile slice trips this — value
+    /// = 0x80 = 128, split = 1 + ((255-1)*128)>>8 = 128, value ≥
+    /// split → marker bit = 1. The non-strict path stays permissive.
+    #[test]
+    fn marker_strict_rejects_first_byte_0x80() {
+        // 0x80 trips the marker → strict mode rejects, non-strict
+        // accepts.
+        let payload = [0x80u8, 0x00, 0x00];
+        assert!(BoolDecoder::new(&payload).is_ok());
+        let err = BoolDecoder::new_with_marker_strict(&payload, true)
+            .err()
+            .expect("strict mode must reject 0x80 marker");
+        match err {
+            Error::InvalidData(msg) => {
+                assert!(msg.contains("marker bit"), "msg = {msg}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+        // 0x00 first byte → value=0 < split=128 → marker bit = 0,
+        // strict accepts.
+        let ok = [0x00u8, 0x42];
+        assert!(BoolDecoder::new_with_marker_strict(&ok, true).is_ok());
     }
 
     /// Read several bits at p=128. Should not panic / EOF.

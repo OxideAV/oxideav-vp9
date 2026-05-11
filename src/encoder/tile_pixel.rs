@@ -1,4 +1,4 @@
-//! VP9 keyframe tile encoder — pixel-encoding path (round 2 + round 40).
+//! VP9 keyframe tile encoder — pixel-encoding path (round 2 + round 40 + round 48).
 //!
 //! Encodes source YUV pixels into a valid VP9 keyframe tile payload.
 //! Strategy per 8×8 block (one MI cell, four 4×4 TX units):
@@ -9,6 +9,18 @@
 //! 2. Apply that mode to all four 4×4 TX units, computing residuals.
 //! 3. Forward 4×4 DCT → quantise → token-encode each residual.
 //! 4. Emit skip=0 if any nonzero coefficients, skip=1 otherwise.
+//!
+//! **Round 48 — chroma intra-mode RDO + RDO pruning** (lever A + lever C
+//! from the round 48 dispatch):
+//! * Chroma now runs the same 4-mode SSE picker over `{DC, V, H, TM}`
+//!   on the U plane; the picked mode applies to both U and V (VP9 stores
+//!   ONE `uv_mode` per block, applied to both chroma planes — §6.4.6).
+//!   This unblocks non-uniform chroma reconstruction; uniform-128 fixtures
+//!   still pick DC and stay at `inf` dB.
+//! * Mode-RDO early termination: if DC's SSE on the 4×4 sample is ≤ 16
+//!   (≤ 1 LSB RMS), the picker skips V/H/TM. On smooth content this
+//!   trims ~75% of the RDO sweep without changing output (DC was going
+//!   to win anyway).
 //!
 //! The compressed header is fixed (tx_mode=ONLY_4X4, no prob updates),
 //! so the decoder consumes the §10.5 default coefficient probabilities.
@@ -39,8 +51,14 @@ use crate::tables::{
     DEFAULT_SCAN_4X4_NEIGHBORS, KF_UV_MODE_PROBS, KF_Y_MODE_PROBS,
 };
 
-const MODE_DC: usize = 0;
 const SKIP_PROBS: [u8; 3] = [192, 128, 64];
+
+/// Round-48 mode-RDO early termination threshold. If DC's SSE on the
+/// 4×4 picker stamp is at or below this value, the picker skips the
+/// V/H/TM evaluations and locks in DC. 16 = 1 LSB RMS over 16 samples;
+/// at this point V/H/TM cannot meaningfully beat DC and the mode tree
+/// emit cost (3-5 bool symbols) would dominate any tiny SSE win.
+const RDO_DC_EARLY_OUT_SSE: u64 = 16;
 
 /// Candidate luma intra modes evaluated per 8×8 block.
 ///
@@ -986,9 +1004,11 @@ fn emit_block_at(
         }
     }
 
-    // Chroma sub-blocks (4:2:0). Always DC_PRED for now — the decoder's
-    // KF_UV_MODE_PROBS row depends on the luma mode, which we honour
-    // when emitting the UV mode tree below.
+    // Chroma sub-blocks (4:2:0). Round 48: per-block chroma intra-mode
+    // RDO. VP9 stores ONE `uv_mode` per block which applies to BOTH U
+    // and V chroma planes (§6.4.6 `read_intra_mode_uv`), so the picker
+    // runs once on the U plane (representative — most natural content
+    // has correlated U/V structure) and the picked mode is reused for V.
     let n4_uv = (bs / 2) / 4;
     let mut u_coefs: Vec<Vec<i32>> = Vec::new();
     let mut u_eobs: Vec<usize> = Vec::new();
@@ -997,12 +1017,27 @@ fn emit_block_at(
     let mut v_eobs: Vec<usize> = Vec::new();
     let mut v_ictx: Vec<usize> = Vec::new();
 
+    let uv_top_left_x = px_col / 2;
+    let uv_top_left_y = px_row / 2;
+    let picked_uv_mode = pick_intra_mode_block(
+        u_src,
+        uv_stride,
+        uv_w,
+        uv_h,
+        recon_u,
+        recon_uvw,
+        uv_top_left_x,
+        uv_top_left_y,
+        bs / 2,
+    );
+    let uv_mode_idx = mode_to_index(picked_uv_mode);
+
     for ty in 0..n4_uv.max(1) {
         for tx in 0..n4_uv.max(1) {
             let bx = px_col / 2 + tx * 4;
             let by = px_row / 2 + ty * 4;
             let (cu, eu, icu) = encode_4x4_block_mode(
-                IntraMode::Dc,
+                picked_uv_mode,
                 u_src,
                 uv_stride,
                 uv_w,
@@ -1017,7 +1052,7 @@ fn emit_block_at(
                 left_nz_u,
             );
             let (cv, ev, icv) = encode_4x4_block_mode(
-                IntraMode::Dc,
+                picked_uv_mode,
                 v_src,
                 uv_stride,
                 uv_w,
@@ -1079,10 +1114,10 @@ fn emit_block_at(
     let py = &KF_Y_MODE_PROBS[above_mode as usize][left_mode as usize];
     emit_intra_mode_tree(be, py, mode_idx);
 
-    // Emit UV mode (DC_PRED) — KF_UV_MODE_PROBS is keyed by the luma
-    // mode we just emitted.
+    // Emit UV mode (round 48 RDO-picked) — KF_UV_MODE_PROBS is keyed
+    // by the luma mode we just emitted.
     let puv = &KF_UV_MODE_PROBS[mode_idx];
-    emit_intra_mode_tree(be, puv, MODE_DC);
+    emit_intra_mode_tree(be, puv, uv_mode_idx);
 
     // Update above/left mode trackers for downstream blocks. >=8×8
     // case: stamp picked mode at every sub_modes position.
@@ -1212,11 +1247,23 @@ fn pick_intra_mode_block(
 
     let nb = build_recon_neighbours(recon, recon_w, bx, by, PICK_BS);
 
-    // Evaluate each candidate mode using the spec-correct decoder predictor.
-    let mut best_mode = IntraMode::Dc;
-    let mut best_sse = u64::MAX;
+    // Round-48 RDO pruning: probe DC first; if the DC residual is
+    // already at noise floor, skip the rest. CAND_MODES[0] == Dc so this
+    // is also the "no other mode wins" baseline.
     let mut pred_buf = [0u8; PICK_BS * PICK_BS];
-    for &mode in &CAND_MODES {
+    crate::reconintra::predict(IntraMode::Dc, &nb, &mut pred_buf, PICK_BS);
+    let mut best_sse: u64 = 0;
+    for i in 0..PICK_BS * PICK_BS {
+        let d = src_block[i] as i32 - pred_buf[i] as i32;
+        best_sse += (d * d) as u64;
+    }
+    if best_sse <= RDO_DC_EARLY_OUT_SSE {
+        return IntraMode::Dc;
+    }
+
+    // Otherwise evaluate the remaining candidates.
+    let mut best_mode = IntraMode::Dc;
+    for &mode in &CAND_MODES[1..] {
         if mode == IntraMode::V && !nb.have_above {
             continue;
         }

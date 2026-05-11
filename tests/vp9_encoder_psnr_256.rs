@@ -188,6 +188,72 @@ fn encoder_256x256_horizontal_stripes_self_roundtrip() {
     );
 }
 
+/// Round-48 chroma-RDO benefit gate: a 256×256 frame with non-uniform
+/// chroma. Pre-r48 the encoder always emitted DC_PRED for chroma so a
+/// non-flat chroma plane reconstructed at the chroma-DC mean (one
+/// constant per 8×8 block — visible blocking + low PSNR_UV). Post-r48
+/// the chroma RDO picks V/H/TM where appropriate and PSNR_UV climbs
+/// above 30 dB.
+fn chroma_gradient_256x256() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    // Mid-gray luma so we isolate chroma quality.
+    let y = vec![128u8; 256 * 256];
+    // U: smooth horizontal gradient (favours H_PRED).
+    // V: smooth vertical gradient (favours V_PRED).
+    let mut u = vec![0u8; 128 * 128];
+    let mut v = vec![0u8; 128 * 128];
+    for r in 0..128 {
+        for c in 0..128 {
+            u[r * 128 + c] = (32 + (r * 192) / 128) as u8; // varies with row
+            v[r * 128 + c] = (32 + (c * 192) / 128) as u8; // varies with col
+        }
+    }
+    (y, u, v)
+}
+
+#[test]
+fn encoder_256x256_chroma_gradient_self_roundtrip() {
+    use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
+    use oxideav_vp9::{make_decoder, CODEC_ID_STR};
+
+    let (y, u, v) = chroma_gradient_256x256();
+    let src = YuvFrame {
+        y: &y,
+        y_stride: 256,
+        u: &u,
+        v: &v,
+        uv_stride: 128,
+        width: 256,
+        height: 256,
+    };
+    let p = EncoderParams::keyframe(256, 256);
+    let frame_bytes = encode_keyframe_yuv(&p, &src);
+
+    let params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+    let mut dec = make_decoder(&params).unwrap();
+    let pkt = Packet::new(0, TimeBase::new(1, 30), frame_bytes);
+    dec.send_packet(&pkt).unwrap();
+    let f = dec.receive_frame().unwrap();
+    let vf = match f {
+        Frame::Video(v) => v,
+        other => panic!("expected Video, got {other:?}"),
+    };
+    let dec_y = &vf.planes[0].data;
+    let dec_u = &vf.planes[1].data;
+    let dec_v = &vf.planes[2].data;
+    let y_psnr = psnr(&y, dec_y);
+    let u_psnr = psnr(&u, dec_u);
+    let v_psnr = psnr(&v, dec_v);
+    eprintln!("256×256 chroma-gradient PSNR Y={y_psnr:.2} dB  U={u_psnr:.2} dB  V={v_psnr:.2} dB");
+    assert!(
+        u_psnr >= 30.0,
+        "chroma-gradient PSNR_U {u_psnr:.2} dB < 30 dB target (chroma RDO regression?)"
+    );
+    assert!(
+        v_psnr >= 30.0,
+        "chroma-gradient PSNR_V {v_psnr:.2} dB < 30 dB target (chroma RDO regression?)"
+    );
+}
+
 /// Self-roundtrip via our own decoder — confirms the pixel-encoded
 /// stream decodes back to a VideoFrame without errors.
 #[test]

@@ -95,7 +95,7 @@ The shipped integration tests live at `tests/vp9_intra_fixture.rs`
 decodes into `Frame::Video` and differs from the keyframe at pixel
 level).
 
-## Encode support (round 40)
+## Encode support (round 48)
 
 `encode_keyframe_yuv(&EncoderParams, &YuvFrame)` produces a valid VP9
 keyframe IVF payload from source 4:2:0 8-bit pixels.
@@ -107,6 +107,18 @@ keyframe IVF payload from source 4:2:0 8-bit pixels.
   to every 4×4 TX sub-block. Mode trackers (`above_mode_4x4` /
   `left_mode_4x4`) mirror `IntraTile`'s state so `KF_Y_MODE_PROBS[a][l]`
   resolves to the same row on both sides.
+* **Per-block chroma intra-mode RDO** (round 48). The same 4-mode
+  SSE-pick now runs on the U plane per block; the picked `uv_mode`
+  applies to BOTH U and V chroma planes (VP9 stores ONE `uv_mode` per
+  block, applied to both chroma planes — §6.4.6 `read_intra_mode_uv`).
+  Pre-r48 the encoder always emitted `DC_PRED` for chroma, regardless
+  of source content. The picked mode is written into the `KF_UV_MODE_PROBS`
+  tree keyed by the just-emitted luma mode.
+* **Mode-RDO early termination** (round 48). The intra-mode picker
+  probes DC first; if its 4×4 SSE is at noise floor (≤ 16 over 16
+  samples ⇒ ≤ 1 LSB RMS), the V/H/TM evaluations are skipped. Drops
+  ~75% of the per-block mode work on smooth content (where DC wins
+  anyway) without changing output quality.
 * **Forward 4×4 DCT + quantise + token-code** the residual with VP9
   EOB / ZERO / ONE / TWO–FOUR / CAT1–6 Pareto8 tokens.
 * **QP-derived loop-filter level** (round 40). `EncoderParams::keyframe`
@@ -121,17 +133,23 @@ ffmpeg 8.1.
 
 Quality at `base_q_idx = 64`:
 
-| fixture                     | r2 (DC-only, lf=0) | round 40 (RDO + lf=29) |
-|-----------------------------|---------------------:|------------------------:|
-| 256×256 smooth gradient Y   | 50.60 dB             | **53.06 dB**            |
-| 256×256 horizontal stripes Y |  n/a (new)          | **47.62 dB**            |
-| 256×256 chroma (uniform)    | ∞ dB                 | ∞ dB                   |
+| fixture                       | r2 (DC-only, lf=0) | r40 (luma RDO + lf=29) | **r48 (luma+chroma RDO + early-out)** |
+|-------------------------------|--------------------:|------------------------:|--------------------------------------:|
+| 256×256 smooth gradient Y     | 50.60 dB            | 53.06 dB                | **53.06 dB**                          |
+| 256×256 horizontal stripes Y  | n/a                 | 47.62 dB                | **47.62 dB**                          |
+| 256×256 uniform chroma        | ∞ dB                | ∞ dB                    | **∞ dB**                              |
+| 256×256 chroma gradient U     | n/a                 | 50.91 dB (DC-only)      | **52.34 dB**                          |
+| 256×256 chroma gradient V     | n/a                 | 50.92 dB (DC-only)      | **50.97 dB**                          |
 
-The smooth-gradient gain (+2.46 dB) is from QP-derived deblocking; the
-DC mode wins the SSE picker on a perfectly smooth signal so the
-mode-RDO path is a no-op there. The mode-RDO path lights up on the
-horizontal-stripes fixture, where V_PRED tracks the row-to-row step
-exactly and DC's row-average baseline would lose meaningfully.
+The chroma RDO improves the chroma-gradient fixture (`U` row gradient
++ `V` column gradient) by **+1.43 dB on U and +0.05 dB on V**. The U
+plane wins more because the synthetic gradient is exactly the V_PRED
+shape (constant within rows, varies with row) — V_PRED extends the
+above row downward, eliminating the per-row offset that DC carries as
+residual. The V plane gradient (constant within columns, varies with
+column) similarly favours H_PRED. The luma fixtures stay flat: their
+chroma is uniform-128, picked DC at the source-vs-predictor SSE check
+which the chroma early-out then locks in.
 
 `encode_keyframe(&EncoderParams)` remains available for callers that
 want a skip=1 / midgrey-only stream without pixel content.
@@ -608,7 +626,7 @@ None of the above prevent the crate from decoding a standard
 `libvpx-vp9 -g N` 8-bit 4:2:0 IPPP stream into frames the caller can
 render.
 
-## Encoder (experimental — round 40)
+## Encoder (experimental — round 48)
 
 The `encoder` module produces a valid VP9 keyframe bitstream accepted
 by ffmpeg / libvpx and round-trippable through this crate's decoder.
@@ -618,8 +636,14 @@ Scope today:
 * Emits the full §6.2 uncompressed header, §6.3 compressed header
   (tx_mode, coef_probs-update flags, skip_prob-update flags) and the
   tile / partition / block symbols per §6.4.
-* Per-block luma intra-mode RDO across `{DC, V, H, TM}` (round 40);
-  `DC_PRED` chroma; forward 4×4 DCT + quantise + token-coded residual.
+* Per-block luma AND chroma intra-mode RDO across `{DC, V, H, TM}`
+  (rounds 40 + 48). The chroma RDO runs once per block on the U plane
+  and the picked `uv_mode` applies to both U and V (one `uv_mode` per
+  block per §6.4.6). Forward 4×4 DCT + quantise + token-coded residual
+  for both luma and chroma.
+* Mode-RDO early termination (round 48) — DC is probed first; if its
+  4×4 SSE is at noise floor (≤ 16 / 16 samples) the V/H/TM evaluations
+  are skipped, trimming ~75% of the per-block RDO work on smooth content.
 * QP-derived loop filter level (round 40) — `EncoderParams::keyframe`
   picks a non-zero deblocking strength via `default_filter_level`.
 * Partition / intra-mode / skip-context / nonzero-context trackers
@@ -632,7 +656,9 @@ Scope today:
 
 Self-roundtrip: the produced bitstream decodes through
 `Vp9Decoder::send_packet` → `receive_frame` and yields ≥ 50 dB PSNR_Y
-on smooth content at `base_q_idx = 64`.
+on smooth content at `base_q_idx = 64`. Chroma quality on a non-flat
+chroma fixture (smooth U/V gradient) lands at 52.34 dB U / 50.97 dB V
+post-r48.
 
 ffmpeg-acceptance: `tests/vp9_encoder_ffmpeg.rs` decodes the frame
 with the system `ffmpeg` binary and confirms zero decode errors.

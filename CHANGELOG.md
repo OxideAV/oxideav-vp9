@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Round 48 — chroma intra-mode RDO + mode-RDO early termination**
+  in the keyframe encoder. The same 4-mode SSE picker that round 40
+  added on luma now runs on the U plane per block; the picked
+  `uv_mode` applies to both U and V chroma planes (VP9 stores ONE
+  `uv_mode` per block applied to both planes — §6.4.6
+  `read_intra_mode_uv`). Pre-r48 the encoder always emitted
+  `DC_PRED` for chroma, regardless of source content. The mode-RDO
+  picker (used for both luma and chroma) now probes `DC_PRED` first
+  and short-circuits if its 4×4 SSE is at noise floor (≤ 16 across
+  16 samples ⇒ ≤ 1 LSB RMS), skipping V/H/TM evaluations on smooth
+  content. On a 256×256 chroma-gradient fixture (mid-gray luma,
+  U = smooth row gradient, V = smooth column gradient) at
+  `base_q_idx = 64` chroma reconstruction climbs from
+  `U = 50.91 / V = 50.92 dB` (DC-only baseline) to
+  `U = 52.34 / V = 50.97 dB`. Luma fixtures stay flat (smooth
+  gradient Y = 53.06 dB; horizontal stripes Y = 47.62 dB) because
+  their chroma is uniform-128 — the picker still selects DC and the
+  early-out then locks it in. New gate test:
+  `encoder_256x256_chroma_gradient_self_roundtrip` (PSNR ≥ 30 dB
+  hard floor on both U and V).
+
 ### Changed
 
 - VP9 fuzz oracle (`ffmpeg_oracle_decode`) is now robust against

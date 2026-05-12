@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Round 49 — P-frame inter encoder scaffold** (§6.2 non-key
+  uncompressed header, §6.3 inter compressed header, §6.4.11 /
+  §6.4.13 / §6.4.16 inter block walk, §6.4.19 MV emit). The encoder
+  now produces a valid VP9 P-frame against a reconstructed
+  LAST_FRAME reference, exposed via `encode_pframe_yuv`. Scope:
+  single-reference inter (LAST=slot 0; no GOLDEN, no ALTREF, no
+  compound), 64×64 PARTITION_NONE blocks (smaller blocks at edge
+  clips), integer-pel ±16 px full-search block matching against the
+  reference luma plane with SAD cost. Two inter modes: `ZEROMV`
+  when source ≈ reference, `NEWMV` otherwise (MV delta against the
+  decoder-shape `find_best_ref_mvs` BestMv so the per-block delta
+  matches the wire). `skip = 1` everywhere — no residual encoded.
+  `tx_mode = ONLY_4X4`, `interpolation_filter = 0` (EightTap fixed,
+  no per-block switchable bits), `allow_high_precision_mv = false`.
+  A 2-frame 64×64 horizontal-translation test
+  (`tests/r49_pframe_inter.rs::pframe_horizontal_translation_high_psnr_small_size`)
+  produces an I-frame of 410 bytes and a P-frame of 22 bytes (18.6×
+  ratio) with a decoded PSNR_Y of 49.96 dB. The identical-content
+  fixture (`pframe_identical_fixture_zeromv_tiny_size`) compresses
+  to 21 bytes with PSNR_Y of 61.24 dB — essentially just the frame
+  header overhead. Existing keyframe encoder + intra RDO tests
+  continue to pass.
+
 - **Round 48 — chroma intra-mode RDO + mode-RDO early termination**
   in the keyframe encoder. The same 4-mode SSE picker that round 40
   added on luma now runs on the U plane per block; the picked

@@ -104,3 +104,29 @@ pub struct YuvFrame<'a> {
     pub width: u32,
     pub height: u32,
 }
+
+/// A reconstructed reference frame's YUV planes — produced by decoding
+/// the previous I-frame (or P-frame) bitstream and fed to the P-frame
+/// encoder as the LAST_FRAME reference for motion estimation /
+/// compensation. Round 49 ships single-reference inter only, so
+/// callers populate exactly one slot.
+///
+/// The encoder reads from `y`/`u`/`v` at decoder-shape stride; ME
+/// runs against the luma plane in integer-pel units.
+#[derive(Clone, Debug)]
+pub struct ReferenceFrame {
+    /// Reconstructed luma plane (row-major, length = `y_stride * height`).
+    pub y: Vec<u8>,
+    /// Luma stride in bytes.
+    pub y_stride: usize,
+    /// Reconstructed U plane (row-major).
+    pub u: Vec<u8>,
+    /// Reconstructed V plane.
+    pub v: Vec<u8>,
+    /// Chroma stride in bytes (shared between U and V).
+    pub uv_stride: usize,
+    /// Frame width (luma sample count per row).
+    pub width: u32,
+    /// Frame height (luma row count).
+    pub height: u32,
+}

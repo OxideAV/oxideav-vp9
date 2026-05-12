@@ -95,10 +95,12 @@ The shipped integration tests live at `tests/vp9_intra_fixture.rs`
 decodes into `Frame::Video` and differs from the keyframe at pixel
 level).
 
-## Encode support (round 48)
+## Encode support (round 49)
 
 `encode_keyframe_yuv(&EncoderParams, &YuvFrame)` produces a valid VP9
 keyframe IVF payload from source 4:2:0 8-bit pixels.
+`encode_pframe_yuv(&EncoderParams, &YuvFrame, &ReferenceFrame)` (round
+49) encodes a P-frame against a reconstructed LAST_FRAME reference.
 
 * **Per-block luma intra-mode RDO** (round 40). Every 8×8+ block runs
   a 4-mode SSE-pick across `{DC_PRED, V_PRED, H_PRED, TM_PRED}` against
@@ -133,13 +135,15 @@ ffmpeg 8.1.
 
 Quality at `base_q_idx = 64`:
 
-| fixture                       | r2 (DC-only, lf=0) | r40 (luma RDO + lf=29) | **r48 (luma+chroma RDO + early-out)** |
-|-------------------------------|--------------------:|------------------------:|--------------------------------------:|
-| 256×256 smooth gradient Y     | 50.60 dB            | 53.06 dB                | **53.06 dB**                          |
-| 256×256 horizontal stripes Y  | n/a                 | 47.62 dB                | **47.62 dB**                          |
-| 256×256 uniform chroma        | ∞ dB                | ∞ dB                    | **∞ dB**                              |
-| 256×256 chroma gradient U     | n/a                 | 50.91 dB (DC-only)      | **52.34 dB**                          |
-| 256×256 chroma gradient V     | n/a                 | 50.92 dB (DC-only)      | **50.97 dB**                          |
+| fixture                       | r2 (DC-only, lf=0) | r40 (luma RDO + lf=29) | r48 (luma+chroma RDO + early-out) | **r49 (P-frame inter, gain over I-frame)** |
+|-------------------------------|--------------------:|------------------------:|----------------------------------:|-------------------------------------------:|
+| 256×256 smooth gradient Y     | 50.60 dB            | 53.06 dB                | 53.06 dB                          | n/a (keyframe-only)                        |
+| 256×256 horizontal stripes Y  | n/a                 | 47.62 dB                | 47.62 dB                          | n/a (keyframe-only)                        |
+| 256×256 uniform chroma        | ∞ dB                | ∞ dB                    | ∞ dB                              | n/a                                        |
+| 256×256 chroma gradient U     | n/a                 | 50.91 dB (DC-only)      | 52.34 dB                          | n/a                                        |
+| 256×256 chroma gradient V     | n/a                 | 50.92 dB (DC-only)      | 50.97 dB                          | n/a                                        |
+| 64×64 horizontal-translation P| n/a                 | n/a                     | n/a                               | **49.96 dB Y; 18.6× smaller than I-frame** |
+| 64×64 identical-source P      | n/a                 | n/a                     | n/a                               | **61.24 dB Y; 16.9× smaller than I-frame** |
 
 The chroma RDO improves the chroma-gradient fixture (`U` row gradient
 + `V` column gradient) by **+1.43 dB on U and +0.05 dB on V**. The U
@@ -153,6 +157,41 @@ which the chroma early-out then locks in.
 
 `encode_keyframe(&EncoderParams)` remains available for callers that
 want a skip=1 / midgrey-only stream without pixel content.
+
+### P-frame inter encode (round 49)
+
+`encode_pframe_yuv` emits a single-reference (LAST_FRAME) P-frame:
+
+* 64×64 `PARTITION_NONE` blocks across the frame (smaller blocks at
+  edge clips per the keyframe partition-tree shape).
+* Integer-pel block matching ME against the reconstructed reference
+  luma plane: ±16 px full-search window, 64×64 SAD cost, picks the
+  minimum-SAD MV.
+* Two inter modes: `ZEROMV` (when MV ≈ 0) and `NEWMV` (any other
+  integer-pel MV, coded as a §6.4.19 joint + per-component
+  class/bits/fr — `hp` bit elided, `allow_high_precision_mv = false`).
+  The encoder mirrors the decoder's `find_mv_refs` + `find_best_ref_mvs`
+  to emit each NEWMV delta against the same BestMv the decoder will
+  resolve, so the wire is self-consistent.
+* `skip = 1` everywhere — no residual encoded. PSNR comes from MC
+  quality (integer-pel translation → near-exact reconstruction modulo
+  loop-filter smoothing at SB edges).
+* `tx_mode = ONLY_4X4`, `interpolation_filter = 0` (EightTap, fixed —
+  no switchable per-block bits), `frame_reference_mode =
+  SingleReference` (uniform `ref_frame_sign_bias` short-circuits the
+  §6.3.12 compound-mode bit).
+
+Round-49 gate tests (`tests/r49_pframe_inter.rs`):
+
+| fixture                          | I-frame  | P-frame | ratio  | PSNR_Y      |
+|----------------------------------|---------:|--------:|-------:|------------:|
+| 64×64 horizontal translation 4px |  410 B   |  22 B   | 18.6×  | **49.96 dB** |
+| 64×64 identical source           |  356 B   |  21 B   | 16.9×  | **61.24 dB** |
+
+The identical-source case is essentially the P-frame header overhead.
+The translation case demonstrates the integer-pel ME + NEWMV path
+end-to-end: the encoder picks MV = (0, -32) in 1/8-pel units (= 4 px
+left in the reference), the decoder MC reproduces the source.
 
 ## Installation
 
@@ -664,9 +703,17 @@ ffmpeg-acceptance: `tests/vp9_encoder_ffmpeg.rs` decodes the frame
 with the system `ffmpeg` binary and confirms zero decode errors.
 
 Deferred to follow-up work:
-* P-frame / inter encode — the decoder side ships a full inter path
-  (single + compound ref, sub-pel MC, scaled refs, MV decode) but the
-  encoder currently produces keyframes only.
+* Sub-pel ME — round 49 ships integer-pel only. Half-/quarter-/
+  eighth-pel refinement would lift the translation PSNR floor and
+  enable non-integer MVs.
+* Smaller inter block sizes (32×32 / 16×16 / 8×8). Round 49 emits
+  64×64 PARTITION_NONE only (with edge-clip recursion). 16×16 inter
+  blocks would improve PSNR on locally-textured content.
+* Inter residual encoding — round 49 forces `skip = 1`. Encoding MC
+  residual via the existing forward DCT + quant + token path would
+  drop the PSNR ceiling from "MC quality" to "MC + residual quality".
+* Compound reference / GOLDEN / ALTREF — single LAST only today.
+* Sub-8×8 inter blocks (B4x4 / B4x8 / B8x4) with per-sub-block MVs.
 * Multi-tile output — the decoder reads multi-tile bitstreams; encode
   emits a single tile.
 * Two-pass ABR (collect first-pass stats, distribute QP per second-pass).
@@ -677,7 +724,9 @@ Deferred to follow-up work:
 
 Entry points: `encoder::encode_keyframe(&EncoderParams)` yields a
 midgrey skip=1 frame; `encoder::encode_keyframe_yuv(&EncoderParams,
-&YuvFrame)` encodes source 4:2:0 pixels.
+&YuvFrame)` encodes source 4:2:0 pixels;
+`encoder::encode_pframe_yuv(&EncoderParams, &YuvFrame, &ReferenceFrame)`
+encodes a single-reference P-frame (round 49).
 
 ## Fuzz oracle
 

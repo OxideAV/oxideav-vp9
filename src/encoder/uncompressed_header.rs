@@ -88,6 +88,112 @@ pub fn emit_uncompressed_header(p: &EncoderParams, compressed_header_size: u16) 
     bw.finish()
 }
 
+/// Emit the §6.2 uncompressed header for a P-frame (non-key, non-intra-only).
+///
+/// `compressed_header_size` is the byte length of the §6.3 compressed
+/// header that will follow.
+///
+/// `refresh_frame_flags`: 8-bit mask of DPB slots to update on output
+/// (round 49 uses `0x01` — slot 0 refreshed, the LAST_FRAME slot the
+/// next inter frame would read from).
+///
+/// `ref_frame_idx_last`: DPB slot index 0..7 for the LAST_FRAME ref
+/// (round 49 uses 0). GOLDEN/ALTREF slots default to 0 — unused since
+/// all blocks code as single-ref LAST.
+///
+/// `interpolation_filter`: 0..3 picks one of EightTap/EightTapSmooth/
+/// EightTapSharp/Bilinear (per §7.2.7 mapping). 4 = SWITCHABLE per
+/// block. Round 49 fixes 0 (EightTap) so per-block bits are omitted.
+///
+/// `allow_high_precision_mv`: when `true` the §6.4.19 MV decoder reads
+/// the extra `hp` bit. Round 49 keeps this `false` (1/4-pel precision
+/// — sufficient for integer-pel ME results).
+pub fn emit_uncompressed_header_p(
+    p: &EncoderParams,
+    compressed_header_size: u16,
+    refresh_frame_flags: u8,
+    ref_frame_idx_last: u8,
+    interpolation_filter: u8,
+    allow_high_precision_mv: bool,
+) -> Vec<u8> {
+    let mut bw = BitWriter::new();
+
+    // §6.2: frame_marker (2) = 2.
+    bw.write(2, 2);
+    // profile_low / profile_high = 00.
+    bw.write(0, 1);
+    bw.write(0, 1);
+    // show_existing_frame = 0.
+    bw.bit(false);
+    // frame_type = 1 (NON_KEY_FRAME / INTER).
+    bw.bit(true);
+    // show_frame = 1.
+    bw.bit(true);
+    // error_resilient_mode = 0.
+    bw.bit(false);
+
+    // §6.2: non-key path:
+    //   if !show_frame: intra_only (1)     // we set show_frame=1, so NO intra_only bit
+    //   reset_frame_context (2) = 0  (only when !error_resilient_mode)
+    //   refresh_frame_flags (8)
+    //   for i in 0..3: ref_frame_idx[i] (3), ref_frame_sign_bias[LAST+i] (1)
+    //   frame_size_with_refs:
+    //     for i in 0..3: found_ref bit. We emit found_ref=0 each time
+    //                    and then write frame_size + render_size.
+    //   allow_high_precision_mv (1)
+    //   read_interpolation_filter:
+    //     is_filter_switchable (1)
+    //     if 0: interp_filter (2)
+    bw.write(0, 2); // reset_frame_context = 0
+    bw.write(refresh_frame_flags as u32, 8);
+    for _ in 0..3 {
+        bw.write(ref_frame_idx_last as u32, 3);
+        bw.bit(false); // ref_frame_sign_bias = 0 (uniform)
+    }
+    // frame_size_with_refs (§6.2.2.1). Three found_ref bits, then
+    // frame_size + render_size when none match.
+    for _ in 0..3 {
+        bw.bit(false); // found_ref[i] = 0
+    }
+    // After all found_ref=0: emit width/height (§6.2.2 frame_size).
+    bw.write(p.width - 1, 16);
+    bw.write(p.height - 1, 16);
+    bw.bit(false); // render_and_frame_size_different = 0
+    bw.bit(allow_high_precision_mv);
+    // read_interpolation_filter — emit `is_filter_switchable = 0`
+    // then 2 bits for the fixed filter id.
+    bw.bit(false);
+    bw.write(interpolation_filter as u32, 2);
+
+    // §6.2 trailing bits (refresh_frame_context, frame_parallel_decoding_mode,
+    // frame_context_idx) — present when !error_resilient_mode.
+    bw.bit(true); // refresh_frame_context = 1 (save updated ctx — harmless with all-defaults)
+    bw.bit(false); // frame_parallel_decoding_mode = 0
+    bw.write(0, 2); // frame_context_idx = 0
+
+    // §6.2.3 loop_filter_params.
+    bw.write(p.loop_filter_level as u32, 6);
+    bw.write(0, 3); // sharpness
+    bw.bit(false); // mode_ref_delta_enabled = 0
+
+    // §6.2.4 quantization_params.
+    bw.write(p.base_q_idx as u32, 8);
+    bw.bit(false); // delta_q_y_dc
+    bw.bit(false); // delta_q_uv_dc
+    bw.bit(false); // delta_q_uv_ac
+
+    // §6.2.5 segmentation_params — disabled.
+    bw.bit(false);
+
+    // §6.2.6 tile_info.
+    write_tile_info(&mut bw, p.width);
+
+    // §6.2 trailing header_size (16 bits).
+    bw.write(compressed_header_size as u32, 16);
+
+    bw.finish()
+}
+
 fn write_tile_info(bw: &mut BitWriter, width: u32) {
     // §6.2.6 tile_info. We pick `log2_tile_cols = min_log2` (single tile
     // when possible). The decoder reads up to `max_log2 - min_log2`

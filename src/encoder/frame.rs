@@ -7,7 +7,8 @@
 
 use crate::compressed_header::TxMode;
 use crate::encoder::compressed_header::emit_compressed_header;
-use crate::encoder::params::{EncoderParams, YuvFrame};
+use crate::encoder::inter::build_pframe;
+use crate::encoder::params::{EncoderParams, ReferenceFrame, YuvFrame};
 use crate::encoder::tile::emit_keyframe_tile;
 use crate::encoder::tile_pixel::build_pixel_keyframe;
 use crate::encoder::uncompressed_header::emit_uncompressed_header;
@@ -41,6 +42,21 @@ pub fn encode_keyframe(p: &EncoderParams) -> Vec<u8> {
 /// own `Vp9Decoder` and through ffmpeg without errors.
 pub fn encode_keyframe_yuv(p: &EncoderParams, src: &YuvFrame<'_>) -> Vec<u8> {
     build_pixel_keyframe(p, src.y, src.y_stride, src.u, src.v, src.uv_stride)
+}
+
+/// Encode a P-frame against a reconstructed LAST_FRAME reference.
+///
+/// Round 49: single-reference inter with 64×64 PARTITION_NONE blocks,
+/// integer-pel ±16 ME, ZEROMV / NEWMV inter modes, `skip = 1`
+/// (no residual). Returns a full VP9 access-unit byte buffer that
+/// can be packetised into IVF / WebM or fed to `Vp9Decoder::send_packet`.
+///
+/// The caller is responsible for keeping the reference frame in sync —
+/// for a typical key + P chain that's the reconstruction of the
+/// preceding keyframe (which the caller obtains by decoding their own
+/// `encode_keyframe_yuv` output).
+pub fn encode_pframe_yuv(p: &EncoderParams, src: &YuvFrame<'_>, refr: &ReferenceFrame) -> Vec<u8> {
+    build_pframe(p, src, refr)
 }
 
 #[cfg(test)]

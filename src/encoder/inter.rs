@@ -1,4 +1,4 @@
-//! VP9 P-frame (inter) tile encoder — round 49.
+//! VP9 P-frame (inter) tile encoder — round 49 + r-next sub-pel ME.
 //!
 //! Emits a non-keyframe VP9 tile payload that the in-tree decoder
 //! reconstructs into motion-compensated pixel output. Scope:
@@ -10,16 +10,25 @@
 //!   into 32×32 / 16×16 sub-blocks). For edge SBs we recurse the
 //!   keyframe-style partition splits so non-multiple-of-64 frames
 //!   still produce a valid tile.
-//! * Per-SB integer-pel block matching against the reconstructed
-//!   LAST_FRAME plane: ±16 px search window, 64×64 SAD cost.
+//! * Per-SB three-stage motion estimation against the reconstructed
+//!   LAST_FRAME plane:
+//!     1. Integer-pel ±16 px full-search, SAD cost.
+//!     2. 8-neighbour HALF-PEL refinement around the integer-pel
+//!        best — VP9 §6.3 8-tap EightTap luma filter
+//!        (`mcfilter::FILTER_EIGHTTAP`, §8.5.4.2) interpolates the
+//!        reference block at each candidate; SAD picks the lowest.
+//!     3. 8-neighbour QUARTER-PEL refinement around the half-pel best.
+//!
+//!   1/8-pel (`allow_high_precision_mv`) is deferred — r-next stops at
+//!   1/4-pel which is the standard VP9 baseline precision.
 //! * Two inter modes: `ZEROMV` (best MV = (0,0)) or `NEWMV` (any
-//!   other integer-pel MV). `NEARESTMV` / `NEARMV` not emitted —
+//!   other sub-pel MV). `NEARESTMV` / `NEARMV` not emitted —
 //!   round 49 doesn't track BestMv per spec, so emitting those would
 //!   risk mismatch with the decoder's `find_best_ref_mvs` result.
 //! * `skip = 1` everywhere — no residual encoding. PSNR comes
-//!   entirely from MC quality. Translation fixtures with integer-pel
-//!   alignment reconstruct exactly (∞ dB) modulo any §8.8 loop-filter
-//!   smoothing at SB boundaries.
+//!   entirely from MC quality. Translation fixtures with sub-pel
+//!   alignment reconstruct via the 8-tap filter modulo §8.8
+//!   loop-filter smoothing at SB boundaries.
 //! * `tx_mode = ONLY_4X4` — `read_tx_size` returns 0 bits regardless.
 //! * `interpolation_filter = 0` (EightTap) frame-level fixed — no
 //!   per-block switchable-filter bits.
@@ -44,6 +53,7 @@ use crate::compressed_header::TxMode;
 use crate::encoder::bool_encoder::BoolEncoder;
 use crate::encoder::params::{EncoderParams, ReferenceFrame};
 use crate::frame_ctx::FrameContext;
+use crate::mcfilter::{mc_block, InterpFilter, RefSampler};
 use crate::mv::{DEFAULT_MV_COMP_PROBS, MV_JOINT_PROBS};
 use crate::mvref::{
     find_best_ref_mvs, find_mv_refs_geom, BlockGeom, InterMiCell, InterMiGrid, Y_MODE_NEWMV,
@@ -427,10 +437,18 @@ fn emit_inter_block(
 
     // Interpolation filter is non-switchable (frame-level EightTap), no bits.
 
-    // §6.4.16 ME + inter_mode tree. Run integer-pel ME on the luma plane.
+    // §6.4.16 ME + inter_mode tree. Three-stage refinement on the luma plane.
+    //
+    //   1. Integer-pel full search across ±ME_SEARCH_RADIUS.
+    //   2. Half-pel 8-neighbour refinement around the integer winner
+    //      (interpolated through `mcfilter::FILTER_EIGHTTAP`).
+    //   3. Quarter-pel 8-neighbour refinement around the half-pel winner.
+    //
+    // MVs are tracked in 1/8-pel units throughout so the final result
+    // feeds directly into §6.4.19 emit_mv.
     let eff_w = (bsize_px as usize).min((src.width as usize).saturating_sub(col as usize));
     let eff_h = (bsize_px as usize).min((src.height as usize).saturating_sub(row as usize));
-    let (best_mv_row, best_mv_col, best_sad, sad_zero) = block_match_integer(
+    let (int_mv_row, int_mv_col, _int_best_sad, sad_zero) = block_match_integer(
         src,
         refr,
         row as i32,
@@ -438,14 +456,57 @@ fn emit_inter_block(
         eff_w as i32,
         eff_h as i32,
     );
+    // Convert integer-pel best to 1/8-pel units (×8) for the sub-pel stages.
+    let mut best_mv_1_8 = (int_mv_row * 8, int_mv_col * 8);
+    let mut best_sad = compute_sad_subpel(
+        src,
+        refr,
+        row as i32,
+        col as i32,
+        eff_w as i32,
+        eff_h as i32,
+        best_mv_1_8.0,
+        best_mv_1_8.1,
+    );
+
+    // Stage 2: half-pel refinement. Half-pel step = 4 in 1/8-pel units.
+    refine_subpel_8nb(
+        src,
+        refr,
+        row as i32,
+        col as i32,
+        eff_w as i32,
+        eff_h as i32,
+        4,
+        &mut best_mv_1_8,
+        &mut best_sad,
+    );
+    // Stage 3: quarter-pel refinement. Quarter-pel step = 2 in 1/8-pel units.
+    refine_subpel_8nb(
+        src,
+        refr,
+        row as i32,
+        col as i32,
+        eff_w as i32,
+        eff_h as i32,
+        2,
+        &mut best_mv_1_8,
+        &mut best_sad,
+    );
 
     let is_zeromv = best_sad + ME_NEWMV_GATE_SAD >= sad_zero;
     let (mv_row_1_8, mv_col_1_8) = if is_zeromv {
         (0i16, 0i16)
     } else {
-        // Convert integer-pel MV to 1/8-pel units (×8). Clamp to i16.
-        let r = (best_mv_row * 8).clamp(-32768, 32767) as i16;
-        let c = (best_mv_col * 8).clamp(-32768, 32767) as i16;
+        let r = best_mv_1_8.0.clamp(-32768, 32767) as i16;
+        let c = best_mv_1_8.1.clamp(-32768, 32767) as i16;
+        // Round to the smallest representable unit. Without
+        // allow_high_precision_mv the encoder must emit MVs whose
+        // 1/8-pel components are even (i.e. quarter-pel quantum). The
+        // refinement loop already constrains to even values; assert
+        // here.
+        debug_assert_eq!(r & 1, 0, "low-precision MV row must be 1/4-pel-aligned");
+        debug_assert_eq!(c & 1, 0, "low-precision MV col must be 1/4-pel-aligned");
         (r, c)
     };
 
@@ -773,6 +834,135 @@ fn compute_sad(
         }
     }
     sad
+}
+
+/// Edge-clamped reference-luma sampler for `mc_block`. The encoder
+/// keeps the reference plane in `ReferenceFrame::y` with `y_stride`;
+/// out-of-bounds reads replicate the nearest sample (§8.5.4).
+struct EncRefLumaSampler<'a> {
+    refr: &'a ReferenceFrame,
+}
+
+impl<'a> RefSampler for EncRefLumaSampler<'a> {
+    fn sample(&self, row: isize, col: isize) -> u8 {
+        let r = row.clamp(0, self.refr.height as isize - 1) as usize;
+        let c = col.clamp(0, self.refr.width as isize - 1) as usize;
+        self.refr.y[r * self.refr.y_stride + c]
+    }
+}
+
+/// SAD for a sub-pel MV `(mv_row_1_8, mv_col_1_8)` in 1/8-pel units.
+///
+/// Decomposes the 1/8-pel MV into:
+///   * integer part = `mv >> 3` (sign-aware floored)
+///   * sub-pel phase = `mv & 7` (0..=7), mapped onto the 16-phase
+///     EightTap filter table as `phase * 2` (the existing 16-phase
+///     bank covers 1/16-pel chroma; for 1/8-pel luma we use only the
+///     even phases, matching §6.3 + §8.5.4.2 + the inter decoder).
+///
+/// Fast path: integer-pel positions (`sub == 0`) short-circuit to the
+/// plain `compute_sad` for cheaper inner-loop cost.
+#[allow(clippy::too_many_arguments)]
+fn compute_sad_subpel(
+    src: &crate::encoder::params::YuvFrame<'_>,
+    refr: &ReferenceFrame,
+    row: i32,
+    col: i32,
+    bs_w: i32,
+    bs_h: i32,
+    mv_row_1_8: i32,
+    mv_col_1_8: i32,
+) -> u32 {
+    // Floor-divide-by-8 gives the integer-pel offset; the residual is
+    // the sub-pel phase. We use `div_euclid` / `rem_euclid` so negative
+    // MVs split into the expected (integer, non-negative phase) pair.
+    let int_r = mv_row_1_8.div_euclid(8);
+    let int_c = mv_col_1_8.div_euclid(8);
+    let sub_r = mv_row_1_8.rem_euclid(8) as u32;
+    let sub_c = mv_col_1_8.rem_euclid(8) as u32;
+
+    if sub_r == 0 && sub_c == 0 {
+        return compute_sad(src, refr, row, col, bs_w, bs_h, int_r, int_c);
+    }
+
+    // 8-tap EightTap luma filter. The 16-phase bank's even phases map
+    // 1:1 onto VP9's 1/8-pel luma offsets (§6.3 sub_pel_filters_8).
+    let bw = bs_w as usize;
+    let bh = bs_h as usize;
+    let mut interp = vec![0u8; bw * bh];
+    let sampler = EncRefLumaSampler { refr };
+    mc_block(
+        &sampler,
+        InterpFilter::EightTap,
+        &mut interp,
+        bw,
+        bw,
+        bh,
+        (row + int_r) as isize,
+        (col + int_c) as isize,
+        sub_r * 2,
+        sub_c * 2,
+    );
+
+    let mut sad: u32 = 0;
+    let src_w = src.width as i32;
+    let src_h = src.height as i32;
+    for r in 0..bh {
+        for c in 0..bw {
+            let sr = (row + r as i32).clamp(0, src_h - 1) as usize;
+            let sc = (col + c as i32).clamp(0, src_w - 1) as usize;
+            let s = src.y[sr * src.y_stride + sc] as i32;
+            let p = interp[r * bw + c] as i32;
+            sad += (s - p).unsigned_abs();
+        }
+    }
+    sad
+}
+
+/// 8-neighbour sub-pel refinement around `*best_mv_1_8` at `step`
+/// granularity (in 1/8-pel units): `step == 4` ⇒ half-pel,
+/// `step == 2` ⇒ quarter-pel. On entry `*best_sad` holds the SAD at
+/// the current best; on exit, both are updated if any neighbour beats
+/// the centre.
+///
+/// Repeats up to a small bounded number of iterations so the local
+/// minimum can drift one step in either axis. VP9 conformant clients
+/// don't care about how the encoder picks its MV — only that the
+/// emitted MV decodes correctly — so an iterated diamond is fine.
+#[allow(clippy::too_many_arguments)]
+fn refine_subpel_8nb(
+    src: &crate::encoder::params::YuvFrame<'_>,
+    refr: &ReferenceFrame,
+    row: i32,
+    col: i32,
+    bs_w: i32,
+    bs_h: i32,
+    step: i32,
+    best_mv_1_8: &mut (i32, i32),
+    best_sad: &mut u32,
+) {
+    // Two passes keep cost bounded while still letting the search drift
+    // a step in either axis. Practical local minima land within 1 pass.
+    for _iter in 0..2 {
+        let mut improved = false;
+        for dr in [-step, 0, step] {
+            for dc in [-step, 0, step] {
+                if dr == 0 && dc == 0 {
+                    continue;
+                }
+                let cand = (best_mv_1_8.0 + dr, best_mv_1_8.1 + dc);
+                let sad = compute_sad_subpel(src, refr, row, col, bs_w, bs_h, cand.0, cand.1);
+                if sad < *best_sad {
+                    *best_sad = sad;
+                    *best_mv_1_8 = cand;
+                    improved = true;
+                }
+            }
+        }
+        if !improved {
+            break;
+        }
+    }
 }
 
 /// Build a complete P-frame: uncompressed + compressed + tile.

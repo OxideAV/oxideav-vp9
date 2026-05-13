@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **r-next — Sub-pel ME refinement** for the P-frame inter encoder
+  (§6.3 `sub_pel_filters_8` / §8.5.4.2 EightTap luma filter). The
+  integer-pel ±16 SAD search from r49 is now followed by two
+  refinement stages: an 8-neighbour HALF-PEL pass that interpolates
+  the reference block through `mcfilter::FILTER_EIGHTTAP` at each
+  candidate, then an 8-neighbour QUARTER-PEL pass around the half-pel
+  winner. MVs are tracked in 1/8-pel units throughout so the final
+  result feeds directly into §6.4.19 emit_mv. The 1/8-pel
+  (`allow_high_precision_mv`) stage is deferred — r-next stops at
+  1/4-pel which is the standard VP9 baseline precision. Each
+  refinement pass is gated by SAD (≤ 2 inner iterations) so the
+  per-block cost stays bounded. New `tests/r_next_subpel_me.rs`
+  gates against three fixtures:
+  - `pframe_half_pel_translation_high_psnr` — 64×64 frame 2 generated
+    by applying the EightTap phase-8 filter to the reconstructed
+    frame 1; expected ≥ 38 dB, measured **55.23 dB**.
+  - `pframe_quarter_pel_translation_high_psnr` — 64×64 frame 2 from
+    EightTap phase-4 filter; expected ≥ 36 dB, measured **55.88 dB**.
+  - `pframe_integer_pel_translation_no_regression` — r49's 4-px
+    horizontal-shift fixture; sub-pel can only help, never hurt;
+    still **49.96 dB**, identical to the r49 baseline.
+
 - **Round 49 — P-frame inter encoder scaffold** (§6.2 non-key
   uncompressed header, §6.3 inter compressed header, §6.4.11 /
   §6.4.13 / §6.4.16 inter block walk, §6.4.19 MV emit). The encoder

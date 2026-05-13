@@ -1,15 +1,22 @@
-//! VP9 P-frame (inter) tile encoder — round 49 + r-next sub-pel ME.
+//! VP9 P-frame (inter) tile encoder — round 49 + r-next sub-pel ME + r-next quadtree partitions.
 //!
 //! Emits a non-keyframe VP9 tile payload that the in-tree decoder
 //! reconstructs into motion-compensated pixel output. Scope:
 //!
 //! * Single-reference inter (LAST_FRAME = slot 0) — no compound, no
 //!   GOLDEN, no ALTREF (round 49 deferral).
-//! * All blocks are 64×64 `PARTITION_NONE` (matches the keyframe
-//!   encoder's partition tree shape so callers don't have to split
-//!   into 32×32 / 16×16 sub-blocks). For edge SBs we recurse the
-//!   keyframe-style partition splits so non-multiple-of-64 frames
-//!   still produce a valid tile.
+//! * Quadtree partitions per §6.4.16 / §6.5: each 64×64 SB may emit
+//!   `PARTITION_NONE` (one 64×64 block) or `PARTITION_SPLIT` into
+//!   four 32×32 sub-blocks. Each 32×32 may further emit
+//!   `PARTITION_NONE` or `PARTITION_SPLIT` into four 16×16 sub-blocks.
+//!   16×16 blocks always emit `PARTITION_NONE` — r-next stops at
+//!   16×16 (8×8 / sub-8×8 is a later round). The split decision is
+//!   RDO-shaped: the encoder runs ME at the parent block size,
+//!   computes the SAD at the picked MV, then runs ME at each
+//!   candidate sub-block, sums their SADs, adds a per-sub-block
+//!   bit-rate penalty, and picks the lower-cost shape. For edge SBs
+//!   we recurse the keyframe-style partition splits so
+//!   non-multiple-of-64 frames still produce a valid tile.
 //! * Per-SB three-stage motion estimation against the reconstructed
 //!   LAST_FRAME plane:
 //!     1. Integer-pel ±16 px full-search, SAD cost.
@@ -91,6 +98,20 @@ const ME_SEARCH_RADIUS: i32 = 16;
 /// SAD at MV=(0,0), pick NEWMV; otherwise ZEROMV. Saves the MV bits
 /// when the source is approximately stationary.
 const ME_NEWMV_GATE_SAD: u32 = 64;
+
+/// Approximate bit-rate cost of one PARTITION_SPLIT decision plus the
+/// extra per-sub-block symbols (skip / is_inter / ref / inter_mode /
+/// MV joint + components — ~16 bits per sub-block on average vs the
+/// ~10 bits a single block costs). The SPLIT path emits 3 extra
+/// partition bits (the four bits to read SPLIT vs NONE) plus 4×
+/// per-block overhead vs the parent's 1× overhead. SAD units are 8-bit
+/// luma absolute differences; with eff_w*eff_h samples per block at
+/// 8-bit precision, the SAD ranges over 0..=255*samples. A per-bit
+/// cost of `λ * samples` where `λ ≈ 0.5` lets the cost trade real SAD
+/// gain against the partition + sub-block bit budget. Keep low so
+/// splits are picked when sub-block ME genuinely reduces SAD; raise
+/// to discourage gratuitous splits on smooth content.
+const SPLIT_RATE_PENALTY_PER_SUBBLOCK_BITS: u32 = 20;
 
 /// Emit a complete P-frame tile payload using single-reference LAST.
 /// Returns the raw bool-coded tile bytes; the caller assembles the
@@ -295,10 +316,18 @@ impl InterCtx {
 }
 
 /// Recursive partition emitter — mirrors `encoder/tile.rs::emit_partition`
-/// for the keyframe path. Splits at edges; otherwise emits PARTITION_NONE
-/// for whatever bsize we're at. Round 49 emits all 64×64 NONE inter blocks
-/// (or smaller for edge clips). The decoder applies the same partition
-/// tree shape.
+/// for the keyframe path but with r-next RDO between PARTITION_NONE
+/// and PARTITION_SPLIT for interior 64×64 / 32×32 blocks. 16×16 is the
+/// smallest block size emitted by this round; 8×8 / sub-8×8 are reached
+/// only at edges via forced SPLIT (matching the keyframe edge handling).
+///
+/// Decision shape at an interior bsize ∈ {64, 32}:
+///   1. Run ME at the parent bsize → parent SAD + cost.
+///   2. Run ME at each 4× half-sized sub-block → sum of child SADs +
+///      child rate penalty.
+///   3. Pick whichever total cost is lower. SPLIT emits bit sequence
+///      "1, 1, 1" against the partition tree probs (= PARTITION_SPLIT);
+///      NONE emits "0" against probs[0].
 #[allow(clippy::too_many_arguments)]
 fn emit_inter_partition(
     be: &mut BoolEncoder,
@@ -393,10 +422,157 @@ fn emit_inter_partition(
         );
         return;
     }
+    // Interior block. For bsize ∈ {64, 32} run a SPLIT-vs-NONE RDO.
+    // bsize == 16 (and any sub-8×8 edge clips) emits NONE — r-next
+    // doesn't recurse below 16×16.
+    if (bsize == 64 || bsize == 32) && should_split(row, col, bsize, src, refr) {
+        // PARTITION_SPLIT — wire bits "1, 1, 1" per §6.4.2 partition
+        // tree (`read_partition_from_tree`):
+        //   bit0 = 1 (not NONE), bit1 = 1 (not HORZ), bit2 = 1 (SPLIT).
+        be.write(1, probs[0]);
+        be.write(1, probs[1]);
+        be.write(1, probs[2]);
+        emit_inter_partition(be, ctx, row, col, half, frame_w, frame_h, src, refr);
+        emit_inter_partition(be, ctx, row, col + half, half, frame_w, frame_h, src, refr);
+        emit_inter_partition(be, ctx, row + half, col, half, frame_w, frame_h, src, refr);
+        emit_inter_partition(
+            be,
+            ctx,
+            row + half,
+            col + half,
+            half,
+            frame_w,
+            frame_h,
+            src,
+            refr,
+        );
+        return;
+    }
     // Interior PARTITION_NONE — emit `bit=0` against probs[0].
     be.write(0, probs[0]);
     emit_inter_block(be, ctx, row, col, bsize, src, refr);
     ctx.update_partition(bsize, bsize, bsize, mi_row, mi_col);
+}
+
+/// RDO: should we PARTITION_SPLIT this interior bsize ∈ {64, 32} block?
+///
+/// Runs ME at the parent bsize and at each of the 4 half-sized children,
+/// summing SADs. SPLIT wins if the sum of child SADs plus a fixed
+/// `SPLIT_RATE_PENALTY_PER_SUBBLOCK_BITS * 3` bit-rate penalty
+/// (3 = the 3 extra sub-blocks that wouldn't have been emitted as
+/// PARTITION_NONE) is strictly less than the parent SAD.
+fn should_split(
+    row: u32,
+    col: u32,
+    bsize: u32,
+    src: &crate::encoder::params::YuvFrame<'_>,
+    refr: &ReferenceFrame,
+) -> bool {
+    let parent_eff_w = (bsize as usize).min((src.width as usize).saturating_sub(col as usize));
+    let parent_eff_h = (bsize as usize).min((src.height as usize).saturating_sub(row as usize));
+    if parent_eff_w == 0 || parent_eff_h == 0 {
+        return false;
+    }
+    let parent = me_search(
+        src,
+        refr,
+        row as i32,
+        col as i32,
+        parent_eff_w as i32,
+        parent_eff_h as i32,
+    );
+    let half = bsize / 2;
+    // Sum child SADs. Skip out-of-frame children (they'd have been
+    // handled by the on_right / on_bottom edge branch in the caller —
+    // we never reach here unless the block is fully interior).
+    let mut child_sad_sum: u64 = 0;
+    for (dr, dc) in [(0, 0), (0, half), (half, 0), (half, half)] {
+        let child_row = row + dr;
+        let child_col = col + dc;
+        let eff_w = (half as usize).min((src.width as usize).saturating_sub(child_col as usize));
+        let eff_h = (half as usize).min((src.height as usize).saturating_sub(child_row as usize));
+        if eff_w == 0 || eff_h == 0 {
+            continue;
+        }
+        let child = me_search(
+            src,
+            refr,
+            child_row as i32,
+            child_col as i32,
+            eff_w as i32,
+            eff_h as i32,
+        );
+        child_sad_sum += child.best_sad as u64;
+    }
+    // 3 extra sub-blocks beyond what PARTITION_NONE would emit.
+    let split_penalty = (SPLIT_RATE_PENALTY_PER_SUBBLOCK_BITS as u64) * 3;
+    child_sad_sum + split_penalty < parent.best_sad as u64
+}
+
+/// Result of a single block-level motion estimation pass.
+struct MeResult {
+    /// Best MV in 1/8-pel units (`row`, `col`), aligned to 1/4-pel (the
+    /// last bit is always 0 because `allow_high_precision_mv = false`).
+    best_mv_1_8: (i32, i32),
+    /// SAD at `best_mv_1_8` (sub-pel SAD via the EightTap luma filter
+    /// when the MV has any sub-pel phase, otherwise integer-pel SAD).
+    best_sad: u32,
+    /// SAD at MV = (0, 0) — caller uses this to pick ZEROMV vs NEWMV.
+    sad_zero: u32,
+}
+
+/// Three-stage motion search: integer-pel full search → half-pel
+/// 8-neighbour refinement → quarter-pel 8-neighbour refinement.
+/// Mirrors the body of `emit_inter_block` so the partition RDO and the
+/// actual emit see identical SADs.
+fn me_search(
+    src: &crate::encoder::params::YuvFrame<'_>,
+    refr: &ReferenceFrame,
+    row: i32,
+    col: i32,
+    eff_w: i32,
+    eff_h: i32,
+) -> MeResult {
+    let (int_mv_row, int_mv_col, _int_best_sad, sad_zero) =
+        block_match_integer(src, refr, row, col, eff_w, eff_h);
+    let mut best_mv_1_8 = (int_mv_row * 8, int_mv_col * 8);
+    let mut best_sad = compute_sad_subpel(
+        src,
+        refr,
+        row,
+        col,
+        eff_w,
+        eff_h,
+        best_mv_1_8.0,
+        best_mv_1_8.1,
+    );
+    refine_subpel_8nb(
+        src,
+        refr,
+        row,
+        col,
+        eff_w,
+        eff_h,
+        4,
+        &mut best_mv_1_8,
+        &mut best_sad,
+    );
+    refine_subpel_8nb(
+        src,
+        refr,
+        row,
+        col,
+        eff_w,
+        eff_h,
+        2,
+        &mut best_mv_1_8,
+        &mut best_sad,
+    );
+    MeResult {
+        best_mv_1_8,
+        best_sad,
+        sad_zero,
+    }
 }
 
 /// Emit one inter block at (row, col, bsize_px × bsize_px). Performs
@@ -438,17 +614,11 @@ fn emit_inter_block(
     // Interpolation filter is non-switchable (frame-level EightTap), no bits.
 
     // §6.4.16 ME + inter_mode tree. Three-stage refinement on the luma plane.
-    //
-    //   1. Integer-pel full search across ±ME_SEARCH_RADIUS.
-    //   2. Half-pel 8-neighbour refinement around the integer winner
-    //      (interpolated through `mcfilter::FILTER_EIGHTTAP`).
-    //   3. Quarter-pel 8-neighbour refinement around the half-pel winner.
-    //
-    // MVs are tracked in 1/8-pel units throughout so the final result
-    // feeds directly into §6.4.19 emit_mv.
+    // Body lives in `me_search` so the partition-RDO and the emit path
+    // see bit-identical SAD numbers.
     let eff_w = (bsize_px as usize).min((src.width as usize).saturating_sub(col as usize));
     let eff_h = (bsize_px as usize).min((src.height as usize).saturating_sub(row as usize));
-    let (int_mv_row, int_mv_col, _int_best_sad, sad_zero) = block_match_integer(
+    let me = me_search(
         src,
         refr,
         row as i32,
@@ -456,43 +626,9 @@ fn emit_inter_block(
         eff_w as i32,
         eff_h as i32,
     );
-    // Convert integer-pel best to 1/8-pel units (×8) for the sub-pel stages.
-    let mut best_mv_1_8 = (int_mv_row * 8, int_mv_col * 8);
-    let mut best_sad = compute_sad_subpel(
-        src,
-        refr,
-        row as i32,
-        col as i32,
-        eff_w as i32,
-        eff_h as i32,
-        best_mv_1_8.0,
-        best_mv_1_8.1,
-    );
-
-    // Stage 2: half-pel refinement. Half-pel step = 4 in 1/8-pel units.
-    refine_subpel_8nb(
-        src,
-        refr,
-        row as i32,
-        col as i32,
-        eff_w as i32,
-        eff_h as i32,
-        4,
-        &mut best_mv_1_8,
-        &mut best_sad,
-    );
-    // Stage 3: quarter-pel refinement. Quarter-pel step = 2 in 1/8-pel units.
-    refine_subpel_8nb(
-        src,
-        refr,
-        row as i32,
-        col as i32,
-        eff_w as i32,
-        eff_h as i32,
-        2,
-        &mut best_mv_1_8,
-        &mut best_sad,
-    );
+    let best_mv_1_8 = me.best_mv_1_8;
+    let best_sad = me.best_sad;
+    let sad_zero = me.sad_zero;
 
     let is_zeromv = best_sad + ME_NEWMV_GATE_SAD >= sad_zero;
     let (mv_row_1_8, mv_col_1_8) = if is_zeromv {

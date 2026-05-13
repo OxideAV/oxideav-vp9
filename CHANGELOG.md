@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **r-next — Quadtree partition support for the P-frame inter encoder**
+  (§6.4.16 inter block walk / §6.4.2 partition tree / §6.5
+  decode_partition). Pre-this-round the encoder always emitted
+  PARTITION_NONE at 64×64 (matching the keyframe encoder shape).
+  This round adds RDO between PARTITION_NONE and PARTITION_SPLIT at
+  both 64→32 and 32→16; 16×16 always emits NONE (8×8 / sub-8×8 is a
+  later round). The split decision is bitwise: at each interior
+  bsize ∈ {64, 32} the encoder runs `me_search` at the parent block
+  and at each of the 4 candidate sub-blocks, sums the child SADs,
+  adds a fixed-rate penalty of `SPLIT_RATE_PENALTY_PER_SUBBLOCK_BITS
+  * 3 = 60` SAD units (a rough proxy for the 3 extra partition bits
+  plus per-sub-block overhead vs NONE), and picks the lower-cost
+  shape. The decoder already handles the full quadtree, so the
+  change is encoder-only — the wire format simply flips the
+  partition-tree bits from `0` (NONE) to `1, 1, 1` (SPLIT) and
+  recurses. New `tests/r_next_partition.rs` gates against three
+  fixtures:
+  - `partition_uniform_64x64_picks_none` — identical-source fixture;
+    encoder MUST pick PARTITION_NONE (no SAD gain from split). P-frame
+    cap of 32 B catches over-eager splits; measured **21 B** (same as
+    r49 baseline).
+  - `partition_textured_corner_picks_split` — per-quadrant divergent
+    motion (TL shift right 4, TR shift left 4, BL shift down 4, BR
+    shift up 4 — no single 64×64 MV aligns all four). Encoder must
+    pick PARTITION_SPLIT; gated on encoded P-frame > 35 B. Measured
+    **56 B**, vs ~25 B for a hypothetical single-NEWMV NONE encode.
+  - `partition_two_frame_translation_pframe_smaller_than_iframe` —
+    r-next regression: 4-px translation fixture. Encoder must still
+    pick PARTITION_NONE (a single 64×64 MV fits) and P-frame stays
+    smaller than the I-frame. Measured **P-frame = 22 B vs I-frame =
+    410 B**, identical to the r49 baseline; PSNR_Y = 49.96 dB.
+  Existing r-next half/quarter-pel sub-pel tests + r49 P-frame tests
+  stay green (same byte counts and PSNR — partition RDO doesn't fire
+  on the smooth-content single-MV fixtures).
+
 - **r-next — Sub-pel ME refinement** for the P-frame inter encoder
   (§6.3 `sub_pel_filters_8` / §8.5.4.2 EightTap luma filter). The
   integer-pel ±16 SAD search from r49 is now followed by two

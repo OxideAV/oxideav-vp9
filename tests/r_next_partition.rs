@@ -177,7 +177,14 @@ fn partition_textured_corner_picks_split() {
     // linear in MV magnitude — small enough on-axis to converge but
     // far enough from a single-MV-fits-all that the 64×64 SAD is
     // significantly worse than the 4×32×32 SAD sum.
-    let tex = |r: usize, c: usize| 30u8.saturating_add(r as u8 * 2 + c as u8 * 3);
+    let tex = |r: usize, c: usize| {
+        // Distinctive value at each (r, c) so SAD is sensitive to MV
+        // mismatch. Keep magnitudes small (≤ ±64 around 128) so the
+        // smooth-but-non-aliasing landscape converges quickly under
+        // sub-pel ME without overflowing u8 on the per-pixel sum.
+        let v = 128i32 + ((r as i32) - 32) + 2 * ((c as i32) - 32);
+        v.clamp(0, 255) as u8
+    };
 
     let (y1, u1, v1) = make_yuv(tex);
     let src1 = YuvFrame {
@@ -221,16 +228,60 @@ fn partition_textured_corner_picks_split() {
         p_bytes.len()
     );
 
-    // Primary assertion: encoder picked SPLIT.
-    // Single 64×64 NEWMV ≈ 25–30 B (with frame header). SPLIT into 4
-    // sub-blocks adds ~5–15 B per extra sub-block. Empirically the
-    // SPLIT case lands in the 40–70 B range. 35 B is comfortably
-    // above any plausible NONE encode of this fixture (the texture
-    // mismatch forces a non-trivial MV emit even for NONE).
-    assert!(
-        p_bytes.len() > 35,
-        "expected PARTITION_SPLIT shape ≫ single-block size, got {} B",
-        p_bytes.len()
+    // Primary assertion: encoder picked SPLIT at 64×64 for SB(0,0).
+    //
+    // Walk the tile-payload bool stream and read just the first
+    // partition symbol. The first partition is the only one with a
+    // fully-default context: above + left partition ctx are both 0
+    // (no neighbours), so `tbl_bsl * 4 + 0` = `(3-3)*4 = 0` → the
+    // probabilities are `PARTITION_PROBS[0]`. Read the §6.4.2
+    // partition tree against those probs:
+    //   bit0 = 0 → NONE
+    //   bit0 = 1, bit1 = 0 → HORZ
+    //   bit0 = 1, bit1 = 1, bit2 = 0 → VERT
+    //   bit0 = 1, bit1 = 1, bit2 = 1 → SPLIT
+    use oxideav_vp9::bool_decoder::BoolDecoder;
+    use oxideav_vp9::compressed_header::parse_compressed_header;
+    use oxideav_vp9::headers::{parse_uncompressed_header, ColorConfig, ColorSpace};
+    use oxideav_vp9::probs::PARTITION_PROBS;
+    // P-frame inherits the keyframe's color config. The encoder emits
+    // profile-0 8-bit 4:2:0 streams (no high-bit-depth, no 4:4:4).
+    let prev_cc = ColorConfig {
+        bit_depth: 8,
+        color_space: ColorSpace::Bt601,
+        color_range: false,
+        subsampling_x: true,
+        subsampling_y: true,
+    };
+    let h = parse_uncompressed_header(&p_bytes, Some(prev_cc)).expect("parse uncompressed hdr");
+    let cmp_start = h.uncompressed_header_size;
+    let cmp_end = cmp_start + h.header_size as usize;
+    let _ch = parse_compressed_header(&p_bytes[cmp_start..cmp_end], &h).expect("parse cmp hdr");
+    // Tile bytes start after the compressed header. For a single-tile
+    // frame there's no 4-byte length prefix.
+    let tile_bytes = &p_bytes[cmp_end..];
+    let mut bd = BoolDecoder::new(tile_bytes).expect("bool decoder init");
+    let probs = PARTITION_PROBS[0]; // tbl_bsl=0 (bsize=64), no neighbours.
+    let bit0 = bd.read(probs[0]).expect("partition bit0");
+    let partition_kind = if bit0 == 0 {
+        "NONE"
+    } else {
+        let bit1 = bd.read(probs[1]).expect("partition bit1");
+        if bit1 == 0 {
+            "HORZ"
+        } else {
+            let bit2 = bd.read(probs[2]).expect("partition bit2");
+            if bit2 == 0 {
+                "VERT"
+            } else {
+                "SPLIT"
+            }
+        }
+    };
+    eprintln!("  SB(0,0) partition decision: {partition_kind}");
+    assert_eq!(
+        partition_kind, "SPLIT",
+        "expected encoder to pick PARTITION_SPLIT for per-quadrant-shift fixture"
     );
     // Soft sanity floor on PSNR — the textured fixture is sub-pel
     // ME-hostile (a smooth ramp has near-flat SAD over a wide MV

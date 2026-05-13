@@ -33,8 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `partition_textured_corner_picks_split` — per-quadrant divergent
     motion (TL shift right 4, TR shift left 4, BL shift down 4, BR
     shift up 4 — no single 64×64 MV aligns all four). Encoder must
-    pick PARTITION_SPLIT; gated on encoded P-frame > 35 B. Measured
-    **56 B**, vs ~25 B for a hypothetical single-NEWMV NONE encode.
+    pick PARTITION_SPLIT, verified via bytestream-level inspection
+    of the first SB's partition bit pattern (`PARTITION_PROBS[0][0]`
+    against the tile bool stream). Measured P-frame **31 B**; the
+    partition tree resolves to SPLIT at 64×64 with 4× NEWMV 32×32
+    children.
   - `partition_two_frame_translation_pframe_smaller_than_iframe` —
     r-next regression: 4-px translation fixture. Encoder must still
     pick PARTITION_NONE (a single 64×64 MV fits) and P-frame stays

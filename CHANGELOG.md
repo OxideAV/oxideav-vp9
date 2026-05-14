@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **r-next-8x8 — 16×16 HORZ/VERT/SPLIT + 8×8 leaf for the P-frame inter
+  encoder** (§6.4.2 partition tree / §6.4.3 decode_partition / §6.4.16
+  inter_block_mode_info / §6.5.18 subsize syntax). Pre-this-round the
+  inter encoder evaluated `{NONE, SPLIT}` at 64×64 / 32×32 and always
+  emitted NONE at 16×16. This round adds:
+  - **16×16 four-way RDO** across `{NONE, HORZ (16×8 + 16×8), VERT
+    (8×16 + 8×16), SPLIT (4 × 8×8)}`. The encoder runs `me_search` at
+    the parent 16×16 and at each candidate sub-shape (top/bottom
+    halves, left/right halves, four 8×8 children), sums SADs, adds
+    a fixed bit-rate penalty proxy (`SPLIT_RATE_PENALTY_PER_SUBBLOCK_
+    BITS × {0, 1, 1, 3}` for NONE/HORZ/VERT/SPLIT), and picks the
+    lowest total. Wire bits per §6.4.2: NONE="0", HORZ="1, 0",
+    VERT="1, 1, 0", SPLIT="1, 1, 1".
+  - **8×8 leaf**. 8×8 always emits PARTITION_NONE for inter — 8×8 is
+    the spec minimum block size; sub-8×8 (B4x4 / B4x8 / B8x4) lives
+    behind the §6.5.18 subsize syntax which this encoder doesn't yet
+    emit (it would require per-4×4 mode-info iteration).
+  - **`emit_inter_block` refactor**: signature gains a separate
+    `(bsize_w_px, bsize_h_px)` so the same emit path handles B8x8,
+    B8x16, B16x8, B16x16, B32x32, B64x64. `block_size_code_for` is
+    generalised from `(side)` to `(w, h)` to return the correct §3
+    Table 3-1 BlockSize enum value (B16x8=5, B8x16=4, B32x16=8, etc.)
+    so `find_mv_refs_geom` reads the right neighbour-offset list.
+  - **`EncoderParams::debug_force_16x16_only`** flag (off by default).
+    Forces the 16×16 partition picker to PARTITION_NONE so regression
+    tests can compare full-shape RDO against the pre-this-round
+    16×16-NONE-only baseline on a shared loop-filter / header / outer-
+    partition path.
+  New `tests/r_next_8x8.rs` (4 cases):
+  - `eight_by_eight_split_at_textured_16x16_patch` — 16×16 patch with
+    per-8×8 divergent motion in a 64×64 uniform frame. Encoder must
+    SPLIT all the way down: 64=SPLIT → TL 32=SPLIT → TL-of-TL 16=SPLIT
+    → 8=NONE. Measured P-frame=166 B at PSNR_Y=19.97 dB.
+  - `eight_by_eight_picks_horz_on_horizontal_stripe` — every 16×16 has
+    top-vs-bottom 16×8 divergent row motion (±4 px). Encoder must
+    emit PARTITION_HORZ at TL 16×16. Measured P-frame=72 B.
+  - `eight_by_eight_picks_vert_on_vertical_stripe` — every 16×16 has
+    left-vs-right 8×16 divergent col motion (±4 px). Encoder must
+    emit PARTITION_VERT. Measured P-frame=74 B.
+  - `eight_by_eight_psnr_gain_over_16x16_baseline` — 2-frame fixture
+    with per-8×8 divergent motion. PSNR_Y must improve by ≥ 0.5 dB
+    over the `debug_force_16x16_only` baseline. Measured baseline
+    14.94 dB vs actual 18.49 dB → **+3.55 dB gain**.
+  Existing r-next + r-next-8x8 sub-pel / partition / r49 tests stay
+  green (same byte counts and PSNR on those fixtures since the new
+  RDO never triggers on smooth single-MV content).
+
 - **r-next — Quadtree partition support for the P-frame inter encoder**
   (§6.4.16 inter block walk / §6.4.2 partition tree / §6.5
   decode_partition). Pre-this-round the encoder always emitted

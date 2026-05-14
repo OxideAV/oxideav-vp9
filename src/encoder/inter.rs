@@ -1,4 +1,5 @@
-//! VP9 P-frame (inter) tile encoder — round 49 + r-next sub-pel ME + r-next quadtree partitions.
+//! VP9 P-frame (inter) tile encoder — round 49 + r-next sub-pel ME + r-next quadtree partitions
+//! + r-next-8x8 16×16 HORZ/VERT shapes + 8×8 leaf.
 //!
 //! Emits a non-keyframe VP9 tile payload that the in-tree decoder
 //! reconstructs into motion-compensated pixel output. Scope:
@@ -9,8 +10,11 @@
 //!   `PARTITION_NONE` (one 64×64 block) or `PARTITION_SPLIT` into
 //!   four 32×32 sub-blocks. Each 32×32 may further emit
 //!   `PARTITION_NONE` or `PARTITION_SPLIT` into four 16×16 sub-blocks.
-//!   16×16 blocks always emit `PARTITION_NONE` — r-next stops at
-//!   16×16 (8×8 / sub-8×8 is a later round). The split decision is
+//!   At 16×16 we evaluate all of `{NONE, HORZ (16×8 + 16×8), VERT
+//!   (8×16 + 8×16), SPLIT (4 × 8×8)}` and pick by RDO. 8×8 emits
+//!   `PARTITION_NONE` as a leaf — for inter, 8×8 is the minimum
+//!   block size; sub-8×8 (B4x4 / B4x8 / B8x4) is intra-only territory
+//!   per §6.5.18 and not emitted by this encoder. The split decision is
 //!   RDO-shaped: the encoder runs ME at the parent block size,
 //!   computes the SAD at the picked MV, then runs ME at each
 //!   candidate sub-block, sums their SADs, adds a per-sub-block
@@ -137,6 +141,7 @@ pub fn emit_pframe_tile(
         mv_grid: InterMiGrid::new(mi_cols, mi_rows),
         mi_cols,
         mi_rows,
+        debug_force_16x16_only: p.debug_force_16x16_only,
     };
 
     let sb_cols = p.width.div_ceil(64);
@@ -166,6 +171,11 @@ struct InterCtx {
     mv_grid: InterMiGrid,
     mi_cols: usize,
     mi_rows: usize,
+    /// Mirror of `EncoderParams::debug_force_16x16_only` — when true,
+    /// the 16×16 partition picker short-circuits to PARTITION_NONE so
+    /// regression tests can compare full-shape RDO vs 16×16-NONE-only
+    /// reconstruction on the same wire/loop-filter path.
+    debug_force_16x16_only: bool,
 }
 
 impl InterCtx {
@@ -316,18 +326,21 @@ impl InterCtx {
 }
 
 /// Recursive partition emitter — mirrors `encoder/tile.rs::emit_partition`
-/// for the keyframe path but with r-next RDO between PARTITION_NONE
-/// and PARTITION_SPLIT for interior 64×64 / 32×32 blocks. 16×16 is the
-/// smallest block size emitted by this round; 8×8 / sub-8×8 are reached
-/// only at edges via forced SPLIT (matching the keyframe edge handling).
+/// for the keyframe path but with r-next RDO between PARTITION_NONE /
+/// PARTITION_HORZ / PARTITION_VERT / PARTITION_SPLIT for interior blocks.
 ///
-/// Decision shape at an interior bsize ∈ {64, 32}:
-///   1. Run ME at the parent bsize → parent SAD + cost.
-///   2. Run ME at each 4× half-sized sub-block → sum of child SADs +
-///      child rate penalty.
-///   3. Pick whichever total cost is lower. SPLIT emits bit sequence
-///      "1, 1, 1" against the partition tree probs (= PARTITION_SPLIT);
-///      NONE emits "0" against probs[0].
+/// Decision shape at an interior bsize:
+///   * bsize = 64 / 32: NONE vs SPLIT RDO. (HORZ / VERT would still be
+///     valid per spec but the rectangular shapes at these sizes carry
+///     little marginal SAD gain on smooth + naturally-textured content
+///     vs the simpler SPLIT path that recurses one level deeper. Saved
+///     for a later round.)
+///   * bsize = 16: full {NONE, HORZ (16×8 + 16×8), VERT (8×16 + 8×16),
+///     SPLIT (4 × 8×8)} RDO. Wire bits per §6.4.2 partition tree:
+///     NONE  → "0", HORZ  → "1, 0", VERT  → "1, 1, 0", SPLIT → "1, 1, 1".
+///   * bsize = 8: always emit PARTITION_NONE (one 8×8 block). For inter,
+///     8×8 is the spec minimum; sub-8×8 (B4x4 / B4x8 / B8x4) lives behind
+///     the §6.5.18 subsize syntax which this encoder doesn't yet emit.
 #[allow(clippy::too_many_arguments)]
 fn emit_inter_partition(
     be: &mut BoolEncoder,
@@ -353,7 +366,7 @@ fn emit_inter_partition(
     if on_right && on_bottom {
         if bsize == 8 {
             // 8×8 at corner — emit as NONE.
-            emit_inter_block(be, ctx, row, col, bsize, src, refr);
+            emit_inter_block(be, ctx, row, col, bsize, bsize, src, refr);
             ctx.update_partition(bsize, bsize, bsize, mi_row, mi_col);
             return;
         }
@@ -375,11 +388,11 @@ fn emit_inter_partition(
         return;
     }
     if on_right {
-        // Only HORZ or SPLIT readable per spec (single bit at probs[2]).
+        // Only VERT or SPLIT readable per spec (single bit at probs[2]).
         // We pick SPLIT.
         be.write(1, probs[2]);
         if bsize == 8 {
-            emit_inter_block(be, ctx, row, col, bsize, src, refr);
+            emit_inter_block(be, ctx, row, col, bsize, bsize, src, refr);
             ctx.update_partition(bsize, bsize, bsize, mi_row, mi_col);
             return;
         }
@@ -402,7 +415,7 @@ fn emit_inter_partition(
     if on_bottom {
         be.write(1, probs[1]);
         if bsize == 8 {
-            emit_inter_block(be, ctx, row, col, bsize, src, refr);
+            emit_inter_block(be, ctx, row, col, bsize, bsize, src, refr);
             ctx.update_partition(bsize, bsize, bsize, mi_row, mi_col);
             return;
         }
@@ -422,10 +435,74 @@ fn emit_inter_partition(
         );
         return;
     }
-    // Interior block. For bsize ∈ {64, 32} run a SPLIT-vs-NONE RDO.
-    // bsize == 16 (and any sub-8×8 edge clips) emits NONE — r-next
-    // doesn't recurse below 16×16.
-    if (bsize == 64 || bsize == 32) && should_split(row, col, bsize, src, refr) {
+    // Interior block.
+    if bsize == 8 {
+        // §6.4.2 still has a partition bit at bsize=8 (NONE vs HORZ vs
+        // VERT vs SPLIT). For inter we always emit NONE — no sub-8×8
+        // splits are produced.
+        be.write(0, probs[0]);
+        emit_inter_block(be, ctx, row, col, bsize, bsize, src, refr);
+        ctx.update_partition(bsize, bsize, bsize, mi_row, mi_col);
+        return;
+    }
+    if bsize == 16 {
+        let pick = if ctx.debug_force_16x16_only {
+            Partition16::None
+        } else {
+            pick_partition_16(row, col, src, refr)
+        };
+        match pick {
+            Partition16::None => {
+                be.write(0, probs[0]);
+                emit_inter_block(be, ctx, row, col, bsize, bsize, src, refr);
+                ctx.update_partition(bsize, bsize, bsize, mi_row, mi_col);
+            }
+            Partition16::Horz => {
+                // PARTITION_HORZ — wire "1, 0".
+                be.write(1, probs[0]);
+                be.write(0, probs[1]);
+                emit_inter_block(be, ctx, row, col, bsize, half, src, refr);
+                if row + half < frame_h {
+                    emit_inter_block(be, ctx, row + half, col, bsize, half, src, refr);
+                }
+                ctx.update_partition(bsize, bsize, half, mi_row, mi_col);
+            }
+            Partition16::Vert => {
+                // PARTITION_VERT — wire "1, 1, 0".
+                be.write(1, probs[0]);
+                be.write(1, probs[1]);
+                be.write(0, probs[2]);
+                emit_inter_block(be, ctx, row, col, half, bsize, src, refr);
+                if col + half < frame_w {
+                    emit_inter_block(be, ctx, row, col + half, half, bsize, src, refr);
+                }
+                ctx.update_partition(bsize, half, bsize, mi_row, mi_col);
+            }
+            Partition16::Split => {
+                // PARTITION_SPLIT — wire "1, 1, 1", recurse to 8×8.
+                be.write(1, probs[0]);
+                be.write(1, probs[1]);
+                be.write(1, probs[2]);
+                emit_inter_partition(be, ctx, row, col, half, frame_w, frame_h, src, refr);
+                emit_inter_partition(be, ctx, row, col + half, half, frame_w, frame_h, src, refr);
+                emit_inter_partition(be, ctx, row + half, col, half, frame_w, frame_h, src, refr);
+                emit_inter_partition(
+                    be,
+                    ctx,
+                    row + half,
+                    col + half,
+                    half,
+                    frame_w,
+                    frame_h,
+                    src,
+                    refr,
+                );
+            }
+        }
+        return;
+    }
+    // bsize ∈ {64, 32} — NONE vs SPLIT RDO.
+    if should_split(row, col, bsize, src, refr) {
         // PARTITION_SPLIT — wire bits "1, 1, 1" per §6.4.2 partition
         // tree (`read_partition_from_tree`):
         //   bit0 = 1 (not NONE), bit1 = 1 (not HORZ), bit2 = 1 (SPLIT).
@@ -450,8 +527,142 @@ fn emit_inter_partition(
     }
     // Interior PARTITION_NONE — emit `bit=0` against probs[0].
     be.write(0, probs[0]);
-    emit_inter_block(be, ctx, row, col, bsize, src, refr);
+    emit_inter_block(be, ctx, row, col, bsize, bsize, src, refr);
     ctx.update_partition(bsize, bsize, bsize, mi_row, mi_col);
+}
+
+/// Outcome of the 16×16 partition RDO: one of the four §6.4.2 shapes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Partition16 {
+    None,
+    Horz,
+    Vert,
+    Split,
+}
+
+/// RDO across {NONE, HORZ, VERT, SPLIT} for a fully-interior 16×16
+/// block. Runs `me_search` at each candidate shape (parent 16×16, the
+/// two 16×8 halves, the two 8×16 halves, the four 8×8 sub-blocks),
+/// sums SADs, adds a fixed bit-rate penalty proportional to the number
+/// of additional inter blocks vs PARTITION_NONE, and picks the lowest
+/// total.
+///
+/// Penalty unit `SPLIT_RATE_PENALTY_PER_SUBBLOCK_BITS`:
+/// * NONE  — 0 extra inter blocks → 0 penalty.
+/// * HORZ  — 1 extra inter block (2 blocks vs 1) → 1× penalty.
+/// * VERT  — 1 extra inter block → 1× penalty.
+/// * SPLIT — 3 extra inter blocks + partition + per-8×8 partition bits
+///   → 3× penalty.
+fn pick_partition_16(
+    row: u32,
+    col: u32,
+    src: &crate::encoder::params::YuvFrame<'_>,
+    refr: &ReferenceFrame,
+) -> Partition16 {
+    let bsize = 16u32;
+    let half = bsize / 2;
+    let parent_eff_w = (bsize as usize).min((src.width as usize).saturating_sub(col as usize));
+    let parent_eff_h = (bsize as usize).min((src.height as usize).saturating_sub(row as usize));
+    if parent_eff_w == 0 || parent_eff_h == 0 {
+        return Partition16::None;
+    }
+    let parent = me_search(
+        src,
+        refr,
+        row as i32,
+        col as i32,
+        parent_eff_w as i32,
+        parent_eff_h as i32,
+    );
+    let cost_none = parent.best_sad as u64;
+
+    // HORZ — 16×8 top + 16×8 bottom.
+    let top = me_search(
+        src,
+        refr,
+        row as i32,
+        col as i32,
+        parent_eff_w as i32,
+        (half as i32).min(parent_eff_h as i32),
+    );
+    let bot_eff_h = (parent_eff_h as i32) - (half as i32);
+    let bot_sad = if bot_eff_h > 0 {
+        me_search(
+            src,
+            refr,
+            (row + half) as i32,
+            col as i32,
+            parent_eff_w as i32,
+            bot_eff_h,
+        )
+        .best_sad as u64
+    } else {
+        0
+    };
+    let cost_horz = top.best_sad as u64 + bot_sad + SPLIT_RATE_PENALTY_PER_SUBBLOCK_BITS as u64;
+
+    // VERT — 8×16 left + 8×16 right.
+    let left = me_search(
+        src,
+        refr,
+        row as i32,
+        col as i32,
+        (half as i32).min(parent_eff_w as i32),
+        parent_eff_h as i32,
+    );
+    let right_eff_w = (parent_eff_w as i32) - (half as i32);
+    let right_sad = if right_eff_w > 0 {
+        me_search(
+            src,
+            refr,
+            row as i32,
+            (col + half) as i32,
+            right_eff_w,
+            parent_eff_h as i32,
+        )
+        .best_sad as u64
+    } else {
+        0
+    };
+    let cost_vert = left.best_sad as u64 + right_sad + SPLIT_RATE_PENALTY_PER_SUBBLOCK_BITS as u64;
+
+    // SPLIT — four 8×8 children.
+    let mut child_sad_sum: u64 = 0;
+    for (dr, dc) in [(0, 0), (0, half), (half, 0), (half, half)] {
+        let child_row = row + dr;
+        let child_col = col + dc;
+        let eff_w = (half as usize).min((src.width as usize).saturating_sub(child_col as usize));
+        let eff_h = (half as usize).min((src.height as usize).saturating_sub(child_row as usize));
+        if eff_w == 0 || eff_h == 0 {
+            continue;
+        }
+        let child = me_search(
+            src,
+            refr,
+            child_row as i32,
+            child_col as i32,
+            eff_w as i32,
+            eff_h as i32,
+        );
+        child_sad_sum += child.best_sad as u64;
+    }
+    let cost_split = child_sad_sum + (SPLIT_RATE_PENALTY_PER_SUBBLOCK_BITS as u64) * 3;
+
+    // Tie-break: NONE wins ties (cheapest wire cost when SADs match).
+    let mut best = Partition16::None;
+    let mut best_cost = cost_none;
+    if cost_horz < best_cost {
+        best = Partition16::Horz;
+        best_cost = cost_horz;
+    }
+    if cost_vert < best_cost {
+        best = Partition16::Vert;
+        best_cost = cost_vert;
+    }
+    if cost_split < best_cost {
+        best = Partition16::Split;
+    }
+    best
 }
 
 /// RDO: should we PARTITION_SPLIT this interior bsize ∈ {64, 32} block?
@@ -575,23 +786,29 @@ fn me_search(
     }
 }
 
-/// Emit one inter block at (row, col, bsize_px × bsize_px). Performs
+/// Emit one inter block at (row, col, bsize_w_px × bsize_h_px). Performs
 /// integer-pel ME against the LAST_FRAME reference, picks ZEROMV /
 /// NEWMV, and writes the symbol sequence per §6.4.11 / §6.4.16.
+///
+/// `bsize_w_px` and `bsize_h_px` need not be equal — HORZ at 16×16 emits
+/// two 16×8 blocks, VERT at 16×16 emits two 8×16 blocks. The decoder
+/// consumes the same `decode_block(row, col, BlockSize::from_wh(w, h))`
+/// for every rectangular shape we emit here.
 #[allow(clippy::too_many_arguments)]
 fn emit_inter_block(
     be: &mut BoolEncoder,
     ctx: &mut InterCtx,
     row: u32,
     col: u32,
-    bsize_px: u32,
+    bsize_w_px: u32,
+    bsize_h_px: u32,
     src: &crate::encoder::params::YuvFrame<'_>,
     refr: &ReferenceFrame,
 ) {
     let mi_row = (row as usize) / 8;
     let mi_col = (col as usize) / 8;
-    let mi_w = (bsize_px as usize) / 8;
-    let mi_h = (bsize_px as usize) / 8;
+    let mi_w = ((bsize_w_px as usize) / 8).max(1);
+    let mi_h = ((bsize_h_px as usize) / 8).max(1);
 
     // §6.4.8 read_skip — emit skip=1 unconditionally (round 49 simplification).
     let sctx = ctx.skip_ctx(mi_row, mi_col);
@@ -616,8 +833,8 @@ fn emit_inter_block(
     // §6.4.16 ME + inter_mode tree. Three-stage refinement on the luma plane.
     // Body lives in `me_search` so the partition-RDO and the emit path
     // see bit-identical SAD numbers.
-    let eff_w = (bsize_px as usize).min((src.width as usize).saturating_sub(col as usize));
-    let eff_h = (bsize_px as usize).min((src.height as usize).saturating_sub(row as usize));
+    let eff_w = (bsize_w_px as usize).min((src.width as usize).saturating_sub(col as usize));
+    let eff_h = (bsize_h_px as usize).min((src.height as usize).saturating_sub(row as usize));
     let me = me_search(
         src,
         refr,
@@ -650,9 +867,9 @@ fn emit_inter_block(
     // decoder will compute, so our NEWMV delta lines up.
     let mi_cols_i32 = ctx.mi_cols as i32;
     let mi_rows_i32 = ctx.mi_rows as i32;
-    let geom = BlockGeom::from_pixels(row, col, bsize_px, bsize_px, mi_rows_i32, mi_cols_i32);
+    let geom = BlockGeom::from_pixels(row, col, bsize_w_px, bsize_h_px, mi_rows_i32, mi_cols_i32);
     let sign_bias: [bool; 4] = [false; 4];
-    let bsize_code = block_size_code_for(bsize_px) as usize;
+    let bsize_code = block_size_code_for(bsize_w_px, bsize_h_px) as usize;
     let mut refs_a = find_mv_refs_geom(
         &ctx.mv_grid,
         &sign_bias,
@@ -749,20 +966,24 @@ fn single_ref_p1_ctx(ctx: &InterCtx, mi_row: usize, mi_col: usize) -> usize {
 }
 
 /// §3 Table 3-1 block_size_code lookup: returns the spec block-size
-/// code for a square block of side `s`. Only 64/32/16/8 supported
-/// for round 49 (the inter encoder emits no sub-8×8 blocks).
-fn block_size_code_for(s: u32) -> u8 {
-    // Spec BlockSize enum: B4x4=0 ... B64x64=12 with intermediate
-    // rectangular shapes. Square mappings used here:
-    //   8×8   → 3
-    //   16×16 → 6
-    //   32×32 → 9
-    //   64×64 → 12
-    match s {
-        8 => 3,
-        16 => 6,
-        32 => 9,
-        64 => 12,
+/// code for a rectangular `w × h` block. The inter encoder ships
+/// 64/32/16/8 squares plus 16×8 + 8×16 (r-next-8x8 round). Sub-8×8
+/// shapes are intra-only and not emitted.
+fn block_size_code_for(w: u32, h: u32) -> u8 {
+    // Spec BlockSize enum: B4x4=0 ... B64x64=12.
+    match (w, h) {
+        (8, 8) => 3,
+        (8, 16) => 4,
+        (16, 8) => 5,
+        (16, 16) => 6,
+        (16, 32) => 7,
+        (32, 16) => 8,
+        (32, 32) => 9,
+        (32, 64) => 10,
+        (64, 32) => 11,
+        (64, 64) => 12,
+        // Defaults for unexpected shapes — fall back to 64×64 (encoder
+        // never reaches this path on validated inputs).
         _ => 12,
     }
 }

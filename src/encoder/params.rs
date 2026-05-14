@@ -18,6 +18,14 @@ pub struct EncoderParams {
     /// constructor derives this from `base_q_idx` via a libvpx-shape
     /// monotonic heuristic; setting it manually overrides the default.
     pub loop_filter_level: u8,
+    /// Debug-only: force the inter encoder's 16×16 partition picker to
+    /// always emit PARTITION_NONE (no HORZ / VERT / SPLIT at bsize=16).
+    /// Used by regression tests to compare the r-next-8x8 encoder against
+    /// the pre-this-round 16×16-NONE-only baseline on a SHARED loop
+    /// filter / header / ME path. NOT a stable public API — gated to
+    /// the regression-test target. Off-by-default; production encoder
+    /// keeps the full {NONE, HORZ, VERT, SPLIT} RDO at bsize=16.
+    pub debug_force_16x16_only: bool,
 }
 
 impl EncoderParams {
@@ -34,6 +42,7 @@ impl EncoderParams {
             height,
             base_q_idx,
             loop_filter_level: Self::default_filter_level(base_q_idx),
+            debug_force_16x16_only: false,
         }
     }
 

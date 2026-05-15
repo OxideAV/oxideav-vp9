@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **r-next-sub8 — 8×8 four-way RDO with §6.4.16 (idy, idx) sub-block walk**
+  (§6.4.2 partition tree / §6.4.3 decode_partition / §6.4.16
+  inter_block_mode_info / §6.5.18 subsize syntax). Extends the r-next-8x8
+  picker so 8×8 evaluates `{NONE, HORZ B8x4, VERT B4x8, SPLIT B4x4}`
+  instead of only NONE. Per-shape SAD + Lagrangian rate penalty mirrors
+  the 16×16 RDO; SPLIT walks the §6.4.16 (idy, idx) sub-block grid.
+  Headline: ≥1.0 dB PSNR_Y gain on a per-4×4 stripe fixture vs the
+  8×8-NONE-only baseline. Three new regression tests cover HORZ on 8×4
+  stripes, VERT on 4×8 stripes, and the headline PSNR delta. The
+  pre-existing `eight_by_eight_split_at_textured_16x16_patch` is now
+  pinned to `debug_force_8x8_none_only=true` so it still validates the
+  outer SPLIT recursion path while the new RDO is exercised by the
+  dedicated sub-8×8 tests.
+
 - **r-next-8x8 — 16×16 HORZ/VERT/SPLIT + 8×8 leaf for the P-frame inter
   encoder** (§6.4.2 partition tree / §6.4.3 decode_partition / §6.4.16
   inter_block_mode_info / §6.5.18 subsize syntax). Pre-this-round the

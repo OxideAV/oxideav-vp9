@@ -1317,8 +1317,16 @@ impl<'a> InterTile<'a> {
         // Pre-allocate one full-block prediction buffer and write each
         // sub-block into its slice. For >=8×8 the loop runs once and
         // matches the previous single-MC behaviour.
-        let w_px = bs.w() as usize;
-        let h_px = bs.h() as usize;
+        // For sub-8×8 cells (B4x4 / B4x8 / B8x4) the spec §6.4.4 (idy,
+        // idx) loop iterates 4×4 sub-blocks WITHIN a single 8×8 MB —
+        // the BlockSize names the SUB-block shape, not the MB envelope,
+        // which is always 8×8. Sizing the cell-level luma_a / chroma_a
+        // buffers off `bs.w() / bs.h()` (= 4 / 4 for B4x4) under-sizes
+        // them and the (idy=*, idx=1) / (idy=1, idx=*) sub-blocks copy
+        // out of bounds during the sub-block walk. Use the 8×8 envelope
+        // for sub-8×8; >=8×8 cells keep `bs.w() / bs.h()` intact.
+        let w_px = if is_sub8x8 { 8 } else { bs.w() as usize };
+        let h_px = if is_sub8x8 { 8 } else { bs.h() as usize };
         let eff_w = w_px.min(self.width.saturating_sub(col as usize));
         let eff_h = h_px.min(self.height.saturating_sub(row as usize));
         let sub_x = self.hdr.color_config.subsampling_x as usize;
@@ -1359,8 +1367,8 @@ impl<'a> InterTile<'a> {
             while idy < 2 {
                 let mut idx = 0usize;
                 while idx < 2 {
-                    let inter_mode = read_inter_mode(bd, self.ch.ctx.inter_mode_probs[ctx])?;
                     let block_idx = idy * 2 + idx;
+                    let inter_mode = read_inter_mode(bd, self.ch.ctx.inter_mode_probs[ctx])?;
                     // #190 / §6.5.11 — re-run find_mv_refs with the
                     // sub-block index so the first-two-neighbour loop
                     // pulls neighbour MVs through `get_sub_block_mv`

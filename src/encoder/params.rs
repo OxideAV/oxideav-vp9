@@ -26,6 +26,13 @@ pub struct EncoderParams {
     /// the regression-test target. Off-by-default; production encoder
     /// keeps the full {NONE, HORZ, VERT, SPLIT} RDO at bsize=16.
     pub debug_force_16x16_only: bool,
+    /// Debug-only: force the inter encoder's 8×8 partition picker to
+    /// always emit PARTITION_NONE (no HORZ B8x4 / VERT B4x8 / SPLIT B4x4
+    /// sub-8×8 emission at bsize=8). Used by the r-next-sub8 regression
+    /// test to compare full-shape RDO at 8×8 against the previous
+    /// 8×8-NONE-only baseline on a SHARED loop filter / header / outer-
+    /// partition path. NOT a stable public API. Off-by-default.
+    pub debug_force_8x8_none_only: bool,
 }
 
 impl EncoderParams {
@@ -43,6 +50,7 @@ impl EncoderParams {
             base_q_idx,
             loop_filter_level: Self::default_filter_level(base_q_idx),
             debug_force_16x16_only: false,
+            debug_force_8x8_none_only: false,
         }
     }
 

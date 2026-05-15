@@ -1,5 +1,7 @@
-//! VP9 P-frame (inter) tile encoder — round 49 + r-next sub-pel ME + r-next quadtree partitions
-//! + r-next-8x8 16×16 HORZ/VERT shapes + 8×8 leaf.
+//! VP9 P-frame (inter) tile encoder — round 49 + r-next sub-pel ME + r-next
+//! quadtree partitions + r-next-8x8 16×16 HORZ/VERT shapes + 8×8 leaf +
+//! r-next-sub8 8×8 four-way RDO (HORZ B8x4 / VERT B4x8 / SPLIT B4x4 sub-8×8
+//! emission).
 //!
 //! Emits a non-keyframe VP9 tile payload that the in-tree decoder
 //! reconstructs into motion-compensated pixel output. Scope:
@@ -11,10 +13,13 @@
 //!   four 32×32 sub-blocks. Each 32×32 may further emit
 //!   `PARTITION_NONE` or `PARTITION_SPLIT` into four 16×16 sub-blocks.
 //!   At 16×16 we evaluate all of `{NONE, HORZ (16×8 + 16×8), VERT
-//!   (8×16 + 8×16), SPLIT (4 × 8×8)}` and pick by RDO. 8×8 emits
-//!   `PARTITION_NONE` as a leaf — for inter, 8×8 is the minimum
-//!   block size; sub-8×8 (B4x4 / B4x8 / B8x4) is intra-only territory
-//!   per §6.5.18 and not emitted by this encoder. The split decision is
+//!   (8×16 + 8×16), SPLIT (4 × 8×8)}` and pick by RDO. At 8×8 we evaluate
+//!   `{NONE (B8x8), HORZ (B8x4 — 2 sub-blocks), VERT (B4x8 — 2 sub-
+//!   blocks), SPLIT (B4x4 — 4 sub-blocks)}` and pick by RDO; sub-8×8
+//!   shapes engage the §6.4.16 (idy, idx) sub-block walk where the
+//!   cell-level header (skip / is_inter / ref / interp filter) emits
+//!   ONCE and only inter_mode + (NEWMV) MV-delta repeat per 4×4-aligned
+//!   sub-block. The split decision is
 //!   RDO-shaped: the encoder runs ME at the parent block size,
 //!   computes the SAD at the picked MV, then runs ME at each
 //!   candidate sub-block, sums their SADs, adds a per-sub-block
@@ -142,6 +147,7 @@ pub fn emit_pframe_tile(
         mi_cols,
         mi_rows,
         debug_force_16x16_only: p.debug_force_16x16_only,
+        debug_force_8x8_none_only: p.debug_force_8x8_none_only,
     };
 
     let sb_cols = p.width.div_ceil(64);
@@ -176,6 +182,11 @@ struct InterCtx {
     /// regression tests can compare full-shape RDO vs 16×16-NONE-only
     /// reconstruction on the same wire/loop-filter path.
     debug_force_16x16_only: bool,
+    /// Mirror of `EncoderParams::debug_force_8x8_none_only` — when true,
+    /// the 8×8 partition picker short-circuits to PARTITION_NONE so
+    /// regression tests can compare full-shape sub-8×8 RDO vs the
+    /// 8×8-NONE-only baseline.
+    debug_force_8x8_none_only: bool,
 }
 
 impl InterCtx {
@@ -323,6 +334,53 @@ impl InterCtx {
         self.mv_grid
             .fill(mi_row, mi_col, mi_w.max(1), mi_h.max(1), cell);
     }
+
+    /// Variant of `stamp_block` for sub-8×8 cells (B8x4 / B4x8 / B4x4).
+    /// `block_mvs` is `SubMvs[refList=0][b]` — the per-4×4 sub-block MVs
+    /// in spec block-index order (`b = idy*2 + idx`). The cell anchor
+    /// `mv[0]` comes from the LAST sub-block's MV (§6.4.4 line 2420 —
+    /// `mv` is `BlockMvs[0][3]`), driving `y_mode` for the §6.5
+    /// contextCounter.
+    #[allow(clippy::too_many_arguments)]
+    fn stamp_block_sub8x8(
+        &mut self,
+        mi_row: usize,
+        mi_col: usize,
+        mi_w: usize,
+        mi_h: usize,
+        skip: bool,
+        mv: (i16, i16),
+        is_zeromv: bool,
+        block_mvs: &[crate::mv::Mv; 4],
+    ) {
+        for i in 0..mi_w.max(1) {
+            let c = mi_col + i;
+            if c < self.skip_above.len() {
+                self.skip_above[c] = skip;
+                self.intra_above[c] = false;
+            }
+        }
+        for i in 0..mi_h.max(1) {
+            let r = mi_row + i;
+            if r < self.skip_left.len() {
+                self.skip_left[r] = skip;
+                self.intra_left[r] = false;
+            }
+        }
+        let mut cell = InterMiCell::default();
+        cell.ref_frame[0] = 1; // LAST_FRAME
+        cell.ref_frame[1] = 255; // NONE
+        cell.mv[0] = crate::mv::Mv::new(mv.0, mv.1);
+        cell.sub_mvs[0] = *block_mvs;
+        cell.y_mode = if is_zeromv {
+            Y_MODE_ZEROMV
+        } else {
+            Y_MODE_NEWMV
+        };
+        cell.interp_filter = 0; // EightTap
+        self.mv_grid
+            .fill(mi_row, mi_col, mi_w.max(1), mi_h.max(1), cell);
+    }
 }
 
 /// Recursive partition emitter — mirrors `encoder/tile.rs::emit_partition`
@@ -338,9 +396,10 @@ impl InterCtx {
 ///   * bsize = 16: full {NONE, HORZ (16×8 + 16×8), VERT (8×16 + 8×16),
 ///     SPLIT (4 × 8×8)} RDO. Wire bits per §6.4.2 partition tree:
 ///     NONE  → "0", HORZ  → "1, 0", VERT  → "1, 1, 0", SPLIT → "1, 1, 1".
-///   * bsize = 8: always emit PARTITION_NONE (one 8×8 block). For inter,
-///     8×8 is the spec minimum; sub-8×8 (B4x4 / B4x8 / B8x4) lives behind
-///     the §6.5.18 subsize syntax which this encoder doesn't yet emit.
+///   * bsize = 8: full {NONE (B8x8), HORZ (B8x4 — 2 sub-blocks), VERT
+///     (B4x8 — 2 sub-blocks), SPLIT (B4x4 — 4 sub-blocks)} RDO. For
+///     sub-8×8 shapes the encoder emits the cell-level mode-info ONCE
+///     and engages the §6.4.16 (idy, idx) per-4×4 inter_mode + MV walk.
 #[allow(clippy::too_many_arguments)]
 fn emit_inter_partition(
     be: &mut BoolEncoder,
@@ -437,12 +496,54 @@ fn emit_inter_partition(
     }
     // Interior block.
     if bsize == 8 {
-        // §6.4.2 still has a partition bit at bsize=8 (NONE vs HORZ vs
-        // VERT vs SPLIT). For inter we always emit NONE — no sub-8×8
-        // splits are produced.
-        be.write(0, probs[0]);
-        emit_inter_block(be, ctx, row, col, bsize, bsize, src, refr);
-        ctx.update_partition(bsize, bsize, bsize, mi_row, mi_col);
+        // §6.4.2 partition tree at bsize=8 picks one of {NONE, HORZ
+        // (B8x4), VERT (B4x8), SPLIT (B4x4)}. For sub-8×8 shapes the
+        // decoder's `decode_block` calls happen ONCE per cell with the
+        // rectangular BlockSize; the spec's §6.4.16 (idy, idx) sub-block
+        // walk inside the cell handles per-4×4 inter_mode + MV reads.
+        // The encoder mirrors that: ONE cell-level header (skip /
+        // is_inter / ref / interp filter) followed by N sub-block
+        // (inter_mode + optional MV-delta) bursts where N ∈ {1, 2, 2, 4}
+        // for {NONE, HORZ, VERT, SPLIT}.
+        let pick = if ctx.debug_force_8x8_none_only {
+            Partition8::None
+        } else {
+            pick_partition_8(row, col, src, refr)
+        };
+        match pick {
+            Partition8::None => {
+                be.write(0, probs[0]);
+                emit_inter_block(be, ctx, row, col, bsize, bsize, src, refr);
+                ctx.update_partition(bsize, bsize, bsize, mi_row, mi_col);
+            }
+            Partition8::Horz => {
+                // Wire "1, 0".
+                be.write(1, probs[0]);
+                be.write(0, probs[1]);
+                emit_inter_block_sub8x8(be, ctx, row, col, 8, 4, src, refr);
+                ctx.update_partition(bsize, bsize, 4, mi_row, mi_col);
+            }
+            Partition8::Vert => {
+                // Wire "1, 1, 0".
+                be.write(1, probs[0]);
+                be.write(1, probs[1]);
+                be.write(0, probs[2]);
+                emit_inter_block_sub8x8(be, ctx, row, col, 4, 8, src, refr);
+                ctx.update_partition(bsize, 4, bsize, mi_row, mi_col);
+            }
+            Partition8::Split => {
+                // Wire "1, 1, 1". For SPLIT @ bsize=8 the spec calls
+                // `decode_block(B4x4)` ONCE — the (idy, idx) loop walks
+                // 4 sub-blocks inside that single decode_block call.
+                // So the encoder emits ONE cell with 4 sub-block bursts,
+                // NOT four separate partition recursions.
+                be.write(1, probs[0]);
+                be.write(1, probs[1]);
+                be.write(1, probs[2]);
+                emit_inter_block_sub8x8(be, ctx, row, col, 4, 4, src, refr);
+                ctx.update_partition(bsize, 4, 4, mi_row, mi_col);
+            }
+        }
         return;
     }
     if bsize == 16 {
@@ -661,6 +762,150 @@ fn pick_partition_16(
     }
     if cost_split < best_cost {
         best = Partition16::Split;
+    }
+    best
+}
+
+/// Outcome of the 8×8 partition RDO: one of the four §6.4.2 shapes
+/// available at the smallest spec partition level. NONE keeps the cell
+/// at B8x8 (one block, one MV); HORZ / VERT / SPLIT enter the §6.4.16
+/// sub-8×8 (idy, idx) walk with shape B8x4 / B4x8 / B4x4 respectively.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Partition8 {
+    None,
+    Horz,
+    Vert,
+    Split,
+}
+
+/// RDO across {NONE, HORZ (2 × 8×4), VERT (2 × 4×8), SPLIT (4 × 4×4)}
+/// for an interior 8×8 block. Mirrors `pick_partition_16` but operates
+/// at the smallest §6.4.2 partition level. The picked shape determines
+/// how many independent sub-block MVs the cell can encode (1 / 2 / 2 / 4).
+///
+/// Per `pick_partition_16`'s rate-penalty table — at bsize=8 the cost
+/// of the PARTITION bits + per-sub-block (inter_mode + MV) bursts:
+/// * NONE  — 0 extra sub-block bursts → 0 penalty.
+/// * HORZ  — 1 extra sub-block burst → 1× penalty.
+/// * VERT  — 1 extra sub-block burst → 1× penalty.
+/// * SPLIT — 3 extra sub-block bursts → 3× penalty.
+fn pick_partition_8(
+    row: u32,
+    col: u32,
+    src: &crate::encoder::params::YuvFrame<'_>,
+    refr: &ReferenceFrame,
+) -> Partition8 {
+    let bsize = 8u32;
+    let half = bsize / 2;
+    let parent_eff_w = (bsize as usize).min((src.width as usize).saturating_sub(col as usize));
+    let parent_eff_h = (bsize as usize).min((src.height as usize).saturating_sub(row as usize));
+    if parent_eff_w == 0 || parent_eff_h == 0 {
+        return Partition8::None;
+    }
+    let parent = me_search(
+        src,
+        refr,
+        row as i32,
+        col as i32,
+        parent_eff_w as i32,
+        parent_eff_h as i32,
+    );
+    let cost_none = parent.best_sad as u64;
+
+    // HORZ — 8×4 top + 8×4 bottom.
+    let top_eff_h = (half as i32).min(parent_eff_h as i32);
+    let cost_horz = if top_eff_h > 0 {
+        let top = me_search(
+            src,
+            refr,
+            row as i32,
+            col as i32,
+            parent_eff_w as i32,
+            top_eff_h,
+        );
+        let bot_eff_h = (parent_eff_h as i32) - (half as i32);
+        let bot_sad = if bot_eff_h > 0 {
+            me_search(
+                src,
+                refr,
+                (row + half) as i32,
+                col as i32,
+                parent_eff_w as i32,
+                bot_eff_h,
+            )
+            .best_sad as u64
+        } else {
+            0
+        };
+        top.best_sad as u64 + bot_sad + SPLIT_RATE_PENALTY_PER_SUBBLOCK_BITS as u64
+    } else {
+        u64::MAX
+    };
+
+    // VERT — 4×8 left + 4×8 right.
+    let left_eff_w = (half as i32).min(parent_eff_w as i32);
+    let cost_vert = if left_eff_w > 0 {
+        let left = me_search(
+            src,
+            refr,
+            row as i32,
+            col as i32,
+            left_eff_w,
+            parent_eff_h as i32,
+        );
+        let right_eff_w = (parent_eff_w as i32) - (half as i32);
+        let right_sad = if right_eff_w > 0 {
+            me_search(
+                src,
+                refr,
+                row as i32,
+                (col + half) as i32,
+                right_eff_w,
+                parent_eff_h as i32,
+            )
+            .best_sad as u64
+        } else {
+            0
+        };
+        left.best_sad as u64 + right_sad + SPLIT_RATE_PENALTY_PER_SUBBLOCK_BITS as u64
+    } else {
+        u64::MAX
+    };
+
+    // SPLIT — four 4×4 children.
+    let mut child_sad_sum: u64 = 0;
+    for (dr, dc) in [(0, 0), (0, half), (half, 0), (half, half)] {
+        let child_row = row + dr;
+        let child_col = col + dc;
+        let eff_w = (half as usize).min((src.width as usize).saturating_sub(child_col as usize));
+        let eff_h = (half as usize).min((src.height as usize).saturating_sub(child_row as usize));
+        if eff_w == 0 || eff_h == 0 {
+            continue;
+        }
+        let child = me_search(
+            src,
+            refr,
+            child_row as i32,
+            child_col as i32,
+            eff_w as i32,
+            eff_h as i32,
+        );
+        child_sad_sum += child.best_sad as u64;
+    }
+    let cost_split = child_sad_sum + (SPLIT_RATE_PENALTY_PER_SUBBLOCK_BITS as u64) * 3;
+
+    let mut best = Partition8::None;
+    let mut best_cost = cost_none;
+    if cost_horz < best_cost {
+        best = Partition8::Horz;
+        best_cost = cost_horz;
+    }
+    if cost_vert < best_cost {
+        best = Partition8::Vert;
+        best_cost = cost_vert;
+    }
+    if cost_split < best_cost {
+        best = Partition8::Split;
     }
     best
 }
@@ -913,52 +1158,244 @@ fn emit_inter_block(
     );
 }
 
+/// Emit one sub-8×8 inter cell at (row, col) with shape `sub_w_px ×
+/// sub_h_px` ∈ {8×4, 4×8, 4×4}. The cell occupies one 8×8 MI slot;
+/// per §6.4.16 the (idy, idx) sub-block walk runs `inter_mode +
+/// assign_mv` once per 4×4-aligned sub-block:
+///   * 8×4 → (num4x4w=2, num4x4h=1) → 2 sub-block bursts (idy=0 then idy=1)
+///   * 4×8 → (num4x4w=1, num4x4h=2) → 2 sub-block bursts (idx=0 then idx=1)
+///   * 4×4 → (num4x4w=1, num4x4h=1) → 4 sub-block bursts (idy×idx)
+///
+/// The cell-level mode-info (skip / is_inter / ref_frame / interp_filter)
+/// is emitted ONCE up front; only `inter_mode + (NEWMV) MV-delta` are
+/// per-sub-block. The cell-level `BestMv` (resolved against the
+/// `BlockGeom` for the rectangular shape) anchors every sub-block's
+/// NEWMV delta — this matches the decoder's `assign_mv` which pins
+/// NEWMV's `BestMv` to the cell-level `RefListMv[0]` per
+/// `sub8x8_refined_refs`.
+///
+/// Per-sub-block ME runs an integer + half + quarter-pel search
+/// against the reference plane on the sub-block footprint, identical
+/// to `emit_inter_block`'s body but applied to each (idy, idx) cell.
+#[allow(clippy::too_many_arguments)]
+fn emit_inter_block_sub8x8(
+    be: &mut BoolEncoder,
+    ctx: &mut InterCtx,
+    row: u32,
+    col: u32,
+    sub_w_px: u32,
+    sub_h_px: u32,
+    src: &crate::encoder::params::YuvFrame<'_>,
+    refr: &ReferenceFrame,
+) {
+    debug_assert!(matches!((sub_w_px, sub_h_px), (8, 4) | (4, 8) | (4, 4)));
+    let mi_row = (row as usize) / 8;
+    let mi_col = (col as usize) / 8;
+    // The cell footprint is always one 8×8 MI cell (1, 1) — sub-8×8
+    // shapes don't span multiple MI rows/cols.
+    let cell_mi_w = 1usize;
+    let cell_mi_h = 1usize;
+
+    // Cell-level header: skip / is_inter / ref / (interp implicit).
+    let sctx = ctx.skip_ctx(mi_row, mi_col);
+    be.write(1, SKIP_PROBS[sctx]);
+    let ictx = ctx.is_inter_ctx(mi_row, mi_col);
+    be.write(1, IS_INTER_PROB[ictx]);
+    // tx_mode = ONLY_4X4 → no tx_size bits.
+    let p1_ctx = single_ref_p1_ctx(ctx, mi_row, mi_col);
+    be.write(0, SINGLE_REF_PROB[p1_ctx][0]);
+    // Interpolation filter is non-switchable (frame-level EightTap), no bits.
+
+    // Cell-level find_mv_refs / find_best_ref_mvs against the rectangular
+    // BlockGeom — `BestMv` is then pinned for every sub-block's NEWMV
+    // delta (matches decoder `sub8x8_refined_refs`).
+    let mi_cols_i32 = ctx.mi_cols as i32;
+    let mi_rows_i32 = ctx.mi_rows as i32;
+    let geom = BlockGeom::from_pixels(row, col, sub_w_px, sub_h_px, mi_rows_i32, mi_cols_i32);
+    let sign_bias: [bool; 4] = [false; 4];
+    let bsize_code = block_size_code_for(sub_w_px, sub_h_px) as usize;
+    let mut refs_a = find_mv_refs_geom(
+        &ctx.mv_grid,
+        &sign_bias,
+        1,
+        bsize_code,
+        geom,
+        0,
+        mi_cols_i32,
+    );
+    let allow_hp = false;
+    find_best_ref_mvs(&mut refs_a, allow_hp, &geom);
+    let mode_ctx = (refs_a.mode_context as usize).min(6);
+    let inter_mode_probs = INTER_MODE_PROBS[mode_ctx];
+    let best_anchor_mv = refs_a.best_mv();
+
+    // (num4x4w, num4x4h) per §6.4.16 — step through the (idy, idx) loop.
+    let (num4x4w, num4x4h) = match (sub_w_px, sub_h_px) {
+        (8, 4) => (2usize, 1usize),
+        (4, 8) => (1usize, 2usize),
+        (4, 4) => (1usize, 1usize),
+        _ => (1usize, 1usize),
+    };
+
+    // Per-sub-block MV record for the mv_grid update at the end —
+    // §6.4.4 SubMvs[r][c][refList][b], indexed by spec block index
+    // `b = idy*2 + idx` in 4×4 raster order. Slot `3` doubles as the
+    // cell-level anchor for ≥8×8 neighbours per §6.4.16 line 2700.
+    let mut block_mvs: [crate::mv::Mv; 4] = [crate::mv::Mv::ZERO; 4];
+    let mut last_mv_row_1_8 = 0i16;
+    let mut last_mv_col_1_8 = 0i16;
+    let mut last_is_zeromv = true;
+
+    let mut idy = 0usize;
+    while idy < 2 {
+        let mut idx = 0usize;
+        while idx < 2 {
+            // Sub-block pixel coords + footprint.
+            let sub_row_px = (row as usize) + idy * 4;
+            let sub_col_px = (col as usize) + idx * 4;
+            let sub_w = num4x4w * 4;
+            let sub_h = num4x4h * 4;
+            let eff_w = sub_w.min((src.width as usize).saturating_sub(sub_col_px));
+            let eff_h = sub_h.min((src.height as usize).saturating_sub(sub_row_px));
+
+            // Per-sub-block ME against the reference luma plane.
+            let me = if eff_w > 0 && eff_h > 0 {
+                me_search(
+                    src,
+                    refr,
+                    sub_row_px as i32,
+                    sub_col_px as i32,
+                    eff_w as i32,
+                    eff_h as i32,
+                )
+            } else {
+                MeResult {
+                    best_mv_1_8: (0, 0),
+                    best_sad: 0,
+                    sad_zero: 0,
+                }
+            };
+            let is_zeromv = me.best_sad + ME_NEWMV_GATE_SAD >= me.sad_zero;
+            let (mv_row_1_8, mv_col_1_8) = if is_zeromv {
+                (0i16, 0i16)
+            } else {
+                let r = me.best_mv_1_8.0.clamp(-32768, 32767) as i16;
+                let c = me.best_mv_1_8.1.clamp(-32768, 32767) as i16;
+                debug_assert_eq!(r & 1, 0, "low-precision MV row must be 1/4-pel-aligned");
+                debug_assert_eq!(c & 1, 0, "low-precision MV col must be 1/4-pel-aligned");
+                (r, c)
+            };
+
+            // Emit inter_mode tree symbol.
+            if is_zeromv {
+                be.write(0, inter_mode_probs[0]); // ZEROMV
+            } else {
+                // NEWMV: bits "1, 1, 1".
+                be.write(1, inter_mode_probs[0]);
+                be.write(1, inter_mode_probs[1]);
+                be.write(1, inter_mode_probs[2]);
+                let dmv_r = (mv_row_1_8 as i32) - (best_anchor_mv.row as i32);
+                let dmv_c = (mv_col_1_8 as i32) - (best_anchor_mv.col as i32);
+                emit_mv(be, dmv_r, dmv_c, allow_hp);
+            }
+
+            // Record this sub-block's MV in `block_mvs` — every 4×4 cell
+            // in the sub-block footprint shares this MV (per spec
+            // BlockMvs[refList][(idy+y2)*2+idx+x2]).
+            for y2 in 0..num4x4h {
+                for x2 in 0..num4x4w {
+                    let bi = (idy + y2) * 2 + (idx + x2);
+                    block_mvs[bi] = crate::mv::Mv::new(mv_row_1_8, mv_col_1_8);
+                }
+            }
+            last_mv_row_1_8 = mv_row_1_8;
+            last_mv_col_1_8 = mv_col_1_8;
+            last_is_zeromv = is_zeromv;
+
+            idx += num4x4w;
+        }
+        idy += num4x4h;
+    }
+
+    // Stamp the 8×8 cell with the LAST sub-block's MV at the cell anchor
+    // (`mv[0]` = `BlockMvs[0][3]` per §6.4.4 line 2420) and the per-4×4
+    // sub_mvs from the (idy, idx) walk so future neighbours see the right
+    // §6.5.11 SubMvs lookup.
+    ctx.stamp_block_sub8x8(
+        mi_row,
+        mi_col,
+        cell_mi_w,
+        cell_mi_h,
+        true,
+        (last_mv_row_1_8, last_mv_col_1_8),
+        last_is_zeromv,
+        &block_mvs,
+    );
+}
+
 /// §9.3.2 `single_ref_p1_ctx` — neighbour-aware context for the
-/// first ref-frame bit. Round-49 simplification: we only ever emit
-/// LAST as the primary, never write intra blocks inside a P-frame,
-/// so neighbour state collapses. The full §9.3.2 derivation is
-/// duplicated here so we agree with `InterTile::single_ref_p1_ctx`
-/// on the wire.
+/// first ref-frame bit. The encoder mirrors `InterTile::single_ref_p1_ctx`
+/// VERBATIM — the previous "all-LAST collapses to {0, 2, 3}" approximation
+/// was wrong and produced wire-desyncs whenever both neighbours were
+/// available LAST inter blocks (decoder returned ctx=4, encoder ctx=0,
+/// divergent SINGLE_REF_PROB[ctx][0] → bool stream desync from that
+/// cell onwards). For the all-single-LAST case the spec returns 4.
 fn single_ref_p1_ctx(ctx: &InterCtx, mi_row: usize, mi_col: usize) -> usize {
+    const LAST: u8 = 1;
     let avail_u = mi_row > 0;
     let avail_l = mi_col > 0;
     let above_intra = avail_u && mi_col < ctx.intra_above.len() && ctx.intra_above[mi_col];
     let left_intra = avail_l && mi_row < ctx.intra_left.len() && ctx.intra_left[mi_row];
-    let above_ref = if avail_u && !above_intra { 1u8 } else { 0u8 };
-    let left_ref = if avail_l && !left_intra { 1u8 } else { 0u8 };
-    // §9.3.2: ctx derived from above/left ref-frame & intra flags. With
-    // all neighbours either unavailable or LAST inter blocks, the
-    // resulting ctx is one of {0, 2, 3} — match `InterTile::single_ref_p1_ctx`
-    // for the all-LAST case.
+    // The encoder only emits single-ref LAST blocks, so when a neighbour
+    // is inter (not intra) its ref_frame[0] is always LAST=1 and slot 1
+    // is NONE. `above_single` / `left_single` are therefore always true
+    // for non-intra neighbours. We mirror the decoder's full §9.3.2
+    // derivation explicitly so any future relaxation of this invariant
+    // (e.g. compound) doesn't quietly drift the wire.
+    let above_ref0 = if above_intra {
+        0u8
+    } else if avail_u {
+        LAST
+    } else {
+        0u8
+    };
+    let left_ref0 = if left_intra {
+        0u8
+    } else if avail_l {
+        LAST
+    } else {
+        0u8
+    };
+    // The encoder only emits single-ref LAST blocks, so non-intra
+    // neighbours always have `single == true` and `ref_frame[0] == LAST`.
+    // The decoder's `single_ref_p1_ctx` `above_single` / `left_single`
+    // branches collapse to "always single" — every spec sub-case the
+    // encoder can reach is one of the four alternatives below.
     if avail_u && avail_l {
         if above_intra && left_intra {
             2
-        } else if above_intra || left_intra {
-            // intra one side, LAST inter the other → ctx=1 if LAST, ctx=3 otherwise.
-            if above_ref == 1 || left_ref == 1 {
-                1
-            } else {
-                3
-            }
+        } else if left_intra {
+            // above is single-LAST inter, left intra.
+            4 * ((above_ref0 == LAST) as usize)
+        } else if above_intra {
+            // left is single-LAST inter, above intra.
+            4 * ((left_ref0 == LAST) as usize)
         } else {
-            // Both inter neighbours. Both LAST → ctx 0.
-            // (Spec derivation: 2 * (above==LAST != left==LAST) +
-            //  (above==LAST && left==LAST ? 0 : 1) — collapses to 0 in our case.)
-            0
+            // Both single-LAST inter neighbours.
+            2 * ((above_ref0 == LAST) as usize) + 2 * ((left_ref0 == LAST) as usize)
         }
-    } else if avail_u || avail_l {
-        let intra = if avail_u { above_intra } else { left_intra };
-        let ref_is_last = if avail_u {
-            above_ref == 1
-        } else {
-            left_ref == 1
-        };
-        if intra {
+    } else if avail_u {
+        if above_intra {
             2
-        } else if ref_is_last {
-            0
         } else {
+            // single-LAST above only.
+            4 * ((above_ref0 == LAST) as usize)
+        }
+    } else if avail_l {
+        if left_intra {
             2
+        } else {
+            4 * ((left_ref0 == LAST) as usize)
         }
     } else {
         2
@@ -966,12 +1403,16 @@ fn single_ref_p1_ctx(ctx: &InterCtx, mi_row: usize, mi_col: usize) -> usize {
 }
 
 /// §3 Table 3-1 block_size_code lookup: returns the spec block-size
-/// code for a rectangular `w × h` block. The inter encoder ships
-/// 64/32/16/8 squares plus 16×8 + 8×16 (r-next-8x8 round). Sub-8×8
-/// shapes are intra-only and not emitted.
+/// code for a rectangular `w × h` block. Covers all 13 spec block sizes
+/// (B4x4=0 .. B64x64=12); sub-8×8 entries (B4x4 / B4x8 / B8x4) are
+/// emitted by the r-next-sub8 round when the 8×8 picker selects HORZ /
+/// VERT / SPLIT.
 fn block_size_code_for(w: u32, h: u32) -> u8 {
     // Spec BlockSize enum: B4x4=0 ... B64x64=12.
     match (w, h) {
+        (4, 4) => 0,
+        (4, 8) => 1,
+        (8, 4) => 2,
         (8, 8) => 3,
         (8, 16) => 4,
         (16, 8) => 5,
@@ -1413,6 +1854,58 @@ mod tests {
         let mut bd = BoolDecoder::new(&buf).unwrap();
         let v = read_mv_component(&mut bd, &DEFAULT_MV_COMP_PROBS, false).unwrap();
         assert_eq!(v, -32);
+    }
+
+    /// Check that a 4-sub-block NEWMV burst (matching what
+    /// `emit_inter_block_sub8x8` emits for B4x4) round-trips through
+    /// the bool-stream.
+    #[test]
+    fn b4x4_4newmv_burst_roundtrips() {
+        use crate::bool_decoder::BoolDecoder;
+        use crate::mv::{read_mv_component, read_mv_joint, DEFAULT_MV_COMP_PROBS, MV_JOINT_PROBS};
+        let mut be = BoolEncoder::new();
+        // 4 NEWMV sub-blocks each with delta (16, 16). Anchor=(0,0).
+        // mode_ctx=2, INTER_MODE_PROBS[2] = [7, 166, 63].
+        let inter_probs = INTER_MODE_PROBS[2];
+        for _ in 0..4 {
+            // NEWMV bits "1, 1, 1".
+            be.write(1, inter_probs[0]);
+            be.write(1, inter_probs[1]);
+            be.write(1, inter_probs[2]);
+            emit_mv(&mut be, 16, 16, false);
+        }
+        let buf = be.finish();
+        let mut bd = BoolDecoder::new(&buf).unwrap();
+        for blk in 0..4 {
+            // read_inter_mode bool tree.
+            assert_eq!(bd.read(inter_probs[0]).unwrap(), 1, "blk {blk} mode bit0");
+            assert_eq!(bd.read(inter_probs[1]).unwrap(), 1, "blk {blk} mode bit1");
+            assert_eq!(bd.read(inter_probs[2]).unwrap(), 1, "blk {blk} mode bit2");
+            // assign_mv NEWMV: read joint + 2 components.
+            let j = read_mv_joint(&mut bd, MV_JOINT_PROBS).unwrap();
+            assert_eq!(j as u32, 3, "blk {blk} joint");
+            let dr = read_mv_component(&mut bd, &DEFAULT_MV_COMP_PROBS, false).unwrap();
+            let dc = read_mv_component(&mut bd, &DEFAULT_MV_COMP_PROBS, false).unwrap();
+            assert_eq!((dr, dc), (16, 16), "blk {blk} delta");
+        }
+    }
+
+    #[test]
+    fn emit_mv_delta_32_32_class1_roundtrips() {
+        use crate::bool_decoder::BoolDecoder;
+        use crate::mv::{read_mv_component, read_mv_joint, DEFAULT_MV_COMP_PROBS, MV_JOINT_PROBS};
+        // This is the exact symbol pattern emit_inter_block_sub8x8 produces
+        // for a NEWMV at row=8 col=0 block_idx=0 with delta=(32, 32):
+        // emit_mv writes joint=3, then row component for +32, then col +32.
+        let mut be = BoolEncoder::new();
+        emit_mv(&mut be, 32, 32, false);
+        let buf = be.finish();
+        let mut bd = BoolDecoder::new(&buf).unwrap();
+        let j = read_mv_joint(&mut bd, MV_JOINT_PROBS).unwrap();
+        assert_eq!(j as u32, 3, "joint");
+        let dr = read_mv_component(&mut bd, &DEFAULT_MV_COMP_PROBS, false).unwrap();
+        let dc = read_mv_component(&mut bd, &DEFAULT_MV_COMP_PROBS, false).unwrap();
+        assert_eq!((dr, dc), (32, 32), "delta round-trip");
     }
 
     #[test]

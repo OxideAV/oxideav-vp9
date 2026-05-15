@@ -160,7 +160,7 @@ which the chroma early-out then locks in.
 `encode_keyframe(&EncoderParams)` remains available for callers that
 want a skip=1 / midgrey-only stream without pixel content.
 
-### P-frame inter encode (round 49 + r-next sub-pel ME + r-next partitions + r-next-8x8 16×16 HORZ/VERT + 8×8 leaf)
+### P-frame inter encode (round 49 + r-next sub-pel ME + r-next partitions + r-next-8x8 16×16 HORZ/VERT + r-next-sub8 8×8 four-way RDO)
 
 `encode_pframe_yuv` emits a single-reference (LAST_FRAME) P-frame:
 
@@ -169,10 +169,11 @@ want a skip=1 / midgrey-only stream without pixel content.
   sub-blocks; each 32×32 may further emit NONE or SPLIT into four
   16×16 sub-blocks. At 16×16 the encoder runs a full four-way RDO
   across `{NONE, HORZ (16×8 + 16×8), VERT (8×16 + 8×16), SPLIT
-  (4 × 8×8)}` and picks the lower-cost shape. 8×8 always emits
-  PARTITION_NONE — for inter, 8×8 is the spec minimum block size;
-  sub-8×8 (B4x4 / B4x8 / B8x4) lives behind the §6.5.18 subsize
-  syntax which this encoder doesn't yet emit. The split decision at
+  (4 × 8×8)}` and picks the lower-cost shape. At 8×8 the same
+  four-way RDO is repeated across `{NONE, HORZ B8x4, VERT B4x8,
+  SPLIT B4x4}` via the §6.4.16 (idy, idx) sub-block walk — the §6.5.18
+  subsize syntax is now emitted. ≥1.0 dB PSNR_Y gain on a per-4×4
+  stripe fixture vs the 8×8-NONE-only baseline. The split decision at
   bsize ∈ {64, 32} runs ME at the parent block + at 4 candidate sub-
   blocks, sums the child SADs, adds a fixed-rate penalty proxy for
   the extra partition + sub-block bits, and picks the lower-cost

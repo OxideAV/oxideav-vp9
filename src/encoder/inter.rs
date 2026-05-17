@@ -34,9 +34,13 @@
 //!        (`mcfilter::FILTER_EIGHTTAP`, §8.5.4.2) interpolates the
 //!        reference block at each candidate; SAD picks the lowest.
 //!     3. 8-neighbour QUARTER-PEL refinement around the half-pel best.
-//!
-//!   1/8-pel (`allow_high_precision_mv`) is deferred — r-next stops at
-//!   1/4-pel which is the standard VP9 baseline precision.
+//!     4. (r-next-hp, optional) 8-neighbour 1/8-PEL refinement around
+//!        the quarter-pel best — only runs when the per-frame
+//!        `EncoderParams::allow_high_precision_mv` flag is `true`. The
+//!        emitted MV components keep all 3 fractional bits in that
+//!        case, and the §6.4.19 `hp` bit is written in the bool stream.
+//!        When the flag is `false` (the round-49 default), MV
+//!        components stay 1/4-pel-aligned and the `hp` bit is elided.
 //! * Two inter modes: `ZEROMV` (best MV = (0,0)) or `NEWMV` (any
 //!   other sub-pel MV). `NEARESTMV` / `NEARMV` not emitted —
 //!   round 49 doesn't track BestMv per spec, so emitting those would
@@ -48,7 +52,10 @@
 //! * `tx_mode = ONLY_4X4` — `read_tx_size` returns 0 bits regardless.
 //! * `interpolation_filter = 0` (EightTap) frame-level fixed — no
 //!   per-block switchable-filter bits.
-//! * `allow_high_precision_mv = false` — `hp` bit elided.
+//! * `allow_high_precision_mv` — gated per-frame via `EncoderParams`.
+//!   Defaults to `false` (round-49 behaviour: `hp` bit elided,
+//!   1/4-pel MV quantum). When `true` (r-next-hp), the encoder runs the
+//!   extra 1/8-pel ME refinement stage and emits the `hp` bit.
 //!
 //! Block emit order per §6.4.11 / §6.4.13 / §6.4.16:
 //!   1. partition bit(s)
@@ -149,6 +156,7 @@ pub fn emit_pframe_tile(
         mi_rows,
         debug_force_16x16_only: p.debug_force_16x16_only,
         debug_force_8x8_none_only: p.debug_force_8x8_none_only,
+        allow_high_precision_mv: p.allow_high_precision_mv,
     };
 
     let sb_cols = p.width.div_ceil(64);
@@ -188,6 +196,11 @@ struct InterCtx {
     /// regression tests can compare full-shape sub-8×8 RDO vs the
     /// 8×8-NONE-only baseline.
     debug_force_8x8_none_only: bool,
+    /// Mirror of `EncoderParams::allow_high_precision_mv`. Gates the
+    /// 1/8-pel ME refinement stage and the `hp` bit in `emit_mv*`.
+    /// When `false`, MV components must be 1/4-pel aligned (even 1/8-pel
+    /// units) and the `hp` bit is elided per §6.4.19.
+    allow_high_precision_mv: bool,
 }
 
 /// Per-CU reference-frame code (§4.8 `LAST_FRAME = 1`, `GOLDEN_FRAME = 2`).
@@ -530,7 +543,7 @@ fn emit_inter_partition(
         let pick = if ctx.debug_force_8x8_none_only {
             Partition8::None
         } else {
-            pick_partition_8(row, col, src, refs)
+            pick_partition_8(row, col, src, refs, ctx.allow_high_precision_mv)
         };
         match pick {
             Partition8::None => {
@@ -572,7 +585,7 @@ fn emit_inter_partition(
         let pick = if ctx.debug_force_16x16_only {
             Partition16::None
         } else {
-            pick_partition_16(row, col, src, refs)
+            pick_partition_16(row, col, src, refs, ctx.allow_high_precision_mv)
         };
         match pick {
             Partition16::None => {
@@ -625,7 +638,7 @@ fn emit_inter_partition(
         return;
     }
     // bsize ∈ {64, 32} — NONE vs SPLIT RDO.
-    if should_split(row, col, bsize, src, refs) {
+    if should_split(row, col, bsize, src, refs, ctx.allow_high_precision_mv) {
         // PARTITION_SPLIT — wire bits "1, 1, 1" per §6.4.2 partition
         // tree (`read_partition_from_tree`):
         //   bit0 = 1 (not NONE), bit1 = 1 (not HORZ), bit2 = 1 (SPLIT).
@@ -681,6 +694,7 @@ fn pick_partition_16(
     col: u32,
     src: &crate::encoder::params::YuvFrame<'_>,
     refs: &ReferenceSet<'_>,
+    allow_hp: bool,
 ) -> Partition16 {
     let bsize = 16u32;
     let half = bsize / 2;
@@ -696,6 +710,7 @@ fn pick_partition_16(
         col as i32,
         parent_eff_w as i32,
         parent_eff_h as i32,
+        allow_hp,
     );
     let cost_none = parent_sad as u64;
 
@@ -707,6 +722,7 @@ fn pick_partition_16(
         col as i32,
         parent_eff_w as i32,
         (half as i32).min(parent_eff_h as i32),
+        allow_hp,
     );
     let bot_eff_h = (parent_eff_h as i32) - (half as i32);
     let bot_sad = if bot_eff_h > 0 {
@@ -717,6 +733,7 @@ fn pick_partition_16(
             col as i32,
             parent_eff_w as i32,
             bot_eff_h,
+            allow_hp,
         ) as u64
     } else {
         0
@@ -731,6 +748,7 @@ fn pick_partition_16(
         col as i32,
         (half as i32).min(parent_eff_w as i32),
         parent_eff_h as i32,
+        allow_hp,
     );
     let right_eff_w = (parent_eff_w as i32) - (half as i32);
     let right_sad = if right_eff_w > 0 {
@@ -741,6 +759,7 @@ fn pick_partition_16(
             (col + half) as i32,
             right_eff_w,
             parent_eff_h as i32,
+            allow_hp,
         ) as u64
     } else {
         0
@@ -764,6 +783,7 @@ fn pick_partition_16(
             child_col as i32,
             eff_w as i32,
             eff_h as i32,
+            allow_hp,
         );
         child_sad_sum += child_sad as u64;
     }
@@ -814,6 +834,7 @@ fn pick_partition_8(
     col: u32,
     src: &crate::encoder::params::YuvFrame<'_>,
     refs: &ReferenceSet<'_>,
+    allow_hp: bool,
 ) -> Partition8 {
     let bsize = 8u32;
     let half = bsize / 2;
@@ -829,6 +850,7 @@ fn pick_partition_8(
         col as i32,
         parent_eff_w as i32,
         parent_eff_h as i32,
+        allow_hp,
     );
     let cost_none = parent_sad as u64;
 
@@ -842,6 +864,7 @@ fn pick_partition_8(
             col as i32,
             parent_eff_w as i32,
             top_eff_h,
+            allow_hp,
         );
         let bot_eff_h = (parent_eff_h as i32) - (half as i32);
         let bot_sad = if bot_eff_h > 0 {
@@ -852,6 +875,7 @@ fn pick_partition_8(
                 col as i32,
                 parent_eff_w as i32,
                 bot_eff_h,
+                allow_hp,
             ) as u64
         } else {
             0
@@ -871,6 +895,7 @@ fn pick_partition_8(
             col as i32,
             left_eff_w,
             parent_eff_h as i32,
+            allow_hp,
         );
         let right_eff_w = (parent_eff_w as i32) - (half as i32);
         let right_sad = if right_eff_w > 0 {
@@ -881,6 +906,7 @@ fn pick_partition_8(
                 (col + half) as i32,
                 right_eff_w,
                 parent_eff_h as i32,
+                allow_hp,
             ) as u64
         } else {
             0
@@ -907,6 +933,7 @@ fn pick_partition_8(
             child_col as i32,
             eff_w as i32,
             eff_h as i32,
+            allow_hp,
         );
         child_sad_sum += child_sad as u64;
     }
@@ -941,6 +968,7 @@ fn should_split(
     bsize: u32,
     src: &crate::encoder::params::YuvFrame<'_>,
     refs: &ReferenceSet<'_>,
+    allow_hp: bool,
 ) -> bool {
     let parent_eff_w = (bsize as usize).min((src.width as usize).saturating_sub(col as usize));
     let parent_eff_h = (bsize as usize).min((src.height as usize).saturating_sub(row as usize));
@@ -954,6 +982,7 @@ fn should_split(
         col as i32,
         parent_eff_w as i32,
         parent_eff_h as i32,
+        allow_hp,
     );
     let half = bsize / 2;
     // Sum child SADs. Skip out-of-frame children (they'd have been
@@ -975,6 +1004,7 @@ fn should_split(
             child_col as i32,
             eff_w as i32,
             eff_h as i32,
+            allow_hp,
         );
         child_sad_sum += child_sad as u64;
     }
@@ -1016,12 +1046,13 @@ fn pick_ref_and_me(
     col: i32,
     eff_w: i32,
     eff_h: i32,
+    allow_hp: bool,
 ) -> (RefPick, MeResult) {
-    let last_me = me_search(src, refs.last, row, col, eff_w, eff_h);
+    let last_me = me_search(src, refs.last, row, col, eff_w, eff_h, allow_hp);
     let Some(golden) = refs.golden else {
         return (RefPick::Last, last_me);
     };
-    let golden_me = me_search(src, golden, row, col, eff_w, eff_h);
+    let golden_me = me_search(src, golden, row, col, eff_w, eff_h, allow_hp);
     if (golden_me.best_sad as u64) + (GOLDEN_REF_RATE_PENALTY_SAD as u64)
         < (last_me.best_sad as u64)
     {
@@ -1041,12 +1072,13 @@ fn best_ref_sad(
     col: i32,
     eff_w: i32,
     eff_h: i32,
+    allow_hp: bool,
 ) -> u32 {
-    let last_sad = me_search(src, refs.last, row, col, eff_w, eff_h).best_sad;
+    let last_sad = me_search(src, refs.last, row, col, eff_w, eff_h, allow_hp).best_sad;
     let Some(golden) = refs.golden else {
         return last_sad;
     };
-    let golden_sad = me_search(src, golden, row, col, eff_w, eff_h).best_sad;
+    let golden_sad = me_search(src, golden, row, col, eff_w, eff_h, allow_hp).best_sad;
     // The +GOLDEN_REF_RATE_PENALTY_SAD penalty IS what
     // `pick_ref_and_me` uses to choose; mirror it here so the
     // partition picker's SAD numbers match the actual emit-path SAD.
@@ -1059,6 +1091,8 @@ fn best_ref_sad(
 
 /// Three-stage motion search: integer-pel full search → half-pel
 /// 8-neighbour refinement → quarter-pel 8-neighbour refinement.
+/// With `allow_high_precision_mv = true` a fourth 1/8-pel 8-neighbour
+/// refinement stage runs after quarter-pel.
 /// Mirrors the body of `emit_inter_block` so the partition RDO and the
 /// actual emit see identical SADs.
 fn me_search(
@@ -1068,6 +1102,7 @@ fn me_search(
     col: i32,
     eff_w: i32,
     eff_h: i32,
+    allow_hp: bool,
 ) -> MeResult {
     let (int_mv_row, int_mv_col, _int_best_sad, sad_zero) =
         block_match_integer(src, refr, row, col, eff_w, eff_h);
@@ -1104,6 +1139,22 @@ fn me_search(
         &mut best_mv_1_8,
         &mut best_sad,
     );
+    if allow_hp {
+        // r-next-hp 1/8-pel refinement — `step == 1` in 1/8-pel units.
+        // Only ever runs when `allow_high_precision_mv = true` so the
+        // emitted MV stays 1/4-pel-aligned in the default-precision path.
+        refine_subpel_8nb(
+            src,
+            refr,
+            row,
+            col,
+            eff_w,
+            eff_h,
+            1,
+            &mut best_mv_1_8,
+            &mut best_sad,
+        );
+    }
     MeResult {
         best_mv_1_8,
         best_sad,
@@ -1150,6 +1201,7 @@ fn emit_inter_block(
     // bit-identical SAD numbers + the same ref pick.
     let eff_w = (bsize_w_px as usize).min((src.width as usize).saturating_sub(col as usize));
     let eff_h = (bsize_h_px as usize).min((src.height as usize).saturating_sub(row as usize));
+    let allow_hp = ctx.allow_high_precision_mv;
     let (ref_pick, me) = pick_ref_and_me(
         src,
         refs,
@@ -1157,6 +1209,7 @@ fn emit_inter_block(
         col as i32,
         eff_w as i32,
         eff_h as i32,
+        allow_hp,
     );
     let best_mv_1_8 = me.best_mv_1_8;
     let best_sad = me.best_sad;
@@ -1179,9 +1232,11 @@ fn emit_inter_block(
         // allow_high_precision_mv the encoder must emit MVs whose
         // 1/8-pel components are even (i.e. quarter-pel quantum). The
         // refinement loop already constrains to even values; assert
-        // here.
-        debug_assert_eq!(r & 1, 0, "low-precision MV row must be 1/4-pel-aligned");
-        debug_assert_eq!(c & 1, 0, "low-precision MV col must be 1/4-pel-aligned");
+        // here. With HP enabled all 1/8-pel values are legal.
+        if !allow_hp {
+            debug_assert_eq!(r & 1, 0, "low-precision MV row must be 1/4-pel-aligned");
+            debug_assert_eq!(c & 1, 0, "low-precision MV col must be 1/4-pel-aligned");
+        }
         (r, c)
     };
 
@@ -1203,7 +1258,6 @@ fn emit_inter_block(
         0,
         mi_cols_i32,
     );
-    let allow_hp = false;
     find_best_ref_mvs(&mut refs_a, allow_hp, &geom);
     let mode_ctx = (refs_a.mode_context as usize).min(6);
 
@@ -1282,6 +1336,7 @@ fn emit_inter_block_sub8x8(
     // 8×8 footprint, then run per-sub-block ME against that ref only.
     let cell_eff_w = 8usize.min((src.width as usize).saturating_sub(col as usize));
     let cell_eff_h = 8usize.min((src.height as usize).saturating_sub(row as usize));
+    let allow_hp = ctx.allow_high_precision_mv;
     let (ref_pick, _) = pick_ref_and_me(
         src,
         refs,
@@ -1289,6 +1344,7 @@ fn emit_inter_block_sub8x8(
         col as i32,
         cell_eff_w as i32,
         cell_eff_h as i32,
+        allow_hp,
     );
     let me_refr: &ReferenceFrame = match ref_pick {
         RefPick::Last => refs.last,
@@ -1321,7 +1377,6 @@ fn emit_inter_block_sub8x8(
         0,
         mi_cols_i32,
     );
-    let allow_hp = false;
     find_best_ref_mvs(&mut refs_a, allow_hp, &geom);
     let mode_ctx = (refs_a.mode_context as usize).min(6);
     let inter_mode_probs = INTER_MODE_PROBS[mode_ctx];
@@ -1365,6 +1420,7 @@ fn emit_inter_block_sub8x8(
                     sub_col_px as i32,
                     eff_w as i32,
                     eff_h as i32,
+                    allow_hp,
                 )
             } else {
                 MeResult {
@@ -1379,8 +1435,10 @@ fn emit_inter_block_sub8x8(
             } else {
                 let r = me.best_mv_1_8.0.clamp(-32768, 32767) as i16;
                 let c = me.best_mv_1_8.1.clamp(-32768, 32767) as i16;
-                debug_assert_eq!(r & 1, 0, "low-precision MV row must be 1/4-pel-aligned");
-                debug_assert_eq!(c & 1, 0, "low-precision MV col must be 1/4-pel-aligned");
+                if !allow_hp {
+                    debug_assert_eq!(r & 1, 0, "low-precision MV row must be 1/4-pel-aligned");
+                    debug_assert_eq!(c & 1, 0, "low-precision MV col must be 1/4-pel-aligned");
+                }
                 (r, c)
             };
 
@@ -2059,9 +2117,10 @@ pub fn build_pframe(
     use crate::encoder::compressed_header::emit_compressed_header_p;
     use crate::encoder::uncompressed_header::emit_uncompressed_header_p;
 
-    // Wiring choices (carry-over from round 49 + r-multiref deltas):
+    // Wiring choices (carry-over from round 49 + r-multiref deltas; r-next-hp
+    // adds `allow_high_precision_mv` as a per-frame encoder param).
     let interpolation_filter = 0u8; // EightTap
-    let allow_hp = false;
+    let allow_hp = p.allow_high_precision_mv;
     let compound_allowed = false; // all sign_bias slots are 0 → uniform → no compound.
 
     let ch = emit_compressed_header_p(

@@ -33,6 +33,17 @@ pub struct EncoderParams {
     /// 8×8-NONE-only baseline on a SHARED loop filter / header / outer-
     /// partition path. NOT a stable public API. Off-by-default.
     pub debug_force_8x8_none_only: bool,
+    /// §6.2 `allow_high_precision_mv` — when `true` the P-frame encoder
+    /// emits the extra `hp` (1/8-pel) bit per MV component and the ME
+    /// pipeline runs a third 1/8-pel 8-neighbour refinement stage after
+    /// the existing integer + half + quarter-pel passes. When `false`
+    /// (the round-49 / r-next default) MV components are quantised to
+    /// 1/4-pel (even 1/8-pel units) and the `hp` bit is elided from the
+    /// uncompressed header.
+    ///
+    /// Only consulted by the P-frame encoder; the keyframe encoder
+    /// doesn't emit MVs.
+    pub allow_high_precision_mv: bool,
 }
 
 impl EncoderParams {
@@ -51,6 +62,7 @@ impl EncoderParams {
             loop_filter_level: Self::default_filter_level(base_q_idx),
             debug_force_16x16_only: false,
             debug_force_8x8_none_only: false,
+            allow_high_precision_mv: false,
         }
     }
 

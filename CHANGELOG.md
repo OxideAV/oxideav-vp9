@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **r-next-hp — 1/8-pel high-precision MV (`allow_high_precision_mv`)**
+  (§6.2 uncompressed-header `allow_high_precision_mv` bit / §6.4.19
+  per-component `hp` bit / §6.3 8-tap EightTap luma interpolation at
+  the 1/16-pel filter bank's odd phases). Pre-r-next-hp the P-frame
+  encoder hard-wired `allow_high_precision_mv = false` and stopped ME
+  at 1/4-pel (MV components quantised to even 1/8-pel units, `hp` bit
+  elided from the wire). r-next-hp adds an opt-in
+  `EncoderParams::allow_high_precision_mv` flag (default `false` for
+  byte-identical compatibility with the round-49 / r-next default
+  path). When set:
+  - The §6.2 uncompressed header carries
+    `allow_high_precision_mv = 1` via the pre-existing
+    `emit_uncompressed_header_p` wire-bit.
+  - The ME pipeline runs a fourth 8-neighbour refinement stage at
+    `step = 1` in 1/8-pel units (after the existing integer +
+    half-pel + quarter-pel passes). The refinement is iteration-
+    bounded (≤ 2 inner passes) on the same shape as the existing
+    `refine_subpel_8nb` so the per-block cost stays bounded.
+  - The `emit_mv` / `emit_mv_component` path keeps the bottom
+    fractional bit (the `hp` / `class0_hp` write) so odd-1/8-pel MV
+    components reach the bool stream. The pre-existing inverse decoder
+    (`crate::mv::read_mv_component`) already reads the `hp` bit when
+    the header flag is set, so the wire is self-consistent.
+  - The `1/4-pel must be even` debug-assert in `emit_inter_block` +
+    `emit_inter_block_sub8x8` is gated by `!allow_hp` so it still
+    fires on the default-precision path (preserving the r-next
+    invariant) but tolerates odd 1/8-pel values under HP.
+  Three new gate tests (`tests/r_next_hp_mv.rs`):
+  - `pframe_hp_off_baseline_caps_psnr_on_eighth_pel_shift` — pins the
+    HP-off PSNR ceiling on the 1/8-pel fixture (phase-2 EightTap
+    shift of frame 1's reconstruction). Measured **52.56 dB**.
+  - `pframe_hp_on_lifts_psnr_on_eighth_pel_shift` — the headline
+    delta: HP-on PSNR_Y MUST clear 38 dB AND beat the HP-off
+    baseline by ≥ 3 dB. Measured **∞ dB** (bit-exact MC
+    reconstruction once MV = 1 in 1/8-pel units is reachable — phase
+    2 of the §6.3 filter bank is the exact one the fixture was
+    generated through) vs the 52.56 dB HP-off baseline → **+inf dB
+    on this exact fixture**.
+  - `pframe_hp_on_no_regression_on_quarter_pel_shift` — feeding HP
+    on at a true 1/4-pel translation must not regress vs HP-off; the
+    1/8-pel refinement is monotone in SAD so HP-on ≥ HP-off on
+    quarter-pel-aligned content. Measured **55.88 dB** (== HP-off
+    baseline, delta 0.00 dB).
+  Existing r49 + r-next + r-next-8x8 + r-next-sub8 + r-multiref tests
+  stay green (same byte counts and PSNR — HP defaults to false so the
+  pre-this-round wire is preserved byte-for-byte).
+
 - **r-multiref — LAST_FRAME + GOLDEN_FRAME per-CU reference RDO**
   (§6.2 reference-frame buffer management / §6.4.5 single_ref tree /
   §9.3.2 `single_ref_p1` + `single_ref_p2` neighbour contexts).

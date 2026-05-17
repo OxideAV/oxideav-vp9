@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **r-multiref — LAST_FRAME + GOLDEN_FRAME per-CU reference RDO**
+  (§6.2 reference-frame buffer management / §6.4.5 single_ref tree /
+  §9.3.2 `single_ref_p1` + `single_ref_p2` neighbour contexts).
+  Extends the P-frame encoder so callers can supply an optional
+  GOLDEN_FRAME alongside LAST_FRAME; per CU the encoder runs ME against
+  both references and picks the lower-SAD reference (with a small
+  bit-rate penalty proxy charged against GOLDEN for its extra
+  `single_ref_p2` bit). Per-block `ref_frame[0]` is emitted via the
+  §6.4.5 single-ref tree — LAST writes 1 bit, GOLDEN writes 2 bits.
+  The §9.3.2 neighbour contexts mirror the decoder's
+  `InterTile::single_ref_p1_ctx` / `single_ref_p2_ctx` VERBATIM so the
+  bool stream stays lock-step. DPB convention:
+  `ref_frame_idx[LAST]=0` (refreshed each P-frame),
+  `ref_frame_idx[GOLDEN]=1` (keyframe survives there because the
+  keyframe sets `refresh_frame_flags=0xFF` and P-frames refresh only
+  slot 0). New types `encoder::ReferenceSet { last, golden: Option<…> }`
+  + entry point `encoder::encode_pframe_yuv_multi_ref`. The existing
+  single-LAST `encode_pframe_yuv` API is preserved unchanged; when
+  `ReferenceSet::golden = None` the multi-ref entry point produces
+  byte-identical output. Sub-8×8 cells (B8x4 / B4x8 / B4x4) emit ONE
+  cell-level ref pick (resolved from the parent 8×8 footprint's ME)
+  per §6.4.5 which gates the per-cell single-ref bits. ALTREF deferred.
+  Headline: **+1.51 dB PSNR_Y** average over frames 3+4 of a 4-frame
+  A→B→A→A GOP fixture where frame 2's orthogonal-content reconstruction
+  is structurally wrong for the back-to-keyframe-content frames; the
+  multi-ref encoder picks GOLDEN(=keyframe) for nearly every CU in
+  frames 3+4 (P-frame sizes also drop, e.g. 472 → 346 bytes for P2).
+  Three new regression tests cover (a) the headline PSNR delta vs
+  LAST-only baseline, (b) end-to-end decode of the multi-ref chain,
+  and (c) byte-identical equivalence between `encode_pframe_yuv` and
+  `encode_pframe_yuv_multi_ref(golden=None)`.
+
 - **r-next-sub8 — 8×8 four-way RDO with §6.4.16 (idy, idx) sub-block walk**
   (§6.4.2 partition tree / §6.4.3 decode_partition / §6.4.16
   inter_block_mode_info / §6.5.18 subsize syntax). Extends the r-next-8x8

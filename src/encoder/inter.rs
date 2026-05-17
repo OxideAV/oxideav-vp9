@@ -67,13 +67,13 @@
 
 use crate::compressed_header::TxMode;
 use crate::encoder::bool_encoder::BoolEncoder;
-use crate::encoder::params::{EncoderParams, ReferenceFrame};
+use crate::encoder::params::{EncoderParams, ReferenceFrame, ReferenceSet};
 use crate::frame_ctx::FrameContext;
 use crate::mcfilter::{mc_block, InterpFilter, RefSampler};
 use crate::mv::{DEFAULT_MV_COMP_PROBS, MV_JOINT_PROBS};
 use crate::mvref::{
-    find_best_ref_mvs, find_mv_refs_geom, BlockGeom, InterMiCell, InterMiGrid, Y_MODE_NEWMV,
-    Y_MODE_ZEROMV,
+    find_best_ref_mvs, find_mv_refs_geom, BlockGeom, InterMiCell, InterMiGrid, INTRA_FRAME,
+    NONE_FRAME, Y_MODE_NEWMV, Y_MODE_ZEROMV,
 };
 use crate::probs::PARTITION_PROBS;
 
@@ -122,13 +122,14 @@ const ME_NEWMV_GATE_SAD: u32 = 64;
 /// to discourage gratuitous splits on smooth content.
 const SPLIT_RATE_PENALTY_PER_SUBBLOCK_BITS: u32 = 20;
 
-/// Emit a complete P-frame tile payload using single-reference LAST.
+/// Emit a complete P-frame tile payload. Single-LAST when
+/// `refs.golden.is_none()`; LAST + GOLDEN per-CU RDO otherwise.
 /// Returns the raw bool-coded tile bytes; the caller assembles the
 /// frame by prepending uncompressed + compressed headers.
 pub fn emit_pframe_tile(
     p: &EncoderParams,
     src: &crate::encoder::params::YuvFrame<'_>,
-    refr: &ReferenceFrame,
+    refs: &ReferenceSet<'_>,
 ) -> Vec<u8> {
     let width = p.width as usize;
     let height = p.height as usize;
@@ -157,7 +158,7 @@ pub fn emit_pframe_tile(
             let col = sbx * 64;
             let row = sby * 64;
             emit_inter_partition(
-                &mut be, &mut ctx, row, col, 64, p.width, p.height, src, refr,
+                &mut be, &mut ctx, row, col, 64, p.width, p.height, src, refs,
             );
         }
     }
@@ -187,6 +188,24 @@ struct InterCtx {
     /// regression tests can compare full-shape sub-8×8 RDO vs the
     /// 8×8-NONE-only baseline.
     debug_force_8x8_none_only: bool,
+}
+
+/// Per-CU reference-frame code (§4.8 `LAST_FRAME = 1`, `GOLDEN_FRAME = 2`).
+/// Only the two single-ref slots the r-multiref round emits; ALTREF
+/// (`3`) is reserved for a future round and is never picked here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefPick {
+    Last,
+    Golden,
+}
+
+impl RefPick {
+    fn ref_code(self) -> u8 {
+        match self {
+            RefPick::Last => 1,
+            RefPick::Golden => 2,
+        }
+    }
 }
 
 impl InterCtx {
@@ -295,6 +314,7 @@ impl InterCtx {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn stamp_block(
         &mut self,
         mi_row: usize,
@@ -304,6 +324,7 @@ impl InterCtx {
         skip: bool,
         mv: (i16, i16),
         is_zeromv: bool,
+        ref_pick: RefPick,
     ) {
         for i in 0..mi_w.max(1) {
             let c = mi_col + i;
@@ -319,10 +340,10 @@ impl InterCtx {
                 self.intra_left[r] = false;
             }
         }
-        // mv_grid fill — record cell with ref_frame=LAST=1, MV.
+        // mv_grid fill — record cell with ref_frame = LAST(1) or GOLDEN(2).
         let mut cell = InterMiCell::default();
-        cell.ref_frame[0] = 1; // LAST_FRAME
-        cell.ref_frame[1] = 255; // NONE
+        cell.ref_frame[0] = ref_pick.ref_code();
+        cell.ref_frame[1] = NONE_FRAME;
         cell.mv[0] = crate::mv::Mv::new(mv.0, mv.1);
         cell.sub_mvs[0] = [crate::mv::Mv::new(mv.0, mv.1); 4];
         cell.y_mode = if is_zeromv {
@@ -352,6 +373,7 @@ impl InterCtx {
         mv: (i16, i16),
         is_zeromv: bool,
         block_mvs: &[crate::mv::Mv; 4],
+        ref_pick: RefPick,
     ) {
         for i in 0..mi_w.max(1) {
             let c = mi_col + i;
@@ -368,8 +390,8 @@ impl InterCtx {
             }
         }
         let mut cell = InterMiCell::default();
-        cell.ref_frame[0] = 1; // LAST_FRAME
-        cell.ref_frame[1] = 255; // NONE
+        cell.ref_frame[0] = ref_pick.ref_code();
+        cell.ref_frame[1] = NONE_FRAME;
         cell.mv[0] = crate::mv::Mv::new(mv.0, mv.1);
         cell.sub_mvs[0] = *block_mvs;
         cell.y_mode = if is_zeromv {
@@ -410,7 +432,7 @@ fn emit_inter_partition(
     frame_w: u32,
     frame_h: u32,
     src: &crate::encoder::params::YuvFrame<'_>,
-    refr: &ReferenceFrame,
+    refs: &ReferenceSet<'_>,
 ) {
     if row >= frame_h || col >= frame_w {
         return;
@@ -425,14 +447,14 @@ fn emit_inter_partition(
     if on_right && on_bottom {
         if bsize == 8 {
             // 8×8 at corner — emit as NONE.
-            emit_inter_block(be, ctx, row, col, bsize, bsize, src, refr);
+            emit_inter_block(be, ctx, row, col, bsize, bsize, src, refs);
             ctx.update_partition(bsize, bsize, bsize, mi_row, mi_col);
             return;
         }
         // SPLIT (forced, no bit read).
-        emit_inter_partition(be, ctx, row, col, half, frame_w, frame_h, src, refr);
-        emit_inter_partition(be, ctx, row, col + half, half, frame_w, frame_h, src, refr);
-        emit_inter_partition(be, ctx, row + half, col, half, frame_w, frame_h, src, refr);
+        emit_inter_partition(be, ctx, row, col, half, frame_w, frame_h, src, refs);
+        emit_inter_partition(be, ctx, row, col + half, half, frame_w, frame_h, src, refs);
+        emit_inter_partition(be, ctx, row + half, col, half, frame_w, frame_h, src, refs);
         emit_inter_partition(
             be,
             ctx,
@@ -442,7 +464,7 @@ fn emit_inter_partition(
             frame_w,
             frame_h,
             src,
-            refr,
+            refs,
         );
         return;
     }
@@ -451,13 +473,13 @@ fn emit_inter_partition(
         // We pick SPLIT.
         be.write(1, probs[2]);
         if bsize == 8 {
-            emit_inter_block(be, ctx, row, col, bsize, bsize, src, refr);
+            emit_inter_block(be, ctx, row, col, bsize, bsize, src, refs);
             ctx.update_partition(bsize, bsize, bsize, mi_row, mi_col);
             return;
         }
-        emit_inter_partition(be, ctx, row, col, half, frame_w, frame_h, src, refr);
-        emit_inter_partition(be, ctx, row, col + half, half, frame_w, frame_h, src, refr);
-        emit_inter_partition(be, ctx, row + half, col, half, frame_w, frame_h, src, refr);
+        emit_inter_partition(be, ctx, row, col, half, frame_w, frame_h, src, refs);
+        emit_inter_partition(be, ctx, row, col + half, half, frame_w, frame_h, src, refs);
+        emit_inter_partition(be, ctx, row + half, col, half, frame_w, frame_h, src, refs);
         emit_inter_partition(
             be,
             ctx,
@@ -467,20 +489,20 @@ fn emit_inter_partition(
             frame_w,
             frame_h,
             src,
-            refr,
+            refs,
         );
         return;
     }
     if on_bottom {
         be.write(1, probs[1]);
         if bsize == 8 {
-            emit_inter_block(be, ctx, row, col, bsize, bsize, src, refr);
+            emit_inter_block(be, ctx, row, col, bsize, bsize, src, refs);
             ctx.update_partition(bsize, bsize, bsize, mi_row, mi_col);
             return;
         }
-        emit_inter_partition(be, ctx, row, col, half, frame_w, frame_h, src, refr);
-        emit_inter_partition(be, ctx, row, col + half, half, frame_w, frame_h, src, refr);
-        emit_inter_partition(be, ctx, row + half, col, half, frame_w, frame_h, src, refr);
+        emit_inter_partition(be, ctx, row, col, half, frame_w, frame_h, src, refs);
+        emit_inter_partition(be, ctx, row, col + half, half, frame_w, frame_h, src, refs);
+        emit_inter_partition(be, ctx, row + half, col, half, frame_w, frame_h, src, refs);
         emit_inter_partition(
             be,
             ctx,
@@ -490,7 +512,7 @@ fn emit_inter_partition(
             frame_w,
             frame_h,
             src,
-            refr,
+            refs,
         );
         return;
     }
@@ -508,19 +530,19 @@ fn emit_inter_partition(
         let pick = if ctx.debug_force_8x8_none_only {
             Partition8::None
         } else {
-            pick_partition_8(row, col, src, refr)
+            pick_partition_8(row, col, src, refs)
         };
         match pick {
             Partition8::None => {
                 be.write(0, probs[0]);
-                emit_inter_block(be, ctx, row, col, bsize, bsize, src, refr);
+                emit_inter_block(be, ctx, row, col, bsize, bsize, src, refs);
                 ctx.update_partition(bsize, bsize, bsize, mi_row, mi_col);
             }
             Partition8::Horz => {
                 // Wire "1, 0".
                 be.write(1, probs[0]);
                 be.write(0, probs[1]);
-                emit_inter_block_sub8x8(be, ctx, row, col, 8, 4, src, refr);
+                emit_inter_block_sub8x8(be, ctx, row, col, 8, 4, src, refs);
                 ctx.update_partition(bsize, bsize, 4, mi_row, mi_col);
             }
             Partition8::Vert => {
@@ -528,7 +550,7 @@ fn emit_inter_partition(
                 be.write(1, probs[0]);
                 be.write(1, probs[1]);
                 be.write(0, probs[2]);
-                emit_inter_block_sub8x8(be, ctx, row, col, 4, 8, src, refr);
+                emit_inter_block_sub8x8(be, ctx, row, col, 4, 8, src, refs);
                 ctx.update_partition(bsize, 4, bsize, mi_row, mi_col);
             }
             Partition8::Split => {
@@ -540,7 +562,7 @@ fn emit_inter_partition(
                 be.write(1, probs[0]);
                 be.write(1, probs[1]);
                 be.write(1, probs[2]);
-                emit_inter_block_sub8x8(be, ctx, row, col, 4, 4, src, refr);
+                emit_inter_block_sub8x8(be, ctx, row, col, 4, 4, src, refs);
                 ctx.update_partition(bsize, 4, 4, mi_row, mi_col);
             }
         }
@@ -550,21 +572,21 @@ fn emit_inter_partition(
         let pick = if ctx.debug_force_16x16_only {
             Partition16::None
         } else {
-            pick_partition_16(row, col, src, refr)
+            pick_partition_16(row, col, src, refs)
         };
         match pick {
             Partition16::None => {
                 be.write(0, probs[0]);
-                emit_inter_block(be, ctx, row, col, bsize, bsize, src, refr);
+                emit_inter_block(be, ctx, row, col, bsize, bsize, src, refs);
                 ctx.update_partition(bsize, bsize, bsize, mi_row, mi_col);
             }
             Partition16::Horz => {
                 // PARTITION_HORZ — wire "1, 0".
                 be.write(1, probs[0]);
                 be.write(0, probs[1]);
-                emit_inter_block(be, ctx, row, col, bsize, half, src, refr);
+                emit_inter_block(be, ctx, row, col, bsize, half, src, refs);
                 if row + half < frame_h {
-                    emit_inter_block(be, ctx, row + half, col, bsize, half, src, refr);
+                    emit_inter_block(be, ctx, row + half, col, bsize, half, src, refs);
                 }
                 ctx.update_partition(bsize, bsize, half, mi_row, mi_col);
             }
@@ -573,9 +595,9 @@ fn emit_inter_partition(
                 be.write(1, probs[0]);
                 be.write(1, probs[1]);
                 be.write(0, probs[2]);
-                emit_inter_block(be, ctx, row, col, half, bsize, src, refr);
+                emit_inter_block(be, ctx, row, col, half, bsize, src, refs);
                 if col + half < frame_w {
-                    emit_inter_block(be, ctx, row, col + half, half, bsize, src, refr);
+                    emit_inter_block(be, ctx, row, col + half, half, bsize, src, refs);
                 }
                 ctx.update_partition(bsize, half, bsize, mi_row, mi_col);
             }
@@ -584,9 +606,9 @@ fn emit_inter_partition(
                 be.write(1, probs[0]);
                 be.write(1, probs[1]);
                 be.write(1, probs[2]);
-                emit_inter_partition(be, ctx, row, col, half, frame_w, frame_h, src, refr);
-                emit_inter_partition(be, ctx, row, col + half, half, frame_w, frame_h, src, refr);
-                emit_inter_partition(be, ctx, row + half, col, half, frame_w, frame_h, src, refr);
+                emit_inter_partition(be, ctx, row, col, half, frame_w, frame_h, src, refs);
+                emit_inter_partition(be, ctx, row, col + half, half, frame_w, frame_h, src, refs);
+                emit_inter_partition(be, ctx, row + half, col, half, frame_w, frame_h, src, refs);
                 emit_inter_partition(
                     be,
                     ctx,
@@ -596,23 +618,23 @@ fn emit_inter_partition(
                     frame_w,
                     frame_h,
                     src,
-                    refr,
+                    refs,
                 );
             }
         }
         return;
     }
     // bsize ∈ {64, 32} — NONE vs SPLIT RDO.
-    if should_split(row, col, bsize, src, refr) {
+    if should_split(row, col, bsize, src, refs) {
         // PARTITION_SPLIT — wire bits "1, 1, 1" per §6.4.2 partition
         // tree (`read_partition_from_tree`):
         //   bit0 = 1 (not NONE), bit1 = 1 (not HORZ), bit2 = 1 (SPLIT).
         be.write(1, probs[0]);
         be.write(1, probs[1]);
         be.write(1, probs[2]);
-        emit_inter_partition(be, ctx, row, col, half, frame_w, frame_h, src, refr);
-        emit_inter_partition(be, ctx, row, col + half, half, frame_w, frame_h, src, refr);
-        emit_inter_partition(be, ctx, row + half, col, half, frame_w, frame_h, src, refr);
+        emit_inter_partition(be, ctx, row, col, half, frame_w, frame_h, src, refs);
+        emit_inter_partition(be, ctx, row, col + half, half, frame_w, frame_h, src, refs);
+        emit_inter_partition(be, ctx, row + half, col, half, frame_w, frame_h, src, refs);
         emit_inter_partition(
             be,
             ctx,
@@ -622,13 +644,13 @@ fn emit_inter_partition(
             frame_w,
             frame_h,
             src,
-            refr,
+            refs,
         );
         return;
     }
     // Interior PARTITION_NONE — emit `bit=0` against probs[0].
     be.write(0, probs[0]);
-    emit_inter_block(be, ctx, row, col, bsize, bsize, src, refr);
+    emit_inter_block(be, ctx, row, col, bsize, bsize, src, refs);
     ctx.update_partition(bsize, bsize, bsize, mi_row, mi_col);
 }
 
@@ -658,7 +680,7 @@ fn pick_partition_16(
     row: u32,
     col: u32,
     src: &crate::encoder::params::YuvFrame<'_>,
-    refr: &ReferenceFrame,
+    refs: &ReferenceSet<'_>,
 ) -> Partition16 {
     let bsize = 16u32;
     let half = bsize / 2;
@@ -667,20 +689,20 @@ fn pick_partition_16(
     if parent_eff_w == 0 || parent_eff_h == 0 {
         return Partition16::None;
     }
-    let parent = me_search(
+    let parent_sad = best_ref_sad(
         src,
-        refr,
+        refs,
         row as i32,
         col as i32,
         parent_eff_w as i32,
         parent_eff_h as i32,
     );
-    let cost_none = parent.best_sad as u64;
+    let cost_none = parent_sad as u64;
 
     // HORZ — 16×8 top + 16×8 bottom.
-    let top = me_search(
+    let top_sad = best_ref_sad(
         src,
-        refr,
+        refs,
         row as i32,
         col as i32,
         parent_eff_w as i32,
@@ -688,24 +710,23 @@ fn pick_partition_16(
     );
     let bot_eff_h = (parent_eff_h as i32) - (half as i32);
     let bot_sad = if bot_eff_h > 0 {
-        me_search(
+        best_ref_sad(
             src,
-            refr,
+            refs,
             (row + half) as i32,
             col as i32,
             parent_eff_w as i32,
             bot_eff_h,
-        )
-        .best_sad as u64
+        ) as u64
     } else {
         0
     };
-    let cost_horz = top.best_sad as u64 + bot_sad + SPLIT_RATE_PENALTY_PER_SUBBLOCK_BITS as u64;
+    let cost_horz = top_sad as u64 + bot_sad + SPLIT_RATE_PENALTY_PER_SUBBLOCK_BITS as u64;
 
     // VERT — 8×16 left + 8×16 right.
-    let left = me_search(
+    let left_sad = best_ref_sad(
         src,
-        refr,
+        refs,
         row as i32,
         col as i32,
         (half as i32).min(parent_eff_w as i32),
@@ -713,19 +734,18 @@ fn pick_partition_16(
     );
     let right_eff_w = (parent_eff_w as i32) - (half as i32);
     let right_sad = if right_eff_w > 0 {
-        me_search(
+        best_ref_sad(
             src,
-            refr,
+            refs,
             row as i32,
             (col + half) as i32,
             right_eff_w,
             parent_eff_h as i32,
-        )
-        .best_sad as u64
+        ) as u64
     } else {
         0
     };
-    let cost_vert = left.best_sad as u64 + right_sad + SPLIT_RATE_PENALTY_PER_SUBBLOCK_BITS as u64;
+    let cost_vert = left_sad as u64 + right_sad + SPLIT_RATE_PENALTY_PER_SUBBLOCK_BITS as u64;
 
     // SPLIT — four 8×8 children.
     let mut child_sad_sum: u64 = 0;
@@ -737,15 +757,15 @@ fn pick_partition_16(
         if eff_w == 0 || eff_h == 0 {
             continue;
         }
-        let child = me_search(
+        let child_sad = best_ref_sad(
             src,
-            refr,
+            refs,
             child_row as i32,
             child_col as i32,
             eff_w as i32,
             eff_h as i32,
         );
-        child_sad_sum += child.best_sad as u64;
+        child_sad_sum += child_sad as u64;
     }
     let cost_split = child_sad_sum + (SPLIT_RATE_PENALTY_PER_SUBBLOCK_BITS as u64) * 3;
 
@@ -793,7 +813,7 @@ fn pick_partition_8(
     row: u32,
     col: u32,
     src: &crate::encoder::params::YuvFrame<'_>,
-    refr: &ReferenceFrame,
+    refs: &ReferenceSet<'_>,
 ) -> Partition8 {
     let bsize = 8u32;
     let half = bsize / 2;
@@ -802,22 +822,22 @@ fn pick_partition_8(
     if parent_eff_w == 0 || parent_eff_h == 0 {
         return Partition8::None;
     }
-    let parent = me_search(
+    let parent_sad = best_ref_sad(
         src,
-        refr,
+        refs,
         row as i32,
         col as i32,
         parent_eff_w as i32,
         parent_eff_h as i32,
     );
-    let cost_none = parent.best_sad as u64;
+    let cost_none = parent_sad as u64;
 
     // HORZ — 8×4 top + 8×4 bottom.
     let top_eff_h = (half as i32).min(parent_eff_h as i32);
     let cost_horz = if top_eff_h > 0 {
-        let top = me_search(
+        let top_sad = best_ref_sad(
             src,
-            refr,
+            refs,
             row as i32,
             col as i32,
             parent_eff_w as i32,
@@ -825,19 +845,18 @@ fn pick_partition_8(
         );
         let bot_eff_h = (parent_eff_h as i32) - (half as i32);
         let bot_sad = if bot_eff_h > 0 {
-            me_search(
+            best_ref_sad(
                 src,
-                refr,
+                refs,
                 (row + half) as i32,
                 col as i32,
                 parent_eff_w as i32,
                 bot_eff_h,
-            )
-            .best_sad as u64
+            ) as u64
         } else {
             0
         };
-        top.best_sad as u64 + bot_sad + SPLIT_RATE_PENALTY_PER_SUBBLOCK_BITS as u64
+        top_sad as u64 + bot_sad + SPLIT_RATE_PENALTY_PER_SUBBLOCK_BITS as u64
     } else {
         u64::MAX
     };
@@ -845,9 +864,9 @@ fn pick_partition_8(
     // VERT — 4×8 left + 4×8 right.
     let left_eff_w = (half as i32).min(parent_eff_w as i32);
     let cost_vert = if left_eff_w > 0 {
-        let left = me_search(
+        let left_sad = best_ref_sad(
             src,
-            refr,
+            refs,
             row as i32,
             col as i32,
             left_eff_w,
@@ -855,19 +874,18 @@ fn pick_partition_8(
         );
         let right_eff_w = (parent_eff_w as i32) - (half as i32);
         let right_sad = if right_eff_w > 0 {
-            me_search(
+            best_ref_sad(
                 src,
-                refr,
+                refs,
                 row as i32,
                 (col + half) as i32,
                 right_eff_w,
                 parent_eff_h as i32,
-            )
-            .best_sad as u64
+            ) as u64
         } else {
             0
         };
-        left.best_sad as u64 + right_sad + SPLIT_RATE_PENALTY_PER_SUBBLOCK_BITS as u64
+        left_sad as u64 + right_sad + SPLIT_RATE_PENALTY_PER_SUBBLOCK_BITS as u64
     } else {
         u64::MAX
     };
@@ -882,15 +900,15 @@ fn pick_partition_8(
         if eff_w == 0 || eff_h == 0 {
             continue;
         }
-        let child = me_search(
+        let child_sad = best_ref_sad(
             src,
-            refr,
+            refs,
             child_row as i32,
             child_col as i32,
             eff_w as i32,
             eff_h as i32,
         );
-        child_sad_sum += child.best_sad as u64;
+        child_sad_sum += child_sad as u64;
     }
     let cost_split = child_sad_sum + (SPLIT_RATE_PENALTY_PER_SUBBLOCK_BITS as u64) * 3;
 
@@ -922,16 +940,16 @@ fn should_split(
     col: u32,
     bsize: u32,
     src: &crate::encoder::params::YuvFrame<'_>,
-    refr: &ReferenceFrame,
+    refs: &ReferenceSet<'_>,
 ) -> bool {
     let parent_eff_w = (bsize as usize).min((src.width as usize).saturating_sub(col as usize));
     let parent_eff_h = (bsize as usize).min((src.height as usize).saturating_sub(row as usize));
     if parent_eff_w == 0 || parent_eff_h == 0 {
         return false;
     }
-    let parent = me_search(
+    let parent_sad = best_ref_sad(
         src,
-        refr,
+        refs,
         row as i32,
         col as i32,
         parent_eff_w as i32,
@@ -950,19 +968,19 @@ fn should_split(
         if eff_w == 0 || eff_h == 0 {
             continue;
         }
-        let child = me_search(
+        let child_sad = best_ref_sad(
             src,
-            refr,
+            refs,
             child_row as i32,
             child_col as i32,
             eff_w as i32,
             eff_h as i32,
         );
-        child_sad_sum += child.best_sad as u64;
+        child_sad_sum += child_sad as u64;
     }
     // 3 extra sub-blocks beyond what PARTITION_NONE would emit.
     let split_penalty = (SPLIT_RATE_PENALTY_PER_SUBBLOCK_BITS as u64) * 3;
-    child_sad_sum + split_penalty < parent.best_sad as u64
+    child_sad_sum + split_penalty < parent_sad as u64
 }
 
 /// Result of a single block-level motion estimation pass.
@@ -975,6 +993,68 @@ struct MeResult {
     best_sad: u32,
     /// SAD at MV = (0, 0) — caller uses this to pick ZEROMV vs NEWMV.
     sad_zero: u32,
+}
+
+/// Bit-rate proxy for the extra symbols GOLDEN_FRAME costs vs
+/// LAST_FRAME at a single block. Per §6.4.5: LAST emits 1 bit
+/// (`single_ref_p1 = 0`); GOLDEN emits 2 bits (`single_ref_p1 = 1`
+/// then `single_ref_p2 = 0`). The marginal cost is ~1 entropy-coded
+/// bit; we charge a constant SAD penalty proxy so RDO only flips to
+/// GOLDEN when the SAD win is meaningful. Same units as
+/// `SPLIT_RATE_PENALTY_PER_SUBBLOCK_BITS`.
+const GOLDEN_REF_RATE_PENALTY_SAD: u32 = 32;
+
+/// Pick the lower-SAD reference for one block. When `refs.golden` is
+/// `None` the picker always returns `(LAST, last_me)`. Otherwise it
+/// runs `me_search` against both refs and compares
+/// `last.best_sad` vs `golden.best_sad + GOLDEN_REF_RATE_PENALTY_SAD`,
+/// returning whichever is cheaper.
+fn pick_ref_and_me(
+    src: &crate::encoder::params::YuvFrame<'_>,
+    refs: &ReferenceSet<'_>,
+    row: i32,
+    col: i32,
+    eff_w: i32,
+    eff_h: i32,
+) -> (RefPick, MeResult) {
+    let last_me = me_search(src, refs.last, row, col, eff_w, eff_h);
+    let Some(golden) = refs.golden else {
+        return (RefPick::Last, last_me);
+    };
+    let golden_me = me_search(src, golden, row, col, eff_w, eff_h);
+    if (golden_me.best_sad as u64) + (GOLDEN_REF_RATE_PENALTY_SAD as u64)
+        < (last_me.best_sad as u64)
+    {
+        (RefPick::Golden, golden_me)
+    } else {
+        (RefPick::Last, last_me)
+    }
+}
+
+/// Best SAD across the available refs (LAST + optional GOLDEN) for
+/// partition-RDO use. Mirrors `pick_ref_and_me` but discards the
+/// `MeResult` payload since RDO only needs the SAD.
+fn best_ref_sad(
+    src: &crate::encoder::params::YuvFrame<'_>,
+    refs: &ReferenceSet<'_>,
+    row: i32,
+    col: i32,
+    eff_w: i32,
+    eff_h: i32,
+) -> u32 {
+    let last_sad = me_search(src, refs.last, row, col, eff_w, eff_h).best_sad;
+    let Some(golden) = refs.golden else {
+        return last_sad;
+    };
+    let golden_sad = me_search(src, golden, row, col, eff_w, eff_h).best_sad;
+    // The +GOLDEN_REF_RATE_PENALTY_SAD penalty IS what
+    // `pick_ref_and_me` uses to choose; mirror it here so the
+    // partition picker's SAD numbers match the actual emit-path SAD.
+    if (golden_sad as u64) + (GOLDEN_REF_RATE_PENALTY_SAD as u64) < (last_sad as u64) {
+        golden_sad + GOLDEN_REF_RATE_PENALTY_SAD
+    } else {
+        last_sad
+    }
 }
 
 /// Three-stage motion search: integer-pel full search → half-pel
@@ -1048,7 +1128,7 @@ fn emit_inter_block(
     bsize_w_px: u32,
     bsize_h_px: u32,
     src: &crate::encoder::params::YuvFrame<'_>,
-    refr: &ReferenceFrame,
+    refs: &ReferenceSet<'_>,
 ) {
     let mi_row = (row as usize) / 8;
     let mi_col = (col as usize) / 8;
@@ -1065,24 +1145,14 @@ fn emit_inter_block(
 
     // §6.3.1 tx_mode=ONLY_4X4 → no tx_size bits.
 
-    // §6.4.17 read_ref_frames — single ref (compoundReferenceAllowed=false
-    // when sign_bias is uniform → no comp_mode bit). Emit p1=0 → LAST_FRAME.
-    // The §9.3.2 single_ref_p1 context for a frame with all-LAST neighbours
-    // collapses to a fixed value; we compute it via `single_ref_p1_ctx` over
-    // the current neighbour info.
-    let p1_ctx = single_ref_p1_ctx(ctx, mi_row, mi_col);
-    be.write(0, SINGLE_REF_PROB[p1_ctx][0]);
-
-    // Interpolation filter is non-switchable (frame-level EightTap), no bits.
-
-    // §6.4.16 ME + inter_mode tree. Three-stage refinement on the luma plane.
-    // Body lives in `me_search` so the partition-RDO and the emit path
-    // see bit-identical SAD numbers.
+    // §6.4.16 ME + per-CU ref-frame RDO. Body lives in `pick_ref_and_me`
+    // so the partition-RDO (via `best_ref_sad`) and the emit path see
+    // bit-identical SAD numbers + the same ref pick.
     let eff_w = (bsize_w_px as usize).min((src.width as usize).saturating_sub(col as usize));
     let eff_h = (bsize_h_px as usize).min((src.height as usize).saturating_sub(row as usize));
-    let me = me_search(
+    let (ref_pick, me) = pick_ref_and_me(
         src,
-        refr,
+        refs,
         row as i32,
         col as i32,
         eff_w as i32,
@@ -1091,6 +1161,13 @@ fn emit_inter_block(
     let best_mv_1_8 = me.best_mv_1_8;
     let best_sad = me.best_sad;
     let sad_zero = me.sad_zero;
+
+    // §6.4.17 read_ref_frames — single ref (compoundReferenceAllowed=false
+    // when sign_bias is uniform → no comp_mode bit). Emit LAST (one bit)
+    // or GOLDEN (two bits: p1=1 then p2=0) per §6.4.5.
+    emit_single_ref_bits(be, ctx, mi_row, mi_col, ref_pick);
+
+    // Interpolation filter is non-switchable (frame-level EightTap), no bits.
 
     let is_zeromv = best_sad + ME_NEWMV_GATE_SAD >= sad_zero;
     let (mv_row_1_8, mv_col_1_8) = if is_zeromv {
@@ -1109,7 +1186,9 @@ fn emit_inter_block(
     };
 
     // §6.5.1 find_mv_refs + §6.5.12 find_best_ref_mvs — exactly what the
-    // decoder will compute, so our NEWMV delta lines up.
+    // decoder will compute, so our NEWMV delta lines up. Note the
+    // `ref_code` passed in here must match `ref_pick` so the neighbour
+    // scan picks MVs whose ref_frame matches.
     let mi_cols_i32 = ctx.mi_cols as i32;
     let mi_rows_i32 = ctx.mi_rows as i32;
     let geom = BlockGeom::from_pixels(row, col, bsize_w_px, bsize_h_px, mi_rows_i32, mi_cols_i32);
@@ -1118,7 +1197,7 @@ fn emit_inter_block(
     let mut refs_a = find_mv_refs_geom(
         &ctx.mv_grid,
         &sign_bias,
-        1,
+        ref_pick.ref_code(),
         bsize_code,
         geom,
         0,
@@ -1155,6 +1234,7 @@ fn emit_inter_block(
         true,
         (mv_row_1_8, mv_col_1_8),
         is_zeromv,
+        ref_pick,
     );
 }
 
@@ -1186,7 +1266,7 @@ fn emit_inter_block_sub8x8(
     sub_w_px: u32,
     sub_h_px: u32,
     src: &crate::encoder::params::YuvFrame<'_>,
-    refr: &ReferenceFrame,
+    refs: &ReferenceSet<'_>,
 ) {
     debug_assert!(matches!((sub_w_px, sub_h_px), (8, 4) | (4, 8) | (4, 4)));
     let mi_row = (row as usize) / 8;
@@ -1196,14 +1276,32 @@ fn emit_inter_block_sub8x8(
     let cell_mi_w = 1usize;
     let cell_mi_h = 1usize;
 
+    // Cell-level reference pick — the §6.4.5 single-ref bits emit
+    // ONCE for the whole 8×8 cell, so all (idy, idx) sub-blocks share
+    // the same reference. We pick the ref that wins for the parent
+    // 8×8 footprint, then run per-sub-block ME against that ref only.
+    let cell_eff_w = 8usize.min((src.width as usize).saturating_sub(col as usize));
+    let cell_eff_h = 8usize.min((src.height as usize).saturating_sub(row as usize));
+    let (ref_pick, _) = pick_ref_and_me(
+        src,
+        refs,
+        row as i32,
+        col as i32,
+        cell_eff_w as i32,
+        cell_eff_h as i32,
+    );
+    let me_refr: &ReferenceFrame = match ref_pick {
+        RefPick::Last => refs.last,
+        RefPick::Golden => refs.golden.expect("Golden pick requires golden ref"),
+    };
+
     // Cell-level header: skip / is_inter / ref / (interp implicit).
     let sctx = ctx.skip_ctx(mi_row, mi_col);
     be.write(1, SKIP_PROBS[sctx]);
     let ictx = ctx.is_inter_ctx(mi_row, mi_col);
     be.write(1, IS_INTER_PROB[ictx]);
     // tx_mode = ONLY_4X4 → no tx_size bits.
-    let p1_ctx = single_ref_p1_ctx(ctx, mi_row, mi_col);
-    be.write(0, SINGLE_REF_PROB[p1_ctx][0]);
+    emit_single_ref_bits(be, ctx, mi_row, mi_col, ref_pick);
     // Interpolation filter is non-switchable (frame-level EightTap), no bits.
 
     // Cell-level find_mv_refs / find_best_ref_mvs against the rectangular
@@ -1217,7 +1315,7 @@ fn emit_inter_block_sub8x8(
     let mut refs_a = find_mv_refs_geom(
         &ctx.mv_grid,
         &sign_bias,
-        1,
+        ref_pick.ref_code(),
         bsize_code,
         geom,
         0,
@@ -1258,11 +1356,11 @@ fn emit_inter_block_sub8x8(
             let eff_w = sub_w.min((src.width as usize).saturating_sub(sub_col_px));
             let eff_h = sub_h.min((src.height as usize).saturating_sub(sub_row_px));
 
-            // Per-sub-block ME against the reference luma plane.
+            // Per-sub-block ME against the cell's chosen reference luma plane.
             let me = if eff_w > 0 && eff_h > 0 {
                 me_search(
                     src,
-                    refr,
+                    me_refr,
                     sub_row_px as i32,
                     sub_col_px as i32,
                     eff_w as i32,
@@ -1330,75 +1428,254 @@ fn emit_inter_block_sub8x8(
         (last_mv_row_1_8, last_mv_col_1_8),
         last_is_zeromv,
         &block_mvs,
+        ref_pick,
     );
 }
 
-/// §9.3.2 `single_ref_p1_ctx` — neighbour-aware context for the
-/// first ref-frame bit. The encoder mirrors `InterTile::single_ref_p1_ctx`
-/// VERBATIM — the previous "all-LAST collapses to {0, 2, 3}" approximation
-/// was wrong and produced wire-desyncs whenever both neighbours were
-/// available LAST inter blocks (decoder returned ctx=4, encoder ctx=0,
-/// divergent SINGLE_REF_PROB[ctx][0] → bool stream desync from that
-/// cell onwards). For the all-single-LAST case the spec returns 4.
-fn single_ref_p1_ctx(ctx: &InterCtx, mi_row: usize, mi_col: usize) -> usize {
-    const LAST: u8 = 1;
+/// Encoder-side neighbour snapshot — the subset of `crate::inter::NeighbourInfo`
+/// that the four §9.3.2 single-ref contexts depend on. Computed once
+/// per emit; the encoder mirrors the decoder's `neighbour_info` body
+/// using its own `InterCtx::mv_grid` + `intra_above` / `intra_left`
+/// tracker.
+///
+/// The r-multiref round only emits single-LAST or single-GOLDEN blocks
+/// (no compound, no ALTREF), so `above_single` / `left_single` are
+/// always true for non-intra neighbours — but we expose the same shape
+/// as the decoder so future compound emission slots in cleanly.
+struct EncNeighbourInfo {
+    avail_u: bool,
+    avail_l: bool,
+    above_ref: [u8; 2], // [0]=primary, [1]=NONE_FRAME when single
+    left_ref: [u8; 2],
+    above_intra: bool,
+    left_intra: bool,
+    above_single: bool,
+    left_single: bool,
+}
+
+fn enc_neighbour_info(ctx: &InterCtx, mi_row: usize, mi_col: usize) -> EncNeighbourInfo {
     let avail_u = mi_row > 0;
     let avail_l = mi_col > 0;
-    let above_intra = avail_u && mi_col < ctx.intra_above.len() && ctx.intra_above[mi_col];
-    let left_intra = avail_l && mi_row < ctx.intra_left.len() && ctx.intra_left[mi_row];
-    // The encoder only emits single-ref LAST blocks, so when a neighbour
-    // is inter (not intra) its ref_frame[0] is always LAST=1 and slot 1
-    // is NONE. `above_single` / `left_single` are therefore always true
-    // for non-intra neighbours. We mirror the decoder's full §9.3.2
-    // derivation explicitly so any future relaxation of this invariant
-    // (e.g. compound) doesn't quietly drift the wire.
-    let above_ref0 = if above_intra {
-        0u8
-    } else if avail_u {
-        LAST
+    let (above_r0, above_r1) = if avail_u {
+        let cell = ctx.mv_grid.get(mi_row - 1, mi_col);
+        (cell.ref_frame[0], cell.ref_frame[1])
     } else {
-        0u8
+        (INTRA_FRAME, NONE_FRAME)
     };
-    let left_ref0 = if left_intra {
-        0u8
-    } else if avail_l {
-        LAST
+    let (left_r0, left_r1) = if avail_l {
+        let cell = ctx.mv_grid.get(mi_row, mi_col - 1);
+        (cell.ref_frame[0], cell.ref_frame[1])
     } else {
-        0u8
+        (INTRA_FRAME, NONE_FRAME)
     };
-    // The encoder only emits single-ref LAST blocks, so non-intra
-    // neighbours always have `single == true` and `ref_frame[0] == LAST`.
-    // The decoder's `single_ref_p1_ctx` `above_single` / `left_single`
-    // branches collapse to "always single" — every spec sub-case the
-    // encoder can reach is one of the four alternatives below.
-    if avail_u && avail_l {
-        if above_intra && left_intra {
+    let above_intra = above_r0 == INTRA_FRAME;
+    let left_intra = left_r0 == INTRA_FRAME;
+    let above_single = above_r1 == NONE_FRAME || above_r1 == INTRA_FRAME;
+    let left_single = left_r1 == NONE_FRAME || left_r1 == INTRA_FRAME;
+    // Defensive: `intra_above` / `intra_left` ought to agree with the
+    // grid; honour either if it claims intra.
+    let above_intra =
+        above_intra || (avail_u && mi_col < ctx.intra_above.len() && ctx.intra_above[mi_col]);
+    let left_intra =
+        left_intra || (avail_l && mi_row < ctx.intra_left.len() && ctx.intra_left[mi_row]);
+    EncNeighbourInfo {
+        avail_u,
+        avail_l,
+        above_ref: [above_r0, above_r1],
+        left_ref: [left_r0, left_r1],
+        above_intra,
+        left_intra,
+        above_single,
+        left_single,
+    }
+}
+
+/// §9.3.2 `single_ref_p1` ctx — first bit of the single-ref tree
+/// (0 = LAST, 1 = {GOLDEN, ALTREF}). Mirrors the decoder's
+/// `InterTile::single_ref_p1_ctx` VERBATIM so the encoder picks the
+/// same SINGLE_REF_PROB[ctx][0] as the decoder will.
+fn single_ref_p1_ctx_from_nbr(n: &EncNeighbourInfo) -> usize {
+    const LAST: u8 = 1;
+    if n.avail_u && n.avail_l {
+        if n.above_intra && n.left_intra {
             2
-        } else if left_intra {
-            // above is single-LAST inter, left intra.
-            4 * ((above_ref0 == LAST) as usize)
-        } else if above_intra {
-            // left is single-LAST inter, above intra.
-            4 * ((left_ref0 == LAST) as usize)
+        } else if n.left_intra {
+            if n.above_single {
+                4 * ((n.above_ref[0] == LAST) as usize)
+            } else {
+                1 + ((n.above_ref[0] == LAST || n.above_ref[1] == LAST) as usize)
+            }
+        } else if n.above_intra {
+            if n.left_single {
+                4 * ((n.left_ref[0] == LAST) as usize)
+            } else {
+                1 + ((n.left_ref[0] == LAST || n.left_ref[1] == LAST) as usize)
+            }
+        } else if n.above_single && n.left_single {
+            2 * ((n.above_ref[0] == LAST) as usize) + 2 * ((n.left_ref[0] == LAST) as usize)
+        } else if !n.above_single && !n.left_single {
+            1 + ((n.above_ref[0] == LAST
+                || n.above_ref[1] == LAST
+                || n.left_ref[0] == LAST
+                || n.left_ref[1] == LAST) as usize)
         } else {
-            // Both single-LAST inter neighbours.
-            2 * ((above_ref0 == LAST) as usize) + 2 * ((left_ref0 == LAST) as usize)
+            let rfs = if n.above_single {
+                n.above_ref[0]
+            } else {
+                n.left_ref[0]
+            };
+            let crf1 = if n.above_single {
+                n.left_ref[0]
+            } else {
+                n.above_ref[0]
+            };
+            let crf2 = if n.above_single {
+                n.left_ref[1]
+            } else {
+                n.above_ref[1]
+            };
+            if rfs == LAST {
+                3 + ((crf1 == LAST || crf2 == LAST) as usize)
+            } else {
+                (crf1 == LAST || crf2 == LAST) as usize
+            }
         }
-    } else if avail_u {
-        if above_intra {
+    } else if n.avail_u {
+        if n.above_intra {
             2
+        } else if n.above_single {
+            4 * ((n.above_ref[0] == LAST) as usize)
         } else {
-            // single-LAST above only.
-            4 * ((above_ref0 == LAST) as usize)
+            1 + ((n.above_ref[0] == LAST || n.above_ref[1] == LAST) as usize)
         }
-    } else if avail_l {
-        if left_intra {
+    } else if n.avail_l {
+        if n.left_intra {
             2
+        } else if n.left_single {
+            4 * ((n.left_ref[0] == LAST) as usize)
         } else {
-            4 * ((left_ref0 == LAST) as usize)
+            1 + ((n.left_ref[0] == LAST || n.left_ref[1] == LAST) as usize)
         }
     } else {
         2
+    }
+}
+
+/// §9.3.2 `single_ref_p2` ctx — second bit of the single-ref tree
+/// (only read when `single_ref_p1 = 1`; selects GOLDEN vs ALTREF).
+/// Mirrors `InterTile::single_ref_p2_ctx` VERBATIM.
+fn single_ref_p2_ctx_from_nbr(n: &EncNeighbourInfo) -> usize {
+    const LAST: u8 = 1;
+    const GOLDEN: u8 = 2;
+    const ALTREF: u8 = 3;
+    if n.avail_u && n.avail_l {
+        if n.above_intra && n.left_intra {
+            2
+        } else if n.left_intra {
+            if n.above_single {
+                if n.above_ref[0] == LAST {
+                    3
+                } else {
+                    4 * ((n.above_ref[0] == GOLDEN) as usize)
+                }
+            } else {
+                1 + 2 * ((n.above_ref[0] == GOLDEN || n.above_ref[1] == GOLDEN) as usize)
+            }
+        } else if n.above_intra {
+            if n.left_single {
+                if n.left_ref[0] == LAST {
+                    3
+                } else {
+                    4 * ((n.left_ref[0] == GOLDEN) as usize)
+                }
+            } else {
+                1 + 2 * ((n.left_ref[0] == GOLDEN || n.left_ref[1] == GOLDEN) as usize)
+            }
+        } else if n.above_single && n.left_single {
+            if n.above_ref[0] == LAST && n.left_ref[0] == LAST {
+                3
+            } else if n.above_ref[0] == LAST {
+                4 * ((n.left_ref[0] == GOLDEN) as usize)
+            } else if n.left_ref[0] == LAST {
+                4 * ((n.above_ref[0] == GOLDEN) as usize)
+            } else {
+                2 * ((n.above_ref[0] == GOLDEN) as usize) + 2 * ((n.left_ref[0] == GOLDEN) as usize)
+            }
+        } else if !n.above_single && !n.left_single {
+            if n.above_ref[0] == n.left_ref[0] && n.above_ref[1] == n.left_ref[1] {
+                3 * ((n.above_ref[0] == GOLDEN || n.above_ref[1] == GOLDEN) as usize)
+            } else {
+                2
+            }
+        } else {
+            let rfs = if n.above_single {
+                n.above_ref[0]
+            } else {
+                n.left_ref[0]
+            };
+            let crf1 = if n.above_single {
+                n.left_ref[0]
+            } else {
+                n.above_ref[0]
+            };
+            let crf2 = if n.above_single {
+                n.left_ref[1]
+            } else {
+                n.above_ref[1]
+            };
+            if rfs == GOLDEN {
+                3 + ((crf1 == GOLDEN || crf2 == GOLDEN) as usize)
+            } else if rfs == ALTREF {
+                (crf1 == GOLDEN || crf2 == GOLDEN) as usize
+            } else {
+                1 + 2 * ((crf1 == GOLDEN || crf2 == GOLDEN) as usize)
+            }
+        }
+    } else if n.avail_u {
+        if n.above_intra || (n.above_ref[0] == LAST && n.above_single) {
+            2
+        } else if n.above_single {
+            4 * ((n.above_ref[0] == GOLDEN) as usize)
+        } else {
+            3 * ((n.above_ref[0] == GOLDEN || n.above_ref[1] == GOLDEN) as usize)
+        }
+    } else if n.avail_l {
+        if n.left_intra || (n.left_ref[0] == LAST && n.left_single) {
+            2
+        } else if n.left_single {
+            4 * ((n.left_ref[0] == GOLDEN) as usize)
+        } else {
+            3 * ((n.left_ref[0] == GOLDEN || n.left_ref[1] == GOLDEN) as usize)
+        }
+    } else {
+        2
+    }
+}
+
+/// Emit the per-block reference-frame symbols for a single-ref pick
+/// (LAST or GOLDEN). The full §6.4.5 single-ref tree:
+///   * `single_ref_p1` bit: 0 → LAST_FRAME, 1 → {GOLDEN, ALTREF}.
+///   * if `single_ref_p1 = 1`: `single_ref_p2` bit: 0 → GOLDEN, 1 → ALTREF.
+///
+/// The r-multiref round only emits LAST / GOLDEN (no ALTREF picks).
+fn emit_single_ref_bits(
+    be: &mut BoolEncoder,
+    ctx: &InterCtx,
+    mi_row: usize,
+    mi_col: usize,
+    pick: RefPick,
+) {
+    let nbr = enc_neighbour_info(ctx, mi_row, mi_col);
+    let p1_ctx = single_ref_p1_ctx_from_nbr(&nbr);
+    match pick {
+        RefPick::Last => {
+            be.write(0, SINGLE_REF_PROB[p1_ctx][0]);
+        }
+        RefPick::Golden => {
+            be.write(1, SINGLE_REF_PROB[p1_ctx][0]);
+            let p2_ctx = single_ref_p2_ctx_from_nbr(&nbr);
+            be.write(0, SINGLE_REF_PROB[p2_ctx][1]);
+        }
     }
 }
 
@@ -1764,15 +2041,25 @@ fn refine_subpel_8nb(
 }
 
 /// Build a complete P-frame: uncompressed + compressed + tile.
+///
+/// `refs.last` is always populated; `refs.golden` is optional. When
+/// present, the encoder runs per-CU RDO between LAST and GOLDEN and
+/// emits §6.4.5 single-ref bits accordingly. DPB layout:
+///   * `ref_frame_idx[LAST]   = 0` — slot 0, refreshed each P-frame.
+///   * `ref_frame_idx[GOLDEN] = 1` — slot 1, holds the keyframe across
+///     subsequent P-frames (refresh_frame_flags = 0x01 only refreshes
+///     slot 0, so slot 1 stays the keyframe).
+///   * `ref_frame_idx[ALTREF] = 0` — unused but must point to a valid
+///     populated slot (the keyframe fills all 8 slots, so 0 is fine).
 pub fn build_pframe(
     p: &EncoderParams,
     src: &crate::encoder::params::YuvFrame<'_>,
-    refr: &ReferenceFrame,
+    refs: &ReferenceSet<'_>,
 ) -> Vec<u8> {
     use crate::encoder::compressed_header::emit_compressed_header_p;
     use crate::encoder::uncompressed_header::emit_uncompressed_header_p;
 
-    // Round 49 wiring choices:
+    // Wiring choices (carry-over from round 49 + r-multiref deltas):
     let interpolation_filter = 0u8; // EightTap
     let allow_hp = false;
     let compound_allowed = false; // all sign_bias slots are 0 → uniform → no compound.
@@ -1784,12 +2071,21 @@ pub fn build_pframe(
         allow_hp,
         compound_allowed,
     );
-    let tile = emit_pframe_tile(p, src, refr);
+    let tile = emit_pframe_tile(p, src, refs);
+    // r-multiref DPB layout: LAST → slot 0, GOLDEN → slot 1, ALTREF
+    // unused (point at 0 — a valid populated slot since the keyframe
+    // filled all 8). When `golden` is absent we keep `[0, 0, 0]` which
+    // matches the round-49 single-LAST behaviour exactly.
+    let ref_frame_idx = if refs.golden.is_some() {
+        [0u8, 1, 0]
+    } else {
+        [0u8, 0, 0]
+    };
     let uh = emit_uncompressed_header_p(
         p,
         ch.len() as u16,
         0x01, // refresh slot 0 (the LAST_FRAME slot).
-        0,    // ref_frame_idx[LAST] = slot 0.
+        ref_frame_idx,
         interpolation_filter,
         allow_hp,
     );

@@ -8,7 +8,7 @@
 use crate::compressed_header::TxMode;
 use crate::encoder::compressed_header::emit_compressed_header;
 use crate::encoder::inter::build_pframe;
-use crate::encoder::params::{EncoderParams, ReferenceFrame, YuvFrame};
+use crate::encoder::params::{EncoderParams, ReferenceFrame, ReferenceSet, YuvFrame};
 use crate::encoder::tile::emit_keyframe_tile;
 use crate::encoder::tile_pixel::build_pixel_keyframe;
 use crate::encoder::uncompressed_header::emit_uncompressed_header;
@@ -46,17 +46,46 @@ pub fn encode_keyframe_yuv(p: &EncoderParams, src: &YuvFrame<'_>) -> Vec<u8> {
 
 /// Encode a P-frame against a reconstructed LAST_FRAME reference.
 ///
-/// Round 49: single-reference inter with 64×64 PARTITION_NONE blocks,
-/// integer-pel ±16 ME, ZEROMV / NEWMV inter modes, `skip = 1`
-/// (no residual). Returns a full VP9 access-unit byte buffer that
-/// can be packetised into IVF / WebM or fed to `Vp9Decoder::send_packet`.
+/// Single-reference convenience wrapper. For multi-reference (LAST +
+/// GOLDEN per-CU RDO) use [`encode_pframe_yuv_multi_ref`].
 ///
-/// The caller is responsible for keeping the reference frame in sync —
-/// for a typical key + P chain that's the reconstruction of the
-/// preceding keyframe (which the caller obtains by decoding their own
+/// Returns a full VP9 access-unit byte buffer that can be packetised
+/// into IVF / WebM or fed to `Vp9Decoder::send_packet`. The caller is
+/// responsible for keeping the reference frame in sync — for a typical
+/// key + P chain that's the reconstruction of the preceding keyframe
+/// (which the caller obtains by decoding their own
 /// `encode_keyframe_yuv` output).
 pub fn encode_pframe_yuv(p: &EncoderParams, src: &YuvFrame<'_>, refr: &ReferenceFrame) -> Vec<u8> {
-    build_pframe(p, src, refr)
+    let refs = ReferenceSet {
+        last: refr,
+        golden: None,
+    };
+    build_pframe(p, src, &refs)
+}
+
+/// Encode a P-frame with multi-reference RDO between LAST_FRAME and
+/// GOLDEN_FRAME (r-multiref round). For every CU the encoder runs ME
+/// against both reference planes and picks the lower-SAD reference
+/// (with a small bit-rate penalty for GOLDEN's extra `single_ref_p2`
+/// bit). Per-block `ref_frame[0]` is signalled via the §6.4.5
+/// single-ref tree.
+///
+/// DPB convention (mirrored in the uncompressed header):
+/// * `refs.last`   → DPB slot 0. The encoder asks the decoder to
+///   refresh slot 0 after this P-frame (`refresh_frame_flags = 0x01`),
+///   so the next P-frame's `last` will be this P-frame's reconstruction.
+/// * `refs.golden` → DPB slot 1. The keyframe writes all 8 slots
+///   (`refresh_frame_flags = 0xFF`), so slot 1 stays the keyframe as
+///   long as P-frames refresh only slot 0.
+///
+/// When `refs.golden` is `None` this collapses to single-LAST exactly
+/// like [`encode_pframe_yuv`].
+pub fn encode_pframe_yuv_multi_ref(
+    p: &EncoderParams,
+    src: &YuvFrame<'_>,
+    refs: &ReferenceSet<'_>,
+) -> Vec<u8> {
+    build_pframe(p, src, refs)
 }
 
 #[cfg(test)]

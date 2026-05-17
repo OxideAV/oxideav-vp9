@@ -124,9 +124,8 @@ pub struct YuvFrame<'a> {
 
 /// A reconstructed reference frame's YUV planes — produced by decoding
 /// the previous I-frame (or P-frame) bitstream and fed to the P-frame
-/// encoder as the LAST_FRAME reference for motion estimation /
-/// compensation. Round 49 ships single-reference inter only, so
-/// callers populate exactly one slot.
+/// encoder as the LAST_FRAME (or, as of r-multiref, GOLDEN_FRAME)
+/// reference for motion estimation / compensation.
 ///
 /// The encoder reads from `y`/`u`/`v` at decoder-shape stride; ME
 /// runs against the luma plane in integer-pel units.
@@ -146,4 +145,30 @@ pub struct ReferenceFrame {
     pub width: u32,
     /// Frame height (luma row count).
     pub height: u32,
+}
+
+/// Reference-frame bundle for the P-frame encoder. The `last` slot is
+/// mandatory; `golden` is optional. When `golden` is present the
+/// encoder runs per-CU RDO between LAST_FRAME and GOLDEN_FRAME (§6.4.5
+/// single_ref tree) and emits the per-block ref-frame bits accordingly.
+/// When `golden` is `None` the encoder collapses back to single-LAST
+/// behaviour for wire compatibility with the round-49 path.
+///
+/// DPB convention (mirrored by `emit_uncompressed_header_p` /
+/// `build_pframe_multi_ref`):
+/// * `last`   → `ref_frame_idx[0]` = DPB slot 0 (refreshed by the
+///   preceding P-frame, or the keyframe).
+/// * `golden` → `ref_frame_idx[1]` = DPB slot 1 (typically the
+///   keyframe, which writes `refresh_frame_flags = 0xFF` and so fills
+///   every slot — slot 1 stays the keyframe as long as the P-frames
+///   refresh only slot 0).
+#[derive(Clone, Debug)]
+pub struct ReferenceSet<'a> {
+    /// Mandatory LAST_FRAME reference. Typically the reconstruction
+    /// of the immediately preceding decoded frame.
+    pub last: &'a ReferenceFrame,
+    /// Optional GOLDEN_FRAME reference. Typically the most recent
+    /// keyframe's reconstruction, preserved across P-frame DPB refreshes
+    /// so the encoder can fall back to it when LAST drifts.
+    pub golden: Option<&'a ReferenceFrame>,
 }

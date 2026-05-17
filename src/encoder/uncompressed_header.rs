@@ -97,9 +97,11 @@ pub fn emit_uncompressed_header(p: &EncoderParams, compressed_header_size: u16) 
 /// (round 49 uses `0x01` — slot 0 refreshed, the LAST_FRAME slot the
 /// next inter frame would read from).
 ///
-/// `ref_frame_idx_last`: DPB slot index 0..7 for the LAST_FRAME ref
-/// (round 49 uses 0). GOLDEN/ALTREF slots default to 0 — unused since
-/// all blocks code as single-ref LAST.
+/// `ref_frame_idx`: 3-element array of DPB slot indices (0..=7) for
+/// `[LAST_FRAME, GOLDEN_FRAME, ALTREF_FRAME]`. r-multiref sets
+/// `[0, 1, 0]` so LAST reads from slot 0 (last refreshed P-frame) and
+/// GOLDEN reads from slot 1 (still holding the keyframe). Round 49
+/// single-LAST sets `[0, 0, 0]`.
 ///
 /// `interpolation_filter`: 0..3 picks one of EightTap/EightTapSmooth/
 /// EightTapSharp/Bilinear (per §7.2.7 mapping). 4 = SWITCHABLE per
@@ -112,7 +114,7 @@ pub fn emit_uncompressed_header_p(
     p: &EncoderParams,
     compressed_header_size: u16,
     refresh_frame_flags: u8,
-    ref_frame_idx_last: u8,
+    ref_frame_idx: [u8; 3],
     interpolation_filter: u8,
     allow_high_precision_mv: bool,
 ) -> Vec<u8> {
@@ -146,8 +148,8 @@ pub fn emit_uncompressed_header_p(
     //     if 0: interp_filter (2)
     bw.write(0, 2); // reset_frame_context = 0
     bw.write(refresh_frame_flags as u32, 8);
-    for _ in 0..3 {
-        bw.write(ref_frame_idx_last as u32, 3);
+    for i in 0..3 {
+        bw.write(ref_frame_idx[i] as u32, 3);
         bw.bit(false); // ref_frame_sign_bias = 0 (uniform)
     }
     // frame_size_with_refs (§6.2.2.1). Three found_ref bits, then

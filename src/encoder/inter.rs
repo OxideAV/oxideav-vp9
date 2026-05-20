@@ -79,8 +79,8 @@ use crate::frame_ctx::FrameContext;
 use crate::mcfilter::{mc_block, InterpFilter, RefSampler};
 use crate::mv::{DEFAULT_MV_COMP_PROBS, MV_JOINT_PROBS};
 use crate::mvref::{
-    find_best_ref_mvs, find_mv_refs_geom, BlockGeom, InterMiCell, InterMiGrid, INTRA_FRAME,
-    NONE_FRAME, Y_MODE_NEWMV, Y_MODE_ZEROMV,
+    find_best_ref_mvs, find_mv_refs_geom, BlockGeom, InterMiCell, InterMiGrid, MvRefs, INTRA_FRAME,
+    NONE_FRAME, Y_MODE_NEARESTMV, Y_MODE_NEARMV, Y_MODE_NEWMV, Y_MODE_ZEROMV,
 };
 use crate::probs::PARTITION_PROBS;
 
@@ -107,6 +107,89 @@ const INTER_MODE_PROBS: [[u8; 3]; 7] = [
 
 /// Block-matching ME search radius (integer-pel).
 const ME_SEARCH_RADIUS: i32 = 16;
+
+/// Encoder-side inter-mode choice for one block. Mirrors the four
+/// VP9 inter modes (§6.4.16) that the decoder reads via
+/// `read_inter_mode` against `INTER_MODE_PROBS[ctx]`.
+///
+/// The bit costs on the wire (per `vp9_inter_mode_tree`):
+///   * `Zeromv`    — 1 bit (`0`).
+///   * `Nearestmv` — 2 bits (`1, 0`) — no MV delta on the wire.
+///   * `Nearmv`    — 3 bits (`1, 1, 0`) — no MV delta on the wire.
+///   * `Newmv`     — 3 bits (`1, 1, 1`) plus a §6.4.19 MV joint +
+///     per-component class/bits/fr/hp delta against `BestMv`.
+///
+/// For the encoder, picking `Nearestmv` or `Nearmv` saves the entire
+/// MV-delta encoding (typically 5–25 bits per component) whenever the
+/// ME-picked MV already matches the §6.5.12 `RefListMv[0]`
+/// (`NearestMv`) or `RefListMv[1]` (`NearMv`) the decoder will derive
+/// from the neighbour scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EmitInterMode {
+    Zeromv,
+    Nearestmv,
+    Nearmv,
+    Newmv,
+}
+
+impl EmitInterMode {
+    fn y_mode(self) -> u8 {
+        match self {
+            EmitInterMode::Zeromv => Y_MODE_ZEROMV,
+            EmitInterMode::Nearestmv => Y_MODE_NEARESTMV,
+            EmitInterMode::Nearmv => Y_MODE_NEARMV,
+            EmitInterMode::Newmv => Y_MODE_NEWMV,
+        }
+    }
+}
+
+/// Pick the cheapest §6.4.16 `inter_mode` for the picked MV
+/// (`mv_row_1_8`, `mv_col_1_8`) against the cell's `find_best_ref_mvs`
+/// result `refs`. Returns the inter-mode the encoder should emit.
+///
+/// Decision logic:
+///   * `is_zeromv == true`  → always emit `Zeromv` (the existing ME
+///     gate already keeps the MV at `(0, 0)` in this branch — the
+///     1-bit ZEROMV symbol stays the cheapest option).
+///   * The MV equals `refs.nearest_mv()` (`= RefListMv[0]`) AND that
+///     candidate is itself non-zero → emit `Nearestmv` (saves the
+///     MV-delta encoding; the decoder's `assign_mv(Nearestmv, ...)`
+///     reproduces the same MV bit-for-bit).
+///   * `refs.count >= 2` AND the MV equals `refs.near_mv()` AND
+///     that candidate is non-zero AND differs from `refs.nearest_mv()`
+///     → emit `Nearmv`.
+///   * Otherwise → `Newmv` with a `(mv - refs.best_mv())` delta.
+///
+/// The non-zero gate on Nearest/Near keeps the choice "best on the
+/// wire" without re-running the full inter-mode tree cost:
+/// `RefListMv[0] == (0, 0)` is a degenerate fallback (no inter
+/// neighbours present) — in that case `Zeromv` at 1 bit beats
+/// `Nearestmv` at 2 bits even though `assign_mv` would still reproduce
+/// `(0, 0)` for both. We never lose the encode here: if `is_zeromv ==
+/// false` the picked MV is itself non-zero, so a zero `RefListMv[0]`
+/// cannot equal it.
+fn pick_inter_mode(
+    is_zeromv: bool,
+    mv_row_1_8: i16,
+    mv_col_1_8: i16,
+    refs: &MvRefs,
+) -> EmitInterMode {
+    if is_zeromv {
+        return EmitInterMode::Zeromv;
+    }
+    let mv = crate::mv::Mv::new(mv_row_1_8, mv_col_1_8);
+    let nearest = refs.nearest_mv();
+    if mv == nearest && (nearest.row != 0 || nearest.col != 0) {
+        return EmitInterMode::Nearestmv;
+    }
+    if refs.count >= 2 {
+        let near = refs.near_mv();
+        if mv == near && near != nearest && (near.row != 0 || near.col != 0) {
+            return EmitInterMode::Nearmv;
+        }
+    }
+    EmitInterMode::Newmv
+}
 
 /// SAD threshold below which a non-zero MV win is considered
 /// "significant" — used by the encoder to decide ZEROMV vs NEWMV. If
@@ -336,7 +419,7 @@ impl InterCtx {
         mi_h: usize,
         skip: bool,
         mv: (i16, i16),
-        is_zeromv: bool,
+        emit_mode: EmitInterMode,
         ref_pick: RefPick,
     ) {
         for i in 0..mi_w.max(1) {
@@ -359,11 +442,13 @@ impl InterCtx {
         cell.ref_frame[1] = NONE_FRAME;
         cell.mv[0] = crate::mv::Mv::new(mv.0, mv.1);
         cell.sub_mvs[0] = [crate::mv::Mv::new(mv.0, mv.1); 4];
-        cell.y_mode = if is_zeromv {
-            Y_MODE_ZEROMV
-        } else {
-            Y_MODE_NEWMV
-        };
+        // Drive `y_mode` from the emit-time inter-mode pick so the
+        // §6.5 `mode_ctx` neighbour bucket on subsequent blocks sees
+        // the same "non-zero predicted" / "new" / "zero" classification
+        // the decoder will see. Pre-this-round only ZEROMV / NEWMV
+        // were ever emitted, so this also covers the new
+        // NEARESTMV / NEARMV paths.
+        cell.y_mode = emit_mode.y_mode();
         cell.interp_filter = 0; // EightTap
         self.mv_grid
             .fill(mi_row, mi_col, mi_w.max(1), mi_h.max(1), cell);
@@ -384,7 +469,7 @@ impl InterCtx {
         mi_h: usize,
         skip: bool,
         mv: (i16, i16),
-        is_zeromv: bool,
+        emit_mode: EmitInterMode,
         block_mvs: &[crate::mv::Mv; 4],
         ref_pick: RefPick,
     ) {
@@ -407,11 +492,9 @@ impl InterCtx {
         cell.ref_frame[1] = NONE_FRAME;
         cell.mv[0] = crate::mv::Mv::new(mv.0, mv.1);
         cell.sub_mvs[0] = *block_mvs;
-        cell.y_mode = if is_zeromv {
-            Y_MODE_ZEROMV
-        } else {
-            Y_MODE_NEWMV
-        };
+        // Cell `y_mode` is the LAST sub-block's emit mode per §6.5
+        // contextCounter rule (cell-level `y_mode` summarises the cell).
+        cell.y_mode = emit_mode.y_mode();
         cell.interp_filter = 0; // EightTap
         self.mv_grid
             .fill(mi_row, mi_col, mi_w.max(1), mi_h.max(1), cell);
@@ -1261,20 +1344,36 @@ fn emit_inter_block(
     find_best_ref_mvs(&mut refs_a, allow_hp, &geom);
     let mode_ctx = (refs_a.mode_context as usize).min(6);
 
+    // Pick the cheapest inter-mode for the picked MV against the
+    // §6.5.12 reference list. NEARESTMV / NEARMV save the entire MV
+    // delta when the ME result matches `RefListMv[0]` / `RefListMv[1]`.
+    let emit_mode = pick_inter_mode(is_zeromv, mv_row_1_8, mv_col_1_8, &refs_a);
+
     // Emit inter_mode tree symbol.
     let probs = INTER_MODE_PROBS[mode_ctx];
-    if is_zeromv {
-        be.write(0, probs[0]); // ZEROMV
-    } else {
-        // NEWMV: emit bits "1, 1, 1".
-        be.write(1, probs[0]);
-        be.write(1, probs[1]);
-        be.write(1, probs[2]);
-        // Compute delta = mv - best_mv.
-        let best = refs_a.best_mv();
-        let dmv_r = (mv_row_1_8 as i32) - (best.row as i32);
-        let dmv_c = (mv_col_1_8 as i32) - (best.col as i32);
-        emit_mv(be, dmv_r, dmv_c, allow_hp);
+    match emit_mode {
+        EmitInterMode::Zeromv => {
+            be.write(0, probs[0]);
+        }
+        EmitInterMode::Nearestmv => {
+            be.write(1, probs[0]);
+            be.write(0, probs[1]);
+        }
+        EmitInterMode::Nearmv => {
+            be.write(1, probs[0]);
+            be.write(1, probs[1]);
+            be.write(0, probs[2]);
+        }
+        EmitInterMode::Newmv => {
+            be.write(1, probs[0]);
+            be.write(1, probs[1]);
+            be.write(1, probs[2]);
+            // Compute delta = mv - best_mv.
+            let best = refs_a.best_mv();
+            let dmv_r = (mv_row_1_8 as i32) - (best.row as i32);
+            let dmv_c = (mv_col_1_8 as i32) - (best.col as i32);
+            emit_mv(be, dmv_r, dmv_c, allow_hp);
+        }
     }
 
     // Skip=1 ⇒ no residual.
@@ -1287,7 +1386,7 @@ fn emit_inter_block(
         mi_h,
         true,
         (mv_row_1_8, mv_col_1_8),
-        is_zeromv,
+        emit_mode,
         ref_pick,
     );
 }
@@ -1397,7 +1496,7 @@ fn emit_inter_block_sub8x8(
     let mut block_mvs: [crate::mv::Mv; 4] = [crate::mv::Mv::ZERO; 4];
     let mut last_mv_row_1_8 = 0i16;
     let mut last_mv_col_1_8 = 0i16;
-    let mut last_is_zeromv = true;
+    let mut last_emit_mode = EmitInterMode::Zeromv;
 
     let mut idy = 0usize;
     while idy < 2 {
@@ -1442,17 +1541,64 @@ fn emit_inter_block_sub8x8(
                 (r, c)
             };
 
-            // Emit inter_mode tree symbol.
-            if is_zeromv {
-                be.write(0, inter_mode_probs[0]); // ZEROMV
+            // Pick cheapest inter-mode for this sub-block. The §6.4.16
+            // (idy, idx) walk uses the cell-level `refs_a` for every
+            // sub-block — `refs_a.nearest_mv()` is therefore the same
+            // for all four sub-blocks of a B4x4 cell. The decoder side
+            // mirrors this: `assign_mv(Nearestmv, sub_refs_a, ...)`
+            // reads `sub_refs_a.nearest_mv()` per sub-block, which the
+            // §6.5.14 `append_sub8x8_mvs` may have refined from earlier
+            // sub-blocks' MVs. Our `refs_a` here is the cell-level
+            // anchor; on the decoder side the per-sub-block
+            // `sub_refs_a` matches it on block 0 and diverges on later
+            // blocks. We use the cell-level list as a conservative
+            // matching key — if the cell-level `RefListMv[0]` already
+            // matches the picked MV, the per-sub-block refinement
+            // never makes Nearest "worse" because `append_sub8x8_mvs`
+            // only ever swaps `RefListMv[0]` for a `BlockMvs[0]` of an
+            // earlier sub-block; on block 0 there's nothing earlier
+            // and on later blocks the swap leaves `Nearestmv` resolved
+            // to the same MV as long as block 0's MV matched. For
+            // safety, we restrict the Nearest/Near match to sub-block
+            // 0 (where the cell-level and per-sub-block lists agree
+            // exactly per spec — block 0 short-circuits to
+            // `sub8x8Mvs = RefListMv[0..2]`).
+            let sub_block_idx = idy * 2 + idx;
+            let candidate_mode = pick_inter_mode(is_zeromv, mv_row_1_8, mv_col_1_8, &refs_a);
+            let emit_mode = if sub_block_idx == 0 {
+                candidate_mode
             } else {
-                // NEWMV: bits "1, 1, 1".
-                be.write(1, inter_mode_probs[0]);
-                be.write(1, inter_mode_probs[1]);
-                be.write(1, inter_mode_probs[2]);
-                let dmv_r = (mv_row_1_8 as i32) - (best_anchor_mv.row as i32);
-                let dmv_c = (mv_col_1_8 as i32) - (best_anchor_mv.col as i32);
-                emit_mv(be, dmv_r, dmv_c, allow_hp);
+                // Beyond block 0 the per-sub-block list may differ from
+                // the cell-level list; fall back to ZEROMV / NEWMV
+                // until the encoder reconstructs the per-sub-block
+                // §6.5.14 refinement.
+                match candidate_mode {
+                    EmitInterMode::Zeromv => EmitInterMode::Zeromv,
+                    _ => EmitInterMode::Newmv,
+                }
+            };
+
+            match emit_mode {
+                EmitInterMode::Zeromv => {
+                    be.write(0, inter_mode_probs[0]);
+                }
+                EmitInterMode::Nearestmv => {
+                    be.write(1, inter_mode_probs[0]);
+                    be.write(0, inter_mode_probs[1]);
+                }
+                EmitInterMode::Nearmv => {
+                    be.write(1, inter_mode_probs[0]);
+                    be.write(1, inter_mode_probs[1]);
+                    be.write(0, inter_mode_probs[2]);
+                }
+                EmitInterMode::Newmv => {
+                    be.write(1, inter_mode_probs[0]);
+                    be.write(1, inter_mode_probs[1]);
+                    be.write(1, inter_mode_probs[2]);
+                    let dmv_r = (mv_row_1_8 as i32) - (best_anchor_mv.row as i32);
+                    let dmv_c = (mv_col_1_8 as i32) - (best_anchor_mv.col as i32);
+                    emit_mv(be, dmv_r, dmv_c, allow_hp);
+                }
             }
 
             // Record this sub-block's MV in `block_mvs` — every 4×4 cell
@@ -1466,7 +1612,7 @@ fn emit_inter_block_sub8x8(
             }
             last_mv_row_1_8 = mv_row_1_8;
             last_mv_col_1_8 = mv_col_1_8;
-            last_is_zeromv = is_zeromv;
+            last_emit_mode = emit_mode;
 
             idx += num4x4w;
         }
@@ -1484,7 +1630,7 @@ fn emit_inter_block_sub8x8(
         cell_mi_h,
         true,
         (last_mv_row_1_8, last_mv_col_1_8),
-        last_is_zeromv,
+        last_emit_mode,
         &block_mvs,
         ref_pick,
     );
@@ -2276,5 +2422,97 @@ mod tests {
         let mut bd = BoolDecoder::new(&buf).unwrap();
         let j = read_mv_joint(&mut bd, MV_JOINT_PROBS).unwrap();
         assert_eq!(j as u32, 3);
+    }
+
+    // ----- r-next-near picker (r78) -----
+
+    fn refs_with(nearest: crate::mv::Mv, near: crate::mv::Mv, count: u8) -> MvRefs {
+        MvRefs {
+            list: [nearest, near],
+            count,
+            mode_context: 0,
+            best_mv_override: None,
+        }
+    }
+
+    #[test]
+    fn pick_inter_mode_zeromv_short_circuits() {
+        // When the ME gate decided ZEROMV, picker stays on ZEROMV
+        // regardless of what NearestMv / NearMv look like.
+        let refs = refs_with(crate::mv::Mv::new(32, 16), crate::mv::Mv::new(0, 0), 2);
+        let m = pick_inter_mode(true, 0, 0, &refs);
+        assert_eq!(m, EmitInterMode::Zeromv);
+    }
+
+    #[test]
+    fn pick_inter_mode_nearest_match_picks_nearestmv() {
+        // ME picked (32, 16). NearestMv is (32, 16). Picker must
+        // emit NEARESTMV (saves the entire MV delta).
+        let refs = refs_with(crate::mv::Mv::new(32, 16), crate::mv::Mv::new(0, 0), 1);
+        let m = pick_inter_mode(false, 32, 16, &refs);
+        assert_eq!(m, EmitInterMode::Nearestmv);
+    }
+
+    #[test]
+    fn pick_inter_mode_near_match_picks_nearmv_when_count_ge_2() {
+        // ME picked (8, 8). NearestMv = (32, 16) (no match). NearMv =
+        // (8, 8) (match). count >= 2 so NearMv is valid.
+        let refs = refs_with(crate::mv::Mv::new(32, 16), crate::mv::Mv::new(8, 8), 2);
+        let m = pick_inter_mode(false, 8, 8, &refs);
+        assert_eq!(m, EmitInterMode::Nearmv);
+    }
+
+    #[test]
+    fn pick_inter_mode_near_count_lt_2_falls_back_to_newmv() {
+        // NearMv "matches" only because the list slot was left at
+        // default zero, but `count == 1` means there's no actual
+        // RefListMv[1] — the picker must not select NEARMV.
+        let refs = refs_with(crate::mv::Mv::new(32, 16), crate::mv::Mv::new(0, 0), 1);
+        let m = pick_inter_mode(false, 0, 0, &refs);
+        // (0, 0) doesn't match NearestMv either; falls back to NEWMV
+        // (the `is_zeromv = false` branch already implies the picked
+        // MV is non-zero — this is a defensive-test corner case).
+        assert_eq!(m, EmitInterMode::Newmv);
+    }
+
+    #[test]
+    fn pick_inter_mode_zero_nearest_falls_back_to_newmv() {
+        // NearestMv = (0, 0) (degenerate — no inter neighbours). The
+        // picked MV is non-zero (is_zeromv = false). NEARESTMV at 2
+        // bits would resolve to (0, 0) on the decoder side which is
+        // WRONG for our non-zero MV. Picker must pick NEWMV instead.
+        let refs = refs_with(crate::mv::Mv::new(0, 0), crate::mv::Mv::new(0, 0), 0);
+        let m = pick_inter_mode(false, 32, 16, &refs);
+        assert_eq!(m, EmitInterMode::Newmv);
+    }
+
+    #[test]
+    fn pick_inter_mode_nearest_eq_near_avoids_double_emit() {
+        // When NearestMv == NearMv (e.g. dedup left both slots
+        // identical), the picker must not emit NEARMV after already
+        // having NEARESTMV — and NEARMV's 1-extra-bit cost is
+        // strictly worse than NEARESTMV when both resolve to the same
+        // MV. Picker should pick NEARESTMV.
+        let refs = refs_with(crate::mv::Mv::new(32, 16), crate::mv::Mv::new(32, 16), 2);
+        let m = pick_inter_mode(false, 32, 16, &refs);
+        assert_eq!(m, EmitInterMode::Nearestmv);
+    }
+
+    #[test]
+    fn pick_inter_mode_mismatch_falls_back_to_newmv() {
+        // Neither NearestMv nor NearMv match the picked MV → NEWMV.
+        let refs = refs_with(crate::mv::Mv::new(8, 8), crate::mv::Mv::new(16, 16), 2);
+        let m = pick_inter_mode(false, 32, 16, &refs);
+        assert_eq!(m, EmitInterMode::Newmv);
+    }
+
+    #[test]
+    fn emit_inter_mode_y_mode_codes_match_decoder() {
+        // Sanity: the EmitInterMode → y_mode codes are the canonical
+        // Y_MODE_* constants the decoder writes in `read_inter_mode`.
+        assert_eq!(EmitInterMode::Zeromv.y_mode(), Y_MODE_ZEROMV);
+        assert_eq!(EmitInterMode::Nearestmv.y_mode(), Y_MODE_NEARESTMV);
+        assert_eq!(EmitInterMode::Nearmv.y_mode(), Y_MODE_NEARMV);
+        assert_eq!(EmitInterMode::Newmv.y_mode(), Y_MODE_NEWMV);
     }
 }

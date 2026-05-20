@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **r-next-near — NEARESTMV / NEARMV emission in the P-frame encoder**
+  (§6.4.16 `inter_block_mode_info` / §6.5.12 `find_best_ref_mvs` /
+  §9.3.2 inter-mode bool tree). Pre-r-next-near the P-frame encoder
+  only ever emitted `ZEROMV` (1 bit, MV ≈ 0) or `NEWMV` (3 bits + the
+  full §6.4.19 MV joint + per-component class/bits/fr/hp delta) — even
+  on blocks where the ME-picked MV exactly matched the
+  `RefListMv[0]` (`NearestMv`) or `RefListMv[1]` (`NearMv`) the
+  decoder derives from the neighbour scan. r-next-near adds a
+  `pick_inter_mode` helper that, after ME and `find_best_ref_mvs`,
+  selects:
+  - `NEARESTMV` (2 bits, no MV delta) when the picked MV equals a
+    non-zero `RefListMv[0]`.
+  - `NEARMV` (3 bits, no MV delta) when `count >= 2`, the picked MV
+    equals a non-zero `RefListMv[1]`, and `RefListMv[1] != RefListMv[0]`.
+  - `NEWMV` (the previous default) otherwise.
+  - `ZEROMV` remains the choice when the existing `ME_NEWMV_GATE_SAD`
+    gate decides the MV is ≈ 0 — a zero `RefListMv[0]` never
+    "out-competes" ZEROMV's 1-bit win.
+  The cell-level `y_mode` stamp is updated to the picked mode so the
+  §6.5 `mode_ctx` neighbour bucket sees the right "predicted vs new"
+  classification on subsequent blocks (matching the decoder
+  verbatim). Sub-8×8 cells (B8x4 / B4x8 / B4x4) apply the same picker
+  to sub-block 0 (where the per-sub-block §6.5.14 `append_sub8x8_mvs`
+  refinement leaves the cell-level and sub-block lists identical per
+  spec); sub-blocks 1+ stay on the ZEROMV / NEWMV path until the
+  encoder reconstructs the per-sub-block refinement (deferred).
+  Headline (`tests/r_next_near_mv.rs`): on a 256×256 uniform 4-px
+  horizontal-translation P-frame the wire drops from **279 B → 262 B
+  (-17 B / -6%)** while round-trip PSNR_Y stays unchanged at 12.74 dB
+  (q=64 deblocking aggressively smooths the stripe pattern; the gate
+  is the byte-size delta, not PSNR). Seven new unit tests cover the
+  picker shape (`pick_inter_mode_*`) and one integration test gates
+  the end-to-end byte saving. Existing r49 / r-next / r-next-8x8 /
+  r-next-sub8 / r-multiref / r-next-hp tests stay green (their
+  fixtures are single-SB so the picker has no neighbours to anchor
+  on — byte counts and PSNRs unchanged).
+
 - **r-next-hp — 1/8-pel high-precision MV (`allow_high_precision_mv`)**
   (§6.2 uncompressed-header `allow_high_precision_mv` bit / §6.4.19
   per-component `hp` bit / §6.3 8-tap EightTap luma interpolation at

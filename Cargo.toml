@@ -1,0 +1,17 @@
+[package]
+name = "oxideav-vp9"
+version = "0.0.10"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-vp9"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust VP9 codec — orphan-rebuild scaffold pending clean-room re-implementation."
+
+readme = "README.md"
+homepage = "https://github.com/OxideAV/oxideav-vp9"
+keywords = ["multimedia", "video", "vp9", "codec", "pure-rust"]
+categories = ["multimedia::encoding", "multimedia::video"]
+
+[dependencies]
+oxideav-core = "0.1"

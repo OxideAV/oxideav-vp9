@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.10...v0.0.11) - 2026-05-20
+
+### Other
+
+- NEARESTMV/NEARMV emission in the P-frame encoder (r-next-near)
+- 1/8-pel high-precision MV (r-next-hp)
+- LAST_FRAME + GOLDEN_FRAME per-CU reference RDO (r-multiref)
+- 8×8 four-way RDO with §6.4.16 (idy, idx) sub-block walk (r-next-sub8)
+- 16×16 HORZ/VERT/SPLIT + 8×8 leaf for the P-frame inter encoder (r-next-8x8)
+- fix debug-mode overflow + bytestream partition-decision probe (r-next)
+- 32×32 + 16×16 partition support for the P-frame encoder (r-next)
+- sub-pel ME refinement — half-pel + quarter-pel 8-neighbour search (r-next)
+- P-frame inter encoder scaffold — single-ref, integer-pel ME (round 49)
+- chroma intra-mode RDO + mode-RDO early termination (round 48)
+- extend uniform-fill detection to chroma planes (#750 followup)
+- version-robust ffmpeg_oracle_decode via bilateral-rejection envelope (closes #750)
+- enforce §9.2.1 marker-bit conformance on tile bool streams (closes #769)
+- pin over_read_bits behaviour with smoke test
+- bound declared dims + bool over-read (closes #748, #749)
+- cap declared dims at 256 KP, structural-only when ours produces no frames
+- drop MAE bound — adversarial fuzz at QP=64 trips it
+- scaffold cargo-fuzz harness with panic + roundtrip + ffmpeg oracle
+
 ### Added
 
 - **r-next-near — NEARESTMV / NEARMV emission in the P-frame encoder**

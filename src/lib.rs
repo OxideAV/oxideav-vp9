@@ -8,24 +8,32 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Round-1 scope (per `docs/IMPLEMENTOR_ROUND.md` dispatch)
+//! ## Cumulative scope (rounds 1 + 2)
 //!
-//! * MSB-first `f(n)` bit reader (spec §9.1).
-//! * Uncompressed header walker up through `render_size()`:
-//!   `frame_marker`, `Profile`, `show_existing_frame`,
-//!   `frame_type`, `show_frame`, `error_resilient_mode`,
-//!   `frame_sync_code`, `color_config`, `frame_size`, `render_size`.
+//! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
+//!   (spec §9.1 + §4.9.2).
+//! * Uncompressed header walker through the end of
+//!   `uncompressed_header()` and the §6.1.1 `trailing_bits()`
+//!   zero-fill alignment.
+//!   * Round 1 covered: `frame_marker`, `Profile`,
+//!     `show_existing_frame`, `frame_type`, `show_frame`,
+//!     `error_resilient_mode`, `frame_sync_code`, `color_config`,
+//!     `frame_size`, `render_size`.
+//!   * Round 2 added: `refresh_frame_context`,
+//!     `frame_parallel_decoding_mode`, `frame_context_idx`,
+//!     `loop_filter_params()` (§6.2.8), `quantization_params()`
+//!     (§6.2.9), `segmentation_params()` (§6.2.11), `tile_info()`
+//!     (§6.2.13), `header_size_in_bytes` (f(16)), and the §6.1.1
+//!     `trailing_bits()` zero-fill conformance check.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return
 //!   [`Error::Unsupported`] for now; they need reference-buffer
 //!   state.
 //!
-//! Everything past `render_size()` in §6.2 (loop_filter_params,
-//! quantization_params, segmentation_params, tile_info,
-//! `header_size_in_bytes`), the trailing-zero alignment in §6.1.1,
-//! and the compressed header are out of round-1 scope and will land
-//! in subsequent rounds.
+//! The compressed header (§6.3) and the entropy / transform / loop
+//! filter pipelines remain out of scope and land in subsequent
+//! rounds.
 //!
 //! ## Provenance
 //!
@@ -41,12 +49,16 @@ use oxideav_core::RuntimeContext;
 mod bitreader;
 mod header;
 
-pub use header::{parse_uncompressed_header, ColorConfig, ColorSpace, FrameType, Vp9FrameHeader};
+pub use header::{
+    parse_uncompressed_header, ColorConfig, ColorSpace, FrameType, LoopFilterParams,
+    QuantizationParams, SegmentationParams, TileInfo, Vp9FrameHeader, MAX_SEGMENTS,
+    SEGMENTATION_FEATURE_BITS, SEGMENTATION_FEATURE_SIGNED, SEG_LVL_MAX,
+};
 
 /// Crate-local error type.
 ///
 /// `decode_vp9` / `encode_vp9` still return [`Error::NotImplemented`]
-/// — the round-1 cut only lands the uncompressed-header walker
+/// — the current cut only lands the uncompressed-header walker
 /// (see [`parse_uncompressed_header`]). Future rounds will wire the
 /// full decode/encode pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,9 +73,8 @@ pub enum Error {
     /// `frame_sync_code`).
     InvalidBitstream,
     /// The input header is valid but uses a syntax path that has not
-    /// yet been implemented in the round-1 cut (currently:
-    /// inter-frame headers that need `frame_size_with_refs` and
-    /// reference-buffer state).
+    /// yet been implemented (currently: inter-frame headers that need
+    /// `frame_size_with_refs` and reference-buffer state).
     Unsupported,
 }
 
@@ -72,7 +83,7 @@ impl core::fmt::Display for Error {
         match self {
             Self::NotImplemented => write!(
                 f,
-                "oxideav-vp9: decode/encode pipeline not wired up yet (round-1 header walker only)"
+                "oxideav-vp9: decode/encode pipeline not wired up yet (uncompressed-header walker only)"
             ),
             Self::UnexpectedEof => {
                 write!(f, "oxideav-vp9: ran out of bits while parsing header")

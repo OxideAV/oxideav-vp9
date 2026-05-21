@@ -2,7 +2,12 @@
 //!
 //! VP9 spec v0.7 §9.1 defines the `f(n)` parsing process: read `n` bits
 //! from the stream, MSB-first within each byte, accumulating `x = 2 * x
-//! + read_bit()`. This module exposes a thin reader with that contract.
+//! + read_bit()`. §4.9.2 defines `s(n)` (signed): an `f(n)` magnitude
+//! followed by an `f(1)` sign bit (1 = negative).
+//!
+//! This module exposes a thin reader with those contracts plus the
+//! `trailing_bits()` zero-fill check from §6.1.1 (zero-pad to the next
+//! byte boundary).
 //!
 //! The reader is intentionally minimal — it serves the uncompressed
 //! header walker only and does not implement the Boolean coder (spec
@@ -27,7 +32,6 @@ impl<'a> BitReader<'a> {
     }
 
     /// Current absolute bit position (number of bits already consumed).
-    #[cfg(test)]
     pub(crate) fn position(&self) -> usize {
         self.bit_pos
     }
@@ -48,6 +52,29 @@ impl<'a> BitReader<'a> {
     /// Convenience for `f(1)` reads that should be interpreted as flags.
     pub(crate) fn read_flag(&mut self) -> Result<bool, Error> {
         Ok(self.read_bit()? != 0)
+    }
+
+    /// `s(n)` from spec §4.9.2: read an `n`-bit magnitude followed by a
+    /// 1-bit sign (1 = negative). `n` must be at most 31 since the
+    /// magnitude fits in `i32` after sign application.
+    pub(crate) fn read_signed(&mut self, n: u32) -> Result<i32, Error> {
+        debug_assert!(n <= 31);
+        let magnitude = self.read_bits(n)? as i32;
+        let sign = self.read_bit()? != 0;
+        Ok(if sign { -magnitude } else { magnitude })
+    }
+
+    /// `trailing_bits()` from spec §6.1.1: read zero bits until the
+    /// stream position is byte-aligned. Returns
+    /// [`Error::InvalidBitstream`] if any of the padding bits is set
+    /// (spec §7.1.1: "zero_bit shall be equal to 0").
+    pub(crate) fn trailing_bits(&mut self) -> Result<(), Error> {
+        while self.bit_pos & 7 != 0 {
+            if self.read_bit()? != 0 {
+                return Err(Error::InvalidBitstream);
+            }
+        }
+        Ok(())
     }
 
     fn read_bit(&mut self) -> Result<u32, Error> {
@@ -92,5 +119,53 @@ mod tests {
         let mut r = BitReader::new(&[0xFF]);
         assert!(r.read_bits(8).is_ok());
         assert_eq!(r.read_bits(1).unwrap_err(), Error::UnexpectedEof);
+    }
+
+    #[test]
+    fn signed_round_trips_positive_and_negative() {
+        // Two consecutive s(6) values laid out MSB-first into a byte
+        // buffer. We construct the bit stream explicitly and then
+        // pack it into bytes. The first s(6) is +10 (magnitude 6 bits
+        // = 001010, sign = 0). The second s(6) is -3 (magnitude =
+        // 000011, sign = 1). Total = 14 bits.
+        let bits: [u32; 14] = [
+            0, 0, 1, 0, 1, 0, // magnitude 10
+            0, // sign +
+            0, 0, 0, 0, 1, 1, // magnitude 3
+            1, // sign -
+        ];
+        let mut bytes = vec![0u8; 2];
+        for (i, b) in bits.iter().enumerate() {
+            let bit_in_byte = 7 - (i & 7);
+            bytes[i / 8] |= (*b as u8) << bit_in_byte;
+        }
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(r.read_signed(6).unwrap(), 10);
+        assert_eq!(r.read_signed(6).unwrap(), -3);
+    }
+
+    #[test]
+    fn trailing_bits_accepts_zero_padding() {
+        // Three bits in, expect 5 zero pad bits.
+        let mut r = BitReader::new(&[0b1010_0000]);
+        let _ = r.read_bits(3).unwrap();
+        r.trailing_bits().unwrap();
+        assert_eq!(r.position(), 8);
+    }
+
+    #[test]
+    fn trailing_bits_rejects_nonzero_padding() {
+        // Three bits in, then padding contains a 1 -> reject.
+        let mut r = BitReader::new(&[0b1010_0100]);
+        let _ = r.read_bits(3).unwrap();
+        assert_eq!(r.trailing_bits().unwrap_err(), Error::InvalidBitstream);
+    }
+
+    #[test]
+    fn trailing_bits_noop_when_aligned() {
+        let mut r = BitReader::new(&[0xFF, 0x00]);
+        let _ = r.read_bits(8).unwrap();
+        r.trailing_bits().unwrap();
+        assert_eq!(r.position(), 8);
     }
 }

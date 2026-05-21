@@ -3,7 +3,34 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
-## Status — 2026-05-21
+## Status — 2026-05-22
+
+**Round 5: §6.3.2 `tx_mode_probs` + §6.3.8 `read_skip_prob` sweeps
+wired into the compressed-header walker.** Round 5 consumes the
+round-4 `read_diff_update_prob` primitive in two table sweeps:
+
+* `tx_mode_probs( )` (§6.3.2) — gated on `tx_mode == TX_MODE_SELECT`,
+  walks `tx_probs_8x8[2][1]`, `tx_probs_16x16[2][2]`,
+  `tx_probs_32x32[2][3]` (12 cells total) via
+  `read_diff_update_prob` starting from the §10 `default_tx_probs`
+  initials transcribed verbatim into `DEFAULT_TX_PROBS`.
+* `read_skip_prob( )` (§6.3.8) — unconditional 3-element
+  (`SKIP_CONTEXTS = 3`) sweep over the §10 `default_skip_prob = {
+  192, 128, 64 }` initials transcribed verbatim into
+  `DEFAULT_SKIP_PROB`.
+
+`Vp9CompressedHeader` now exposes the post-sweep `tx_probs` /
+`skip_prob` tables. When `tx_mode != TX_MODE_SELECT` the §6.3
+syntax skips `tx_mode_probs( )` entirely, so the field is left
+equal to `DEFAULT_TX_PROBS`. `parse_compressed_header` runs both
+sweeps in spec order: `read_tx_mode` → optional `read_tx_mode_probs`
+→ `read_skip_prob`.
+
+The §6.3.7 `read_coef_probs` 4D nested sweep (gated by an outer
+`L(1) update_probs` flag per tx-size) plus all inter-only §6.3.9+
+syntax remain deferred — they fire only on
+`tx_mode == TX_MODE_SELECT` (for coef) or `FrameIsIntra == 0` (for
+the inter sweeps).
 
 **Round 4: §6.3.3 `diff_update_prob` chain (`decode_term_subexp` +
 `inv_remap_prob` + `inv_recenter_nonneg` + 255-entry
@@ -96,9 +123,22 @@ remainder of the frame.
 
 ## Test surface
 
-* `cargo test`: 42 unit tests + 16 integration tests (4 in
+* `cargo test`: 52 unit tests + 18 integration tests (6 in
   `tests/compressed_header.rs` plus 12 in
   `tests/uncompressed_header.rs`).
+* Round-5 additions: 10 unit tests covering `DEFAULT_TX_PROBS`
+  shape + value spot-check against the §10 listing, `DEFAULT_SKIP_PROB
+  = [192, 128, 64]`, `read_tx_mode_probs` on a zero buffer
+  (defaults pass through; row 0 (`TX_4X4`) is never touched), the
+  12-cell loop-count shape, `read_skip_prob` on a zero buffer plus
+  a 3-context-visit sanity check, and three `parse_compressed_header`
+  integration tests confirming the §10 defaults survive the
+  zero-buffer sweep for the `ONLY_4X4`, lossless, and `TX_MODE_SELECT`
+  paths. 2 new end-to-end integration tests
+  (`tests/compressed_header.rs`): one driving the
+  `TX_MODE_SELECT` → `tx_mode_probs` → `read_skip_prob` chain from
+  a 64×64 uncompressed-header splice, one confirming `ALLOW_16X16`
+  skips the §6.3.2 sweep.
 * Round-4 additions: 16 unit tests covering `inv_recenter_nonneg`
   (all three piecewise branches plus the `v == 2*m` boundary),
   `INV_MAP_TABLE` length + spot-checks against the spec listing
@@ -155,11 +195,14 @@ harness.
 
 Future rounds, roughly in order:
 
-1. §6.3.2 `tx_mode_probs` (tx-mode-conditional `diff_update_prob`
-   sweeps), §6.3.7 `read_coef_probs` (4D nested sweep gated by an
-   outer `L(1) update_probs` flag per tx-size), §6.3.8
-   `read_skip_prob` (3-element sweep). All three now consume the
-   round-4 `read_diff_update_prob`.
+1. §6.3.7 `read_coef_probs` (4D nested sweep gated by an outer
+   `L(1) update_probs` flag per tx-size). The sweep walks `txSz ∈
+   [TX_4X4, maxTxSize]` with `maxTxSize = tx_mode_to_biggest_tx_size[
+   tx_mode ]`, so it produces visible output for every non-trivial
+   `tx_mode` and consumes the round-4 `read_diff_update_prob`. Needs
+   the §10 `default_coef_probs[ TX_SIZES ][ BLOCK_TYPES ][ REF_TYPES
+   ][ COEF_BANDS ][ PREV_COEF_CONTEXTS ][ UNCONSTRAINED_NODES ]`
+   table transcribed into a const lookup first.
 2. Inter (non-intra-only) header path — `frame_size_with_refs`,
    `allow_high_precision_mv`, `read_interpolation_filter` — plus
    the inter-only §6.3.9–§6.3.16 syntax (`read_inter_mode_probs`,

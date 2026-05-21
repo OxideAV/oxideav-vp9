@@ -190,3 +190,50 @@ fn empty_compressed_payload_rejected() {
     let empty: [u8; 0] = [];
     assert!(parse_compressed_header(&empty, false).is_err());
 }
+
+#[test]
+fn end_to_end_tx_mode_select_runs_tx_mode_probs_and_skip_prob() {
+    // TX_MODE_SELECT path with a zero-filled tail. Round 5 fires the
+    // §6.3.2 tx_mode_probs sweep then the §6.3.8 read_skip_prob
+    // sweep; on a zero buffer every B(252) update_prob decodes to 0
+    // so the post-sweep tables equal their §10 defaults.
+    let mut payload = vec![0u8; 16];
+    payload[0] = 0x70; // L(2)=3, L(1)=1 → TX_MODE_SELECT.
+    let header_size = payload.len() as u16;
+    let mut buffer = build_uncompressed_64x64_key(header_size, false);
+    let uncompressed_end = buffer.len();
+    buffer.extend_from_slice(&payload);
+
+    let h = parse_uncompressed_header(&buffer).expect("uncompressed header walks");
+    let payload_slice =
+        &buffer[uncompressed_end..uncompressed_end + h.header_size_in_bytes as usize];
+    let c = parse_compressed_header(payload_slice, h.quantization.lossless)
+        .expect("compressed header walks");
+    assert_eq!(c.tx_mode, TxMode::TxModeSelect);
+    // The §10 default tables survive the zero-buffer sweep verbatim.
+    assert_eq!(c.tx_probs[1], [[100, 0, 0], [66, 0, 0]]);
+    assert_eq!(c.tx_probs[2], [[20, 152, 0], [15, 101, 0]]);
+    assert_eq!(c.tx_probs[3], [[3, 136, 37], [5, 52, 13]]);
+    assert_eq!(c.skip_prob, [192, 128, 64]);
+}
+
+#[test]
+fn end_to_end_non_select_tx_mode_skips_tx_mode_probs_sweep() {
+    // ALLOW_16X16 (0x40 prefix): the §6.3.2 tx_mode_probs sweep is
+    // gated on TX_MODE_SELECT and must NOT fire. §6.3.8
+    // read_skip_prob still runs.
+    let payload = vec![0x40u8, 0x00, 0x00, 0x00];
+    let header_size = payload.len() as u16;
+    let mut buffer = build_uncompressed_64x64_key(header_size, false);
+    let uncompressed_end = buffer.len();
+    buffer.extend_from_slice(&payload);
+
+    let h = parse_uncompressed_header(&buffer).unwrap();
+    let payload_slice =
+        &buffer[uncompressed_end..uncompressed_end + h.header_size_in_bytes as usize];
+    let c = parse_compressed_header(payload_slice, h.quantization.lossless).unwrap();
+    assert_eq!(c.tx_mode, TxMode::Allow16x16);
+    // §10 defaults preserved since tx_mode_probs() was not invoked.
+    assert_eq!(c.tx_probs[1], [[100, 0, 0], [66, 0, 0]]);
+    assert_eq!(c.skip_prob, [192, 128, 64]);
+}

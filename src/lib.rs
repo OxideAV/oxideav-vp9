@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3 + 4)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -33,10 +33,16 @@
 //!   `read_diff_update_prob` (§6.3.3) + `decode_term_subexp`
 //!   (§6.3.4) + `inv_remap_prob` (§6.3.5) +
 //!   `inv_recenter_nonneg` (§6.3.6) + the 255-entry
-//!   `INV_MAP_TABLE` constant — as a `pub(crate)` primitive. The
-//!   §6.3.2 / §6.3.7+ syntax (`tx_mode_probs`, `read_coef_probs`,
-//!   `read_skip_prob`, `read_inter_mode_probs`, …) that consume it
-//!   land in the next round.
+//!   `INV_MAP_TABLE` constant — as a `pub(crate)` primitive.
+//! * Round 5 wired the round-4 chain into the §6.3.2
+//!   `tx_mode_probs( )` (conditional on `tx_mode == TX_MODE_SELECT`)
+//!   and §6.3.8 `read_skip_prob( )` sweeps. `Vp9CompressedHeader`
+//!   now exposes the post-sweep `tx_probs` and `skip_prob` tables;
+//!   defaults come from the §10 `default_tx_probs` and
+//!   `default_skip_prob` listings (transcribed verbatim into
+//!   `DEFAULT_TX_PROBS` / `DEFAULT_SKIP_PROB`). The §6.3.7
+//!   `read_coef_probs` 4D nested sweep and inter-only §6.3.9+
+//!   syntax remain deferred.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return

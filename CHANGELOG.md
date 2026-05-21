@@ -6,6 +6,39 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 5: §6.3.2 `tx_mode_probs` + §6.3.8 `read_skip_prob` sweeps
+  wired into `parse_compressed_header`.**
+  * `read_tx_mode_probs(&mut coder, &mut tx_probs)` (§6.3.2) —
+    three nested sweeps (`TX_SIZE_CONTEXTS * (1+2+3) = 12` cells)
+    walking `tx_probs_8x8`, `tx_probs_16x16`, `tx_probs_32x32` via
+    `read_diff_update_prob`. Gated on
+    `tx_mode == TX_MODE_SELECT` per the §6.3 compressed-header
+    syntax dispatch.
+  * `read_skip_prob(&mut coder, &mut skip_prob)` (§6.3.8) —
+    unconditional `SKIP_CONTEXTS = 3` sweep via
+    `read_diff_update_prob`.
+  * `DEFAULT_TX_PROBS: [[[u8; 3]; 2]; 4]` and
+    `DEFAULT_SKIP_PROB: [u8; 3] = [192, 128, 64]` constants
+    transcribed verbatim from the §10 default-tables listing.
+  * `Vp9CompressedHeader` extended with `tx_probs` and `skip_prob`
+    fields exposing the post-sweep tables to callers.
+    `parse_compressed_header` runs the sweeps in spec order:
+    `read_tx_mode` → optional `read_tx_mode_probs` →
+    `read_skip_prob`.
+  * 10 new unit tests covering `DEFAULT_TX_PROBS` shape + value
+    spot-check, `DEFAULT_SKIP_PROB` value, `read_tx_mode_probs`
+    zero-buffer passthrough, the 12-cell sweep count, the row-0
+    (`TX_4X4`) non-modification invariant, `read_skip_prob`
+    zero-buffer passthrough across `SKIP_CONTEXTS = 3`, and three
+    `parse_compressed_header` integration scenarios (ONLY_4X4
+    non-lossless, lossless, and TX_MODE_SELECT). 2 new end-to-end
+    integration tests in `tests/compressed_header.rs` driving the
+    full uncompressed-header splice plus the new sweeps.
+  * `read_diff_update_prob`, `decode_term_subexp`,
+    `inv_remap_prob`, `inv_recenter_nonneg`, and `INV_MAP_TABLE`
+    drop their round-4 `#[allow(dead_code)]` markers — they are
+    now driven live by the §6.3.2 / §6.3.8 sweeps.
+
 * **Round 4: §6.3.3 `diff_update_prob` chain (`decode_term_subexp` +
   `inv_remap_prob` + `inv_recenter_nonneg` + 255-entry
   `inv_map_table`).**

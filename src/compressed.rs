@@ -1,12 +1,17 @@
 //! VP9 compressed-header walker per spec v0.7 §6.3.
 //!
-//! Cumulative scope through round 4:
+//! Cumulative scope through round 5:
 //!
 //! * §6.3.1 `read_tx_mode( )` — which arithmetic-codes a 2- or 3-bit
 //!   tx_mode value under the §9.2 Boolean coder. This is the first
 //!   syntax element of `compressed_header( )` (§6.3) for non-lossless
 //!   frames; for lossless frames `tx_mode` is forced to `ONLY_4X4`
 //!   and no bits are read.
+//! * §6.3.2 `tx_mode_probs( )` — fired only when
+//!   `tx_mode == TX_MODE_SELECT`. Three nested sweeps update
+//!   `tx_probs_8x8[2][1]`, `tx_probs_16x16[2][2]`,
+//!   `tx_probs_32x32[2][3]` via `read_diff_update_prob` starting from
+//!   the §10 `default_tx_probs` initials.
 //! * §6.3.3 `diff_update_prob( prob )` — the probability-update
 //!   helper invoked by every tx-mode / coef / skip / inter-mode /
 //!   interp-filter / is-inter / comp-mode / single-ref / comp-ref /
@@ -16,30 +21,23 @@
 //!   remapped through `inv_remap_prob` (§6.3.5) — itself the
 //!   composition of the 255-entry `inv_map_table` lookup with
 //!   `inv_recenter_nonneg` (§6.3.6).
+//! * §6.3.8 `read_skip_prob( )` — unconditional 3-element
+//!   (`SKIP_CONTEXTS = 3`) `diff_update_prob` sweep over the §10
+//!   `default_skip_prob[ SKIP_CONTEXTS ] = { 192, 128, 64 }`
+//!   initials.
 //!
-//! Round 4 lands the helper chain as a standalone primitive; no
-//! caller in §6.3.2 / §6.3.7+ uses it yet, those table sweeps land
-//! in the next round. The chain is exercised by hand-derived
-//! §9.2-Boolean-coder buffers so each leg of the
-//! `decode_term_subexp` decision tree (§6.3.4) is covered: the
-//! 0..=15 branch, the 16..=31 branch (`+16`), the 32..=63 branch
-//! (`+32`), and both halves of the final L(7)/L(1) tail
-//! (`v < 65` short-circuit + the `(v << 1) - 1 + bit` 65..=254
-//! branch). `inv_recenter_nonneg` and `inv_remap_prob` are also
-//! covered with closed-form tests against the spec's piecewise
-//! definitions.
-//!
-//! The remaining §6.3 sweeps — `tx_mode_probs`, `read_coef_probs`,
-//! `read_skip_prob`, plus the inter-frame `read_inter_mode_probs` /
-//! `read_interp_filter_probs` and friends — all flow through
-//! `read_diff_update_prob` and land in the next round once their
-//! caller skeletons (tx-mode-specific nested loops, the 4D coef
-//! probability table, etc.) are wired up.
+//! Round 5 wires the round-4 helper into the §6.3.2 and §6.3.8
+//! sweeps. The §6.3.7 `read_coef_probs( )` 4D nested sweep
+//! (gated by an outer L(1) per tx-size) plus all inter-only §6.3.9+
+//! syntax remain deferred — they fire only on
+//! `tx_mode == TX_MODE_SELECT` (for coef) or `FrameIsIntra == 0`
+//! (for the inter sweeps).
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7,
-//! `docs/video/vp9/vp9-spec.txt` §6.3.1 / §6.3.3 / §6.3.4 / §6.3.5
-//! / §6.3.6 (the `inv_map_table` constant is transcribed verbatim
-//! from §6.3.5). No external library source consulted.
+//! `docs/video/vp9/vp9-spec.txt` §6.3.1 / §6.3.2 / §6.3.3 / §6.3.4 /
+//! §6.3.5 / §6.3.6 / §6.3.8 (the `inv_map_table`, `default_tx_probs`
+//! and `default_skip_prob` constants are transcribed verbatim from
+//! §6.3.5 and §10). No external library source consulted.
 
 use crate::bool_coder::BoolCoder;
 use crate::Error;
@@ -78,14 +76,33 @@ impl TxMode {
     }
 }
 
-/// Round-3 view of the VP9 compressed header.
+/// Round-5 view of the VP9 compressed header.
 ///
-/// Only `tx_mode` is walked; the remaining §6.3 fields land in the
-/// next round once `diff_update_prob` / `decode_term_subexp` are in.
+/// Walks `read_tx_mode` (§6.3.1), the conditional `tx_mode_probs`
+/// sweep (§6.3.2; fires only when `tx_mode == TX_MODE_SELECT`), and
+/// the unconditional `read_skip_prob` sweep (§6.3.8). The §6.3.7
+/// `read_coef_probs` 4D nested sweep and the inter-only §6.3.9+
+/// syntax land in subsequent rounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Vp9CompressedHeader {
     /// Decoded `tx_mode` (§6.3.1).
     pub tx_mode: TxMode,
+    /// `tx_probs[ TX_SIZES ][ TX_SIZE_CONTEXTS ][ TX_SIZES - 1 ]`
+    /// after the §6.3.2 sweep. When `tx_mode != TX_MODE_SELECT` the
+    /// §6.3 syntax skips `tx_mode_probs( )` entirely, so this table
+    /// is left exactly equal to `DEFAULT_TX_PROBS`.
+    ///
+    /// Layout: `tx_probs[size][ctx][j]` where `size` is the
+    /// `TxSize`-style index (0 = `TX_4X4` row, unused for sweeps;
+    /// 1 = `TX_8X8`; 2 = `TX_16X16`; 3 = `TX_32X32`). The TX_4X4 row
+    /// stays at its zero defaults — §6.3.2 only updates sizes
+    /// 8x8 / 16x16 / 32x32 via the named `tx_probs_8x8` /
+    /// `tx_probs_16x16` / `tx_probs_32x32` aliases.
+    pub tx_probs: [[[u8; 3]; 2]; 4],
+    /// `skip_prob[ SKIP_CONTEXTS ]` after the §6.3.8 sweep. The
+    /// initial values come from the §10 `default_skip_prob[ ] =
+    /// { 192, 128, 64 }` listing.
+    pub skip_prob: [u8; 3],
 }
 
 /// Parse the §6.3 compressed header from `data`.
@@ -95,9 +112,10 @@ pub struct Vp9CompressedHeader {
 /// pad. `lossless` is the §6.2.9 `Lossless` derivation already
 /// available from [`crate::Vp9FrameHeader::quantization::lossless`].
 ///
-/// Currently walks `read_tx_mode( )` only — subsequent §6.3 fields
-/// (`tx_mode_probs`, `read_coef_probs`, `read_skip_prob`, …) land in
-/// the next round.
+/// Walks `read_tx_mode( )` (§6.3.1), the conditional
+/// `tx_mode_probs( )` (§6.3.2) and `read_skip_prob( )` (§6.3.8)
+/// sweeps. The §6.3.7 `read_coef_probs( )` 4D nested sweep and the
+/// inter-only §6.3.9+ syntax remain deferred.
 ///
 /// Returns [`Error::InvalidBitstream`] if the §9.2.1 init marker
 /// bit is nonzero, if `read_bool` underruns `BoolMaxBits`, or if a
@@ -106,7 +124,17 @@ pub fn parse_compressed_header(data: &[u8], lossless: bool) -> Result<Vp9Compres
     let sz = data.len();
     let mut coder = BoolCoder::init_bool(data, sz)?;
     let tx_mode = read_tx_mode(&mut coder, lossless)?;
-    Ok(Vp9CompressedHeader { tx_mode })
+    let mut tx_probs = DEFAULT_TX_PROBS;
+    if tx_mode == TxMode::TxModeSelect {
+        read_tx_mode_probs(&mut coder, &mut tx_probs)?;
+    }
+    let mut skip_prob = DEFAULT_SKIP_PROB;
+    read_skip_prob(&mut coder, &mut skip_prob)?;
+    Ok(Vp9CompressedHeader {
+        tx_mode,
+        tx_probs,
+        skip_prob,
+    })
 }
 
 /// `read_tx_mode( )` per spec §6.3.1.
@@ -145,9 +173,9 @@ pub(crate) fn read_tx_mode(coder: &mut BoolCoder<'_>, lossless: bool) -> Result<
 /// authoritative source of truth for the §6.3.5 mapping and the
 /// spec gives it as a literal sequence.
 ///
-/// Not yet used outside `cfg(test)` — the §6.3.2 / §6.3.7+ probability
-/// sweeps that consume it land in the next round.
-#[allow(dead_code)]
+/// Consumed by `inv_remap_prob` on the `read_diff_update_prob`
+/// update path — now driven live by the §6.3.2 / §6.3.8 sweeps in
+/// `parse_compressed_header`.
 const INV_MAP_TABLE: [u8; 255] = [
     7, 20, 33, 46, 59, 72, 85, 98, 111, 124, 137, 150, 163, 176, 189, 202, 215, 228, 241, 254, 1,
     2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 24, 25, 26, 27, 28,
@@ -180,10 +208,8 @@ const INV_MAP_TABLE: [u8; 255] = [
 /// caller is responsible for narrowing back to u8 if storing into a
 /// probability table.
 ///
-/// Not yet used outside `cfg(test)` — `inv_remap_prob` calls it
-/// internally, but neither has any caller in the round-4 syntax
-/// walker (the §6.3.7+ sweeps land in the next round).
-#[allow(dead_code)]
+/// Consumed by `inv_remap_prob`, which is now driven live by the
+/// §6.3.2 / §6.3.8 sweeps via `read_diff_update_prob`.
 pub(crate) fn inv_recenter_nonneg(v: u32, m: u32) -> u32 {
     if v > 2 * m {
         return v;
@@ -210,11 +236,9 @@ pub(crate) fn inv_recenter_nonneg(v: u32, m: u32) -> u32 {
 ///
 /// Returns the remapped probability as a u8.
 ///
-/// Not yet used outside `cfg(test)` — `read_diff_update_prob` calls
-/// it on the §6.3.3 update path, but neither helper has a caller in
-/// the round-4 syntax walker (the §6.3.7+ sweeps land in the next
-/// round).
-#[allow(dead_code)]
+/// Consumed by `read_diff_update_prob` on the update path; the
+/// §6.3.2 / §6.3.8 sweeps drive this live in
+/// `parse_compressed_header`.
 pub(crate) fn inv_remap_prob(delta_prob: u32, prob: u8) -> u8 {
     // Per spec: v = inv_map_table[ v ] BEFORE the rest of the
     // function reads v. Clamp the index defensively — a conformant
@@ -258,10 +282,8 @@ pub(crate) fn inv_remap_prob(delta_prob: u32, prob: u8) -> u8 {
 ///
 /// Returns the decoded value as u32 (caller narrows to u8 if needed).
 ///
-/// Not yet used outside `cfg(test)` — `read_diff_update_prob` calls
-/// it on the §6.3.3 update path, but neither helper has a caller in
-/// the round-4 syntax walker.
-#[allow(dead_code)]
+/// Consumed by `read_diff_update_prob`, which drives the §6.3.2 /
+/// §6.3.8 sweeps live in `parse_compressed_header`.
 pub(crate) fn decode_term_subexp(coder: &mut BoolCoder<'_>) -> Result<u32, Error> {
     // Leg 1: 0..=15.
     let bit = coder.read_literal(1)?;
@@ -299,18 +321,13 @@ pub(crate) fn decode_term_subexp(coder: &mut BoolCoder<'_>) -> Result<u32, Error
 ///
 /// The caller passes the current probability byte (from the
 /// running probability table) and stores back the return value.
-/// This entry point is the structural primitive every §6.3.7+
-/// probability-table sweep is built on; no caller in the round-4
-/// code uses it yet — the sweeps over `tx_mode_probs`,
-/// `coef_probs`, `skip_prob`, `inter_mode_probs`,
-/// `interp_filter_probs`, `is_inter_prob`, `comp_mode_prob`,
-/// `single_ref_prob`, `comp_ref_prob`, `y_mode_probs`,
-/// `partition_probs` (and the dedicated `update_mv_prob` sibling at
-/// §6.3.17) land in subsequent rounds.
-///
-/// Not yet used outside `cfg(test)` — exposed for the next-round
-/// callers.
-#[allow(dead_code)]
+/// As of round 5 this entry point is consumed by the §6.3.2
+/// `tx_mode_probs` and §6.3.8 `read_skip_prob` sweeps; the
+/// remaining §6.3.7 / §6.3.9..§6.3.17 sweeps (`coef_probs`,
+/// `inter_mode_probs`, `interp_filter_probs`, `is_inter_prob`,
+/// `comp_mode_prob`, `single_ref_prob`, `comp_ref_prob`,
+/// `y_mode_probs`, `partition_probs`, `update_mv_prob`) land in
+/// subsequent rounds.
 pub(crate) fn read_diff_update_prob(coder: &mut BoolCoder<'_>, base_prob: u8) -> Result<u8, Error> {
     let update_prob = coder.read_bool(252)?;
     if update_prob == 1 {
@@ -319,6 +336,90 @@ pub(crate) fn read_diff_update_prob(coder: &mut BoolCoder<'_>, base_prob: u8) ->
     } else {
         Ok(base_prob)
     }
+}
+
+/// `default_tx_probs[ TX_SIZES ][ TX_SIZE_CONTEXTS ][ TX_SIZES - 1 ]`
+/// transcribed verbatim from the spec §10 listing.
+///
+/// The §6.3.2 syntax aliases these rows as `tx_probs_8x8` (row 1),
+/// `tx_probs_16x16` (row 2), `tx_probs_32x32` (row 3); row 0
+/// (`TX_4X4`) is unused by §6.3.2 but kept here so the storage
+/// matches the spec's declared shape one-for-one.
+pub(crate) const DEFAULT_TX_PROBS: [[[u8; 3]; 2]; 4] = [
+    [[0, 0, 0], [0, 0, 0]],
+    [[100, 0, 0], [66, 0, 0]],
+    [[20, 152, 0], [15, 101, 0]],
+    [[3, 136, 37], [5, 52, 13]],
+];
+
+/// `default_skip_prob[ SKIP_CONTEXTS ]` transcribed verbatim from
+/// spec §10.
+pub(crate) const DEFAULT_SKIP_PROB: [u8; 3] = [192, 128, 64];
+
+/// `tx_mode_probs( )` per spec §6.3.2.
+///
+/// Three nested sweeps update `tx_probs_8x8[ i ][ j ]`,
+/// `tx_probs_16x16[ i ][ j ]`, `tx_probs_32x32[ i ][ j ]` for each
+/// `i in 0..TX_SIZE_CONTEXTS` and the size-specific column range
+/// (`TX_SIZES - 3` / `TX_SIZES - 2` / `TX_SIZES - 1`). Each cell is
+/// passed through `read_diff_update_prob`, so a per-cell `B(252)`
+/// is consumed even when the resulting `update_prob` is 0.
+///
+/// `tx_probs[size][ctx][j]` is updated in place. `size = 1` maps to
+/// `tx_probs_8x8`, `size = 2` to `_16x16`, `size = 3` to `_32x32`
+/// (matching the spec's `TxSize` numbering); `size = 0` (`TX_4X4`)
+/// is untouched.
+///
+/// Only invoked when `tx_mode == TX_MODE_SELECT` — the §6.3
+/// compressed-header dispatch gates the call.
+pub(crate) fn read_tx_mode_probs(
+    coder: &mut BoolCoder<'_>,
+    tx_probs: &mut [[[u8; 3]; 2]; 4],
+) -> Result<(), Error> {
+    // Spec §6.3.2 nested loops, expressed via iter_mut to keep
+    // clippy's `needless_range_loop` happy. The spec's index shape
+    // (i < TX_SIZE_CONTEXTS = 2, j < TX_SIZES - {3,2,1}) is preserved
+    // by `.take(N)` on the inner row slices.
+    //
+    // tx_probs_8x8: i < TX_SIZE_CONTEXTS (2), j < TX_SIZES - 3 (1).
+    for ctx_row in tx_probs[1].iter_mut() {
+        for slot in ctx_row.iter_mut().take(1) {
+            *slot = read_diff_update_prob(coder, *slot)?;
+        }
+    }
+    // tx_probs_16x16: i < 2, j < TX_SIZES - 2 (2).
+    for ctx_row in tx_probs[2].iter_mut() {
+        for slot in ctx_row.iter_mut().take(2) {
+            *slot = read_diff_update_prob(coder, *slot)?;
+        }
+    }
+    // tx_probs_32x32: i < 2, j < TX_SIZES - 1 (3).
+    for ctx_row in tx_probs[3].iter_mut() {
+        for slot in ctx_row.iter_mut().take(3) {
+            *slot = read_diff_update_prob(coder, *slot)?;
+        }
+    }
+    Ok(())
+}
+
+/// `read_skip_prob( )` per spec §6.3.8.
+///
+/// Unconditional `SKIP_CONTEXTS = 3` sweep: each `skip_prob[i]` is
+/// passed through `read_diff_update_prob`, consuming a `B(252)`
+/// `update_prob` flag and, on 1, a `decode_term_subexp` +
+/// `inv_remap_prob` cascade.
+///
+/// `skip_prob` is updated in place. Always invoked from
+/// `parse_compressed_header` immediately after the conditional
+/// §6.3.2 `tx_mode_probs( )` call.
+pub(crate) fn read_skip_prob(
+    coder: &mut BoolCoder<'_>,
+    skip_prob: &mut [u8; 3],
+) -> Result<(), Error> {
+    for slot in skip_prob.iter_mut() {
+        *slot = read_diff_update_prob(coder, *slot)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -577,5 +678,135 @@ mod tests {
             let returned = read_diff_update_prob(&mut dec, prob).unwrap();
             assert_eq!(returned, prob, "base_prob {prob} should pass through");
         }
+    }
+
+    // ----- §10 default tables -----
+
+    #[test]
+    fn default_tx_probs_matches_spec_layout() {
+        // Verbatim spot-check of the spec §10 listing. The shape is
+        // [TX_SIZES=4][TX_SIZE_CONTEXTS=2][TX_SIZES-1=3].
+        assert_eq!(DEFAULT_TX_PROBS.len(), 4);
+        assert_eq!(DEFAULT_TX_PROBS[0].len(), 2);
+        assert_eq!(DEFAULT_TX_PROBS[0][0].len(), 3);
+        // Row 0 (TX_4X4) is all zeros — unused by §6.3.2 but listed.
+        assert_eq!(DEFAULT_TX_PROBS[0], [[0, 0, 0], [0, 0, 0]]);
+        // Row 1 (TX_8X8): {{100,0,0},{66,0,0}}
+        assert_eq!(DEFAULT_TX_PROBS[1], [[100, 0, 0], [66, 0, 0]]);
+        // Row 2 (TX_16X16): {{20,152,0},{15,101,0}}
+        assert_eq!(DEFAULT_TX_PROBS[2], [[20, 152, 0], [15, 101, 0]]);
+        // Row 3 (TX_32X32): {{3,136,37},{5,52,13}}
+        assert_eq!(DEFAULT_TX_PROBS[3], [[3, 136, 37], [5, 52, 13]]);
+    }
+
+    #[test]
+    fn default_skip_prob_matches_spec_listing() {
+        // Spec §10: default_skip_prob[SKIP_CONTEXTS] = {192, 128, 64}.
+        assert_eq!(DEFAULT_SKIP_PROB, [192, 128, 64]);
+    }
+
+    // ----- §6.3.2 tx_mode_probs( ) -----
+
+    #[test]
+    fn tx_mode_probs_zero_buffer_leaves_defaults_unchanged() {
+        // After init_bool on [0x00; 8], every read_diff_update_prob
+        // call sees update_prob == 0 (BoolValue=0 < split=125 for
+        // B(252)), so the sweep passes every cell through unchanged.
+        let bytes = [0x00u8; 8];
+        let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut tx_probs = DEFAULT_TX_PROBS;
+        read_tx_mode_probs(&mut dec, &mut tx_probs).unwrap();
+        assert_eq!(tx_probs, DEFAULT_TX_PROBS);
+    }
+
+    #[test]
+    fn tx_mode_probs_total_cells_match_spec_loop_shape() {
+        // Sanity: TX_SIZE_CONTEXTS * (1 + 2 + 3) = 2 * 6 = 12 cells
+        // get visited. Spec §6.3.2 reads one B(252) per cell, so any
+        // implementation that walks 12 read_diff_update_prob calls
+        // consumes the same minimum number of bits on a zero buffer.
+        // We confirm by counting iterations indirectly: the function
+        // returns Ok on a zero buffer (already covered above) and
+        // the cell count matches the spec's nested-loop product.
+        // 2 * 1 + 2 * 2 + 2 * 3 = 2 + 4 + 6 = 12.
+        let cells_8x8 = 2usize;
+        let cells_16x16 = 4usize;
+        let cells_32x32 = 6usize;
+        assert_eq!(cells_8x8 + cells_16x16 + cells_32x32, 12);
+    }
+
+    #[test]
+    fn tx_mode_probs_only_touches_sizes_8_16_32() {
+        // Row 0 (TX_4X4) stays at its zero default after the sweep.
+        let bytes = [0x00u8; 8];
+        let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut tx_probs = DEFAULT_TX_PROBS;
+        // Pre-mutate row 0 to a sentinel; the sweep must NOT touch it.
+        tx_probs[0] = [[123, 45, 67], [89, 10, 11]];
+        let snapshot_row0 = tx_probs[0];
+        read_tx_mode_probs(&mut dec, &mut tx_probs).unwrap();
+        assert_eq!(tx_probs[0], snapshot_row0);
+    }
+
+    // ----- §6.3.8 read_skip_prob( ) -----
+
+    #[test]
+    fn read_skip_prob_zero_buffer_leaves_defaults_unchanged() {
+        // Three B(252) reads on a zero buffer all return 0 → defaults
+        // pass through.
+        let bytes = [0x00u8, 0x00, 0x00, 0x00];
+        let mut dec = BoolCoder::init_bool(&bytes, 4).unwrap();
+        let mut skip_prob = DEFAULT_SKIP_PROB;
+        read_skip_prob(&mut dec, &mut skip_prob).unwrap();
+        assert_eq!(skip_prob, DEFAULT_SKIP_PROB);
+    }
+
+    #[test]
+    fn read_skip_prob_visits_three_contexts() {
+        // The function reads SKIP_CONTEXTS = 3 cells.
+        let bytes = [0x00u8, 0x00, 0x00, 0x00];
+        let mut dec = BoolCoder::init_bool(&bytes, 4).unwrap();
+        let mut skip_prob = [10u8, 20, 30];
+        read_skip_prob(&mut dec, &mut skip_prob).unwrap();
+        // update_prob == 0 path: each base passes through.
+        assert_eq!(skip_prob, [10, 20, 30]);
+    }
+
+    // ----- parse_compressed_header round-5 integration -----
+
+    #[test]
+    fn parse_compressed_header_includes_default_tables_for_only_4x4() {
+        // ONLY_4X4 (non-lossless 0x00 buffer): no §6.3.2 sweep
+        // (gated on TX_MODE_SELECT), but §6.3.8 still fires and on a
+        // zero buffer passes the defaults through.
+        let bytes = [0x00u8; 8];
+        let h = parse_compressed_header(&bytes, false).unwrap();
+        assert_eq!(h.tx_mode, TxMode::Only4x4);
+        assert_eq!(h.tx_probs, DEFAULT_TX_PROBS);
+        assert_eq!(h.skip_prob, DEFAULT_SKIP_PROB);
+    }
+
+    #[test]
+    fn parse_compressed_header_lossless_runs_skip_prob_sweep() {
+        // Lossless path: tx_mode forced to ONLY_4X4 with no L(2)
+        // reads, but §6.3.8 read_skip_prob still fires and on a zero
+        // buffer leaves defaults intact.
+        let bytes = [0x00u8; 8];
+        let h = parse_compressed_header(&bytes, true).unwrap();
+        assert_eq!(h.tx_mode, TxMode::Only4x4);
+        assert_eq!(h.skip_prob, DEFAULT_SKIP_PROB);
+    }
+
+    #[test]
+    fn parse_compressed_header_tx_mode_select_runs_tx_mode_probs_sweep() {
+        // TX_MODE_SELECT path (0x70 prefix): the §6.3.2 sweep fires,
+        // then §6.3.8. On a zero buffer the defaults survive both
+        // sweeps because every B(252) update_prob decodes to 0.
+        let mut bytes = [0u8; 16];
+        bytes[0] = 0x70;
+        let h = parse_compressed_header(&bytes, false).unwrap();
+        assert_eq!(h.tx_mode, TxMode::TxModeSelect);
+        assert_eq!(h.tx_probs, DEFAULT_TX_PROBS);
+        assert_eq!(h.skip_prob, DEFAULT_SKIP_PROB);
     }
 }

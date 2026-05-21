@@ -6,6 +6,39 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 4: §6.3.3 `diff_update_prob` chain (`decode_term_subexp` +
+  `inv_remap_prob` + `inv_recenter_nonneg` + 255-entry
+  `inv_map_table`).**
+  * `read_diff_update_prob( coder, base_prob )` (§6.3.3) — reads the
+    `B(252)` `update_prob` flag, on 1 pulls a `decode_term_subexp`
+    value and remaps the previous probability through
+    `inv_remap_prob`. On 0, passes the base probability straight
+    through.
+  * `decode_term_subexp( )` (§6.3.4) — the 5-leg
+    `L(1) → L(4)` / `L(1) → L(4)+16` / `L(1) → L(5)+32` /
+    `L(7) → +64` / `L(7), L(1) → (v<<1)-1+bit` cascade producing a
+    value in `0..=254`.
+  * `inv_remap_prob( delta_prob, prob )` (§6.3.5) — low-half /
+    high-half piecewise remap calling `inv_recenter_nonneg`.
+  * `inv_recenter_nonneg( v, m )` (§6.3.6) — pure arithmetic
+    helper covering the `v > 2*m` short-circuit plus the
+    odd / even split.
+  * `INV_MAP_TABLE: [u8; 255]` — the §6.3.5 listing transcribed
+    verbatim (a permutation of 1..=254 with a duplicated trailing
+    253).
+  * 16 new unit tests covering `inv_recenter_nonneg` (all three
+    piecewise branches plus the `v == 2*m` boundary),
+    `INV_MAP_TABLE` length + spot-checks, `inv_remap_prob` against
+    both low-half / high-half branches and the `v > 2m`
+    short-circuit, `decode_term_subexp` against hand-derived §9.2
+    buffers (leg-1 zero plus a sweep that confirms the result
+    stays in `0..=254`), and `read_diff_update_prob` confirming
+    the `update_prob == 0` passthrough across the full
+    1..=255 base-probability sweep.
+  * The chain is structural; no caller in §6.3.2 / §6.3.7+ uses it
+    yet, so each helper carries `#[allow(dead_code)]` until the
+    next round wires them into the table sweeps.
+
 * **Round 3: §9.2 Boolean decoder primitives + §6.3.1 `read_tx_mode`
   walk.**
   * New `src/bool_coder.rs` module implementing the four §9.2

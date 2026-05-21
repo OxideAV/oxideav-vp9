@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -28,10 +28,15 @@
 //! * Round 3 added: the §9.2 Boolean (range) decoder primitives —
 //!   `init_bool( sz )` / `read_bool( p )` / `read_literal( n )` /
 //!   `exit_bool( )` — plus the §6.3.1 `read_tx_mode( )` walk
-//!   exposed via [`parse_compressed_header`]. The §6.3.2+ syntax
-//!   (`tx_mode_probs`, `read_coef_probs`, `read_skip_prob`, …) all
-//!   depend on the §6.3.3 `diff_update_prob` chain and have been
-//!   deferred to the next round.
+//!   exposed via [`parse_compressed_header`].
+//! * Round 4 added: the §6.3.3 `diff_update_prob` chain —
+//!   `read_diff_update_prob` (§6.3.3) + `decode_term_subexp`
+//!   (§6.3.4) + `inv_remap_prob` (§6.3.5) +
+//!   `inv_recenter_nonneg` (§6.3.6) + the 255-entry
+//!   `INV_MAP_TABLE` constant — as a `pub(crate)` primitive. The
+//!   §6.3.2 / §6.3.7+ syntax (`tx_mode_probs`, `read_coef_probs`,
+//!   `read_skip_prob`, `read_inter_mode_probs`, …) that consume it
+//!   land in the next round.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return

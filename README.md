@@ -5,6 +5,31 @@ Bitstream & Decoding Process Specification v0.7.
 
 ## Status — 2026-05-21
 
+**Round 4: §6.3.3 `diff_update_prob` chain (`decode_term_subexp` +
+`inv_remap_prob` + `inv_recenter_nonneg` + 255-entry
+`inv_map_table`).** Round 4 lands the helper chain every §6.3.7+
+probability sweep is built on:
+
+* `read_diff_update_prob( coder, base_prob )` (§6.3.3) — reads the
+  `B(252)` `update_prob` flag and, on 1, pulls a
+  `decode_term_subexp` value (§6.3.4) then remaps the previous
+  probability through `inv_remap_prob` (§6.3.5). On 0, passes the
+  base probability straight through.
+* `decode_term_subexp` (§6.3.4) — the 5-leg cascade
+  (`L(1) → L(4)` / `L(1) → L(4)+16` / `L(1) → L(5)+32` /
+  `L(7) → +64` / `L(7), L(1) → (v<<1)-1+bit`) yielding a value in
+  `0..=254`.
+* `inv_remap_prob` (§6.3.5) — the low-half / high-half piecewise
+  remap, with the 255-entry `INV_MAP_TABLE` constant transcribed
+  verbatim from the §6.3.5 listing.
+* `inv_recenter_nonneg` (§6.3.6) — pure arithmetic helper.
+
+The chain is structural — no caller in §6.3.2 / §6.3.7+ uses it yet.
+That's deferred to the next round so this drop lands the primitive
+in isolation. All four helpers are `pub(crate)` with explicit
+`#[allow(dead_code)]` until the next round wires them into the
+table sweeps.
+
 **Round 3: §9.2 Boolean decoder + §6.3.1 `read_tx_mode` walk.** Building
 on round 2's full §6.2 uncompressed-header walker, round 3 lands the
 arithmetic-decode primitive — `init_bool( sz )` / `read_bool( p )` /
@@ -19,15 +44,14 @@ check is enforced (`InvalidBitstream` on a nonzero marker), and the
 §9.2.2 `BoolMaxBits` underflow path is surfaced rather than silently
 papered over.
 
-The §6.3.2–§6.3.16 syntax — `tx_mode_probs`, `read_coef_probs`,
-`read_skip_prob`, `read_inter_mode_probs`, `read_interp_filter_probs`,
-… — all funnel through the §6.3.3 `diff_update_prob( )` chain
-(`decode_term_subexp` + `inv_remap_prob` + `inv_recenter_nonneg` +
-the 255-entry `inv_map_table`) and have been deferred to the next
-round so this drop lands a verifiable Boolean-coder primitive plus
-the §6.3.1 walk in isolation. The remaining `read_inter_mode_probs`
-/ `read_interp_filter_probs` only fire on inter-frame headers, which
-already return `Error::Unsupported` until reference-buffer state lands.
+The remaining §6.3.7+ syntax — `tx_mode_probs`, `read_coef_probs`,
+`read_skip_prob`, `read_inter_mode_probs`,
+`read_interp_filter_probs`, … — all funnel through
+`read_diff_update_prob` (landed this round) and the table sweeps
+themselves land in the next round. `read_inter_mode_probs` /
+`read_interp_filter_probs` only fire on inter-frame headers, which
+already return `Error::Unsupported` until reference-buffer state
+lands.
 
 **Round 2: full §6.2 uncompressed-header walk.** Building on round 1,
 `parse_uncompressed_header(&[u8]) -> Result<Vp9FrameHeader, Error>` now
@@ -72,9 +96,20 @@ remainder of the frame.
 
 ## Test surface
 
-* `cargo test`: 26 unit tests + 16 integration tests (4 in
+* `cargo test`: 42 unit tests + 16 integration tests (4 in
   `tests/compressed_header.rs` plus 12 in
   `tests/uncompressed_header.rs`).
+* Round-4 additions: 16 unit tests covering `inv_recenter_nonneg`
+  (all three piecewise branches plus the `v == 2*m` boundary),
+  `INV_MAP_TABLE` length + spot-checks against the spec listing
+  anchors (`[0]=7`, `[19]=254`, `[20]=1`, `[254]=253` with the
+  duplicated trailing 253), `inv_remap_prob` covering both
+  low-half and high-half `(m << 1) ≤ 255` branches plus the
+  `v > 2m` short-circuit, `decode_term_subexp` against
+  hand-derived §9.2 buffers (leg-1 zero plus a sweep that confirms
+  the result stays in `0..=254` for every first-byte family), and
+  `read_diff_update_prob` confirming the `update_prob == 0`
+  passthrough against the full 1..=255 base-probability sweep.
 * Round-3 additions: 9 `bool_coder` unit tests covering
   `init_bool` (zero-size / short-slice / nonzero-marker rejection +
   the zero-buffer accept path), `read_bool` against hand-traced
@@ -120,10 +155,11 @@ harness.
 
 Future rounds, roughly in order:
 
-1. §6.3.3 `diff_update_prob` chain (`decode_term_subexp` +
-   `inv_remap_prob` + `inv_recenter_nonneg` + 255-entry
-   `inv_map_table`) and the §6.3.2 / §6.3.7 / §6.3.8 syntax
-   (`tx_mode_probs`, `read_coef_probs`, `read_skip_prob`).
+1. §6.3.2 `tx_mode_probs` (tx-mode-conditional `diff_update_prob`
+   sweeps), §6.3.7 `read_coef_probs` (4D nested sweep gated by an
+   outer `L(1) update_probs` flag per tx-size), §6.3.8
+   `read_skip_prob` (3-element sweep). All three now consume the
+   round-4 `read_diff_update_prob`.
 2. Inter (non-intra-only) header path — `frame_size_with_refs`,
    `allow_high_precision_mv`, `read_interpolation_filter` — plus
    the inter-only §6.3.9–§6.3.16 syntax (`read_inter_mode_probs`,

@@ -6,6 +6,39 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 3: §9.2 Boolean decoder primitives + §6.3.1 `read_tx_mode`
+  walk.**
+  * New `src/bool_coder.rs` module implementing the four §9.2
+    primitives: `init_bool( sz )` (§9.2.1) with the marker-bit
+    zero-conformance check, `read_bool( p )` (§9.2.2) with the
+    `split = 1 + (((BoolRange-1) * p) >> 8)` narrow and the
+    `range < 128` renormalisation refill, `read_literal( n )`
+    (§9.2.4) folded over `read_bool(128)`, and `exit_bool( )`
+    (§9.2.3) consuming the remaining `BoolMaxBits` with a
+    zero-pad conformance check. `BoolMaxBits` underflow raises
+    `InvalidBitstream` instead of silently injecting 0.
+  * New `src/compressed.rs` module with `Vp9CompressedHeader`,
+    `TxMode` (5-variant enum mapping §3 `TX_MODES`), and the
+    `parse_compressed_header(payload, lossless)` entry point.
+    `read_tx_mode( )` (§6.3.1) short-circuits to `ONLY_4X4` when
+    `Lossless == 1` (§6.2.9), otherwise reads `L(2)` and (for the
+    `ALLOW_32X32` raw value) an extra `L(1)` `tx_mode_select` to
+    distinguish `ALLOW_32X32` from `TX_MODE_SELECT`.
+  * 9 `bool_coder` unit tests + 7 `compressed` unit tests + 4
+    end-to-end integration tests (`tests/compressed_header.rs`)
+    splicing a hand-derived §9.2 payload past
+    `Vp9FrameHeader::uncompressed_header_size_bytes`. Every byte
+    vector used was derived by stepping the §9.2 decoder, not
+    borrowed from any third-party VP9 implementation.
+  * The §6.3.2+ syntax (`tx_mode_probs`, `read_coef_probs`,
+    `read_skip_prob`, `read_inter_mode_probs`,
+    `read_interp_filter_probs`, …) all flow through the §6.3.3
+    `diff_update_prob` chain (`decode_term_subexp` (§6.3.4) +
+    `inv_remap_prob` (§6.3.5) + `inv_recenter_nonneg` (§6.3.6) +
+    the 255-entry `inv_map_table` constant) and have been
+    deferred to the next round so this drop lands a verifiable
+    Boolean-coder primitive plus the §6.3.1 walk in isolation.
+
 * **Round 2: full §6.2 uncompressed-header walk.** Extends the round-1
   walker through the end of `uncompressed_header()` and the §6.1.1
   `trailing_bits()` zero-fill alignment:

@@ -5,6 +5,30 @@ Bitstream & Decoding Process Specification v0.7.
 
 ## Status — 2026-05-21
 
+**Round 3: §9.2 Boolean decoder + §6.3.1 `read_tx_mode` walk.** Building
+on round 2's full §6.2 uncompressed-header walker, round 3 lands the
+arithmetic-decode primitive — `init_bool( sz )` / `read_bool( p )` /
+`read_literal( n )` / `exit_bool( )` per spec §9.2.1–§9.2.4 — plus the
+first §6.3 compressed-header field (`read_tx_mode( )`, §6.3.1) exposed
+via `parse_compressed_header(payload, lossless) -> Vp9CompressedHeader`.
+
+Decoded `tx_mode` covers all five §3 values (`ONLY_4X4`, `ALLOW_8X8`,
+`ALLOW_16X16`, `ALLOW_32X32`, `TX_MODE_SELECT`), including the lossless
+short-circuit to `ONLY_4X4`. The §9.2.1 marker-bit zero-conformance
+check is enforced (`InvalidBitstream` on a nonzero marker), and the
+§9.2.2 `BoolMaxBits` underflow path is surfaced rather than silently
+papered over.
+
+The §6.3.2–§6.3.16 syntax — `tx_mode_probs`, `read_coef_probs`,
+`read_skip_prob`, `read_inter_mode_probs`, `read_interp_filter_probs`,
+… — all funnel through the §6.3.3 `diff_update_prob( )` chain
+(`decode_term_subexp` + `inv_remap_prob` + `inv_recenter_nonneg` +
+the 255-entry `inv_map_table`) and have been deferred to the next
+round so this drop lands a verifiable Boolean-coder primitive plus
+the §6.3.1 walk in isolation. The remaining `read_inter_mode_probs`
+/ `read_interp_filter_probs` only fire on inter-frame headers, which
+already return `Error::Unsupported` until reference-buffer state lands.
+
 **Round 2: full §6.2 uncompressed-header walk.** Building on round 1,
 `parse_uncompressed_header(&[u8]) -> Result<Vp9FrameHeader, Error>` now
 walks the entire `uncompressed_header()` syntax tree plus the §6.1.1
@@ -48,26 +72,39 @@ remainder of the frame.
 
 ## Test surface
 
-* `cargo test`: 9 internal tests (`src/bitreader.rs` — MSB-first
-  `f(n)`, `s(n)` round-trip, `trailing_bits` accept/reject/no-op;
-  `src/header.rs` — `Sb64Cols` / `calc_*_log2_tile_cols` arithmetic
-  for small and 4K frames) + 12 integration tests
-  (`tests/uncompressed_header.rs`).
-* Integration coverage spans the four profiles, studio/full-swing
-  color ranges, render-size overrides, the `show_existing_frame` early
-  return, the intra-only inter-frame branch (with the spec's BT.601 /
-  4:2:0 / 8-bit defaults for Profile 0), full `loop_filter_params`
-  delta update with mixed `update_ref_delta` / `update_mode_delta`
-  flags and signed `s(6)` deltas, `quantization_params` with a
-  nonzero `base_q_idx` and signed `delta_q_y_dc`, full segmentation
-  with `update_map` + `temporal_update` + `update_data` driving the
-  per-segment / per-feature inner loop including the 0-magnitude-bit
-  skip feature, `tile_info` increment-walk for a 4K-wide frame, plus
-  three failure paths (bad `frame_marker`, bad `frame_sync_code`,
-  truncated buffer) and the §7.1.1 nonzero trailing-bit rejection.
+* `cargo test`: 26 unit tests + 16 integration tests (4 in
+  `tests/compressed_header.rs` plus 12 in
+  `tests/uncompressed_header.rs`).
+* Round-3 additions: 9 `bool_coder` unit tests covering
+  `init_bool` (zero-size / short-slice / nonzero-marker rejection +
+  the zero-buffer accept path), `read_bool` against hand-traced
+  golden buffers (mixed probabilities, extreme p=255 run), `read_literal`,
+  and `exit_bool` accept/reject paths; plus 7 `compressed` unit tests
+  for `parse_compressed_header` covering each `TxMode` value
+  (lossless short-circuit, `ONLY_4X4`/`ALLOW_8X8`/`ALLOW_16X16`/
+  `ALLOW_32X32`/`TX_MODE_SELECT` golden buffers) and the
+  marker / empty-buffer rejection paths; and 4 end-to-end
+  integration tests (`tests/compressed_header.rs`) that build a
+  64x64 key-frame uncompressed header, splice a §9.2 payload past
+  the byte-aligned `trailing_bits` pad, and verify the walker
+  picks up the right `tx_mode` from the spliced payload.
+* Uncompressed-header coverage (rounds 1 + 2, unchanged) spans the
+  four profiles, studio/full-swing color ranges, render-size
+  overrides, the `show_existing_frame` early return, the intra-only
+  inter-frame branch (with the spec's BT.601 / 4:2:0 / 8-bit defaults
+  for Profile 0), full `loop_filter_params` delta update with mixed
+  `update_ref_delta` / `update_mode_delta` flags and signed `s(6)`
+  deltas, `quantization_params` with a nonzero `base_q_idx` and
+  signed `delta_q_y_dc`, full segmentation with `update_map` +
+  `temporal_update` + `update_data` driving the per-segment /
+  per-feature inner loop including the 0-magnitude-bit skip feature,
+  `tile_info` increment-walk for a 4K-wide frame, plus three failure
+  paths (bad `frame_marker`, bad `frame_sync_code`, truncated buffer)
+  and the §7.1.1 nonzero trailing-bit rejection.
 * No external fixtures are involved yet; each test constructs its
-  input bit-by-bit and round-trips against the expected
-  `Vp9FrameHeader` fields.
+  input bit-by-bit (and §9.2 golden buffers are hand-derived by
+  stepping the decoder, not borrowed from any third-party VP9
+  implementation).
 
 ## Provenance
 
@@ -83,11 +120,16 @@ harness.
 
 Future rounds, roughly in order:
 
-1. Boolean (range) decoder per §9.2 and compressed-header walk
-   (§6.3 / §7.3).
+1. §6.3.3 `diff_update_prob` chain (`decode_term_subexp` +
+   `inv_remap_prob` + `inv_recenter_nonneg` + 255-entry
+   `inv_map_table`) and the §6.3.2 / §6.3.7 / §6.3.8 syntax
+   (`tx_mode_probs`, `read_coef_probs`, `read_skip_prob`).
 2. Inter (non-intra-only) header path — `frame_size_with_refs`,
-   `allow_high_precision_mv`, `read_interpolation_filter` — once
-   reference-buffer state is in place.
+   `allow_high_precision_mv`, `read_interpolation_filter` — plus
+   the inter-only §6.3.9–§6.3.16 syntax (`read_inter_mode_probs`,
+   `read_interp_filter_probs`, `read_is_inter_probs`,
+   `frame_reference_mode`, `mv_probs`) once reference-buffer state
+   is in place.
 3. Intra prediction (§8.5) over a single tile.
 4. Inverse transforms + dequant.
 5. Inter prediction, loop filter, multi-tile, then encoder paths.

@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2)
+//! ## Cumulative scope (rounds 1 + 2 + 3)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -25,13 +25,20 @@
 //!     (§6.2.9), `segmentation_params()` (§6.2.11), `tile_info()`
 //!     (§6.2.13), `header_size_in_bytes` (f(16)), and the §6.1.1
 //!     `trailing_bits()` zero-fill conformance check.
+//! * Round 3 added: the §9.2 Boolean (range) decoder primitives —
+//!   `init_bool( sz )` / `read_bool( p )` / `read_literal( n )` /
+//!   `exit_bool( )` — plus the §6.3.1 `read_tx_mode( )` walk
+//!   exposed via [`parse_compressed_header`]. The §6.3.2+ syntax
+//!   (`tx_mode_probs`, `read_coef_probs`, `read_skip_prob`, …) all
+//!   depend on the §6.3.3 `diff_update_prob` chain and have been
+//!   deferred to the next round.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return
 //!   [`Error::Unsupported`] for now; they need reference-buffer
 //!   state.
 //!
-//! The compressed header (§6.3) and the entropy / transform / loop
+//! The remaining §6.3 fields and the entropy / transform / loop
 //! filter pipelines remain out of scope and land in subsequent
 //! rounds.
 //!
@@ -47,8 +54,11 @@
 use oxideav_core::RuntimeContext;
 
 mod bitreader;
+mod bool_coder;
+mod compressed;
 mod header;
 
+pub use compressed::{parse_compressed_header, TxMode, Vp9CompressedHeader};
 pub use header::{
     parse_uncompressed_header, ColorConfig, ColorSpace, FrameType, LoopFilterParams,
     QuantizationParams, SegmentationParams, TileInfo, Vp9FrameHeader, MAX_SEGMENTS,

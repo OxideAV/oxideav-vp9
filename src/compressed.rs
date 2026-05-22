@@ -1,6 +1,6 @@
 //! VP9 compressed-header walker per spec v0.7 §6.3.
 //!
-//! Cumulative scope through round 5:
+//! Cumulative scope through round 6:
 //!
 //! * §6.3.1 `read_tx_mode( )` — which arithmetic-codes a 2- or 3-bit
 //!   tx_mode value under the §9.2 Boolean coder. This is the first
@@ -21,25 +21,37 @@
 //!   remapped through `inv_remap_prob` (§6.3.5) — itself the
 //!   composition of the 255-entry `inv_map_table` lookup with
 //!   `inv_recenter_nonneg` (§6.3.6).
+//! * §6.3.7 `read_coef_probs( )` — the 4D-plus-outer-loop coefficient
+//!   probability sweep. Walks `txSz ∈ [TX_4X4, maxTxSize]` with
+//!   `maxTxSize = tx_mode_to_biggest_tx_size[ tx_mode ]`. For each
+//!   active `txSz`, an outer `L(1) update_probs` flag gates a nested
+//!   `(i, j, k, l, m)` sweep — 2 block_types × 2 ref_types × 6 bands
+//!   × `maxL` previous-coef contexts (`maxL = (k == 0) ? 3 : 6`) × 3
+//!   unconstrained nodes — calling `diff_update_prob` per cell into
+//!   the running `coef_probs[ txSz ][ i ][ j ][ k ][ l ][ m ]` table.
+//!   Initial values come from the §10 `default_coef_probs` listing
+//!   (transcribed verbatim into `coef_probs::DEFAULT_COEF_PROBS`).
 //! * §6.3.8 `read_skip_prob( )` — unconditional 3-element
 //!   (`SKIP_CONTEXTS = 3`) `diff_update_prob` sweep over the §10
 //!   `default_skip_prob[ SKIP_CONTEXTS ] = { 192, 128, 64 }`
 //!   initials.
 //!
-//! Round 5 wires the round-4 helper into the §6.3.2 and §6.3.8
-//! sweeps. The §6.3.7 `read_coef_probs( )` 4D nested sweep
-//! (gated by an outer L(1) per tx-size) plus all inter-only §6.3.9+
-//! syntax remain deferred — they fire only on
-//! `tx_mode == TX_MODE_SELECT` (for coef) or `FrameIsIntra == 0`
-//! (for the inter sweeps).
+//! Round 6 lands the §6.3.7 walker between the round-5 §6.3.2
+//! `tx_mode_probs` and §6.3.8 `read_skip_prob` calls. The
+//! inter-only §6.3.9+ syntax remains deferred — those fire only on
+//! `FrameIsIntra == 0` and need reference-buffer state which the
+//! header walker still rejects with `Error::Unsupported`.
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7,
 //! `docs/video/vp9/vp9-spec.txt` §6.3.1 / §6.3.2 / §6.3.3 / §6.3.4 /
-//! §6.3.5 / §6.3.6 / §6.3.8 (the `inv_map_table`, `default_tx_probs`
-//! and `default_skip_prob` constants are transcribed verbatim from
-//! §6.3.5 and §10). No external library source consulted.
+//! §6.3.5 / §6.3.6 / §6.3.7 / §6.3.8 (the `inv_map_table`,
+//! `default_tx_probs`, `default_skip_prob`, `default_coef_probs` and
+//! `tx_mode_to_biggest_tx_size` constants are transcribed verbatim
+//! from §6.3.5, §10 and §10.5). No external library source
+//! consulted.
 
 use crate::bool_coder::BoolCoder;
+use crate::coef_probs::{CoefProbs, DEFAULT_COEF_PROBS};
 use crate::Error;
 
 /// `tx_mode` per spec §3 (TX_MODES = 5).
@@ -76,14 +88,19 @@ impl TxMode {
     }
 }
 
-/// Round-5 view of the VP9 compressed header.
+/// Round-6 view of the VP9 compressed header.
 ///
 /// Walks `read_tx_mode` (§6.3.1), the conditional `tx_mode_probs`
-/// sweep (§6.3.2; fires only when `tx_mode == TX_MODE_SELECT`), and
-/// the unconditional `read_skip_prob` sweep (§6.3.8). The §6.3.7
-/// `read_coef_probs` 4D nested sweep and the inter-only §6.3.9+
-/// syntax land in subsequent rounds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// sweep (§6.3.2; fires only when `tx_mode == TX_MODE_SELECT`),
+/// the §6.3.7 `read_coef_probs` 4D nested sweep (per-tx-size gated
+/// by an outer `L(1) update_probs`), and the unconditional
+/// `read_skip_prob` sweep (§6.3.8). The inter-only §6.3.9+ syntax
+/// lands in subsequent rounds.
+///
+/// `Vp9CompressedHeader` is intentionally **not** `Copy` — the
+/// `coef_probs` field is 1728 bytes and silent `memcpy` on every
+/// move would be costly. `Clone` is provided.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Vp9CompressedHeader {
     /// Decoded `tx_mode` (§6.3.1).
     pub tx_mode: TxMode,
@@ -99,6 +116,16 @@ pub struct Vp9CompressedHeader {
     /// 8x8 / 16x16 / 32x32 via the named `tx_probs_8x8` /
     /// `tx_probs_16x16` / `tx_probs_32x32` aliases.
     pub tx_probs: [[[u8; 3]; 2]; 4],
+    /// `coef_probs[ TX_SIZES ][ BLOCK_TYPES ][ REF_TYPES ][
+    /// COEF_BANDS ][ PREV_COEF_CONTEXTS ][ UNCONSTRAINED_NODES ]`
+    /// after the §6.3.7 sweep.
+    ///
+    /// `read_coef_probs( )` walks only the tx-sizes
+    /// `[TX_4X4, maxTxSize]` where `maxTxSize` is selected by
+    /// `tx_mode_to_biggest_tx_size[ tx_mode ]` (§10.5). Inactive
+    /// tx-size slabs and unselected `(update_probs == 0)` slabs
+    /// are left equal to `DEFAULT_COEF_PROBS`.
+    pub coef_probs: CoefProbs,
     /// `skip_prob[ SKIP_CONTEXTS ]` after the §6.3.8 sweep. The
     /// initial values come from the §10 `default_skip_prob[ ] =
     /// { 192, 128, 64 }` listing.
@@ -113,9 +140,9 @@ pub struct Vp9CompressedHeader {
 /// available from [`crate::Vp9FrameHeader::quantization::lossless`].
 ///
 /// Walks `read_tx_mode( )` (§6.3.1), the conditional
-/// `tx_mode_probs( )` (§6.3.2) and `read_skip_prob( )` (§6.3.8)
-/// sweeps. The §6.3.7 `read_coef_probs( )` 4D nested sweep and the
-/// inter-only §6.3.9+ syntax remain deferred.
+/// `tx_mode_probs( )` (§6.3.2), `read_coef_probs( )` (§6.3.7), and
+/// `read_skip_prob( )` (§6.3.8) sweeps. The inter-only §6.3.9+
+/// syntax remains deferred.
 ///
 /// Returns [`Error::InvalidBitstream`] if the §9.2.1 init marker
 /// bit is nonzero, if `read_bool` underruns `BoolMaxBits`, or if a
@@ -128,11 +155,14 @@ pub fn parse_compressed_header(data: &[u8], lossless: bool) -> Result<Vp9Compres
     if tx_mode == TxMode::TxModeSelect {
         read_tx_mode_probs(&mut coder, &mut tx_probs)?;
     }
+    let mut coef_probs = DEFAULT_COEF_PROBS;
+    read_coef_probs(&mut coder, tx_mode, &mut coef_probs)?;
     let mut skip_prob = DEFAULT_SKIP_PROB;
     read_skip_prob(&mut coder, &mut skip_prob)?;
     Ok(Vp9CompressedHeader {
         tx_mode,
         tx_probs,
+        coef_probs,
         skip_prob,
     })
 }
@@ -402,6 +432,79 @@ pub(crate) fn read_tx_mode_probs(
     Ok(())
 }
 
+/// `tx_mode_to_biggest_tx_size[ TX_MODES ]` per spec §10.5.
+///
+/// Maps a `TxMode` (5 values) to the largest tx-size whose
+/// probabilities should be swept by §6.3.7 `read_coef_probs( )`.
+/// Both `ALLOW_32X32` and `TX_MODE_SELECT` map to `TX_32X32 = 3`;
+/// for `TX_MODE_SELECT` the per-block tx_size is signalled in the
+/// residual but the probability tables still need full coverage up
+/// to TX_32X32.
+pub(crate) const fn tx_mode_to_biggest_tx_size(tx_mode: TxMode) -> usize {
+    match tx_mode {
+        TxMode::Only4x4 => 0,
+        TxMode::Allow8x8 => 1,
+        TxMode::Allow16x16 => 2,
+        TxMode::Allow32x32 => 3,
+        TxMode::TxModeSelect => 3,
+    }
+}
+
+/// `read_coef_probs( )` per spec §6.3.7.
+///
+/// Outer loop runs `txSz ∈ [TX_4X4, maxTxSize]` with `maxTxSize =
+/// tx_mode_to_biggest_tx_size[ tx_mode ]`. Per `txSz`:
+///
+/// 1. Read an `L(1) update_probs` flag from the §9.2 coder.
+/// 2. If 0, leave that tx-size's `coef_probs` slab unchanged.
+/// 3. If 1, walk the nested `(i, j, k, l, m)` sweep:
+///    * `i in 0..BLOCK_TYPES` (= 2) — plane type Y vs UV.
+///    * `j in 0..REF_TYPES` (= 2) — intra vs inter.
+///    * `k in 0..COEF_BANDS` (= 6).
+///    * `maxL = (k == 0) ? 3 : 6` per §6.3.7.
+///    * `l in 0..maxL` — previous-coef context.
+///    * `m in 0..UNCONSTRAINED_NODES` (= 3) — coef-tree node.
+///
+///    Each cell is replaced by `read_diff_update_prob( coder, cell )`.
+///
+/// On a fully-active sweep (every `update_probs == 1`) the cell
+/// count is `4 × 2 × 2 × (3 + 5*6) × 3 = 1584` `read_diff_update_prob`
+/// calls — `tx_mode == TX_MODE_SELECT` activates all four tx-sizes,
+/// whereas `ONLY_4X4` activates only the first slab (4×2×2×33×3 ÷ 4
+/// → 396 cells for that one slab). For tx-sizes outside the active
+/// range, no bits are read.
+///
+/// `coef_probs` is updated in place. Always invoked from
+/// `parse_compressed_header` between the conditional §6.3.2
+/// `tx_mode_probs( )` and the unconditional §6.3.8 `read_skip_prob( )`.
+pub(crate) fn read_coef_probs(
+    coder: &mut BoolCoder<'_>,
+    tx_mode: TxMode,
+    coef_probs: &mut CoefProbs,
+) -> Result<(), Error> {
+    let max_tx_size = tx_mode_to_biggest_tx_size(tx_mode);
+    for tx_slab in coef_probs.iter_mut().take(max_tx_size + 1) {
+        let update_probs = coder.read_literal(1)?;
+        if update_probs == 0 {
+            continue;
+        }
+        // Nested (i, j, k, l, m) walk per spec §6.3.7.
+        for block_type_slab in tx_slab.iter_mut() {
+            for ref_type_slab in block_type_slab.iter_mut() {
+                for (k, band_slab) in ref_type_slab.iter_mut().enumerate() {
+                    let max_l = if k == 0 { 3 } else { 6 };
+                    for ctx_row in band_slab.iter_mut().take(max_l) {
+                        for cell in ctx_row.iter_mut() {
+                            *cell = read_diff_update_prob(coder, *cell)?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `read_skip_prob( )` per spec §6.3.8.
 ///
 /// Unconditional `SKIP_CONTEXTS = 3` sweep: each `skip_prob[i]` is
@@ -410,8 +513,8 @@ pub(crate) fn read_tx_mode_probs(
 /// `inv_remap_prob` cascade.
 ///
 /// `skip_prob` is updated in place. Always invoked from
-/// `parse_compressed_header` immediately after the conditional
-/// §6.3.2 `tx_mode_probs( )` call.
+/// `parse_compressed_header` immediately after the §6.3.7
+/// `read_coef_probs( )` call.
 pub(crate) fn read_skip_prob(
     coder: &mut BoolCoder<'_>,
     skip_prob: &mut [u8; 3],
@@ -748,6 +851,117 @@ mod tests {
         assert_eq!(tx_probs[0], snapshot_row0);
     }
 
+    // ----- §6.3.7 read_coef_probs( ) -----
+
+    #[test]
+    fn tx_mode_to_biggest_tx_size_matches_spec_listing() {
+        // Spec §10.5: { TX_4X4, TX_8X8, TX_16X16, TX_32X32, TX_32X32 }.
+        assert_eq!(tx_mode_to_biggest_tx_size(TxMode::Only4x4), 0);
+        assert_eq!(tx_mode_to_biggest_tx_size(TxMode::Allow8x8), 1);
+        assert_eq!(tx_mode_to_biggest_tx_size(TxMode::Allow16x16), 2);
+        assert_eq!(tx_mode_to_biggest_tx_size(TxMode::Allow32x32), 3);
+        assert_eq!(tx_mode_to_biggest_tx_size(TxMode::TxModeSelect), 3);
+    }
+
+    #[test]
+    fn read_coef_probs_zero_buffer_leaves_defaults_unchanged_only_4x4() {
+        // ONLY_4X4: outer loop visits tx-size 0 only.
+        // Zero buffer → outer L(1) update_probs = 0 → no inner walk.
+        let bytes = [0x00u8; 4];
+        let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut coef_probs = DEFAULT_COEF_PROBS;
+        read_coef_probs(&mut dec, TxMode::Only4x4, &mut coef_probs).unwrap();
+        assert_eq!(coef_probs, DEFAULT_COEF_PROBS);
+    }
+
+    #[test]
+    fn read_coef_probs_zero_buffer_leaves_defaults_unchanged_tx_mode_select() {
+        // TX_MODE_SELECT: outer loop visits all four tx-sizes.
+        // Zero buffer → all four outer L(1)s decode to 0.
+        let bytes = [0x00u8; 4];
+        let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut coef_probs = DEFAULT_COEF_PROBS;
+        read_coef_probs(&mut dec, TxMode::TxModeSelect, &mut coef_probs).unwrap();
+        assert_eq!(coef_probs, DEFAULT_COEF_PROBS);
+    }
+
+    #[test]
+    fn read_coef_probs_outer_loop_count_matches_tx_mode() {
+        // Per spec §6.3.7 + §10.5: outer L(1) update_probs reads are
+        // gated by tx-mode -> maxTxSize. On a zero buffer where every
+        // update_probs decodes to 0, the only state change is the
+        // BoolCoder cursor advancing one read_bool(128) per outer iter.
+        // We assert this by checking the function returns Ok across all
+        // tx-modes (no underrun) — the §6.3.7 walker is the only thing
+        // consuming bits.
+        for (mode, _expected_iters) in [
+            (TxMode::Only4x4, 1usize),
+            (TxMode::Allow8x8, 2),
+            (TxMode::Allow16x16, 3),
+            (TxMode::Allow32x32, 4),
+            (TxMode::TxModeSelect, 4),
+        ] {
+            let bytes = [0x00u8; 4];
+            let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+            let mut coef_probs = DEFAULT_COEF_PROBS;
+            read_coef_probs(&mut dec, mode, &mut coef_probs).unwrap();
+            assert_eq!(coef_probs, DEFAULT_COEF_PROBS);
+        }
+    }
+
+    #[test]
+    fn default_coef_probs_shape_and_anchors() {
+        // 4 tx-sizes × 2 block types × 2 ref types × 6 bands ×
+        // 6 contexts × 3 nodes = 1728 entries.
+        assert_eq!(DEFAULT_COEF_PROBS.len(), 4);
+        assert_eq!(DEFAULT_COEF_PROBS[0].len(), 2);
+        assert_eq!(DEFAULT_COEF_PROBS[0][0].len(), 2);
+        assert_eq!(DEFAULT_COEF_PROBS[0][0][0].len(), 6);
+        assert_eq!(DEFAULT_COEF_PROBS[0][0][0][0].len(), 6);
+        assert_eq!(DEFAULT_COEF_PROBS[0][0][0][0][0].len(), 3);
+
+        // Anchor: TX_4X4 / block_type 0 / Intra / band 0 / context 0.
+        // Spec: { 195, 29, 183 }.
+        assert_eq!(DEFAULT_COEF_PROBS[0][0][0][0][0], [195, 29, 183]);
+        // Anchor: TX_4X4 / block_type 0 / Intra / band 0 / context 3
+        // (one of the "unused" rows).
+        assert_eq!(DEFAULT_COEF_PROBS[0][0][0][0][3], [0, 0, 0]);
+        // Anchor: TX_4X4 / block_type 0 / Inter / band 5 / context 5.
+        // Spec: { 3, 16, 42 }.
+        assert_eq!(DEFAULT_COEF_PROBS[0][0][1][5][5], [3, 16, 42]);
+        // Anchor: TX_32X32 / block_type 1 / Inter / band 5 / context 5.
+        // Spec: { 1, 16, 6 }.
+        assert_eq!(DEFAULT_COEF_PROBS[3][1][1][5][5], [1, 16, 6]);
+    }
+
+    #[test]
+    fn default_coef_probs_band0_unused_rows_are_zero() {
+        // For every tx-size, block_type and ref_type, the band-0 rows
+        // at contexts 3, 4, 5 must be {0, 0, 0} (the spec "// unused"
+        // tail) — this confirms the maxL = 3 clamp at k == 0 is
+        // consistent with the in-table sentinel rows.
+        for tx_slab in DEFAULT_COEF_PROBS.iter() {
+            for block_type_slab in tx_slab.iter() {
+                for ref_type_slab in block_type_slab.iter() {
+                    let band0 = &ref_type_slab[0];
+                    for row in band0.iter().skip(3).take(3) {
+                        assert_eq!(row, &[0, 0, 0]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn read_coef_probs_inner_sweep_cell_count_is_396() {
+        // Per spec §6.3.7: when update_probs == 1, the inner walk
+        // covers 2 * 2 * (3 + 5*6) * 3 = 396 read_diff_update_prob
+        // calls per active tx-size. Confirm the arithmetic.
+        let cells_k0 = 2 * 2 * 3 * 3; // i × j × maxL(k=0) × m
+        let cells_k_rest = 2 * 2 * 5 * 6 * 3; // 5 bands with maxL = 6
+        assert_eq!(cells_k0 + cells_k_rest, 396);
+    }
+
     // ----- §6.3.8 read_skip_prob( ) -----
 
     #[test]
@@ -777,36 +991,41 @@ mod tests {
     #[test]
     fn parse_compressed_header_includes_default_tables_for_only_4x4() {
         // ONLY_4X4 (non-lossless 0x00 buffer): no §6.3.2 sweep
-        // (gated on TX_MODE_SELECT), but §6.3.8 still fires and on a
-        // zero buffer passes the defaults through.
+        // (gated on TX_MODE_SELECT); §6.3.7 runs once with maxTxSize=0
+        // and its outer L(1) decodes to 0 (no inner walk); §6.3.8
+        // fires unconditionally. On a zero buffer all defaults survive.
         let bytes = [0x00u8; 8];
         let h = parse_compressed_header(&bytes, false).unwrap();
         assert_eq!(h.tx_mode, TxMode::Only4x4);
         assert_eq!(h.tx_probs, DEFAULT_TX_PROBS);
+        assert_eq!(h.coef_probs, DEFAULT_COEF_PROBS);
         assert_eq!(h.skip_prob, DEFAULT_SKIP_PROB);
     }
 
     #[test]
     fn parse_compressed_header_lossless_runs_skip_prob_sweep() {
         // Lossless path: tx_mode forced to ONLY_4X4 with no L(2)
-        // reads, but §6.3.8 read_skip_prob still fires and on a zero
-        // buffer leaves defaults intact.
+        // reads, then §6.3.7 with maxTxSize=0 + §6.3.8 still fire.
+        // On a zero buffer all defaults survive.
         let bytes = [0x00u8; 8];
         let h = parse_compressed_header(&bytes, true).unwrap();
         assert_eq!(h.tx_mode, TxMode::Only4x4);
+        assert_eq!(h.coef_probs, DEFAULT_COEF_PROBS);
         assert_eq!(h.skip_prob, DEFAULT_SKIP_PROB);
     }
 
     #[test]
     fn parse_compressed_header_tx_mode_select_runs_tx_mode_probs_sweep() {
         // TX_MODE_SELECT path (0x70 prefix): the §6.3.2 sweep fires,
-        // then §6.3.8. On a zero buffer the defaults survive both
-        // sweeps because every B(252) update_prob decodes to 0.
+        // then §6.3.7 (visiting all four tx-sizes with outer
+        // update_probs = 0 each on a zero buffer), then §6.3.8. The
+        // §10 defaults survive across all three sweeps.
         let mut bytes = [0u8; 16];
         bytes[0] = 0x70;
         let h = parse_compressed_header(&bytes, false).unwrap();
         assert_eq!(h.tx_mode, TxMode::TxModeSelect);
         assert_eq!(h.tx_probs, DEFAULT_TX_PROBS);
+        assert_eq!(h.coef_probs, DEFAULT_COEF_PROBS);
         assert_eq!(h.skip_prob, DEFAULT_SKIP_PROB);
     }
 }

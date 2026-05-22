@@ -237,3 +237,57 @@ fn end_to_end_non_select_tx_mode_skips_tx_mode_probs_sweep() {
     assert_eq!(c.tx_probs[1], [[100, 0, 0], [66, 0, 0]]);
     assert_eq!(c.skip_prob, [192, 128, 64]);
 }
+
+#[test]
+fn end_to_end_tx_mode_select_runs_coef_probs_sweep() {
+    // Round-6 end-to-end: TX_MODE_SELECT path drives
+    // read_tx_mode → tx_mode_probs (§6.3.2) → read_coef_probs (§6.3.7)
+    // → read_skip_prob (§6.3.8). On a zero-filled payload every outer
+    // L(1) update_probs decodes to 0 across all four tx-size slabs, so
+    // the §10 default coef-probability anchors survive verbatim.
+    let mut payload = vec![0u8; 16];
+    payload[0] = 0x70; // L(2)=3, L(1)=1 → TX_MODE_SELECT.
+    let header_size = payload.len() as u16;
+    let mut buffer = build_uncompressed_64x64_key(header_size, false);
+    let uncompressed_end = buffer.len();
+    buffer.extend_from_slice(&payload);
+
+    let h = parse_uncompressed_header(&buffer).expect("uncompressed header walks");
+    let payload_slice =
+        &buffer[uncompressed_end..uncompressed_end + h.header_size_in_bytes as usize];
+    let c = parse_compressed_header(payload_slice, h.quantization.lossless)
+        .expect("compressed header walks");
+    assert_eq!(c.tx_mode, TxMode::TxModeSelect);
+    // Pick a representative anchor from the §10 default_coef_probs
+    // listing: TX_4X4 / block-type 0 / Intra / Coeff Band 0 / context
+    // 0 → { 195, 29, 183 }.
+    assert_eq!(c.coef_probs[0][0][0][0][0], [195, 29, 183]);
+    // Another anchor: TX_32X32 / block-type 1 / Inter / Coeff Band 5
+    // / context 5 → { 1, 16, 6 } (the trailing entry of the §10
+    // listing).
+    assert_eq!(c.coef_probs[3][1][1][5][5], [1, 16, 6]);
+}
+
+#[test]
+fn end_to_end_only_4x4_visits_only_first_tx_size_coef_slab() {
+    // ONLY_4X4: §6.3.7 outer loop visits tx-size 0 only.
+    // §6.3.2 is skipped (TX_MODE_SELECT gate); §6.3.7 reads ONE outer
+    // L(1) flag and (on a zero buffer) makes no inner updates.
+    let payload = vec![0u8; 8];
+    let header_size = payload.len() as u16;
+    let mut buffer = build_uncompressed_64x64_key(header_size, false);
+    let uncompressed_end = buffer.len();
+    buffer.extend_from_slice(&payload);
+
+    let h = parse_uncompressed_header(&buffer).unwrap();
+    let payload_slice =
+        &buffer[uncompressed_end..uncompressed_end + h.header_size_in_bytes as usize];
+    let c = parse_compressed_header(payload_slice, h.quantization.lossless).unwrap();
+    assert_eq!(c.tx_mode, TxMode::Only4x4);
+    // tx-size 0 anchor preserved.
+    assert_eq!(c.coef_probs[0][0][0][0][0], [195, 29, 183]);
+    // tx-size 3 anchor preserved (it wasn't touched by the outer
+    // loop — maxTxSize was 0).
+    assert_eq!(c.coef_probs[3][1][1][5][5], [1, 16, 6]);
+    assert_eq!(c.skip_prob, [192, 128, 64]);
+}

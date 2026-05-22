@@ -6,6 +6,59 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 6: §6.3.7 `read_coef_probs` 6D coefficient-probability
+  sweep wired into `parse_compressed_header`.**
+  * `read_coef_probs(&mut coder, tx_mode, &mut coef_probs)` (§6.3.7)
+    — walks `txSz ∈ [TX_4X4, maxTxSize]` with `maxTxSize =
+    tx_mode_to_biggest_tx_size[ tx_mode ]` (§10.5). Per active
+    tx-size, reads an outer `L(1) update_probs` flag and, on 1,
+    drives a nested `(i, j, k, l, m)` sweep over `BLOCK_TYPES=2 ×
+    REF_TYPES=2 × COEF_BANDS=6 × maxL(k) × UNCONSTRAINED_NODES=3`
+    cells, with `maxL = (k == 0) ? 3 : 6` per §6.3.7 (band 0 has
+    only 3 valid previous-coef contexts). Each cell becomes
+    `read_diff_update_prob( coder, cell )`. Fully-active inner
+    walk is 396 cells per tx-size, 1584 for a TX_MODE_SELECT
+    frame.
+  * `tx_mode_to_biggest_tx_size( tx_mode )` const-fn (§10.5) —
+    maps `TxMode` to the spec's biggest-tx-size index, with the
+    `ALLOW_32X32` and `TX_MODE_SELECT` rows both mapping to
+    `TX_32X32 = 3`.
+  * `coef_probs::DEFAULT_COEF_PROBS: CoefProbs` constant in the
+    new `src/coef_probs.rs` module — the §10
+    `default_coef_probs[TX_SIZES=4][BLOCK_TYPES=2][REF_TYPES=2][
+    COEF_BANDS=6][PREV_COEF_CONTEXTS=6][UNCONSTRAINED_NODES=3]`
+    table (1728 u8 entries) transcribed verbatim from the spec
+    listing. Band-0 trailing `{0, 0, 0} // unused` rows preserved
+    as in-table sentinels matching the `maxL = 3` clamp.
+  * `CoefProbs` public type alias re-exported from the crate root
+    (`pub use coef_probs::CoefProbs;`), naming the 6D array shape.
+  * `Vp9CompressedHeader` extended with `pub coef_probs:
+    CoefProbs`. `parse_compressed_header` now runs the sweeps in
+    spec order: `read_tx_mode` → optional `read_tx_mode_probs` →
+    `read_coef_probs` → `read_skip_prob`.
+  * `Vp9CompressedHeader` no longer derives `Copy` — the 1728-byte
+    `coef_probs` field makes silent copies costly. `Clone` is
+    retained.
+  * 7 new unit tests: `tx_mode_to_biggest_tx_size` against the
+    §10.5 listing, `read_coef_probs` zero-buffer passthrough for
+    `ONLY_4X4` (1-slab) and `TX_MODE_SELECT` (4-slab) modes, an
+    across-mode sweep, `DEFAULT_COEF_PROBS` shape +
+    spec-listing anchors (TX_4X4 / block-type 0 / Intra / band 0
+    / ctx 0 = {195, 29, 183}; TX_32X32 / block-type 1 / Inter /
+    band 5 / ctx 5 = {1, 16, 6}), the band-0 unused-row sentinel
+    invariant, and the inner-sweep `2 × 2 × (3 + 5 × 6) × 3 =
+    396` cell-count check.
+  * 2 new end-to-end integration tests
+    (`tests/compressed_header.rs`):
+    `end_to_end_tx_mode_select_runs_coef_probs_sweep` driving the
+    full TX_MODE_SELECT → tx_mode_probs → coef_probs → skip_prob
+    chain through `parse_uncompressed_header` +
+    `parse_compressed_header` and verifying two §10 default
+    anchors survive verbatim; and
+    `end_to_end_only_4x4_visits_only_first_tx_size_coef_slab`
+    confirming the outer-loop tx-size clipping for the ONLY_4X4
+    path.
+
 * **Round 5: §6.3.2 `tx_mode_probs` + §6.3.8 `read_skip_prob` sweeps
   wired into `parse_compressed_header`.**
   * `read_tx_mode_probs(&mut coder, &mut tx_probs)` (§6.3.2) —

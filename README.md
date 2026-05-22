@@ -5,6 +5,43 @@ Bitstream & Decoding Process Specification v0.7.
 
 ## Status — 2026-05-22
 
+**Round 6: §6.3.7 `read_coef_probs` 6D coefficient-probability sweep
+wired in.** Round 6 inserts the §6.3.7 walker between the round-5
+§6.3.2 `tx_mode_probs` and §6.3.8 `read_skip_prob` calls. The
+walker:
+
+* Visits `txSz ∈ [TX_4X4, maxTxSize]` where `maxTxSize =
+  tx_mode_to_biggest_tx_size[ tx_mode ]` per §10.5 (1, 2, 3, 4 or 4
+  active tx-size slabs for `ONLY_4X4` / `ALLOW_8X8` / `ALLOW_16X16`
+  / `ALLOW_32X32` / `TX_MODE_SELECT` respectively).
+* For each active slab, reads an outer `L(1) update_probs` flag.
+* If 1, walks the nested `(i, j, k, l, m)` sweep — `BLOCK_TYPES=2 ×
+  REF_TYPES=2 × COEF_BANDS=6 × maxL(k) × UNCONSTRAINED_NODES=3`
+  cells where `maxL = (k == 0) ? 3 : 6` (band 0 has only 3 valid
+  previous-coef contexts; the §10 listing trails it with `{0, 0, 0}
+  // unused` rows).
+* Each cell becomes `read_diff_update_prob( coder, cell )` against
+  the running `coef_probs[ txSz ][ i ][ j ][ k ][ l ][ m ]` table.
+
+When `update_probs == 1` the inner sweep traverses `2 × 2 × (3 + 5
+× 6) × 3 = 396` cells per active tx-size, totalling up to `4 × 396
+= 1584` `diff_update_prob` calls for a fully-active
+`TX_MODE_SELECT` frame.
+
+Initial probabilities come from the §10 `default_coef_probs[
+TX_SIZES ][ BLOCK_TYPES ][ REF_TYPES ][ COEF_BANDS ][
+PREV_COEF_CONTEXTS ][ UNCONSTRAINED_NODES ]` listing (1728 u8
+entries) transcribed verbatim into a new `DEFAULT_COEF_PROBS`
+constant in `src/coef_probs.rs`. The public type alias `CoefProbs`
+names the 6D shape so callers of [`parse_compressed_header`] can
+match on the new `Vp9CompressedHeader::coef_probs` field.
+
+The §6.3.7 walker is **structural-parse only**: it advances the
+§9.2 Boolean coder by exactly the bits the spec dictates and
+updates the running `coef_probs` table, but the actual entropy
+decode of residual coefficients (§6.4) still lands in a later
+round.
+
 **Round 5: §6.3.2 `tx_mode_probs` + §6.3.8 `read_skip_prob` sweeps
 wired into the compressed-header walker.** Round 5 consumes the
 round-4 `read_diff_update_prob` primitive in two table sweeps:
@@ -26,11 +63,12 @@ equal to `DEFAULT_TX_PROBS`. `parse_compressed_header` runs both
 sweeps in spec order: `read_tx_mode` → optional `read_tx_mode_probs`
 → `read_skip_prob`.
 
-The §6.3.7 `read_coef_probs` 4D nested sweep (gated by an outer
-`L(1) update_probs` flag per tx-size) plus all inter-only §6.3.9+
-syntax remain deferred — they fire only on
-`tx_mode == TX_MODE_SELECT` (for coef) or `FrameIsIntra == 0` (for
-the inter sweeps).
+The inter-only §6.3.9+ syntax (`read_inter_mode_probs`,
+`read_interp_filter_probs`, `read_is_inter_probs`,
+`frame_reference_mode`, `mv_probs`) remains deferred — those fire
+only on `FrameIsIntra == 0` and need reference-buffer state which
+the uncompressed-header walker still rejects with
+`Error::Unsupported`.
 
 **Round 4: §6.3.3 `diff_update_prob` chain (`decode_term_subexp` +
 `inv_remap_prob` + `inv_recenter_nonneg` + 255-entry
@@ -123,9 +161,22 @@ remainder of the frame.
 
 ## Test surface
 
-* `cargo test`: 52 unit tests + 18 integration tests (6 in
+* `cargo test`: 59 unit tests + 20 integration tests (8 in
   `tests/compressed_header.rs` plus 12 in
   `tests/uncompressed_header.rs`).
+* Round-6 additions: 7 unit tests covering
+  `tx_mode_to_biggest_tx_size` against the §10.5 listing,
+  `read_coef_probs` zero-buffer passthrough for both `ONLY_4X4`
+  (1-slab) and `TX_MODE_SELECT` (4-slab) paths plus an across-mode
+  sweep, `DEFAULT_COEF_PROBS` shape (4 × 2 × 2 × 6 × 6 × 3 = 1728
+  entries) + four hand-picked anchor values from the §10 listing,
+  the band-0 unused-row sentinel invariant (every `(txSz, i, j)`
+  triple's band 0 has `{0, 0, 0}` at contexts 3..6), and the inner
+  sweep cell-count check `2 × 2 × (3 + 5 × 6) × 3 = 396`. 2 new
+  end-to-end integration tests (`tests/compressed_header.rs`)
+  splicing a TX_MODE_SELECT frame and an ONLY_4X4 frame through
+  the full pipeline and verifying §10 default anchors survive the
+  zero-buffer §6.3.7 sweep verbatim.
 * Round-5 additions: 10 unit tests covering `DEFAULT_TX_PROBS`
   shape + value spot-check against the §10 listing, `DEFAULT_SKIP_PROB
   = [192, 128, 64]`, `read_tx_mode_probs` on a zero buffer
@@ -195,20 +246,15 @@ harness.
 
 Future rounds, roughly in order:
 
-1. §6.3.7 `read_coef_probs` (4D nested sweep gated by an outer
-   `L(1) update_probs` flag per tx-size). The sweep walks `txSz ∈
-   [TX_4X4, maxTxSize]` with `maxTxSize = tx_mode_to_biggest_tx_size[
-   tx_mode ]`, so it produces visible output for every non-trivial
-   `tx_mode` and consumes the round-4 `read_diff_update_prob`. Needs
-   the §10 `default_coef_probs[ TX_SIZES ][ BLOCK_TYPES ][ REF_TYPES
-   ][ COEF_BANDS ][ PREV_COEF_CONTEXTS ][ UNCONSTRAINED_NODES ]`
-   table transcribed into a const lookup first.
-2. Inter (non-intra-only) header path — `frame_size_with_refs`,
+1. Inter (non-intra-only) header path — `frame_size_with_refs`,
    `allow_high_precision_mv`, `read_interpolation_filter` — plus
    the inter-only §6.3.9–§6.3.16 syntax (`read_inter_mode_probs`,
    `read_interp_filter_probs`, `read_is_inter_probs`,
    `frame_reference_mode`, `mv_probs`) once reference-buffer state
    is in place.
+2. Per-tile partition-tree walk (§6.4) including the §6.4.21
+   `coef_token` decode that finally consumes the round-6
+   `coef_probs` tables.
 3. Intra prediction (§8.5) over a single tile.
 4. Inverse transforms + dequant.
 5. Inter prediction, loop filter, multi-tile, then encoder paths.

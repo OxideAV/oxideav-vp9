@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -40,9 +40,18 @@
 //!   now exposes the post-sweep `tx_probs` and `skip_prob` tables;
 //!   defaults come from the §10 `default_tx_probs` and
 //!   `default_skip_prob` listings (transcribed verbatim into
-//!   `DEFAULT_TX_PROBS` / `DEFAULT_SKIP_PROB`). The §6.3.7
-//!   `read_coef_probs` 4D nested sweep and inter-only §6.3.9+
-//!   syntax remain deferred.
+//!   `DEFAULT_TX_PROBS` / `DEFAULT_SKIP_PROB`).
+//! * Round 6 lands the §6.3.7 `read_coef_probs( )` 6D
+//!   coefficient-probability sweep between the round-5 §6.3.2 and
+//!   §6.3.8 calls. The walker visits `txSz ∈ [TX_4X4, maxTxSize]`
+//!   with `maxTxSize = tx_mode_to_biggest_tx_size[ tx_mode ]`, an
+//!   outer `L(1) update_probs` per active slab, and a nested
+//!   `BLOCK_TYPES × REF_TYPES × COEF_BANDS × maxL × UNCONSTRAINED_NODES`
+//!   `read_diff_update_prob` walk. `Vp9CompressedHeader` exposes
+//!   the post-sweep `coef_probs: CoefProbs` table (1728 entries);
+//!   defaults come from the §10 `default_coef_probs` listing
+//!   transcribed verbatim into `DEFAULT_COEF_PROBS`. The inter-only
+//!   §6.3.9+ syntax remains deferred.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return
@@ -66,9 +75,11 @@ use oxideav_core::RuntimeContext;
 
 mod bitreader;
 mod bool_coder;
+mod coef_probs;
 mod compressed;
 mod header;
 
+pub use coef_probs::CoefProbs;
 pub use compressed::{parse_compressed_header, TxMode, Vp9CompressedHeader};
 pub use header::{
     parse_uncompressed_header, ColorConfig, ColorSpace, FrameType, LoopFilterParams,

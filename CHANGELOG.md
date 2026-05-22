@@ -6,6 +6,43 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 7: §6.4.24 / §6.4.26 coefficient-token decoder (crate-local
+  `tokens` module).**
+  * `read_token( coder, &probs )` (§6.4.24, §9.3.3) — walks the
+    20-entry `token_tree` returning one of `ZERO_TOKEN` ..
+    `DCT_VAL_CATEGORY6`. `probs[0..=9]` are the 10 internal-node
+    `read_bool` probabilities pre-derived from
+    `coef_probs[...][1]` / `coef_probs[...][2]` via `pareto`.
+  * `pareto( node, prob )` (§9.3.2) — short-circuits to `prob` for
+    `node < 2`; otherwise looks up
+    `PARETO_TABLE[ (prob - 1) / 2 ][ node - 2 ]` (odd `prob`) or
+    interpolates two adjacent rows (even `prob`). The full 128×8
+    pareto table is transcribed verbatim from spec §10.3.
+  * `read_more_coefs( coder, prob )` (§6.4.24, §9.3.2) — single
+    `B(p)` returning `true` (continue scan) / `false` (EOB).
+  * `read_coef( coder, token, bit_depth )` (§6.4.26) — extra-bits
+    decoder. For tokens `ONE`..`FOUR` no bits are read and the base
+    coef is returned. For `DCT_VAL_CATEGORY1..6` the `numExtra`
+    `B(p)` reads against `cat_probs[cat]` build the magnitude in
+    `EXTRA_BITS[token][2] + (extra_bits_value)`. For `CAT6` at
+    `bit_depth ∈ {10, 12}` an additional `BitDepth - 8` `B(255)`
+    `high_bit` reads prepend MSBs at shift `5 + BitDepth - e`.
+  * `read_coef_token( coder, check_eob, more_coefs_prob,
+    &token_probs, bit_depth )` — driver returning
+    `CoefStep::Eob | Coef { token, value }`. Folds `read_more_coefs`
+    + `read_token` + `read_coef` + `L(1) sign_bit` together. The
+    `checkEob` flag itself stays in the caller's residual loop per
+    §6.4.24.
+  * `EXTRA_BITS[11][3]`, `CAT_PROBS[7][14]`, `ENERGY_CLASS[12]`,
+    `TOKEN_TREE[20]`, `PARETO_TABLE[128][8]` constants — all
+    transcribed verbatim from spec §6.4.26 / §10.2 / §10.3 / §9.3.
+  * 28 unit tests including hand-traced golden buffers for
+    `ONE_TOKEN` (`0x40 0x00 …`) and `TWO_TOKEN` (`0x60 0x00 …`)
+    derived by stepping the §9.2 decoder by hand. No external
+    library / source was consulted; the §6.4.21 `residual( )` driver
+    that will consume these helpers remains deferred to a future
+    round.
+
 * **Round 6: §6.3.7 `read_coef_probs` 6D coefficient-probability
   sweep wired into `parse_compressed_header`.**
   * `read_coef_probs(&mut coder, tx_mode, &mut coef_probs)` (§6.3.7)

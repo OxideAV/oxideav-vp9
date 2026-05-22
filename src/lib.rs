@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -52,6 +52,18 @@
 //!   defaults come from the §10 `default_coef_probs` listing
 //!   transcribed verbatim into `DEFAULT_COEF_PROBS`. The inter-only
 //!   §6.3.9+ syntax remains deferred.
+//! * Round 7 lands the §6.4.24 / §6.4.26 coefficient-token decoder
+//!   (a crate-local module `tokens`) — the §9.3.3 `token_tree`
+//!   walker, the §9.3.2 `pareto( node, prob )` helper backed by the
+//!   §10.3 128-entry pareto table, the `more_coefs` `B(p)` reader,
+//!   the §6.4.26 `read_coef` extra-bits + 8/10/12-bit `high_bit`
+//!   decode, and a `read_coef_token` driver returning `CoefStep::
+//!   Eob | Coef { token, value }`. The §11 `extra_bits[11][3]`
+//!   table, the `cat_probs[7][14]` table, and the §10.2
+//!   `energy_class[12]` table are all transcribed verbatim. The
+//!   §6.4.21 `residual( )` plane / sub-block driver and the
+//!   `AboveNonzeroContext` / `LeftNonzeroContext` state still need
+//!   a later round; the round-7 surface is internal-only.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return
@@ -78,6 +90,7 @@ mod bool_coder;
 mod coef_probs;
 mod compressed;
 mod header;
+mod tokens;
 
 pub use coef_probs::CoefProbs;
 pub use compressed::{parse_compressed_header, TxMode, Vp9CompressedHeader};

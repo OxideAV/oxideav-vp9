@@ -5,6 +5,42 @@ Bitstream & Decoding Process Specification v0.7.
 
 ## Status — 2026-05-22
 
+**Round 7: §6.4.24 / §6.4.26 coefficient-token decoder.** Round 7
+adds a `tokens` module (crate-internal, `pub(crate)`) implementing
+the pieces needed to recover one quantised DCT coefficient at a time
+from the §9.2 Boolean coder, given a pre-selected
+`coef_probs[ txSz ][ plane>0 ][ is_inter ][ band ][ ctx ][..3 ]` cell:
+
+* The §9.3 `token_tree[20]` walker — `read_token( coder, &probs )` —
+  returning one of the 11 spec tokens (`ZERO_TOKEN` through
+  `DCT_VAL_CATEGORY6`).
+* The §9.3.2 `pareto( node, prob )` helper backed by the §10.3
+  128×8 `pareto_table` (transcribed verbatim).
+* The §6.4.24 `more_coefs` `B(p)` reader.
+* The §6.4.26 `read_coef( coder, token, bit_depth )` extra-bits
+  decoder consuming the `extra_bits[11][3]` and `cat_probs[7][14]`
+  tables (transcribed verbatim) plus the CAT6 `high_bit` `B(255)`
+  loop that prepends `BitDepth - 8` MSBs for 10- and 12-bit profiles
+  at shift positions `5 + BitDepth - e`.
+* A `read_coef_token` driver that wires `more_coefs` + `read_token` +
+  `read_coef` + `L(1) sign_bit` together and returns
+  `CoefStep::{ Eob, Coef { token, value } }`.
+* The §10.2 `energy_class[12]` table (for `TokenCache` once the
+  residual driver lands).
+
+The hand-traced golden buffers in the test suite cover every token
+slot's "all-zero extra bits" base value, both legs of the
+`more_coefs` decision, and two non-trivial tree-walk paths
+(`ONE_TOKEN` from buffer `0x40 0x00 …`, `TWO_TOKEN` from buffer
+`0x60 0x00 …`).
+
+The §6.4.21 `residual( )` plane/sub-block driver still lands in a
+later round — it owns the `AboveNonzeroContext` / `LeftNonzeroContext`
+arrays and the per-block `ctx` derivation that picks the right
+`coef_probs` cell. The round-7 surface is internal-only; the public
+API still exposes `parse_uncompressed_header` and
+`parse_compressed_header` exclusively.
+
 **Round 6: §6.3.7 `read_coef_probs` 6D coefficient-probability sweep
 wired in.** Round 6 inserts the §6.3.7 walker between the round-5
 §6.3.2 `tx_mode_probs` and §6.3.8 `read_skip_prob` calls. The

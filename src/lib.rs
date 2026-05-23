@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -87,6 +87,19 @@
 //!   rounding). The §8.6.2 reconstruct driver that builds the
 //!   `Dequant` input and adds the residual to the prediction lands
 //!   in a later round; the round-9 surface is internal-only.
+//! * Round 10 lands the §8.5.1 intra prediction process (a crate-local
+//!   module `intra`) — the `PredMode` enum (the 10 §7.4.5 modes,
+//!   `DC_PRED` = 0 .. `TM_PRED` = 9), a `Plane` row-major buffer
+//!   standing in for `CurrFrame[ plane ]`, and `predict_intra` which
+//!   builds the `aboveRow` / `leftCol` neighbour arrays (with the
+//!   `haveAbove` / `haveLeft` / `notOnRight` availability rules and
+//!   the `Min(maxX, .)` / `Min(maxY, .)` plane-edge clamps), forms the
+//!   `pred` block for each mode (`V`/`H`/`DC` with all four neighbour
+//!   cases, `D45`/`D63`/`D117`/`D135`/`D153`/`D207` directional, and
+//!   `TM` with `Clip1`), and stores it back. The §8.6.2 reconstruct
+//!   driver that supplies the real availability flags (from tile /
+//!   frame edges) and adds the round-9 inverse-transformed residual
+//!   lands in a later round; the round-10 surface is internal-only.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return
@@ -115,6 +128,7 @@ mod compressed;
 mod dequant;
 mod header;
 mod idct;
+mod intra;
 mod tokens;
 
 pub use coef_probs::CoefProbs;

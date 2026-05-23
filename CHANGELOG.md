@@ -6,6 +6,47 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 10: §8.5.1 intra prediction process (crate-local `intra`
+  module).**
+  * `PredMode` — the 10 §7.4.5 intra prediction modes with
+    discriminants matching the spec numbering exactly (`DC_PRED` = 0,
+    `V_PRED` = 1, `H_PRED` = 2, `D45_PRED` = 3, `D135_PRED` = 4,
+    `D117_PRED` = 5, `D153_PRED` = 6, `D207_PRED` = 7, `D63_PRED` = 8,
+    `TM_PRED` = 9) plus `from_raw` for the (deferred) mode-info decode.
+  * `Plane` — a minimal row-major `i32` plane buffer standing in for
+    `CurrFrame[ plane ]`; the §8.5.1 process reads neighbour samples
+    from it and writes the prediction back.
+  * `predict_intra( plane, x, y, have_left, have_above, not_on_right,
+    tx_sz, mode, max_x, max_y, bit_depth )` (§8.5.1) — builds
+    `aboveRow[-1 .. 2*size-1]` and `leftCol[0 .. size-1]` per the
+    `haveAbove` / `haveLeft` / `notOnRight` availability rules (the
+    upper-right extension fires only for `txSz == 0`; missing
+    neighbours fill `(1<<(BitDepth-1)) ± 1`), forms the `pred` block
+    for the selected mode — `V`/`H` copies; the four `DC` neighbour
+    cases (`avg` = `(sum + size) >> (log2Size+1)`, `leftAvg` /
+    `aboveAvg` = `(sum + (1<<(log2Size-1))) >> log2Size`, and the
+    `1<<(BitDepth-1)` no-neighbour fill); the `D45`/`D63`/`D117`/
+    `D135`/`D153`/`D207` directional `Round2` recurrences (including
+    the reverse-order `D207` step 5); and `TM` with `Clip1` — then
+    stores it back. Neighbour reads clamp with `Min(maxX, .)` /
+    `Min(maxY, .)`. Crate-local `round2` (§3) and `clip1` (§3)
+    helpers.
+  * 16 unit tests: `PredMode::from_raw` round-tripping the §7.4.5
+    numbering (and the discriminant values), `round2` / `clip1`
+    against their §3 definitions, `V_PRED` / `H_PRED` copy semantics,
+    all four `DC_PRED` neighbour cases, the `TM_PRED` formula plus
+    out-of-range clipping, a constant-neighbour invariant collapsing
+    every directional mode to the neighbour constant across all four
+    transform sizes, the `D207_PRED` bottom-row / step-2 formulas, the
+    `notOnRight`-gated upper-right `aboveRow` extension (via
+    `D45_PRED`, enabled only for `txSz == 0`), and the `Min(maxX, .)`
+    plane-edge clamping of neighbour reads. No external library /
+    source was consulted; every formula is transcribed directly from
+    the spec §8.5.1 listing. The §8.6.2 reconstruct driver that
+    supplies the real availability flags and adds the round-9
+    inverse-transformed residual to this prediction remains deferred
+    to a future round; the round-10 surface is internal-only.
+
 * **Round 9: §8.7 inverse transform process (crate-local `idct`
   module).**
   * The §8.7.1.1 butterfly primitives — `B` (butterfly rotation,

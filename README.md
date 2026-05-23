@@ -5,6 +5,38 @@ Bitstream & Decoding Process Specification v0.7.
 
 ## Status — 2026-05-24
 
+**Round 10: §8.5.1 intra prediction process.** Round 10 adds an
+`intra` module (crate-internal, `pub(crate)`) implementing the §8.5.1
+intra prediction the §8.6.2 reconstruct process invokes for intra
+blocks (the prediction half of `reconstruct = predict + residual`):
+
+* `PredMode` — the 10 §7.4.5 intra prediction modes, with
+  discriminants matching the spec numbering exactly (`DC_PRED` = 0,
+  `V_PRED` = 1, `H_PRED` = 2, `D45_PRED` = 3, `D135_PRED` = 4,
+  `D117_PRED` = 5, `D153_PRED` = 6, `D207_PRED` = 7, `D63_PRED` = 8,
+  `TM_PRED` = 9), plus `from_raw` for the (deferred) mode-info decode.
+* `Plane` — a minimal row-major `i32` plane buffer standing in for
+  `CurrFrame[ plane ]`, read for neighbour samples and written with
+  the prediction.
+* `predict_intra( .. )` (§8.5.1) — builds the `aboveRow[-1 .. 2*size-1]`
+  and `leftCol[0 .. size-1]` neighbour arrays per the `haveAbove` /
+  `haveLeft` / `notOnRight` availability rules (including the
+  upper-right extension that fires only for `txSz == 0` and the
+  `(1<<(BitDepth-1)) ± 1` no-neighbour fills), then forms the `pred`
+  block for the selected mode: `V`/`H` copies, the four `DC` neighbour
+  cases (`avg` / `leftAvg` / `aboveAvg` / midpoint), the
+  `D45`/`D63`/`D117`/`D135`/`D153`/`D207` directional `Round2`
+  recurrences, and `TM` with `Clip1`. Neighbour reads clamp with
+  `Min(maxX, .)` / `Min(maxY, .)`; the result is stored back into the
+  plane.
+
+The §8.6.2 reconstruct driver — which supplies the real `haveAbove` /
+`haveLeft` / `notOnRight` flags (from tile / frame edges) and adds the
+round-9 inverse-transformed residual to this prediction — lands in a
+later round. The round-10 surface is internal-only; the public API
+still exposes `parse_uncompressed_header`, `parse_compressed_header`
+and their result types exclusively.
+
 **Round 9: §8.7 inverse transform process.** Round 9 adds an `idct`
 module (crate-internal, `pub(crate)`) implementing the §8.7 inverse
 transform stage the §8.6.2 reconstruct process invokes after the
@@ -266,9 +298,21 @@ remainder of the frame.
 
 ## Test surface
 
-* `cargo test`: 100 unit tests + 20 integration tests (8 in
+* `cargo test`: 136 unit tests + 20 integration tests (8 in
   `tests/compressed_header.rs` plus 12 in
   `tests/uncompressed_header.rs`).
+* Round-10 additions: 16 unit tests covering `PredMode::from_raw`
+  round-tripping the §7.4.5 numbering (and rejecting 10+), the local
+  `round2` / `clip1` helpers against their §3 definitions, `V_PRED`
+  copying `aboveRow` down and `H_PRED` copying `leftCol` across, all
+  four `DC_PRED` neighbour cases (both / left-only / above-only /
+  none), `TM_PRED`'s `Clip1(aboveRow[j] + leftCol[i] - aboveRow[-1])`
+  formula (including out-of-range clipping), a constant-neighbour
+  invariant that collapses every directional mode to the neighbour
+  constant across all four transform sizes, the `D207_PRED` bottom-row
+  / step-2 formula, the `notOnRight`-gated upper-right extension of
+  `aboveRow` (enabled only for `txSz == 0`) via `D45_PRED`, and the
+  `Min(maxX, .)` plane-edge clamping of neighbour reads.
 * Round-8 additions: 13 unit tests covering the `DC_QLOOKUP` /
   `AC_QLOOKUP` shape (256 entries per row) and §8.6.1 listing
   anchors (first/last entry of every row plus two interior anchors),
@@ -363,19 +407,23 @@ harness.
 
 Future rounds, roughly in order:
 
-1. Inter (non-intra-only) header path — `frame_size_with_refs`,
+1. The §8.6.2 reconstruct driver tying the pieces together: scale
+   the round-7 `Tokens` by the round-8 quantizers (with the
+   `dqDenom = 2` halving for `TX_32X32`), run the round-9 inverse
+   transform, add the residual to the round-10 intra prediction, and
+   `Clip1` into `CurrFrame`.
+2. Inter (non-intra-only) header path — `frame_size_with_refs`,
    `allow_high_precision_mv`, `read_interpolation_filter` — plus
    the inter-only §6.3.9–§6.3.16 syntax (`read_inter_mode_probs`,
    `read_interp_filter_probs`, `read_is_inter_probs`,
    `frame_reference_mode`, `mv_probs`) once reference-buffer state
    is in place.
-2. Per-tile partition-tree walk (§6.4) including the §6.4.21
-   `coef_token` decode that finally consumes the round-6
-   `coef_probs` tables.
-3. Intra prediction (§8.5) over a single tile.
-4. §8.7 inverse transforms (DCT / ADST / WHT) + the §8.6.2
-   reconstruct driver wiring round-8 dequant to the round-7 tokens.
-5. Inter prediction, loop filter, multi-tile, then encoder paths.
+3. Per-tile partition-tree walk (§6.4) including the §6.4.21
+   `residual()` driver that finally consumes the round-7 tokens and
+   the round-6 `coef_probs` tables, plus the per-block mode-info
+   decode that feeds `predict_intra`.
+4. Inter prediction (§8.5.2), loop filter (§8.8), multi-tile, then
+   encoder paths.
 
 ## License
 

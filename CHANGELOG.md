@@ -6,6 +6,46 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 9: §8.7 inverse transform process (crate-local `idct`
+  module).**
+  * The §8.7.1.1 butterfly primitives — `B` (butterfly rotation,
+    including the `16 + 32*k` two-multiply fast path), `H` (Hadamard
+    rotation), `SB` (butterfly into the high-precision `S` array) and
+    `SH` (Hadamard rotation + `Round2(·,14)` out of `S`) — plus the
+    `cos64` / `sin64` angle functions backed by the verbatim 33-entry
+    `COS64_LOOKUP` quarter-wave table and the `brev` bit-reversal
+    helper. All fixed-point intermediates are evaluated in `i64`
+    (the spec notes `S` needs `24 + BitDepth` bits).
+  * `inverse_dct( t, n )` (§8.7.1.2 + §8.7.1.3) — the inverse-DCT
+    array permutation (`T[i] = copyT[ brev(n, i) ]`) followed by the
+    recursive inverse DCT process for `2 <= n <= 5`.
+  * `inverse_adst( t, n )` (§8.7.1.4 .. §8.7.1.9) — the ADST
+    input/output permutations and the ADST4 / ADST8 / ADST16
+    processes (the `SINPI_1_9 .. SINPI_4_9` constants transcribed
+    verbatim) dispatched by `n` for `2 <= n <= 4`.
+  * `inverse_wht( t, shift )` (§8.7.1.10) — the in-place inverse
+    Walsh-Hadamard transform with the `shift` pre-scaling argument.
+  * `inverse_transform_2d( dequant, n, tx_type, lossless )` (§8.7.2)
+    — the 2D driver: per-`TxType` row transform then column
+    transform over a `(1<<n)` by `(1<<n)` `Dequant` block, the
+    lossless WHT path (`shift = 2` rows / `0` columns), and the
+    `Round2( T[i], Min(6, n+2) )` column rounding. `TxType` constants
+    `DCT_DCT` / `ADST_DCT` / `DCT_ADST` / `ADST_ADST` are defined per
+    §3.
+  * 20 unit tests: `cos64` quarter-wave symmetry + periodicity,
+    `sin64` shift, `brev`, the Hadamard sum/difference + flip
+    semantics, the `16+32*k` butterfly fast-path equivalence, the
+    DC-only "flat output" property of the 4/8/16/32-point inverse
+    DCT, zero-in/zero-out for all ADST sizes, the §8.7.1.5 output
+    permutation indices, and the 2D driver's zero-in/zero-out (all
+    four `TxType`s, `n = 2..5`) + DC-only flat-block property (lossy
+    and lossless paths). No external library / source was consulted;
+    the `cos64_lookup` table and `SINPI_*_9` constants are
+    transcribed directly from the spec §8.7.1 listings. The §8.6.2
+    reconstruct driver that builds the `Dequant` input (round-7 token
+    magnitudes scaled by the round-8 quantizers) and adds the
+    residual to the prediction remains deferred to a future round.
+
 * **Round 8: §8.6.1 dequantization functions (crate-local `dequant`
   module).**
   * `dc_q( bit_depth, b )` / `ac_q( bit_depth, b )` (§8.6.1) — index

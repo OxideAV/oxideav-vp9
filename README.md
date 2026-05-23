@@ -5,11 +5,48 @@ Bitstream & Decoding Process Specification v0.7.
 
 ## Status — 2026-05-24
 
+**Round 9: §8.7 inverse transform process.** Round 9 adds an `idct`
+module (crate-internal, `pub(crate)`) implementing the §8.7 inverse
+transform stage the §8.6.2 reconstruct process invokes after the
+round-8 dequantization step:
+
+* The §8.7.1.1 butterfly primitives — `B` (butterfly rotation, with
+  the `16 + 32*k` two-multiply fast path), `H` (Hadamard rotation),
+  `SB` (butterfly into the high-precision `S` array) and `SH`
+  (Hadamard rotation + `Round2(·, 14)` out of `S`) — plus `cos64` /
+  `sin64` backed by the verbatim 33-entry `cos64_lookup` quarter-wave
+  table and the `brev` bit-reversal helper. Fixed-point intermediates
+  are evaluated in `i64` (the spec notes `S` needs `24 + BitDepth`
+  bits of precision).
+* `inverse_dct( t, n )` (§8.7.1.2 + §8.7.1.3) — the inverse-DCT array
+  bit-reversal permutation followed by the recursive inverse DCT
+  process for `2 <= n <= 5` (4/8/16/32-point).
+* `inverse_adst( t, n )` (§8.7.1.4 .. §8.7.1.9) — the ADST
+  input/output permutations and the ADST4 / ADST8 / ADST16 processes
+  (with the `SINPI_1_9 .. SINPI_4_9` constants transcribed verbatim)
+  dispatched by `n` for `2 <= n <= 4`.
+* `inverse_wht( t, shift )` (§8.7.1.10) — the in-place inverse
+  Walsh-Hadamard transform.
+* `inverse_transform_2d( dequant, n, tx_type, lossless )` (§8.7.2) —
+  the 2D driver applying the per-`TxType` row transform then column
+  transform over a `(1<<n)` by `(1<<n)` block, the lossless WHT path
+  (`shift = 2` rows / `0` columns), and the `Round2( T[i], Min(6,
+  n+2) )` column rounding. `TxType` constants `DCT_DCT` / `ADST_DCT`
+  / `DCT_ADST` / `ADST_ADST` follow §3.
+
+The §8.6.2 reconstruct driver — which builds the `Dequant` input
+(round-7 token magnitudes scaled by the round-8 quantizers, with the
+`dqDenom = 2` halving for `TX_32X32`), calls this transform layer and
+adds the residual to the prediction — lands in a later round. The
+round-9 surface is internal-only; the public API still exposes
+`parse_uncompressed_header`, `parse_compressed_header` and their
+result types exclusively.
+
 **Round 8: §8.6.1 dequantization functions.** Round 8 adds a
 `dequant` module (crate-internal, `pub(crate)`) implementing the
 quantizer-value derivation the §8.6.2 reconstruct process consumes
-between the round-7 coefficient-token decode and the (deferred) §8.7
-inverse transform:
+between the round-7 coefficient-token decode and the §8.7 inverse
+transform:
 
 * `dc_q( bit_depth, b )` / `ac_q( bit_depth, b )` (§8.6.1) — index
   the `dc_qlookup[3][256]` / `ac_qlookup[3][256]` tables by the

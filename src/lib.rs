@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -74,6 +74,19 @@
 //!   `delta_q_*` header deltas through. The §8.6.2 reconstruct
 //!   driver that scales the round-7 `Tokens` by these quantizers
 //!   lands in a later round; the round-8 surface is internal-only.
+//! * Round 9 lands the §8.7 inverse transform process (a crate-local
+//!   module `idct`) — the §8.7.1.1 butterfly primitives (`B` / `H` /
+//!   `SB` / `SH`, the `16+32*k` two-multiply fast path, `cos64` /
+//!   `sin64` backed by the verbatim 33-entry `cos64_lookup` table,
+//!   `brev`), the recursive §8.7.1.2/§8.7.1.3 inverse DCT for
+//!   `2 <= n <= 5`, the §8.7.1.4 .. §8.7.1.9 inverse ADST
+//!   (ADST4/8/16) for `2 <= n <= 4`, the §8.7.1.10 inverse
+//!   Walsh-Hadamard transform, and the §8.7.2 2D driver
+//!   `inverse_transform_2d` (per-`TxType` row/column transforms, the
+//!   lossless WHT path, and the `Round2(T[i], Min(6, n+2))` column
+//!   rounding). The §8.6.2 reconstruct driver that builds the
+//!   `Dequant` input and adds the residual to the prediction lands
+//!   in a later round; the round-9 surface is internal-only.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return
@@ -101,6 +114,7 @@ mod coef_probs;
 mod compressed;
 mod dequant;
 mod header;
+mod idct;
 mod tokens;
 
 pub use coef_probs::CoefProbs;

@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -64,6 +64,16 @@
 //!   §6.4.21 `residual( )` plane / sub-block driver and the
 //!   `AboveNonzeroContext` / `LeftNonzeroContext` state still need
 //!   a later round; the round-7 surface is internal-only.
+//! * Round 8 lands the §8.6.1 dequantization functions (a crate-local
+//!   module `dequant`) — `dc_q` / `ac_q` indexing the verbatim
+//!   `dc_qlookup[3][256]` / `ac_qlookup[3][256]` tables by the
+//!   `(BitDepth-8)>>1` row and a `Clip3(0,255,b)` column,
+//!   `seg_feature_active` (§6.4.9), `get_qindex` (with the
+//!   `SEG_LVL_ALT_Q` absolute/delta segment-feature path), and
+//!   `get_dc_quant` / `get_ac_quant` threading the plane-specific
+//!   `delta_q_*` header deltas through. The §8.6.2 reconstruct
+//!   driver that scales the round-7 `Tokens` by these quantizers
+//!   lands in a later round; the round-8 surface is internal-only.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return
@@ -89,6 +99,7 @@ mod bitreader;
 mod bool_coder;
 mod coef_probs;
 mod compressed;
+mod dequant;
 mod header;
 mod tokens;
 

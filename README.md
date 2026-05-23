@@ -3,7 +3,39 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
-## Status — 2026-05-22
+## Status — 2026-05-24
+
+**Round 8: §8.6.1 dequantization functions.** Round 8 adds a
+`dequant` module (crate-internal, `pub(crate)`) implementing the
+quantizer-value derivation the §8.6.2 reconstruct process consumes
+between the round-7 coefficient-token decode and the (deferred) §8.7
+inverse transform:
+
+* `dc_q( bit_depth, b )` / `ac_q( bit_depth, b )` (§8.6.1) — index
+  the `dc_qlookup[3][256]` / `ac_qlookup[3][256]` tables by the
+  `(BitDepth - 8) >> 1` row (0 / 1 / 2 for 8- / 10- / 12-bit) and the
+  `Clip3(0, 255, b)` column. Both 256-entry tables are transcribed
+  verbatim from the §8.6.1 listing into `DC_QLOOKUP` / `AC_QLOOKUP`.
+* `seg_feature_active( seg, segment_id, feature )` (§6.4.9) —
+  `segmentation_enabled && FeatureEnabled[ segment_id ][ feature ]`.
+* `get_qindex( seg, quant, segment_id )` (§8.6.1) — the per-block
+  quantizer index. When `seg_feature_active( SEG_LVL_ALT_Q )`, the
+  segment's `FeatureData` either replaces `base_q_idx` (absolute
+  update) or offsets it (delta update), then `Clip3(0, 255, .)`;
+  otherwise `base_q_idx` is returned directly.
+* `get_dc_quant( plane, .. )` / `get_ac_quant( plane, .. )`
+  (§8.6.1) — combine `get_qindex()` with the plane-appropriate
+  header delta (`delta_q_y_dc` luma DC, `delta_q_uv_dc` chroma DC,
+  `delta_q_uv_ac` chroma AC; luma AC has no delta in VP9) and
+  dispatch to `dc_q` / `ac_q`.
+
+The §8.6.2 reconstruct driver — which scales the round-7 `Tokens`
+array by these quantizers (with the `dqDenom = 2` halving for
+`TX_32X32`), runs the §8.7 inverse transform and adds the residual
+to the prediction — lands in a later round. The round-8 surface is
+internal-only; the public API still exposes
+`parse_uncompressed_header`, `parse_compressed_header` and their
+result types exclusively.
 
 **Round 7: §6.4.24 / §6.4.26 coefficient-token decoder.** Round 7
 adds a `tokens` module (crate-internal, `pub(crate)`) implementing
@@ -197,9 +229,21 @@ remainder of the frame.
 
 ## Test surface
 
-* `cargo test`: 59 unit tests + 20 integration tests (8 in
+* `cargo test`: 100 unit tests + 20 integration tests (8 in
   `tests/compressed_header.rs` plus 12 in
   `tests/uncompressed_header.rs`).
+* Round-8 additions: 13 unit tests covering the `DC_QLOOKUP` /
+  `AC_QLOOKUP` shape (256 entries per row) and §8.6.1 listing
+  anchors (first/last entry of every row plus two interior anchors),
+  `qlookup_row` bit-depth mapping (8→0 / 10→1 / 12→2), `clip3`
+  both-end clamping, `dc_q` / `ac_q` index clipping + bit-depth row
+  selection, `get_qindex` for the segmentation-off / delta-update /
+  absolute-update paths (with the `Clip3` clamps), `seg_feature_active`
+  needing both `segmentation_enabled` and the per-segment bit,
+  `get_dc_quant` / `get_ac_quant` plane-delta selection (luma AC has
+  no delta), a segment-overridden qindex threaded through both, and
+  the high-bit-depth divergence of the same qindex across the three
+  table rows.
 * Round-6 additions: 7 unit tests covering
   `tx_mode_to_biggest_tx_size` against the §10.5 listing,
   `read_coef_probs` zero-buffer passthrough for both `ONLY_4X4`
@@ -292,7 +336,8 @@ Future rounds, roughly in order:
    `coef_token` decode that finally consumes the round-6
    `coef_probs` tables.
 3. Intra prediction (§8.5) over a single tile.
-4. Inverse transforms + dequant.
+4. §8.7 inverse transforms (DCT / ADST / WHT) + the §8.6.2
+   reconstruct driver wiring round-8 dequant to the round-7 tokens.
 5. Inter prediction, loop filter, multi-tile, then encoder paths.
 
 ## License

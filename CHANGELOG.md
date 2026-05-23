@@ -6,6 +6,37 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 8: §8.6.1 dequantization functions (crate-local `dequant`
+  module).**
+  * `dc_q( bit_depth, b )` / `ac_q( bit_depth, b )` (§8.6.1) — index
+    the `dc_qlookup[3][256]` / `ac_qlookup[3][256]` tables by the
+    `(BitDepth - 8) >> 1` row and the `Clip3(0, 255, b)` column.
+    Both 256-entry tables are transcribed verbatim from the §8.6.1
+    listing into `DC_QLOOKUP` / `AC_QLOOKUP`.
+  * `seg_feature_active( seg, segment_id, feature )` (§6.4.9) —
+    `segmentation_enabled && FeatureEnabled[ segment_id ][ feature ]`.
+  * `get_qindex( seg, quant, segment_id )` (§8.6.1) — applies the
+    `SEG_LVL_ALT_Q` segment feature (absolute update replaces
+    `base_q_idx`, delta update offsets it, then `Clip3(0, 255, .)`)
+    or returns `base_q_idx` when the feature is inactive.
+  * `get_dc_quant( plane, .. )` / `get_ac_quant( plane, .. )`
+    (§8.6.1) — combine `get_qindex()` with the plane-specific header
+    delta (`delta_q_y_dc` luma DC, `delta_q_uv_dc` chroma DC,
+    `delta_q_uv_ac` chroma AC; luma AC has none) and dispatch to
+    `dc_q` / `ac_q`.
+  * `SEG_LVL_ALT_Q` constant (§3 table of constants) plus a private
+    `clip3` helper (§5.1).
+  * 13 unit tests including table-shape / spec-anchor checks, the
+    `clip3` clamp branches, `dc_q` / `ac_q` index clipping + row
+    selection, all three `get_qindex` paths, plane-delta selection
+    for `get_dc_quant` / `get_ac_quant`, and the high-bit-depth
+    divergence of the same qindex across the three table rows. The
+    §8.6.2 reconstruct driver that consumes these helpers (scaling
+    the round-7 `Tokens` array, with the `dqDenom = 2` halving for
+    `TX_32X32`) remains deferred to a future round. No external
+    library / source was consulted; the lookup tables are
+    transcribed directly from the spec §8.6.1 listing.
+
 * **Round 7: §6.4.24 / §6.4.26 coefficient-token decoder (crate-local
   `tokens` module).**
   * `read_token( coder, &probs )` (§6.4.24, §9.3.3) — walks the

@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -168,6 +168,25 @@
 //!   `tx_size` / `skip` / `segment_id` from §6.4) that the residual
 //!   loop reads is also a later-round increment. The round-14 surface
 //!   is internal-only.
+//! * Round 15 lands the first slice of the §6.4 per-block mode-info
+//!   decode the round-14 [`residual_intra`] driver currently consumes
+//!   via a caller-supplied bundle: the §9.3.3 generic `tree_decode( )`
+//!   helper, the §6.4.8 `read_skip( )` syntax element (with the §6.4.9
+//!   `seg_feature_active( SEG_LVL_SKIP )` early-return and the §9.3.2
+//!   ctx `Skips[ MiRow-1 ][ MiCol ] + Skips[ MiRow ][ MiCol-1 ]`), and
+//!   the §6.4.10 `read_tx_size( allowSelect )` syntax element (the
+//!   `TX_MODE_SELECT && MiSize >= BLOCK_8X8` `tx_size` decode using
+//!   the §9.3.1 `tx_size_8_tree` / `tx_size_16_tree` / `tx_size_32_tree`
+//!   transcribed verbatim, indexed by `max_txsize_lookup[ MiSize ]`,
+//!   plus the §9.3.2 ctx `( above + left ) > maxTxSize` from
+//!   `TxSizes[ ][ ]` / `Skips[ ][ ]` neighbour cells, and the
+//!   `Min( maxTxSize, tx_mode_to_biggest_tx_size[ tx_mode ] )`
+//!   fallback). `NeighbourSkips` / `NeighbourTxSizes` bundles thread
+//!   the §7.4.4 `AvailL` / `AvailU` rules through. The §6.4.6
+//!   `intra_frame_mode_info( )` orchestrator that wires `read_skip` +
+//!   `read_tx_size` + the deferred §6.4.7 `intra_segment_id` +
+//!   §6.4.15 `intra_block_mode_info` into a single `Vp9IntraMiBlock`
+//!   lands in a later round; the round-15 surface is internal-only.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return
@@ -197,6 +216,7 @@ mod dequant;
 mod header;
 mod idct;
 mod intra;
+mod mode_info;
 mod reconstruct;
 mod residual;
 mod scan;

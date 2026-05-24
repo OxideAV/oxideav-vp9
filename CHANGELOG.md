@@ -6,6 +6,73 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 15: §6.4.8 `read_skip` + §6.4.10 `read_tx_size` + §9.3.3
+  `tree_decode` (crate-local `mode_info` module).** The first slice of
+  the §6.4 per-block mode-info decode that the round-14
+  `residual_intra` driver currently consumes via a caller-supplied
+  bundle — unblocks the per-block `BoolCoder`-driven mode-info wiring
+  the §6.4.6 `intra_frame_mode_info()` orchestrator will need.
+  * `tree_decode( coder, tree, prob )` — the §9.3.3 generic tree
+    decoding loop `do { n = T[n + read_bool(P(n >> 1))] } while (n >
+    0)` that every tree-coded syntax element routes through. The
+    probability callback is a `FnMut(usize) -> u8` so call-sites can
+    splice the right §9.3.2 row in without the helper needing to know
+    which syntax element it's decoding.
+  * §9.3.1 trees `tx_size_8_tree[2]` / `tx_size_16_tree[4]` /
+    `tx_size_32_tree[6]` and `binary_tree[2]` transcribed verbatim
+    from the spec listing.
+  * `skip_context( nb )` (§9.3.2) — the `Skips[MiRow-1][MiCol] +
+    Skips[MiRow][MiCol-1]` ctx derivation with `AvailU` / `AvailL`
+    gating; `tx_size_context( nb, max_tx_size )` (§9.3.2) — the
+    `(above + left) > maxTxSize` ctx derivation that consults
+    neighbour `TxSizes[ ]` only on unskipped MI blocks (and mirrors
+    the side when a neighbour is unavailable).
+  * `read_skip( coder, seg_feature_skip_active, skip_prob, nb )`
+    (§6.4.8) — the §6.4.9 `seg_feature_active(SEG_LVL_SKIP)`
+    early-return rule plus the §9.3.2 binary tree decode under
+    `skip_prob[skip_context(nb)]`.
+  * `read_tx_size( coder, allow_select, tx_mode, mi_size, tx_probs,
+    nb )` (§6.4.10) — the `allow_select && tx_mode == TX_MODE_SELECT
+    && MiSize >= BLOCK_8X8` path picking the §9.3.1 tree by
+    `max_txsize_lookup[MiSize]` and the §9.3.2 ctx, falling through
+    to `Min(maxTxSize, tx_mode_to_biggest_tx_size[tx_mode])` per the
+    spec's `else` branch.
+  * `NeighbourSkips` / `NeighbourTxSizes` — the per-MI-block
+    neighbour-state bundles a tile driver builds from its
+    frame-wide `Skips[ ][ ]` / `TxSizes[ ][ ]` arrays.
+  * 22 unit tests: the §9.3.1 tree-listing anchors (verbatim
+    transcription check), the §9.3.3 walker with a zero-coder
+    (every read yields bit=0, every tree picks its first leaf),
+    a "bias buffer" prefix `[0x7F, 0x00, ...]` whose post-marker
+    coder state lets the first `read_bool(255)` flip to 1 (one
+    right-branch step in any tree), the node-index argument-order
+    invariant for `tree_decode`'s prob callback, exhaustive
+    `skip_context` cases (no neighbours, single-side, both-sides
+    mixed and matching), `tx_size_context` against the §9.3.2
+    listing across max_tx_size 0..=3 plus the skipped-neighbour
+    fallback and the `!AvailL` / `!AvailU` mirroring, the §6.4.8
+    `seg_feature_active` early-return path, `read_skip` against
+    both the zero coder (always false) and the bias coder + p=255
+    (true), the §6.4.10 `else`-branch `Min(max, biggest)` fallback
+    for `allow_select == false` / non-SELECT `tx_mode` / sub-8x8
+    `MiSize`, the §9.3.1 tree-dispatch for `BLOCK_8X8` /
+    `BLOCK_16X16` / `BLOCK_32X32`, and the row-by-ctx selection
+    correctness via the spec-derived ctx derivation lockstep
+    (both ctx=0 and ctx=1 evaluated against `tx_size_context`).
+    Every test consumes the §9.2 BoolCoder through valid byte
+    buffers (marker-bit conformant) hand-derived by walking the
+    §9.2 listing — no external library or source was consulted.
+  * Out of scope this round: the §6.4.6 `intra_frame_mode_info()`
+    orchestrator (which wires `read_skip` + `read_tx_size` + the
+    deferred §6.4.7 `intra_segment_id` + §6.4.15
+    `intra_block_mode_info` into a single `Vp9IntraMiBlock`); the
+    `Skips[ ][ ]` / `TxSizes[ ][ ]` frame-wide array write-back
+    (left to the §6.4.6 driver); inter-frame mode info (§6.4.11+,
+    needs reference-buffer state); and the §8.4 `counts_skip` /
+    `counts_tx_size` probability-adaption accumulators. The
+    round-15 surface is internal-only; the public API still
+    exposes `parse_uncompressed_header`, `parse_compressed_header`
+    and their result types exclusively.
 * **Round 14: §6.4.21 `residual( )` intra driver (crate-local `residual`
   module).** The §6.4.21 outer loop for the intra path — the per-plane,
   per-4x4-sub-block walk that owns the `AboveNonzeroContext` /

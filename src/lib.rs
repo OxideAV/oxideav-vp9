@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -126,6 +126,24 @@
 //!   force-to-`DCT_DCT` first half. The §6.4.24 `tokens( )` loop that
 //!   walks `pos = scan[ c ]` and the §6.4.21 residual driver above it
 //!   land in a later round; the round-12 surface is internal-only.
+//! * Round 13 lands the §6.4.24 `tokens( )` per-block coefficient
+//!   driver (extending the crate-local `tokens` module) — the §10
+//!   `coefband_4x4` / `coefband_8x8plus` band tables and the
+//!   `coef_band` dispatch, the §9.3.2 `token_cache_neighbours`
+//!   derivation (`nb[ 0 ]` / `nb[ 1 ]`), the `build_token_probs`
+//!   §9.3.2 10-node probability array, the `NonzeroContext` /
+//!   `TokenBlockCtx` state bundles, and `tokens( )` itself: the
+//!   `checkEob`-gated walk over `pos = scan[ c ]` that derives the
+//!   per-coefficient `ctx` (DC from the non-zero strips, `c > 0` from
+//!   `TokenCache`), picks the
+//!   `coef_probs[txSz][plane>0][is_inter][band][ctx]` cell, runs the
+//!   round-7 `more_coefs` / `token` / `read_coef` / `sign_bit` decode,
+//!   writes `TokenCache[ pos ] = energy_class[ token ]`, applies the
+//!   `ZERO_TOKEN`-clears-`checkEob` rule, zero-fills the trailing scan
+//!   positions, and returns `nonzero = c > 0`. The §6.4.21 residual
+//!   loop that threads `NonzeroContext` across the frame and feeds the
+//!   round-11 reconstruct driver lands in a later round; the round-13
+//!   surface is internal-only.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return

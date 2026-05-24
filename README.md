@@ -5,6 +5,46 @@ Bitstream & Decoding Process Specification v0.7.
 
 ## Status — 2026-05-24
 
+**Round 13: §6.4.24 `tokens( )` per-block coefficient driver.** Round 13
+adds the §6.4.24 `tokens( )` driver to the `tokens` module — the per-block
+loop that walks the round-12 §6.4.25 scan order (`pos = scan[ c ]`) and
+feeds each scan position through the round-7 `read_coef_token` pipeline,
+recovering one transform block's quantised coefficients into a `Tokens[ ]`
+array:
+
+* The §10 band tables — `coefband_4x4[ 16 ]` transcribed verbatim and
+  `coefband_8x8plus[ 1024 ]` built from the verbatim 21-entry prefix plus
+  the all-`5` tail — picked by `coef_band( c, txSz )` per the §6.4.24
+  `(txSz == TX_4X4) ? coefband_4x4 : coefband_8x8plus` rule.
+* `token_cache_neighbours( c, pos, txSz, txType )` — the §9.3.2 neighbour
+  pair (`nb[ 0 ]` / `nb[ 1 ]`): `(0, 0)` for the DC coefficient, and for
+  `c > 0` the above (`(i-1)*n + j`) / left (`i*n + j-1`) raster cells with
+  the `DCT_ADST` (double above) / `ADST_DCT` (double left) / first-row /
+  first-column variants (`n = 4 << txSz`).
+* `build_token_probs( cell )` — the §9.3.2 10-node probability array
+  (node 0 → `cell[1]`, node 1 → `cell[2]`, node `2..=9` →
+  `pareto( node, cell[2] )`).
+* `NonzeroContext` (the per-plane `AboveNonzeroContext` /
+  `LeftNonzeroContext` 4-sample strips) and `TokenBlockCtx` (the per-block
+  / per-frame state the driver reads).
+* `tokens( coder, block, txSz, scan, coef_probs, nz, token_cache, tokens )`
+  — the §6.4.24 driver proper: `segEob = 16 << (txSz << 1)`, the `checkEob`
+  gating, the §9.3.2 per-coefficient `ctx` (DC from the non-zero strips,
+  `c > 0` from `TokenCache`), the
+  `coef_probs[txSz][plane>0][is_inter][band][ctx]` cell pick, the
+  `more_coefs` / `token` / `read_coef` / `sign_bit` decode, the
+  `TokenCache[ pos ] = energy_class[ token ]` write, the
+  `ZERO_TOKEN`-clears-`checkEob` rule, the trailing `Tokens[ scan[ i ] ] =
+  0` zero-fill, and the `nonzero = c > 0` return.
+
+The §6.4.21 `residual( )` plane / sub-block driver — which owns the
+`AboveNonzeroContext` / `LeftNonzeroContext` write-back across a whole
+frame, the per-block mode-info decode, and the wiring into the round-11
+§8.6.2 `reconstruct_block` — lands in a later round. The round-13 surface
+is internal-only; the public API still exposes
+`parse_uncompressed_header`, `parse_compressed_header` and their result
+types exclusively.
+
 **Round 12: §6.4.25 `get_scan` scan-order selection.** Round 12 adds a
 `scan` module (crate-internal, `pub(crate)`) implementing the §6.4.25
 `get_scan( )` process — the first step of the §6.4.24 `tokens( )`
@@ -363,9 +403,25 @@ remainder of the frame.
 
 ## Test surface
 
-* `cargo test`: 156 unit tests + 20 integration tests (8 in
+* `cargo test`: 171 unit tests + 20 integration tests (8 in
   `tests/compressed_header.rs` plus 12 in
   `tests/uncompressed_header.rs`).
+* Round-13 additions: 15 unit tests covering `coefband_4x4` /
+  `coefband_8x8plus` against the §10 listing (21-entry prefix + all-`5`
+  tail) and the `coef_band` tx-size dispatch, the §9.3.2
+  `token_cache_neighbours` derivation (DC origin, interior DCT_DCT,
+  the `DCT_ADST` / `ADST_DCT` double-neighbour variants, first-row /
+  first-column fallbacks, and the `n = 4 << txSz` 8x8 width scaling),
+  `build_token_probs` node mapping (node 0 → `cell[1]`, node 1 →
+  `cell[2]`, node `2..=9` → `pareto`), and the `tokens( )` driver
+  itself: a zero-buffer immediate EOB (returns `nonzero = false`, all
+  `Tokens` zeroed), the `ZERO_TOKEN`-clears-`checkEob` block fill
+  (`nonzero = true`, explicit zeros), a lockstep equality against an
+  independent `read_coef_token` walk over the same scan / buffer
+  (`Tokens` + `TokenCache` + return value), the DC non-zero-context
+  cell routing (a non-zero strip selects the `ctx = 2` cell), the
+  trailing `c..segEob` zero-fill on an 8x8 block, and the
+  `NonzeroContext::new` all-zero invariant.
 * Round-12 additions: 10 unit tests covering every §10.1 scan table's
   spec length, the permutation invariant (each raster position appears
   exactly once — the property the §6.4.24 loop relies on to zero
@@ -490,18 +546,18 @@ harness.
 
 Future rounds, roughly in order:
 
-1. The §6.4.24 `tokens()` per-block driver — walks `pos = scan[ c ]`
-   from the round-12 §6.4.25 `get_scan`, derives the per-coefficient
-   `ctx` from `AboveNonzeroContext` / `LeftNonzeroContext` (`c == 0`)
-   and `TokenCache` neighbours (`c > 0`), and feeds the round-7 token
-   decode — followed by the §6.4.21 `residual()` driver and the
-   per-block mode-info decode that feed the round-11 §8.6.2
-   `reconstruct_block` / `reconstruct_intra_block` with real per-block
-   `Tokens` arrays, availability flags, and segment/quantizer state,
-   then surface a public single-frame intra decode path. (The §8.6.2
-   driver itself — dequant + inverse transform + add-residual +
-   `Clip1` — landed in round 11; the §6.4.25 scan-order selection in
-   round 12.)
+1. The §6.4.21 `residual()` plane / sub-block driver — the outer walk
+   over planes and 4x4 sub-blocks that owns the `AboveNonzeroContext` /
+   `LeftNonzeroContext` write-back across a whole frame, drives the
+   round-13 §6.4.24 `tokens()` per-block decode, and feeds the round-11
+   §8.6.2 `reconstruct_block` / `reconstruct_intra_block` with real
+   per-block `Tokens` arrays, availability flags, and segment/quantizer
+   state — followed by the per-block mode-info decode (`y_mode` /
+   `sub_modes` / `tx_size` / `skip` / `segment_id`) that the residual
+   driver and `predict_intra` consume, then a public single-frame intra
+   decode path. (The §6.4.24 `tokens()` per-block driver landed in
+   round 13; the §8.6.2 reconstruct driver in round 11; the §6.4.25
+   scan-order selection in round 12.)
 2. Inter (non-intra-only) header path — `frame_size_with_refs`,
    `allow_high_precision_mv`, `read_interpolation_filter` — plus
    the inter-only §6.3.9–§6.3.16 syntax (`read_inter_mode_probs`,

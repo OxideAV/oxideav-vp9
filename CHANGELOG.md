@@ -6,6 +6,53 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 13: §6.4.24 `tokens( )` per-block coefficient driver
+  (crate-local `tokens` module).** Walks the round-12 §6.4.25 scan
+  order and feeds each scan position through the round-7
+  `read_coef_token` pipeline, recovering one transform block's
+  quantised coefficients into a `Tokens[ ]` array.
+  * The §10 band tables — `coefband_4x4[ 16 ]` transcribed verbatim and
+    `coefband_8x8plus[ 1024 ]` built from the verbatim 21-entry prefix
+    plus the all-`5` tail — selected by `coef_band( c, txSz )` per the
+    §6.4.24 `(txSz == TX_4X4) ? coefband_4x4 : coefband_8x8plus` rule.
+  * `token_cache_neighbours( c, pos, txSz, txType )` — the §9.3.2
+    neighbour pair (`nb[ 0 ]` / `nb[ 1 ]`): `(0, 0)` for the DC
+    coefficient, and for `c > 0` the above (`(i-1)*n + j`) / left
+    (`i*n + j-1`) raster cells with the `DCT_ADST` (double above) /
+    `ADST_DCT` (double left) / first-row / first-column variants
+    (`n = 4 << txSz`).
+  * `build_token_probs( cell )` — the §9.3.2 10-node probability array:
+    node 0 → `cell[1]`, node 1 → `cell[2]`, node `2..=9` →
+    `pareto( node, cell[2] )`.
+  * `NonzeroContext` (the per-plane `AboveNonzeroContext` /
+    `LeftNonzeroContext` 4-sample strips) and `TokenBlockCtx` (the
+    per-block / per-frame state `tokens( )` reads — `plane`,
+    `is_inter`, resolved `TxType`, `BitDepth`, `x4` / `y4`, `maxX` /
+    `maxY`).
+  * `tokens( coder, block, txSz, scan, coef_probs, nz, token_cache,
+    tokens )` — the §6.4.24 driver: `segEob = 16 << (txSz << 1)`, the
+    `checkEob` gating, the §9.3.2 per-coefficient `ctx` (DC from the
+    non-zero strips, `c > 0` from `TokenCache`), the
+    `coef_probs[txSz][plane>0][is_inter][band][ctx]` cell pick, the
+    `more_coefs` / `token` / `read_coef` / `sign_bit` decode, the
+    `TokenCache[ pos ] = energy_class[ token ]` write, the
+    `ZERO_TOKEN`-clears-`checkEob` rule, the trailing `Tokens[ scan[ i
+    ] ] = 0` zero-fill, and the `nonzero = c > 0` return.
+  * 15 unit tests: the band tables vs the §10 listing + the
+    `coef_band` dispatch, the §9.3.2 neighbour derivation (DC, interior
+    DCT_DCT / ADST variants, first row / column, 8x8 width scaling),
+    `build_token_probs` node mapping, and the `tokens( )` driver
+    (zero-buffer immediate EOB + all-zero fill, the
+    `ZERO_TOKEN`-clears-`checkEob` block fill, a lockstep match against
+    an independent `read_coef_token` walk, the DC non-zero-context cell
+    routing, the trailing zero-fill, and the `NonzeroContext::new`
+    all-zero invariant). No external library source was consulted; the
+    band tables and every formula are transcribed directly from the
+    §6.4.24 / §9.3.2 / §10 listings. The §6.4.21 residual loop that
+    threads `NonzeroContext` across the frame and feeds the round-11
+    reconstruct driver lands in a later round; the round-13 surface is
+    internal-only.
+
 * **Round 12: §6.4.25 `get_scan` scan-order selection (crate-local
   `scan` module).** The first step of the §6.4.24 `tokens( )` per-block
   driver — it picks the scan order (the sequence of raster positions

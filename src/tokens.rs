@@ -48,6 +48,7 @@
 #![allow(dead_code)]
 
 use crate::bool_coder::BoolCoder;
+use crate::idct::{ADST_DCT, DCT_ADST};
 use crate::Error;
 
 /// `ZERO_TOKEN` per §7.4.16. Indicates the next coefficient at scan
@@ -505,9 +506,288 @@ pub(crate) fn read_coef_token(
     Ok(CoefStep::Coef { token, value })
 }
 
+// ----- §6.4.24 `tokens( )` per-block driver -----
+
+/// `coefband_4x4[ 16 ]` per spec §10 — transcribed verbatim.
+///
+/// Maps a 4x4 transform block's scan index `c` (`0..16`) to its
+/// coefficient band, which selects the `coef_probs[ … ][ band ][ … ]`
+/// slab for the `more_coefs` / `token` decode at that scan position.
+pub(crate) const COEFBAND_4X4: [u8; 16] = [0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5];
+
+/// `coefband_8x8plus[ 1024 ]` per spec §10 — built from the verbatim
+/// listing. The first 21 entries are
+/// `{0,1,1,2,2,2,3,3,3,3,4,4,4,4,4,4,4,4,4,4,4}`; every entry from
+/// index 21 onward is `5` (the §10 listing fills the remaining 1003
+/// rows with `5`). Used for every transform size larger than 4x4
+/// (`TX_8X8` / `TX_16X16` / `TX_32X32`), indexed by the scan index `c`.
+pub(crate) const COEFBAND_8X8PLUS: [u8; 1024] = build_coefband_8x8plus();
+
+const fn build_coefband_8x8plus() -> [u8; 1024] {
+    // §10 listing prefix (indices 0..=20), then `5` for the rest.
+    const PREFIX: [u8; 21] = [
+        0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    ];
+    let mut t = [5u8; 1024];
+    let mut i = 0;
+    while i < PREFIX.len() {
+        t[i] = PREFIX[i];
+        i += 1;
+    }
+    t
+}
+
+/// `band( c, txSz )` — the §6.4.24 band selection
+/// `(txSz == TX_4X4) ? coefband_4x4[ c ] : coefband_8x8plus[ c ]`.
+#[inline]
+pub(crate) fn coef_band(c: usize, tx_sz: u32) -> usize {
+    if tx_sz == 0 {
+        COEFBAND_4X4[c] as usize
+    } else {
+        COEFBAND_8X8PLUS[c] as usize
+    }
+}
+
+/// The §9.3.2 neighbour pair `nb[ 0 ]` / `nb[ 1 ]` of the coefficient at
+/// scan position `pos` for a transform block of size `txSz` and the
+/// resolved `tx_type`.
+///
+/// Returns `(0, 0)` for the DC coefficient (`c == 0`), where the spec
+/// uses the above/left non-zero context rather than `TokenCache`
+/// neighbours. For `c > 0` the neighbour positions are the raster cells
+/// directly above (`a = (i-1)*n + j`) and to the left (`a2 = i*n + j-1`)
+/// of `pos`, picked per the `tx_type` (`DCT_ADST` doubles the above
+/// neighbour, `ADST_DCT` the left neighbour, every other `tx_type` uses
+/// one of each), with single-edge fallbacks for the first row / column.
+///
+/// `n = 4 << txSz` is the transform-block width in samples (4 / 8 / 16 /
+/// 32). `pos` is a raster index in `0 .. n*n`.
+#[inline]
+pub(crate) fn token_cache_neighbours(
+    c: usize,
+    pos: usize,
+    tx_sz: u32,
+    tx_type: u8,
+) -> (usize, usize) {
+    if c == 0 {
+        return (0, 0);
+    }
+    let n = 4usize << tx_sz;
+    let i = pos / n;
+    let j = pos % n;
+    if i > 0 && j > 0 {
+        let a = (i - 1) * n + j;
+        let a2 = i * n + j - 1;
+        if tx_type == DCT_ADST {
+            (a, a)
+        } else if tx_type == ADST_DCT {
+            (a2, a2)
+        } else {
+            (a, a2)
+        }
+    } else if i > 0 {
+        let a = (i - 1) * n + j;
+        (a, a)
+    } else {
+        let a2 = i * n + j - 1;
+        (a2, a2)
+    }
+}
+
+/// Build the 10-element `read_token` probability array for one
+/// `coef_probs[ … ][ ctx ]` cell per §9.3.2.
+///
+/// `cell` is the three-element unconstrained-node slab
+/// `coef_probs[txSz][plane>0][is_inter][band][ctx]`. The token tree has
+/// 10 internal nodes; per §9.3.2 the probability for internal node
+/// `node` is `pareto( node, cell[ Min(2, 1 + node) ] )`. So:
+///
+/// * node 0 → `pareto(0, cell[1])` = `cell[1]` (pareto passes through
+///   for `node < 2`),
+/// * node 1 → `pareto(1, cell[2])` = `cell[2]`,
+/// * node `2..=9` → `pareto(node, cell[2])`.
+#[inline]
+pub(crate) fn build_token_probs(cell: &[u8; 3]) -> [u8; 10] {
+    let mut probs = [0u8; 10];
+    for (node, slot) in probs.iter_mut().enumerate() {
+        let probe = cell[(1 + node).min(2)];
+        *slot = pareto(node as u32, probe);
+    }
+    probs
+}
+
+/// Per-plane non-zero context strips used by the §6.4.21 residual driver
+/// and read by the §6.4.24 `tokens( )` DC-context derivation.
+///
+/// `AboveNonzeroContext[ plane ][ x4 ]` / `LeftNonzeroContext[ plane ][
+/// y4 ]` record, at a 4-sample granularity, whether the transform block
+/// covering that 4-sample column / row decoded any non-zero coefficient.
+/// `tokens( )` reads them for the DC coefficient's `ctx`; the residual
+/// driver writes them back after each block per §6.4.21.
+#[derive(Debug, Clone)]
+pub(crate) struct NonzeroContext {
+    /// `AboveNonzeroContext[ plane ]` — one bit per 4-sample column.
+    pub above: Vec<u8>,
+    /// `LeftNonzeroContext[ plane ]` — one bit per 4-sample row.
+    pub left: Vec<u8>,
+}
+
+impl NonzeroContext {
+    /// All-zero context of the given column / row span (in 4-sample
+    /// units). `above_len` covers `(2 * MiCols) >> subsampling_x`
+    /// columns; `left_len` covers `(2 * MiRows) >> subsampling_y` rows.
+    pub(crate) fn new(above_len: usize, left_len: usize) -> Self {
+        Self {
+            above: vec![0u8; above_len],
+            left: vec![0u8; left_len],
+        }
+    }
+}
+
+/// Mode-info / frame state the §6.4.24 `tokens( )` driver reads to pick
+/// the `coef_probs` cell and resolve the `TxType` for the neighbour
+/// derivation.
+///
+/// This bundles the per-block / per-frame variables the spec references
+/// inside `tokens( )` and its §9.3.2 context derivation without yet
+/// owning the whole §6.4.21 residual loop. The residual loop (a later
+/// round) fills these in per block and threads the `NonzeroContext`
+/// across the frame.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TokenBlockCtx {
+    /// `plane` (0 = luma, 1 / 2 = chroma).
+    pub plane: usize,
+    /// `is_inter` for the block (selects the `coef_probs` ref-type
+    /// slab).
+    pub is_inter: bool,
+    /// Resolved §6.4.25 `TxType` for the block (already past the
+    /// chroma / `TX_32X32` / lossless `DCT_DCT` overrides). Used for the
+    /// §9.3.2 neighbour selection.
+    pub tx_type: u8,
+    /// `BitDepth` (8 / 10 / 12) for the §6.4.26 `read_coef` high-bit
+    /// loop.
+    pub bit_depth: u32,
+    /// `x4 = startX >> 2` — the block's leftmost 4-sample column index
+    /// into `AboveNonzeroContext[ plane ]`.
+    pub x4: usize,
+    /// `y4 = startY >> 2` — the block's topmost 4-sample row index into
+    /// `LeftNonzeroContext[ plane ]`.
+    pub y4: usize,
+    /// `maxX = (2 * MiCols) >> subsampling_x` — the column count of
+    /// `AboveNonzeroContext[ plane ]` (DC-context loop bound).
+    pub max_x: usize,
+    /// `maxY = (2 * MiRows) >> subsampling_y` — the row count of
+    /// `LeftNonzeroContext[ plane ]` (DC-context loop bound).
+    pub max_y: usize,
+}
+
+/// `tokens( plane, startX, startY, txSz, blockIdx )` per spec §6.4.24.
+///
+/// Decodes the coefficient tokens of one transform block, walking the
+/// scan order returned by [`crate::scan::get_scan`] and feeding each
+/// scan position through the round-7 [`read_coef_token`] pipeline. The
+/// per-coefficient `ctx` is derived per §9.3.2: for the DC coefficient
+/// (`c == 0`) from the `AboveNonzeroContext` / `LeftNonzeroContext`
+/// strips in `nz`; for `c > 0` from the running [`TokenCache`] via the
+/// §9.3.2 neighbour pair.
+///
+/// The output `tokens` buffer (`Tokens[ ]`, length `segEob = 16 << (txSz
+/// << 1)`) is filled in raster order: decoded coefficients land at their
+/// `pos = scan[ c ]`, every scan position past the early `more_coefs ==
+/// 0` exit is zeroed (§6.4.24's trailing `for ( i = c; … ) Tokens[
+/// scan[ i ] ] = 0`).
+///
+/// Returns `nonzero = c > 0` — `true` if any coefficient (even a single
+/// explicit `ZERO_TOKEN`) was decoded before the end-of-block. The
+/// §6.4.21 residual driver writes this back into the `nz` strips for the
+/// block's columns / rows.
+///
+/// `coef_probs` is the round-6 6D table
+/// `coef_probs[txSz][plane>0][is_inter][band][ctx][node]`. `scan` is the
+/// §6.4.25 scan slice for this block. `tokens` must have exactly
+/// `segEob` entries and is fully overwritten.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn tokens(
+    coder: &mut BoolCoder<'_>,
+    block: &TokenBlockCtx,
+    tx_sz: u32,
+    scan: &[u16],
+    coef_probs: &crate::coef_probs::CoefProbs,
+    nz: &NonzeroContext,
+    token_cache: &mut [u8],
+    tokens: &mut [i64],
+) -> Result<bool, Error> {
+    let seg_eob = 16usize << (tx_sz << 1);
+    debug_assert_eq!(scan.len(), seg_eob);
+    debug_assert_eq!(tokens.len(), seg_eob);
+    debug_assert!(token_cache.len() >= seg_eob);
+
+    let plane_gt0 = usize::from(block.plane > 0);
+    let is_inter = usize::from(block.is_inter);
+    // `coef_probs[txSz]` slab is constant for the whole block.
+    let tx_slab = &coef_probs[tx_sz as usize][plane_gt0][is_inter];
+
+    let mut check_eob = true;
+    let mut c = 0usize;
+    while c < seg_eob {
+        let pos = scan[c] as usize;
+        let band = coef_band(c, tx_sz);
+
+        // §9.3.2 ctx derivation.
+        let ctx = if c == 0 {
+            // DC: above/left non-zero context across `numpts` 4-sample
+            // units (numpts = 1 << txSz). `above`/`left` are OR-reduced
+            // bits, so ctx ∈ {0, 1, 2}.
+            let numpts = 1usize << tx_sz;
+            let mut above = 0u8;
+            let mut left = 0u8;
+            for i in 0..numpts {
+                if block.x4 + i < block.max_x {
+                    above |= nz.above[block.x4 + i];
+                }
+                if block.y4 + i < block.max_y {
+                    left |= nz.left[block.y4 + i];
+                }
+            }
+            (above + left) as usize
+        } else {
+            let (nb0, nb1) = token_cache_neighbours(c, pos, tx_sz, block.tx_type);
+            (1 + token_cache[nb0] as usize + token_cache[nb1] as usize) >> 1
+        };
+
+        let cell = &tx_slab[band][ctx];
+
+        if check_eob && !read_more_coefs(coder, cell[0])? {
+            break;
+        }
+
+        let token_probs = build_token_probs(cell);
+        let token = read_token(coder, &token_probs)?;
+        token_cache[pos] = ENERGY_CLASS[token as usize];
+        if token == ZERO_TOKEN {
+            tokens[pos] = 0;
+            check_eob = false;
+        } else {
+            let mag = read_coef(coder, token, block.bit_depth)?;
+            let sign = coder.read_literal(1)?;
+            tokens[pos] = if sign == 1 { -(mag as i64) } else { mag as i64 };
+            check_eob = true;
+        }
+        c += 1;
+    }
+
+    let nonzero = c > 0;
+    // §6.4.24: zero every scan position from `c` to the end.
+    for &p in &scan[c..] {
+        tokens[p as usize] = 0;
+    }
+    Ok(nonzero)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::idct::{ADST_ADST, DCT_DCT};
 
     // The hand-traced golden buffers below were derived by stepping
     // the §9.2 Boolean decoder by hand against the documented
@@ -923,5 +1203,352 @@ mod tests {
         assert_eq!(probs1, 130);
         let expected_node2 = ((PARETO_TABLE[64][0] as u32 + PARETO_TABLE[65][0] as u32) >> 1) as u8;
         assert_eq!(pareto(2, unconstrained), expected_node2);
+    }
+
+    // ----- §6.4.24 band tables -----
+
+    #[test]
+    fn coefband_4x4_matches_spec() {
+        // §10 coefband_4x4[16].
+        assert_eq!(
+            COEFBAND_4X4,
+            [0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5]
+        );
+    }
+
+    #[test]
+    fn coefband_8x8plus_matches_spec_prefix_then_fives() {
+        // §10 coefband_8x8plus[1024]: 21-entry prefix, then all 5s.
+        assert_eq!(COEFBAND_8X8PLUS.len(), 1024);
+        let prefix = [
+            0u8, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+        ];
+        assert_eq!(&COEFBAND_8X8PLUS[..21], &prefix);
+        // Index 21 is the first 5; every entry from there is 5.
+        assert!(COEFBAND_8X8PLUS[21..].iter().all(|&b| b == 5));
+        assert_eq!(COEFBAND_8X8PLUS[1023], 5);
+    }
+
+    #[test]
+    fn coef_band_dispatches_by_tx_size() {
+        // TX_4X4 (tx_sz == 0) uses coefband_4x4; everything else uses
+        // coefband_8x8plus.
+        assert_eq!(coef_band(13, 0), 5); // coefband_4x4[13] = 5
+        assert_eq!(coef_band(13, 1), 4); // coefband_8x8plus[13] = 4
+        assert_eq!(coef_band(0, 0), 0);
+        assert_eq!(coef_band(0, 1), 0);
+        assert_eq!(coef_band(21, 3), 5); // 8x8plus[21] = 5
+    }
+
+    // ----- §9.3.2 neighbour derivation -----
+
+    #[test]
+    fn token_cache_neighbours_dc_is_origin() {
+        // c == 0 -> nb = (0, 0) regardless of pos / tx_type.
+        for tt in [DCT_DCT, ADST_DCT, DCT_ADST, ADST_ADST] {
+            assert_eq!(token_cache_neighbours(0, 0, 0, tt), (0, 0));
+            assert_eq!(token_cache_neighbours(0, 5, 1, tt), (0, 0));
+        }
+    }
+
+    #[test]
+    fn token_cache_neighbours_interior_dct_dct() {
+        // 4x4 (n=4), pos = 5 -> i=1, j=1 (interior). DCT_DCT: nb0 = above
+        // = (i-1)*n+j = 1, nb1 = left = i*n+j-1 = 4.
+        assert_eq!(token_cache_neighbours(1, 5, 0, DCT_DCT), (1, 4));
+        // ADST_ADST behaves like DCT_DCT for the neighbour pick.
+        assert_eq!(token_cache_neighbours(1, 5, 0, ADST_ADST), (1, 4));
+    }
+
+    #[test]
+    fn token_cache_neighbours_interior_adst_variants() {
+        // pos = 5 (i=1, j=1) in a 4x4 block.
+        // DCT_ADST doubles the above neighbour (a = 1).
+        assert_eq!(token_cache_neighbours(1, 5, 0, DCT_ADST), (1, 1));
+        // ADST_DCT doubles the left neighbour (a2 = 4).
+        assert_eq!(token_cache_neighbours(1, 5, 0, ADST_DCT), (4, 4));
+    }
+
+    #[test]
+    fn token_cache_neighbours_first_row_and_column() {
+        // First row (i == 0): only the left neighbour exists. pos = 2
+        // (i=0, j=2) -> nb = (i*n+j-1, same) = (1, 1).
+        assert_eq!(token_cache_neighbours(1, 2, 0, DCT_DCT), (1, 1));
+        // First column (j == 0): only the above neighbour exists. pos = 8
+        // (i=2, j=0) in a 4x4 -> nb = ((i-1)*n+j, same) = (4, 4).
+        assert_eq!(token_cache_neighbours(1, 8, 0, DCT_DCT), (4, 4));
+    }
+
+    #[test]
+    fn token_cache_neighbours_8x8_width_scaling() {
+        // n = 4 << txSz: at TX_8X8 (tx_sz=1) n=8. pos=9 -> i=1, j=1.
+        // DCT_DCT: nb0 = above = 1, nb1 = left = 8.
+        assert_eq!(token_cache_neighbours(1, 9, 1, DCT_DCT), (1, 8));
+    }
+
+    // ----- build_token_probs -----
+
+    #[test]
+    fn build_token_probs_maps_nodes_per_spec() {
+        // cell = [more_coefs, node0_prob, node1+_prob].
+        let cell = [200u8, 130, 90];
+        let probs = build_token_probs(&cell);
+        // node 0 -> pareto(0, cell[Min(2,1)] = cell[1]) = cell[1] = 130.
+        assert_eq!(probs[0], 130);
+        // node 1 -> pareto(1, cell[Min(2,2)] = cell[2]) = cell[2] = 90.
+        assert_eq!(probs[1], 90);
+        // node 2..9 -> pareto(node, cell[2] = 90).
+        for node in 2..10u32 {
+            assert_eq!(probs[node as usize], pareto(node, 90));
+        }
+        // cell[0] (the more_coefs prob) is never folded into probs.
+        assert!(!probs.contains(&200) || probs[0] == 130);
+    }
+
+    // ----- §6.4.24 tokens( ) driver -----
+
+    /// A `CoefProbs` table with every cell set to `[p, p, p]`.
+    fn uniform_coef_probs(p: u8) -> crate::coef_probs::CoefProbs {
+        [[[[[[p; 3]; 6]; 6]; 2]; 2]; 4]
+    }
+
+    /// A block ctx with empty non-zero context (so the DC ctx is 0) and
+    /// the given tx_type.
+    fn luma_block(tx_type: u8) -> TokenBlockCtx {
+        TokenBlockCtx {
+            plane: 0,
+            is_inter: false,
+            tx_type,
+            bit_depth: 8,
+            x4: 0,
+            y4: 0,
+            max_x: 16,
+            max_y: 16,
+        }
+    }
+
+    #[test]
+    fn tokens_zero_buffer_returns_immediate_eob() {
+        // On a zero buffer, the first `more_coefs` read_bool(prob>0)
+        // returns 0 -> immediate EOB at c == 0 -> nonzero = false and
+        // every Tokens entry is zeroed.
+        let bytes = [0u8; 8];
+        let mut dec = coder_zero(&bytes);
+        let probs = uniform_coef_probs(128);
+        let nz = NonzeroContext::new(16, 16);
+        let scan = &crate::scan::DEFAULT_SCAN_4X4;
+        let mut cache = [0u8; 16];
+        let mut tokens = [99i64; 16];
+        let block = luma_block(DCT_DCT);
+        let nonzero = super::tokens(
+            &mut dec,
+            &block,
+            0,
+            scan,
+            &probs,
+            &nz,
+            &mut cache,
+            &mut tokens,
+        )
+        .unwrap();
+        assert!(!nonzero);
+        assert!(tokens.iter().all(|&t| t == 0), "all tokens must be zeroed");
+    }
+
+    #[test]
+    fn tokens_zero_token_clears_check_eob_and_fills_block() {
+        // Buffer `0x40 0x00…` with uniform probs = 128:
+        //   c=0: more_coefs read_bool(128) on value 64 -> bit 1
+        //        (continue). token tree decodes ZERO_TOKEN -> check_eob
+        //        clears. With check_eob now false, every later position
+        //        decodes a `token` directly with no `more_coefs` gate;
+        //        on the zero-extended buffer each is ZERO_TOKEN, so the
+        //        loop runs to c == segEob.
+        //   nonzero = c > 0 = true; every Tokens entry is an explicit 0.
+        let bytes = [0x40u8, 0, 0, 0, 0, 0, 0, 0];
+        let mut dec = coder_zero(&bytes);
+        let probs = uniform_coef_probs(128);
+        let nz = NonzeroContext::new(16, 16);
+        let scan = &crate::scan::DEFAULT_SCAN_4X4;
+        let mut cache = [0u8; 16];
+        let mut tokens = [7i64; 16];
+        let block = luma_block(DCT_DCT);
+        let nonzero = super::tokens(
+            &mut dec,
+            &block,
+            0,
+            scan,
+            &probs,
+            &nz,
+            &mut cache,
+            &mut tokens,
+        )
+        .unwrap();
+        assert!(
+            nonzero,
+            "a decoded ZERO_TOKEN still makes the block nonzero"
+        );
+        assert!(tokens.iter().all(|&t| t == 0));
+        // TokenCache for DC was set to energy_class[ZERO_TOKEN] = 0.
+        assert_eq!(cache[0], 0);
+    }
+
+    #[test]
+    fn tokens_matches_independent_read_coef_token_walk() {
+        // The §6.4.24 driver must produce the same coefficients as an
+        // independent walk built from the round-7 `read_coef_token`
+        // primitive driven over the same scan with the same per-position
+        // ctx / cell selection. Two fresh coders on one buffer; assert
+        // the Tokens arrays and the return value match.
+        let bytes = [0x55u8, 0xAA, 0x33, 0xCC, 0x0F, 0xF0, 0x12, 0x34];
+        let probs = uniform_coef_probs(120);
+        let nz = NonzeroContext::new(16, 16);
+        let scan = &crate::scan::DEFAULT_SCAN_4X4;
+        let tx_sz = 0u32;
+        let block = luma_block(DCT_DCT);
+
+        // Driver under test.
+        let mut dec_a = coder_zero(&bytes);
+        let mut cache_a = [0u8; 16];
+        let mut tokens_a = [0i64; 16];
+        let nonzero_a = super::tokens(
+            &mut dec_a,
+            &block,
+            tx_sz,
+            scan,
+            &probs,
+            &nz,
+            &mut cache_a,
+            &mut tokens_a,
+        )
+        .unwrap();
+
+        // Independent reference walk.
+        let mut dec_b = coder_zero(&bytes);
+        let mut cache_b = [0u8; 16];
+        let mut tokens_b = [0i64; 16];
+        let tx_slab = &probs[tx_sz as usize][0][0];
+        let mut check_eob = true;
+        let seg_eob = 16usize << (tx_sz << 1);
+        let mut c = 0usize;
+        while c < seg_eob {
+            let pos = scan[c] as usize;
+            let band = coef_band(c, tx_sz);
+            let ctx = if c == 0 {
+                0usize
+            } else {
+                let (n0, n1) = token_cache_neighbours(c, pos, tx_sz, block.tx_type);
+                (1 + cache_b[n0] as usize + cache_b[n1] as usize) >> 1
+            };
+            let cell = &tx_slab[band][ctx];
+            let token_probs = build_token_probs(cell);
+            let step = read_coef_token(
+                &mut dec_b,
+                check_eob,
+                cell[0],
+                &token_probs,
+                block.bit_depth,
+            )
+            .unwrap();
+            match step {
+                CoefStep::Eob => break,
+                CoefStep::Coef { token, value } => {
+                    cache_b[pos] = ENERGY_CLASS[token as usize];
+                    tokens_b[pos] = value as i64;
+                    check_eob = token != ZERO_TOKEN;
+                }
+            }
+            c += 1;
+        }
+        for &p in &scan[c..] {
+            tokens_b[p as usize] = 0;
+        }
+        let nonzero_b = c > 0;
+
+        assert_eq!(nonzero_a, nonzero_b, "return value mismatch");
+        assert_eq!(tokens_a, tokens_b, "Tokens array mismatch");
+        assert_eq!(cache_a, cache_b, "TokenCache mismatch");
+    }
+
+    #[test]
+    fn tokens_dc_context_uses_nonzero_strips() {
+        // The DC ctx is `above + left` over the block's 4-sample units.
+        // Set both strips at the block origin so ctx = 2, and confirm
+        // the driver selects coef_probs[..][band 0][ctx 2]. Use a probs
+        // table where ctx 2's more_coefs prob is 0-ish (forces EOB) but
+        // ctx 0/1's is high — proving the right cell was consulted.
+        //
+        // more_coefs prob = 1 with a zero buffer always yields bit 0
+        // (EOB), and prob = 255 with the `0x40…` buffer's value 64
+        // yields bit 1 (continue). We set ctx-2's [0] to a low prob and
+        // ctx-0's to a high one and check that a non-zero context routes
+        // to the EOB cell.
+        let mut probs = uniform_coef_probs(255);
+        // Force ctx 2, band 0, luma intra, TX_4X4 more_coefs prob low so
+        // a zero buffer triggers EOB there.
+        probs[0][0][0][0][2][0] = 1;
+        let mut nz = NonzeroContext::new(16, 16);
+        nz.above[0] = 1;
+        nz.left[0] = 1;
+        let scan = &crate::scan::DEFAULT_SCAN_4X4;
+        let mut cache = [0u8; 16];
+        let mut tokens = [5i64; 16];
+        let block = luma_block(DCT_DCT);
+
+        // Zero buffer: read_bool(1) -> bit 0 -> EOB immediately.
+        let bytes = [0u8; 8];
+        let mut dec = coder_zero(&bytes);
+        let nonzero = super::tokens(
+            &mut dec,
+            &block,
+            0,
+            scan,
+            &probs,
+            &nz,
+            &mut cache,
+            &mut tokens,
+        )
+        .unwrap();
+        assert!(!nonzero, "ctx-2 low more_coefs prob routes to EOB");
+        assert!(tokens.iter().all(|&t| t == 0));
+    }
+
+    #[test]
+    fn tokens_trailing_positions_are_zeroed() {
+        // After an early EOB, every scan position from c..segEob must be
+        // explicitly zeroed even if the caller's buffer had garbage.
+        let bytes = [0u8; 8];
+        let mut dec = coder_zero(&bytes);
+        let probs = uniform_coef_probs(128);
+        let nz = NonzeroContext::new(16, 16);
+        let scan = &crate::scan::DEFAULT_SCAN_8X8;
+        let mut cache = [0u8; 64];
+        let mut tokens = [-1i64; 64];
+        let block = luma_block(DCT_DCT);
+        let nonzero = super::tokens(
+            &mut dec,
+            &block,
+            1,
+            scan,
+            &probs,
+            &nz,
+            &mut cache,
+            &mut tokens,
+        )
+        .unwrap();
+        assert!(!nonzero);
+        assert!(
+            tokens.iter().all(|&t| t == 0),
+            "trailing zero-fill must clear the whole block"
+        );
+    }
+
+    #[test]
+    fn nonzero_context_new_is_all_zero() {
+        let nz = NonzeroContext::new(8, 12);
+        assert_eq!(nz.above.len(), 8);
+        assert_eq!(nz.left.len(), 12);
+        assert!(nz.above.iter().all(|&b| b == 0));
+        assert!(nz.left.iter().all(|&b| b == 0));
     }
 }

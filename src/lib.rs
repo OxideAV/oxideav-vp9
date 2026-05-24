@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -144,6 +144,30 @@
 //!   loop that threads `NonzeroContext` across the frame and feeds the
 //!   round-11 reconstruct driver lands in a later round; the round-13
 //!   surface is internal-only.
+//! * Round 14 lands the §6.4.21 `residual( )` intra driver (a
+//!   crate-local module `residual`) — the per-plane, per-4x4-sub-block
+//!   walk that owns the `AboveNonzeroContext` / `LeftNonzeroContext`
+//!   write-back across a whole MI block, drives the round-13 §6.4.24
+//!   `tokens( )` per-block decode, and feeds the round-11 §8.6.2
+//!   `reconstruct_block` with real per-block `Tokens` arrays,
+//!   availability flags and plane/quantizer state. Surfaces the §10.2
+//!   `num_4x4_blocks_wide_lookup` / `_high_lookup`, §6.4.10
+//!   `max_txsize_lookup`, §6.4.23 `ss_size_lookup` tables, the
+//!   `get_plane_block_size` / `get_uv_tx_size` helpers (§6.4.23 /
+//!   §6.4.22), the `ResidualBlockCtx` / `AvailFlags` / `PlaneBuffers`
+//!   state bundles, and `residual_intra( planes, nz, block, avail,
+//!   token_source )` itself: per plane, computes the §6.4.21
+//!   `bsize = max(MiSize, BLOCK_8X8)`, the per-plane `num4x4w` /
+//!   `num4x4h` dimensions and chroma `txSz`, then steps the `(y, x)`
+//!   4x4 grid by `step = 1 << txSz` calling `predict_intra` /
+//!   (`!skip`) `tokens` + `reconstruct_block` per in-bounds block, and
+//!   writing the `nonzero` flag back into the `AboveNonzeroContext` /
+//!   `LeftNonzeroContext` strips. The `is_inter` branch (which calls
+//!   `predict_inter( )`) is deferred until reference-buffer state
+//!   lands; the per-block mode-info decode (`y_mode` / `sub_modes` /
+//!   `tx_size` / `skip` / `segment_id` from §6.4) that the residual
+//!   loop reads is also a later-round increment. The round-14 surface
+//!   is internal-only.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return
@@ -174,6 +198,7 @@ mod header;
 mod idct;
 mod intra;
 mod reconstruct;
+mod residual;
 mod scan;
 mod tokens;
 

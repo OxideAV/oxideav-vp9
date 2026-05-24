@@ -5,6 +5,55 @@ Bitstream & Decoding Process Specification v0.7.
 
 ## Status — 2026-05-24
 
+**Round 14: §6.4.21 `residual( )` intra driver.** Round 14 adds a
+`residual` module (crate-internal, `pub(crate)`) implementing the §6.4.21
+`residual( )` outer loop for the **intra** path — the per-plane,
+per-4x4-sub-block walk that owns the `AboveNonzeroContext` /
+`LeftNonzeroContext` write-back across a whole MI block, drives the
+round-13 §6.4.24 `tokens( )` per-block decode, and feeds the round-11
+§8.6.2 `reconstruct_block` with real per-block `Tokens` arrays,
+availability flags and plane/quantizer state:
+
+* The §10.2 `num_4x4_blocks_wide_lookup` / `num_4x4_blocks_high_lookup`
+  / `max_txsize_lookup` tables and the §6.4.23 `ss_size_lookup[ 13 ][ 2
+  ][ 2 ]` table transcribed verbatim, alongside the `BLOCK_4X4 ..
+  BLOCK_64X64` / `BLOCK_INVALID` `subsize` constants from §3.
+* `get_plane_block_size( subsize, plane, subsampling_x, subsampling_y )`
+  (§6.4.23) and `get_uv_tx_size( tx_size, mi_size, subsampling_x,
+  subsampling_y )` (§6.4.22) — the chroma-plane block-size /
+  transform-size derivations that key the per-plane loop.
+* `ResidualBlockCtx` — the per-MI-block / per-frame bundle (`MiCol` /
+  `MiRow` / `MiCols` / `MiRows`, `MiSize`, `tx_size`, `subsampling_x` /
+  `y`, `skip`, `Lossless`, `BitDepth`, the per-block `PredMode` for luma
+  + chroma, and the per-plane DC/AC quantizers from round 8); plus
+  `AvailFlags` for §7.4.4 `AvailL` / `AvailU` and a `PlaneBuffers`
+  wrapper for the three `CurrFrame[ plane ]` planes.
+* `residual_intra` — the §6.4.21 driver proper: per plane, computes
+  `bsize = MiSize < BLOCK_8X8 ? BLOCK_8X8 : MiSize`, the per-plane
+  `planeSz` + `num4x4w` / `num4x4h` dimensions and chroma `txSz`, then
+  walks the `(y, x)` 4x4 grid stepping by `step = 1 << txSz`. For each
+  in-bounds transform block (`startX < maxx && startY < maxy`) it calls
+  the round-10 `predict_intra` with the resolved `have_left` /
+  `have_above` / `not_on_right` flags, pulls `Tokens[ ]` from a per-block
+  `TokenSource` callback (when `!skip`), derives the §6.4.25 `TxType`
+  (chroma / `TX_32X32` / lossless force `DCT_DCT`; luma intra uses
+  round-11 `tx_type_for_intra`), runs the round-11 `reconstruct_block`,
+  and writes `AboveNonzeroContext[ plane ][ x4 + i ] =
+  LeftNonzeroContext[ plane ][ y4 + i ] = nonzero` for `i ∈ 0..step` per
+  the §6.4.21 trailing write-back.
+
+The `is_inter` branch of §6.4.21 (which calls `predict_inter( )` before
+the per-block loop) is deferred until the §8.5.2 inter prediction
+process and reference-buffer state land in a later round; the
+per-block mode-info decode (`y_mode` / `sub_modes` / `tx_size` / `skip`
+/ `segment_id` from §6.4) that the residual loop reads is also a
+later-round increment — for round 14 the per-block mode-info bundle is
+passed in by the test caller, and a production caller would thread it
+in once the §6.4.6 / §6.4.7 / §6.4.10 mode-info syntax lands. The
+round-14 surface is internal-only; the public API still exposes
+`parse_uncompressed_header`, `parse_compressed_header` and their result
+types exclusively.
+
 **Round 13: §6.4.24 `tokens( )` per-block coefficient driver.** Round 13
 adds the §6.4.24 `tokens( )` driver to the `tokens` module — the per-block
 loop that walks the round-12 §6.4.25 scan order (`pos = scan[ c ]`) and
@@ -403,9 +452,29 @@ remainder of the frame.
 
 ## Test surface
 
-* `cargo test`: 171 unit tests + 20 integration tests (8 in
+* `cargo test`: 183 unit tests + 20 integration tests (8 in
   `tests/compressed_header.rs` plus 12 in
   `tests/uncompressed_header.rs`).
+* Round-14 additions: 12 unit tests covering the §10.2
+  `num_4x4_blocks_wide_lookup` / `_high_lookup` and §6.4.10
+  `max_txsize_lookup` listings, the §6.4.23 `ss_size_lookup` luma
+  identity invariant + the 4:2:0 / asymmetric-subsampling anchors
+  (`BLOCK_8X8 -> BLOCK_4X4`, `BLOCK_64X64 -> BLOCK_32X32`, the
+  `(1,0)` / `(0,1)` mixed chroma cases), the §6.4.22 `get_uv_tx_size`
+  chroma cap (`MiSize=BLOCK_16X16 -> chroma TX_8X8`) and the sub-8x8
+  short-circuit, the `skip = true` path leaving every `AboveNonzero`
+  / `LeftNonzero` cell at 0 (no token decode), the full `skip = false`
+  walk firing `token_source` exactly 16 luma + 4 U + 4 V times for a
+  `BLOCK_16X16` MI block at `tx_size = TX_4X4` (each call recorded
+  with `(plane, block_idx, tx_sz)`), the `nonzero = true` strip
+  write-back over `step = 1 << tx_sz` 4-sample units for `tx_size =
+  TX_8X8`, the out-of-bounds (`startX >= maxx`) block skip with
+  intact zero context, a DC-only luma block at MI (1,1) lockstep
+  against an independent `predict_intra` + `reconstruct_block` probe
+  (proving the residual loop ties the rounds 10/11/13 pieces
+  identically), and the §6.4.21 `bsize = max(MiSize, BLOCK_8X8)`
+  widening for a `BLOCK_4X4` MI block (4 luma + 1 U + 1 V blocks
+  decoded).
 * Round-13 additions: 15 unit tests covering `coefband_4x4` /
   `coefband_8x8plus` against the §10 listing (21-entry prefix + all-`5`
   tail) and the `coef_band` tx-size dispatch, the §9.3.2
@@ -546,18 +615,13 @@ harness.
 
 Future rounds, roughly in order:
 
-1. The §6.4.21 `residual()` plane / sub-block driver — the outer walk
-   over planes and 4x4 sub-blocks that owns the `AboveNonzeroContext` /
-   `LeftNonzeroContext` write-back across a whole frame, drives the
-   round-13 §6.4.24 `tokens()` per-block decode, and feeds the round-11
-   §8.6.2 `reconstruct_block` / `reconstruct_intra_block` with real
-   per-block `Tokens` arrays, availability flags, and segment/quantizer
-   state — followed by the per-block mode-info decode (`y_mode` /
-   `sub_modes` / `tx_size` / `skip` / `segment_id`) that the residual
-   driver and `predict_intra` consume, then a public single-frame intra
-   decode path. (The §6.4.24 `tokens()` per-block driver landed in
-   round 13; the §8.6.2 reconstruct driver in round 11; the §6.4.25
-   scan-order selection in round 12.)
+1. Per-block mode-info decode (`y_mode` / `sub_modes` / `tx_size` /
+   `skip` / `segment_id`) per §6.4.6 / §6.4.7 / §6.4.10 — the missing
+   piece between the round-3 `BoolCoder` and the round-14
+   `residual_intra` driver. Once that lands, the per-block `BoolCoder`
+   token decode can replace the `TokenSource` callback to expose a
+   public single-MI-block intra decode path; the partition-tree walk
+   (§6.4.4) closes the per-tile loop.
 2. Inter (non-intra-only) header path — `frame_size_with_refs`,
    `allow_high_precision_mv`, `read_interpolation_filter` — plus
    the inter-only §6.3.9–§6.3.16 syntax (`read_inter_mode_probs`,

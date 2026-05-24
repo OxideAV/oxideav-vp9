@@ -6,6 +6,64 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 14: §6.4.21 `residual( )` intra driver (crate-local `residual`
+  module).** The §6.4.21 outer loop for the intra path — the per-plane,
+  per-4x4-sub-block walk that owns the `AboveNonzeroContext` /
+  `LeftNonzeroContext` write-back across a whole MI block, drives the
+  round-13 §6.4.24 `tokens( )` per-block decode, and feeds the round-11
+  §8.6.2 `reconstruct_block` with real per-block `Tokens` arrays,
+  availability flags and plane/quantizer state.
+  * §10.2 `num_4x4_blocks_wide_lookup[13]` / `num_4x4_blocks_high_lookup[13]`,
+    §6.4.10 `max_txsize_lookup[13]`, and §6.4.23 `ss_size_lookup[13][2][2]`
+    tables transcribed verbatim, alongside the `BLOCK_4X4 .. BLOCK_64X64`
+    / `BLOCK_INVALID` `subsize` constants from §3.
+  * `get_plane_block_size( subsize, plane, subsampling_x, subsampling_y )`
+    (§6.4.23) and `get_uv_tx_size( tx_size, mi_size, subsampling_x,
+    subsampling_y )` (§6.4.22) — the chroma-plane block-size /
+    transform-size derivations that key the per-plane loop.
+  * `ResidualBlockCtx` — the per-MI-block / per-frame bundle (`MiCol` /
+    `MiRow` / `MiCols` / `MiRows`, `MiSize`, `tx_size`, `subsampling_x` /
+    `y`, `skip`, `Lossless`, `BitDepth`, the per-block `PredMode` for
+    luma and chroma, and the per-plane DC/AC quantizers from round 8);
+    plus `AvailFlags` for §7.4.4 `AvailL` / `AvailU` and a
+    `PlaneBuffers` wrapper for the three `CurrFrame[ plane ]` planes.
+  * `residual_intra( planes, nz, block, avail, token_source )` — the
+    §6.4.21 driver proper: per plane, computes `bsize = MiSize <
+    BLOCK_8X8 ? BLOCK_8X8 : MiSize`, the per-plane `planeSz` +
+    `num4x4w` / `num4x4h` dimensions and chroma `txSz`, then walks the
+    `(y, x)` 4x4 grid stepping by `step = 1 << txSz`. For each in-bounds
+    transform block (`startX < maxx && startY < maxy`) it calls the
+    round-10 `predict_intra` with the resolved `have_left` /
+    `have_above` / `not_on_right` flags, pulls `Tokens[ ]` from a
+    per-block `TokenSource` callback (when `!skip`), derives the §6.4.25
+    `TxType` (chroma / `TX_32X32` / lossless force `DCT_DCT`; luma intra
+    uses round-11 `tx_type_for_intra`), runs the round-11
+    `reconstruct_block`, and writes
+    `AboveNonzeroContext[ plane ][ x4 + i ] = LeftNonzeroContext[
+    plane ][ y4 + i ] = nonzero` for `i ∈ 0..step` per the §6.4.21
+    trailing write-back.
+  * 12 unit tests: the §10.2 / §6.4.10 / §6.4.23 table-anchor checks
+    (luma-identity invariant + 4:2:0 / asymmetric subsampling
+    anchors), the §6.4.22 `get_uv_tx_size` chroma cap and the sub-8x8
+    short-circuit, the `skip = true` path leaving every strip cell at 0
+    (no token decode), the full `skip = false` walk firing
+    `token_source` exactly 16 luma + 4 U + 4 V times for a `BLOCK_16X16`
+    MI block at `tx_size = TX_4X4` (each call recorded with `(plane,
+    block_idx, tx_sz)`), the `nonzero = true` strip write-back over
+    `step = 1 << tx_sz` 4-sample units for `tx_size = TX_8X8`, the
+    out-of-bounds block skip with intact zero context, a DC-only luma
+    block at MI (1,1) lockstep against an independent `predict_intra` +
+    `reconstruct_block` probe, and the `bsize = max(MiSize, BLOCK_8X8)`
+    widening for a `BLOCK_4X4` MI block. No external library / source
+    was consulted; every formula and table is transcribed directly from
+    the §6.4.21 / §6.4.22 / §6.4.23 / §10.2 listings.
+  * The `is_inter` branch of §6.4.21 (which calls `predict_inter( )`
+    before the per-block loop) is deferred until the §8.5.2 inter
+    prediction process and reference-buffer state land; the per-block
+    mode-info decode (`y_mode` / `sub_modes` / `tx_size` / `skip` /
+    `segment_id` from §6.4) that the residual loop reads is also a
+    later-round increment. The round-14 surface is internal-only.
+
 * **Round 13: §6.4.24 `tokens( )` per-block coefficient driver
   (crate-local `tokens` module).** Walks the round-12 §6.4.25 scan
   order and feeds each scan position through the round-7

@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -100,6 +100,21 @@
 //!   driver that supplies the real availability flags (from tile /
 //!   frame edges) and adds the round-9 inverse-transformed residual
 //!   lands in a later round; the round-10 surface is internal-only.
+//! * Round 11 lands the §8.6.2 reconstruct driver (a crate-local module
+//!   `reconstruct`) that finally ties the rounds 7-10 pieces together:
+//!   `tx_type_for_intra` (the §6.4.25 `mode2txfm_map[ y_mode ]` lookup
+//!   selecting `TxType` from the intra `PredMode`), `reconstruct_block`
+//!   (the §8.6.2 process — `dqDenom = 2 if txSz == TX_32X32 else 1`,
+//!   step 1/2 `Dequant[i][j] = (Tokens[i*n0+j] * ac_quant) / dqDenom`
+//!   with the `Dequant[0][0]` DC override, step 3 the §8.7.2 inverse
+//!   transform, step 4 `Clip1( CurrFrame + Dequant )`), and
+//!   `reconstruct_intra_block` (the end-to-end one-block driver that
+//!   predicts via §8.5.1 `predict_intra`, derives the `TxType` with the
+//!   §6.4.25 `TX_32X32` / lossless `DCT_DCT` overrides, then runs
+//!   `reconstruct_block`). The §6.4.21 residual loop that supplies the
+//!   real per-block `Tokens` arrays, availability flags and
+//!   segment/quantizer state across a whole frame lands in a later
+//!   round; the round-11 surface is internal-only.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return
@@ -129,6 +144,7 @@ mod dequant;
 mod header;
 mod idct;
 mod intra;
+mod reconstruct;
 mod tokens;
 
 pub use coef_probs::CoefProbs;

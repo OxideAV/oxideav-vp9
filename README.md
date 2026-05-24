@@ -5,6 +5,40 @@ Bitstream & Decoding Process Specification v0.7.
 
 ## Status — 2026-05-24
 
+**Round 11: §8.6.2 reconstruct driver.** Round 11 adds a `reconstruct`
+module (crate-internal, `pub(crate)`) implementing the §8.6.2
+reconstruct process — the conceptual `reconstruct( plane, startX,
+startY, txSz )` call site of the §6.4.21 residual syntax — that finally
+ties the rounds 7-10 pieces into `reconstruct = predict + residual`:
+
+* `tx_type_for_intra( mode )` (§6.4.25) — the `mode2txfm_map[ y_mode ]`
+  lookup selecting the `TxType` (`DCT_DCT` / `ADST_DCT` / `DCT_ADST` /
+  `ADST_ADST`) for a luma intra block from its `PredMode`. The 10-entry
+  intra prefix of `mode2txfm_map` (§10.5) is transcribed verbatim (the
+  four inter-mode entries, all `DCT_DCT`, are omitted as the helper
+  only indexes the intra prefix).
+* `reconstruct_block( plane_buf, x, y, tx_sz, tokens, dc_quant,
+  ac_quant, tx_type, lossless, bit_depth )` (§8.6.2) — sets `dqDenom =
+  2` for `txSz == TX_32X32` else `1`, `n = 2 + txSz`, `n0 = 1 << n`;
+  step 1 `Dequant[i][j] = (Tokens[i*n0+j] * get_ac_quant) / dqDenom`,
+  step 2 the `Dequant[0][0] = (Tokens[0] * get_dc_quant) / dqDenom` DC
+  override, step 3 the round-9 §8.7.2 `inverse_transform_2d`, step 4
+  `CurrFrame[ plane ][ y+i ][ x+j ] = Clip1( CurrFrame[..] +
+  Dequant[i][j] )`. Integer division truncates toward zero per §4.1.
+* `reconstruct_intra_block( .. )` — the end-to-end one-block driver:
+  predicts via the round-10 §8.5.1 `predict_intra`, derives the
+  `TxType` with the §6.4.25 `TX_32X32` / lossless `DCT_DCT` overrides,
+  then runs `reconstruct_block`. This is the single-block shape the
+  deferred §6.4.21 residual loop will drive once it threads real
+  availability and quantizer state.
+
+The §6.4.21 residual loop — which supplies the real per-block `Tokens`
+arrays, availability flags and segment/quantizer state across a whole
+frame, and wires this driver into a public decode path — lands in a
+later round. The round-11 surface is internal-only; the public API
+still exposes `parse_uncompressed_header`, `parse_compressed_header`
+and their result types exclusively.
+
 **Round 10: §8.5.1 intra prediction process.** Round 10 adds an
 `intra` module (crate-internal, `pub(crate)`) implementing the §8.5.1
 intra prediction the §8.6.2 reconstruct process invokes for intra
@@ -298,9 +332,19 @@ remainder of the frame.
 
 ## Test surface
 
-* `cargo test`: 136 unit tests + 20 integration tests (8 in
+* `cargo test`: 146 unit tests + 20 integration tests (8 in
   `tests/compressed_header.rs` plus 12 in
   `tests/uncompressed_header.rs`).
+* Round-11 additions: 10 unit tests covering the `mode2txfm_map` intra
+  prefix vs the §10.5 listing, the local `clip1` range clamping, an
+  all-zero `Tokens` block leaving the prediction unchanged, a DC-only
+  `Tokens` block adding a flat residual to a flat prediction, step-4
+  `Clip1` saturation at both the bit-depth max and zero, the
+  `TX_32X32` `dqDenom = 2` halving exercised through the real
+  `reconstruct_block`, and three `reconstruct_intra_block` end-to-end
+  cases (DC_PRED + zero tokens equalling the pure DC prediction,
+  DC_PRED + a known DC residual reconstructing the expected pixels,
+  and the lossless WHT path).
 * Round-10 additions: 16 unit tests covering `PredMode::from_raw`
   round-tripping the §7.4.5 numbering (and rejecting 10+), the local
   `round2` / `clip1` helpers against their §3 definitions, `V_PRED`
@@ -407,11 +451,13 @@ harness.
 
 Future rounds, roughly in order:
 
-1. The §8.6.2 reconstruct driver tying the pieces together: scale
-   the round-7 `Tokens` by the round-8 quantizers (with the
-   `dqDenom = 2` halving for `TX_32X32`), run the round-9 inverse
-   transform, add the residual to the round-10 intra prediction, and
-   `Clip1` into `CurrFrame`.
+1. The §6.4.21 `residual()` driver and the per-block mode-info decode
+   that feed the round-11 §8.6.2 `reconstruct_block` /
+   `reconstruct_intra_block` with real per-block `Tokens` arrays
+   (round-7 token decode), availability flags, and segment/quantizer
+   state, then surface a public single-frame intra decode path. (The
+   §8.6.2 driver itself — dequant + inverse transform + add-residual +
+   `Clip1` — landed in round 11.)
 2. Inter (non-intra-only) header path — `frame_size_with_refs`,
    `allow_high_precision_mv`, `read_interpolation_filter` — plus
    the inter-only §6.3.9–§6.3.16 syntax (`read_inter_mode_probs`,

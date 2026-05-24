@@ -6,6 +6,42 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 11: §8.6.2 reconstruct driver (crate-local `reconstruct`
+  module).** Ties the rounds 7-10 pieces together at the conceptual
+  `reconstruct( plane, startX, startY, txSz )` call site of the
+  §6.4.21 residual syntax.
+  * `tx_type_for_intra( mode )` — the §6.4.25 `mode2txfm_map[ y_mode ]`
+    lookup selecting the `TxType` (`DCT_DCT` / `ADST_DCT` / `DCT_ADST`
+    / `ADST_ADST`) for a luma intra block from its `PredMode`. The
+    10-entry intra prefix of `mode2txfm_map` (§10.5) is transcribed
+    verbatim.
+  * `reconstruct_block( plane_buf, x, y, tx_sz, tokens, dc_quant,
+    ac_quant, tx_type, lossless, bit_depth )` (§8.6.2) — sets
+    `dqDenom = 2` for `txSz == TX_32X32` else `1`, `n = 2 + txSz`,
+    `n0 = 1 << n`; step 1 `Dequant[i][j] = (Tokens[i*n0+j] *
+    get_ac_quant) / dqDenom`; step 2 the `Dequant[0][0] = (Tokens[0] *
+    get_dc_quant) / dqDenom` DC override; step 3 the §8.7.2
+    `inverse_transform_2d`; step 4 `CurrFrame[plane][y+i][x+j] =
+    Clip1( CurrFrame[...] + Dequant[i][j] )`. Integer division
+    truncates toward zero per §4.1 (Rust's `i64 /` matches).
+  * `reconstruct_intra_block( … )` — the end-to-end one-block driver:
+    predicts via §8.5.1 `predict_intra` (round 10), derives the
+    `TxType` with the §6.4.25 `TX_32X32` / lossless `DCT_DCT`
+    overrides, then runs `reconstruct_block`. The shape the deferred
+    §6.4.21 residual loop will call once it threads real availability
+    and quantizer state.
+  * Crate-local `clip1` (§3) helper operating in `i64` so the
+    high-precision residual sum does not overflow before clamping.
+  * 10 unit tests: the `mode2txfm_map` intra prefix vs the §10.5
+    listing, `clip1` range clamping, an all-zero `Tokens` block
+    leaving the prediction unchanged, a DC-only `Tokens` block adding
+    a flat residual to a flat prediction, step-4 clipping at both the
+    bit-depth max and zero, the `TX_32X32` `dqDenom = 2` halving
+    through the real driver, `reconstruct_intra_block` with DC_PRED +
+    zero tokens equalling the pure DC prediction, DC_PRED + a known DC
+    residual reconstructing the expected pixels, and the lossless WHT
+    path driven via `reconstruct_intra_block`.
+
 * **Round 10: §8.5.1 intra prediction process (crate-local `intra`
   module).**
   * `PredMode` — the 10 §7.4.5 intra prediction modes with

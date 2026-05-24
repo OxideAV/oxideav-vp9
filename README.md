@@ -5,6 +5,37 @@ Bitstream & Decoding Process Specification v0.7.
 
 ## Status — 2026-05-24
 
+**Round 12: §6.4.25 `get_scan` scan-order selection.** Round 12 adds a
+`scan` module (crate-internal, `pub(crate)`) implementing the §6.4.25
+`get_scan( )` process — the first step of the §6.4.24 `tokens( )`
+per-block driver, which selects the scan order (the sequence of raster
+positions `pos = scan[ c ]` the coefficient loop walks) for a transform
+block:
+
+* The §10.1 scan tables transcribed verbatim — `default_scan_4x4` /
+  `col_scan_4x4` / `row_scan_4x4` (16), the 8x8 trio (64), the 16x16
+  trio (256), and `default_scan_32x32` (1024). The element type is
+  `u16` so the 32x32 table's `0..=1023` raster positions fit.
+* `get_scan( plane, tx_sz, tx_type )` (§6.4.25) — selects between the
+  tables by the resolved `TxType`: `ADST_DCT` → `row_scan`, `DCT_ADST`
+  → `col_scan`, else (`DCT_DCT` / `ADST_ADST`) → `default`. The §6.4.25
+  first half (a chroma plane `plane > 0` or a `TX_32X32` block forces
+  `TxType = DCT_DCT`) is applied here, so a caller passing the luma
+  `TxType` for every plane still selects the right scan. The
+  mode-info-dependent `mode2txfm_map[ y_mode ]` `TxType` derivation
+  already lives in `reconstruct::tx_type_for_intra` (round 11); the
+  per-block mode-info state (`y_mode`, `sub_modes`, `Lossless`,
+  `is_inter`) is owned by the deferred §6.4.21 residual driver.
+* `TX_4X4` / `TX_8X8` / `TX_16X16` / `TX_32X32` `txSz` index constants
+  (§3).
+
+The §6.4.24 `tokens( )` loop that walks `pos = scan[ c ]`, derives the
+per-coefficient `ctx` from `AboveNonzeroContext` / `LeftNonzeroContext`
+and `TokenCache`, and feeds the round-7 token decode lands in a later
+round. The round-12 surface is internal-only; the public API still
+exposes `parse_uncompressed_header`, `parse_compressed_header` and their
+result types exclusively.
+
 **Round 11: §8.6.2 reconstruct driver.** Round 11 adds a `reconstruct`
 module (crate-internal, `pub(crate)`) implementing the §8.6.2
 reconstruct process — the conceptual `reconstruct( plane, startX,
@@ -332,9 +363,17 @@ remainder of the frame.
 
 ## Test surface
 
-* `cargo test`: 146 unit tests + 20 integration tests (8 in
+* `cargo test`: 156 unit tests + 20 integration tests (8 in
   `tests/compressed_header.rs` plus 12 in
   `tests/uncompressed_header.rs`).
+* Round-12 additions: 10 unit tests covering every §10.1 scan table's
+  spec length, the permutation invariant (each raster position appears
+  exactly once — the property the §6.4.24 loop relies on to zero
+  untouched coefficients), the DC-first invariant, §10.1 listing
+  anchors (first four + last entry of each table), the §6.4.25
+  `txType` → table selection for 4x4 / 8x8 / 16x16, the
+  `TX_32X32`-always-default and chroma-forces-`DCT_DCT` first-half
+  overrides, and the `16 << (txSz << 1)` `segEob` scan-length match.
 * Round-11 additions: 10 unit tests covering the `mode2txfm_map` intra
   prefix vs the §10.5 listing, the local `clip1` range clamping, an
   all-zero `Tokens` block leaving the prediction unchanged, a DC-only
@@ -451,13 +490,18 @@ harness.
 
 Future rounds, roughly in order:
 
-1. The §6.4.21 `residual()` driver and the per-block mode-info decode
-   that feed the round-11 §8.6.2 `reconstruct_block` /
-   `reconstruct_intra_block` with real per-block `Tokens` arrays
-   (round-7 token decode), availability flags, and segment/quantizer
-   state, then surface a public single-frame intra decode path. (The
-   §8.6.2 driver itself — dequant + inverse transform + add-residual +
-   `Clip1` — landed in round 11.)
+1. The §6.4.24 `tokens()` per-block driver — walks `pos = scan[ c ]`
+   from the round-12 §6.4.25 `get_scan`, derives the per-coefficient
+   `ctx` from `AboveNonzeroContext` / `LeftNonzeroContext` (`c == 0`)
+   and `TokenCache` neighbours (`c > 0`), and feeds the round-7 token
+   decode — followed by the §6.4.21 `residual()` driver and the
+   per-block mode-info decode that feed the round-11 §8.6.2
+   `reconstruct_block` / `reconstruct_intra_block` with real per-block
+   `Tokens` arrays, availability flags, and segment/quantizer state,
+   then surface a public single-frame intra decode path. (The §8.6.2
+   driver itself — dequant + inverse transform + add-residual +
+   `Clip1` — landed in round 11; the §6.4.25 scan-order selection in
+   round 12.)
 2. Inter (non-intra-only) header path — `frame_size_with_refs`,
    `allow_high_precision_mv`, `read_interpolation_filter` — plus
    the inter-only §6.3.9–§6.3.16 syntax (`read_inter_mode_probs`,

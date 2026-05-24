@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -115,6 +115,17 @@
 //!   real per-block `Tokens` arrays, availability flags and
 //!   segment/quantizer state across a whole frame lands in a later
 //!   round; the round-11 surface is internal-only.
+//! * Round 12 lands the §6.4.25 `get_scan( )` scan-order selection (a
+//!   crate-local module `scan`) — the first step of the §6.4.24
+//!   `tokens( )` per-block driver. The §10.1 scan tables
+//!   (`default_scan_4x4` .. `default_scan_32x32`, plus the `row_scan`
+//!   / `col_scan` variants for 4x4 / 8x8 / 16x16) are transcribed
+//!   verbatim, and `get_scan( plane, txSz, txType )` selects between
+//!   them — `ADST_DCT` → `row_scan`, `DCT_ADST` → `col_scan`, else
+//!   `default` — applying the §6.4.25 chroma / `TX_32X32`
+//!   force-to-`DCT_DCT` first half. The §6.4.24 `tokens( )` loop that
+//!   walks `pos = scan[ c ]` and the §6.4.21 residual driver above it
+//!   land in a later round; the round-12 surface is internal-only.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return
@@ -145,6 +156,7 @@ mod header;
 mod idct;
 mod intra;
 mod reconstruct;
+mod scan;
 mod tokens;
 
 pub use coef_probs::CoefProbs;

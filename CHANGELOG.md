@@ -6,6 +6,34 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 12: §6.4.25 `get_scan` scan-order selection (crate-local
+  `scan` module).** The first step of the §6.4.24 `tokens( )` per-block
+  driver — it picks the scan order (the sequence of raster positions
+  `pos = scan[ c ]` the coefficient loop visits) for a transform block.
+  * The §10.1 scan tables transcribed verbatim: `default_scan_4x4` /
+    `col_scan_4x4` / `row_scan_4x4` (16 entries), the 8x8 trio (64),
+    the 16x16 trio (256), and `default_scan_32x32` (1024). Element
+    type `u16` so the 32x32 table's `0..=1023` range fits.
+  * `get_scan( plane, txSz, txType )` — the §6.4.25 selection:
+    `ADST_DCT` → `row_scan`, `DCT_ADST` → `col_scan`, else
+    (`DCT_DCT` / `ADST_ADST`) → `default`, applying the §6.4.25 first
+    half (a chroma plane or a `TX_32X32` block forces `TxType =
+    DCT_DCT`). The mode-info-dependent `mode2txfm_map[ y_mode ]`
+    `TxType` derivation already lives in
+    [`reconstruct::tx_type_for_intra`]; the per-block mode-info state
+    is owned by the (deferred) §6.4.21 residual driver.
+  * `TX_4X4` / `TX_8X8` / `TX_16X16` / `TX_32X32` `txSz` index
+    constants (§3).
+  * 10 unit tests: every table's spec length, the permutation
+    invariant (each raster position appears exactly once), the
+    DC-first invariant, §10.1 listing anchors (first four + last
+    entry of each table), the §6.4.25 `txType` → table selection for
+    4x4 / 8x8 / 16x16, the `TX_32X32`-always-default and
+    chroma-forces-default first-half overrides, and the
+    `16 << (txSz << 1)` `segEob` length match. No external library
+    source was consulted; the tables are transcribed directly from the
+    §10.1 listing.
+
 * **Round 11: §8.6.2 reconstruct driver (crate-local `reconstruct`
   module).** Ties the rounds 7-10 pieces together at the conceptual
   `reconstruct( plane, startX, startY, txSz )` call site of the

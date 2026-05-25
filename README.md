@@ -3,6 +3,60 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-05-26
+
+**Round 18: §6.4.3 `decode_partition_type()` per-call partition reader (new
+`partition` module).** Round 18 lands the single-call partition decoder
+the recursive §6.4.3 `decode_partition(r, c, bsize)` driver fires once per
+quadrant inside a tile, plus every §3 / §10.2 / §10.4 / §10.5 surface it
+consumes:
+
+* §3 enumeration `PARTITION_NONE = 0`, `PARTITION_HORZ = 1`,
+  `PARTITION_VERT = 2`, `PARTITION_SPLIT = 3` plus `PARTITION_TYPES = 4`
+  and `PARTITION_CONTEXTS = 16`.
+* §9.3.1 trees `PARTITION_TREE[6]`, `COLS_PARTITION_TREE[2]`,
+  `ROWS_PARTITION_TREE[2]` transcribed verbatim from the spec listing.
+* §10.2 lookups `B_WIDTH_LOG2_LOOKUP` / `B_HEIGHT_LOG2_LOOKUP` (the
+  §6.4.3 tail `15 >> b_*_log2_lookup[subsize]` write-back inputs),
+  `MI_WIDTH_LOG2_LOOKUP` (the §9.3.2 `bsl` input), and
+  `NUM_8X8_BLOCKS_WIDE_LOOKUP` (the §6.4.3 `num8x8` input) — all
+  transcribed verbatim.
+* §10.2 `SUBSIZE_LOOKUP[4][13]` transcribed verbatim (with
+  `BLOCK_INVALID = 14` for the HORZ / VERT / SPLIT entries with no
+  legal child at non-square parents).
+* §10.4 `KF_PARTITION_PROBS[16][3]` (keyframe / intra-only fixed table)
+  and §10.5 `DEFAULT_PARTITION_PROBS[16][3]` (inter-frame initial
+  table prior to §6.3 `read_partition_probs()`) transcribed verbatim
+  with per-table shape + listing-anchor + §9.2 min-prob tests.
+* `partition_plane_context(bsize, above_ctx, left_ctx)` — the §9.3.2
+  `ctx = bsl * 4 + left * 2 + above` derivation: `bsl =
+  mi_width_log2_lookup[bsize]`, `boffset = 3 - bsl`, OR-fold of the
+  `AbovePartitionContext[]` / `LeftPartitionContext[]` strips across
+  `num8x8` cells, extract the `bsl`-th bit. Covers `bsl ∈ {0, 1, 2, 3}`
+  for the four superblock recursion sizes (`BLOCK_8X8` / `BLOCK_16X16`
+  / `BLOCK_32X32` / `BLOCK_64X64`) with the full `ctx ∈ 0..=15`
+  reached via the included exhaustive sweep.
+* `decode_partition_type(coder, has_rows, has_cols, probs)` — the
+  §6.4.3 reader proper. Dispatches on `(has_rows, has_cols)` per the
+  §9.3.1 tree-selection rule: interior (`(true, true)`) walks the
+  6-entry `PARTITION_TREE` with `node2 = node`; right-edge
+  (`(false, true)`) walks 2-entry `COLS_PARTITION_TREE` with
+  `node2 = 1`; bottom-edge (`(true, false)`) walks 2-entry
+  `ROWS_PARTITION_TREE` with `node2 = 2`; corner (`(false, false)`)
+  returns `PARTITION_SPLIT` directly without consuming any bool-coder
+  bits. Returns one of the four `PARTITION_*` constants.
+
+The recursive §6.4.3 driver itself — which threads
+`SUBSIZE_LOOKUP[partition][bsize]` into four recursive calls when
+`PARTITION_SPLIT` and writes back the `AbovePartitionContext[]` /
+`LeftPartitionContext[]` strips with `15 >> b_*_log2_lookup[subsize]` —
+lands in a later round. The §6.3 `read_partition_probs()`
+compressed-header sweep (`PARTITION_CONTEXTS × (PARTITION_TYPES - 1) =
+16 × 3 = 48` `diff_update_prob` cells against `DEFAULT_PARTITION_PROBS`)
+also lands in a later round. The round-18 surface is internal-only;
+the public API still exposes `parse_uncompressed_header`,
+`parse_compressed_header` and their result types exclusively.
+
 ## Status — 2026-05-25
 
 **§6.4.15 `intra_block_mode_info()` inter-frame intra-block reader.**
@@ -642,9 +696,40 @@ remainder of the frame.
 
 ## Test surface
 
-* `cargo test`: 212 unit tests + 20 integration tests (8 in
+* `cargo test`: 285 unit tests + 20 integration tests (8 in
   `tests/compressed_header.rs` plus 12 in
   `tests/uncompressed_header.rs`).
+* Round-18 additions: 37 unit tests covering the §3 partition
+  enumeration (`PARTITION_NONE` / `_HORZ` / `_VERT` / `_SPLIT` =
+  0..=3) and dimensions (`PARTITION_TYPES = 4`,
+  `PARTITION_CONTEXTS = 16`); the four §10.2 lookups
+  (`B_WIDTH_LOG2_LOOKUP` / `B_HEIGHT_LOG2_LOOKUP` /
+  `MI_WIDTH_LOG2_LOOKUP` / `NUM_8X8_BLOCKS_WIDE_LOOKUP`) against
+  the spec listings; `SUBSIZE_LOOKUP` `PARTITION_NONE` identity,
+  `PARTITION_SPLIT` superblock anchors (`BLOCK_8X8 -> BLOCK_4X4`,
+  …, `BLOCK_64X64 -> BLOCK_32X32`), `PARTITION_HORZ` /
+  `PARTITION_VERT` superblock anchors, and the
+  `BLOCK_INVALID = 14` cell at non-square parents; the three
+  §9.3.1 trees (`PARTITION_TREE[6]`, `COLS_PARTITION_TREE[2]`,
+  `ROWS_PARTITION_TREE[2]`) verbatim transcription;
+  `KF_PARTITION_PROBS` + `DEFAULT_PARTITION_PROBS` shape + four
+  per-table listing anchors + §9.2 minimum-probability sanity
+  check; `partition_plane_context` zero-strips + above-bit-set +
+  left-bit-set + both-set across each of the four superblock
+  sizes, the OR-fold across the strip width, unrelated-bit
+  masking, the panic-on-`BLOCK_INVALID` / mismatched-strip
+  guards, and an exhaustive sweep that proves all 16
+  `ctx ∈ 0..=15` are reachable across (`bsize`, `above_bit`,
+  `left_bit`); `decode_partition_type` against the zero coder
+  (`PARTITION_NONE` / `_HORZ` / `_VERT` for the four arm
+  combinations), the all-ones coder (interior right-branch walk
+  → `PARTITION_SPLIT`), the one-then-zero coder (interior →
+  `PARTITION_HORZ`, right-edge → `PARTITION_SPLIT`, bottom-edge →
+  `PARTITION_SPLIT`, with a follow-up confirming the same outcome
+  for uniform probs = 255), the corner (`(false, false)`) case
+  with a bool-coder reuse probe proving zero bits are consumed,
+  and an exhaustive 4 × 3 (arm × buffer) smoke-test confirming
+  the output stays in `0..=3`.
 * Round-16 additions: 7 unit tests covering the §9.3.1
   `segment_tree[14]` verbatim transcription, `read_segment_id` against
   the zero coder (every bit=0 walks `tree[0]=2 → tree[2]=6 →
@@ -868,7 +953,18 @@ Future rounds, roughly in order:
 3. Per-tile partition-tree walk (§6.4) including the §6.4.21
    `residual()` driver that finally consumes the round-7 tokens and
    the round-6 `coef_probs` tables, plus the per-block mode-info
-   decode that feeds `predict_intra`.
+   decode that feeds `predict_intra`. Round 18 added the §6.4.3
+   `decode_partition_type()` per-call primitive plus the §10.2
+   `subsize_lookup` / `b_*_log2_lookup` / `num_8x8_blocks_wide_lookup`
+   tables and the §10.4 `kf_partition_probs` / §10.5
+   `default_partition_probs` probability tables; the recursive
+   `decode_partition(r, c, bsize)` driver that splits on the
+   decoded `partition`, threads `subsize_lookup[partition][bsize]`
+   into four recursive calls when `PARTITION_SPLIT`, and writes
+   back `AbovePartitionContext[]` / `LeftPartitionContext[]`
+   with `15 >> b_*_log2_lookup[subsize]` lands in the next round,
+   alongside the §6.3 `read_partition_probs()` compressed-header
+   sweep that updates `default_partition_probs` on inter frames.
 4. Inter prediction (§8.5.2), loop filter (§8.8), multi-tile, then
    encoder paths.
 

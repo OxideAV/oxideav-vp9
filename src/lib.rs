@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -237,6 +237,38 @@
 //!   header rather than the keyframe `kf_*_mode_probs` tables) lands
 //!   alongside the §6.4.11 inter-frame driver in a later round; the
 //!   round-17 surface is internal-only.
+//! * Round 18 lands the §6.4.3 `decode_partition_type( )` partition reader
+//!   (a crate-local module `partition`) — the per-call decoder that fires
+//!   once per `(r, c, bsize)` quadrant inside the recursive §6.4.3
+//!   `decode_partition( )` driver. Covers the §9.3.1 tree-selection
+//!   (`partition_tree[6]` interior, `cols_partition_tree[2]` right-edge,
+//!   `rows_partition_tree[2]` bottom-edge, plus the four-corner case that
+//!   returns `PARTITION_SPLIT` without consuming any bits), the §9.3.2
+//!   probability-selection rule (`node2 = node` for interior, fixed at 1
+//!   for right-edge, fixed at 2 for bottom-edge), the §9.3.2 `ctx = bsl *
+//!   4 + left * 2 + above` derivation via `partition_plane_context`
+//!   (`bsl = mi_width_log2_lookup[bsize]`, `boffset = 3 - bsl`, OR-fold
+//!   of `AbovePartitionContext[ ]` / `LeftPartitionContext[ ]` strips
+//!   across `num8x8 = num_8x8_blocks_wide_lookup[bsize]` cells), the §3
+//!   `PARTITION_NONE`=0 / `PARTITION_HORZ`=1 / `PARTITION_VERT`=2 /
+//!   `PARTITION_SPLIT`=3 constants and `PARTITION_TYPES=4` /
+//!   `PARTITION_CONTEXTS=16` dimensions, the §10.2
+//!   `b_width_log2_lookup` / `b_height_log2_lookup` /
+//!   `mi_width_log2_lookup` / `num_8x8_blocks_wide_lookup` lookups
+//!   transcribed verbatim, the §10.2 `subsize_lookup[4][13]`
+//!   PARTITION→child block-size table transcribed verbatim (with
+//!   `BLOCK_INVALID = 14` for illegal combinations), and the §10.4
+//!   `kf_partition_probs[16][3]` keyframe fixed-probability table plus
+//!   the §10.5 `default_partition_probs[16][3]` inter-frame initial
+//!   probability table both transcribed verbatim. The recursive §6.4.3
+//!   driver itself (the `decode_partition( r, c, bsize )` function that
+//!   splits on the decoded `partition`, threads `subsize_lookup[
+//!   partition ][ bsize ]` into four recursive calls when
+//!   `PARTITION_SPLIT`, and writes back the
+//!   `AbovePartitionContext[ ]` / `LeftPartitionContext[ ]` strips with
+//!   `15 >> b_*_log2_lookup[ subsize ]`) and the §6.3
+//!   `read_partition_probs( )` compressed-header sweep both land in a
+//!   later round; the round-18 surface is internal-only.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return
@@ -267,6 +299,7 @@ mod header;
 mod idct;
 mod intra;
 mod mode_info;
+mod partition;
 mod reconstruct;
 mod residual;
 mod scan;

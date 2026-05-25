@@ -6,6 +6,73 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **§6.4.3 `decode_partition_type( )` per-call partition reader (new
+  crate-local `partition` module).** The single-call decoder the
+  recursive §6.4.3 `decode_partition( r, c, bsize )` driver (later
+  round) fires once per `(r, c, bsize)` quadrant inside a tile:
+  * §9.3.1 partition trees `PARTITION_TREE[6]`, `COLS_PARTITION_TREE[2]`
+    and `ROWS_PARTITION_TREE[2]` transcribed verbatim from
+    `docs/video/vp9/vp9-spec.txt`.
+  * §3 partition enumeration: `PARTITION_NONE = 0`, `PARTITION_HORZ = 1`,
+    `PARTITION_VERT = 2`, `PARTITION_SPLIT = 3`, plus dimensions
+    `PARTITION_TYPES = 4` and `PARTITION_CONTEXTS = 16`.
+  * §10.2 lookups transcribed verbatim: `B_WIDTH_LOG2_LOOKUP` /
+    `B_HEIGHT_LOG2_LOOKUP` (the §6.4.3 tail `15 >>
+    b_*_log2_lookup[subsize]` write-back inputs),
+    `MI_WIDTH_LOG2_LOOKUP` (the §9.3.2 `bsl` derivation input),
+    `NUM_8X8_BLOCKS_WIDE_LOOKUP` (the §6.4.3 `num8x8` input).
+  * §10.2 `SUBSIZE_LOOKUP[4][13]` (`PARTITION → child block size`)
+    transcribed verbatim, with `BLOCK_INVALID = 14` for the
+    horizontal / vertical / split combinations that have no legal
+    child at non-square parents.
+  * §10.4 `KF_PARTITION_PROBS[16][3]` (keyframe / intra-only fixed
+    probabilities) and §10.5 `DEFAULT_PARTITION_PROBS[16][3]` (inter
+    frame initial probabilities, prior to the §6.3
+    `read_partition_probs( )` sweep) transcribed verbatim. Each
+    table has a shape + listing-anchor + §9.2-minimum-prob test.
+  * `partition_plane_context( bsize, above_ctx, left_ctx )` — the
+    §9.3.2 `ctx = bsl * 4 + left * 2 + above` derivation, with
+    `bsl = mi_width_log2_lookup[bsize]`, `boffset = 3 - bsl`, and
+    an OR-fold of the `AbovePartitionContext[ ]` /
+    `LeftPartitionContext[ ]` strips across `num8x8` cells.
+  * `decode_partition_type( coder, has_rows, has_cols, probs )` —
+    the §6.4.3 reader proper: dispatches on `(has_rows, has_cols)`
+    per the §9.3.1 tree-selection rule (interior → 6-entry tree,
+    right-edge → 2-entry `cols_partition_tree`, bottom-edge →
+    2-entry `rows_partition_tree`, corner → return
+    `PARTITION_SPLIT` without consuming bits) and remaps the §9.3.3
+    walker's node index per the §9.3.2 `node2` rule (interior:
+    `node2 = node`, right-edge: `node2 = 1`, bottom-edge:
+    `node2 = 2`). Returns one of the four `PARTITION_*` constants.
+  * 37 new unit tests covering: every §3 constant (4 partition
+    values + 2 dimensions); the four §10.2 lookups against the
+    spec listings; `SUBSIZE_LOOKUP` `PARTITION_NONE` identity /
+    `PARTITION_SPLIT` superblock anchors / `PARTITION_HORZ` +
+    `PARTITION_VERT` superblock anchors / `BLOCK_INVALID` at
+    non-square parents; all three §9.3.1 trees verbatim;
+    `KF_PARTITION_PROBS` + `DEFAULT_PARTITION_PROBS` shape + four
+    listing anchors each + §9.2 min-prob sanity;
+    `partition_plane_context` zero-strip + above-only + left-only +
+    both-bits-set cases across each of the four superblock sizes,
+    the OR-fold across the strip, unrelated-bit masking, the
+    panic-on-invalid-bsize / mismatched-strip guards, and an
+    exhaustive sweep proving the 16 ctx values 0..=15 are all
+    reachable; `decode_partition_type` against the zero coder
+    (every arm picks its first leaf), the all-ones coder (interior
+    walks every right-branch → `PARTITION_SPLIT`), the
+    one-then-zero coder (each arm's first-right-then-left walk),
+    the corner case (consumes zero bits + leaves bool-coder
+    untouched), and an exhaustive arm × buffer × probability
+    smoke-test confirming every output stays in `0..=3`.
+
+  The recursive §6.4.3 `decode_partition( )` driver itself (which
+  threads `SUBSIZE_LOOKUP[partition][bsize]` into four recursive
+  calls when `PARTITION_SPLIT` and writes back the
+  `AbovePartitionContext[ ]` / `LeftPartitionContext[ ]` strips with
+  `15 >> b_*_log2_lookup[subsize]`) and the §6.3
+  `read_partition_probs( )` compressed-header sweep both land in a
+  later round; the round-18 surface is internal-only, `pub(crate)`.
+
 * **§6.4.15 `intra_block_mode_info( )` inter-frame intra-block reader
   (extending the crate-local `mode_info` module).** The companion to
   the §6.4.6 keyframe driver, for intra blocks within non-keyframe

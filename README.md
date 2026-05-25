@@ -807,20 +807,24 @@ Future rounds, roughly in order:
    `skip` / `segment_id`) per §6.4.6 / §6.4.7 / §6.4.10. Round 15
    landed §6.4.8 `read_skip` + §6.4.10 `read_tx_size` + the §9.3.3
    `tree_decode` walker; round 16 added §6.4.7 `intra_segment_id` +
-   the §9.3.1 `segment_tree[14]`. The remaining pieces are §6.4.15
-   `intra_block_mode_info` (the `default_intra_mode` / `default_uv_mode`
-   decode against the §10.5 `kf_y_mode_probs` / `kf_uv_mode_probs`
-   tables for key frames, with the `abovemode` / `leftmode` neighbour
-   reads from the `SubModes[ ][ ]` frame-wide array per §9.3.2; this
-   includes the `MiSize < BLOCK_8X8` sub-block loop that decodes one
-   `default_intra_mode` per 4x4 sub-block and fans it into the
-   `sub_modes[ ]` array), and the §6.4.6 `intra_frame_mode_info()`
-   orchestrator that composes `intra_segment_id` + `read_skip` +
-   `read_tx_size` + `intra_block_mode_info` into a single
-   `Vp9IntraMiBlock`. Once that lands, the per-block `BoolCoder` token
-   decode can replace the round-14 `TokenSource` callback to expose a
-   public single-MI-block intra decode path; the partition-tree walk
-   (§6.4.3) closes the per-tile loop.
+   the §9.3.1 `segment_tree[14]`; round 17 added the §6.4.6
+   `intra_frame_mode_info()` keyframe orchestrator on top of the
+   §9.3.1 `intra_mode_tree[18]` + §10.5 `kf_y_mode_probs` /
+   `kf_uv_mode_probs` decode (`default_intra_mode` plus
+   `default_uv_mode`, with the `MiSize < BLOCK_8X8` `(idy, idx)`
+   sub-block walk fanning a per-cell `default_intra_mode` into the
+   `sub_modes[ ]` array, and the §9.3.2 above/left neighbour
+   derivation handled by the `IntraFrameNeighbours` bundle). The
+   remaining intra piece is §6.4.15 `intra_block_mode_info` — the
+   intra-block branch used inside inter frames, which uses
+   `y_mode_probs[size_group_lookup[MiSize]][node]` /
+   `y_mode_probs[0][node]` / `uv_mode_probs[y_mode][node]` from the
+   compressed header rather than the keyframe `kf_*_mode_probs`
+   tables; it lands alongside the §6.4.11 inter-frame driver. Once
+   that lands the per-block `BoolCoder` token decode can replace the
+   round-14 `TokenSource` callback to expose a public single-MI-block
+   intra decode path; the partition-tree walk (§6.4.3) closes the
+   per-tile loop.
 2. Inter (non-intra-only) header path — `frame_size_with_refs`,
    `allow_high_precision_mv`, `read_interpolation_filter` — plus
    the inter-only §6.3.9–§6.3.16 syntax (`read_inter_mode_probs`,

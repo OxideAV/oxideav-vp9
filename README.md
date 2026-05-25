@@ -5,6 +5,44 @@ Bitstream & Decoding Process Specification v0.7.
 
 ## Status — 2026-05-25
 
+**Round 16: §6.4.7 `intra_segment_id` + §9.3.1 `segment_tree`.** Round
+16 extends the round-15 `mode_info` module (crate-internal,
+`pub(crate)`) with the next slice of the §6.4.6
+`intra_frame_mode_info()` orchestrator's primitives:
+
+* §9.3.1 `segment_tree[14]` —
+  `{ 2, 4, 6, 8, 10, 12, 0, -1, -2, -3, -4, -5, -6, -7 }` transcribed
+  verbatim. A 7-leaf binary tree mapping to segment ids `0..=7`; note
+  the §9.3.1 packing means the all-bit-0 walk visits node indices
+  `{0, 1, 3}` (not the contiguous `0..3` a regular binary tree would).
+* `read_segment_id( coder, tree_probs )` — the §9.3.3 `tree_decode`
+  walk over `SEGMENT_TREE` with per-node probability
+  `segmentation_tree_probs[node]` per the §9.3.2 listing's
+  `segment_id` entry. Returns the decoded segment id directly (the
+  §9.3.3 post-loop `-n` already produces it).
+* `intra_segment_id( coder, segmentation_enabled,
+  segmentation_update_map, tree_probs )` (§6.4.7) — the
+  `segmentation_enabled && segmentation_update_map` gate around
+  `read_segment_id`. The intra-only path has no
+  `segmentation_temporal_update` / `seg_id_predicted` machinery; when
+  the gate fails `segment_id = 0` per the spec listing.
+
+Out of scope for round 16: the §6.4.12 `inter_segment_id( )` syntax
+(with the `predictedSegmentId = get_segment_id( )` spatial-prediction
+helper + the `seg_id_predicted` binary decode + the
+`AboveSegPredContext` / `LeftSegPredContext` write-back) — that's an
+inter-frame primitive blocked on the reference-buffer state the
+round-2 header walker still rejects with `Error::Unsupported`. The
+§6.4.15 `intra_block_mode_info` (`default_intra_mode` /
+`default_uv_mode` decode against the §10.5 `kf_y_mode_probs` /
+`kf_uv_mode_probs` 3D / 2D tables) and the §6.4.6
+`intra_frame_mode_info()` orchestrator that composes
+`intra_segment_id` + `read_skip` + `read_tx_size` +
+`intra_block_mode_info` into a single `Vp9IntraMiBlock` are deferred
+to the next round. The round-16 surface is internal-only; the public
+API still exposes `parse_uncompressed_header`,
+`parse_compressed_header` and their result types exclusively.
+
 **Round 15: §6.4.8 `read_skip` + §6.4.10 `read_tx_size` + §9.3.3
 `tree_decode`.** Round 15 adds a `mode_info` module (crate-internal,
 `pub(crate)`) implementing the first slice of the §6.4 per-block
@@ -497,9 +535,22 @@ remainder of the frame.
 
 ## Test surface
 
-* `cargo test`: 205 unit tests + 20 integration tests (8 in
+* `cargo test`: 212 unit tests + 20 integration tests (8 in
   `tests/compressed_header.rs` plus 12 in
   `tests/uncompressed_header.rs`).
+* Round-16 additions: 7 unit tests covering the §9.3.1
+  `segment_tree[14]` verbatim transcription, `read_segment_id` against
+  the zero coder (every bit=0 walks `tree[0]=2 → tree[2]=6 →
+  tree[6]=0` and returns segment 0), the bias-buffer + `[255; 7]`
+  trace producing segment id 4 (first read flips to bit=1 picking
+  inner branch 4, the next two collapse to bit=0 picking leaf -4), the
+  §9.3.1 node-index packing fact that a pure-left walk visits node
+  indices `{0, 1, 3}` (not contiguous), `intra_segment_id` short-
+  circuiting to `segment_id = 0` when either `segmentation_enabled`
+  or `segmentation_update_map` is false (without dereferencing
+  `tree_probs`), the active path decoding through `read_segment_id`,
+  and the `Error::InvalidBitstream` surface when the caller forgets
+  to thread `tree_probs` despite the active gate.
 * Round-15 additions: 22 unit tests covering the §9.3.1 tree-listing
   anchors (`tx_size_8_tree` / `tx_size_16_tree` / `tx_size_32_tree` /
   `binary_tree` verbatim transcription), the §9.3.3 `tree_decode`
@@ -682,17 +733,21 @@ Future rounds, roughly in order:
 1. Per-block mode-info decode (`y_mode` / `sub_modes` / `tx_size` /
    `skip` / `segment_id`) per §6.4.6 / §6.4.7 / §6.4.10. Round 15
    landed §6.4.8 `read_skip` + §6.4.10 `read_tx_size` + the §9.3.3
-   `tree_decode` walker; the remaining pieces are §6.4.7
-   `intra_segment_id` (the `segmentation_tree_probs` decode under
-   `update_map`), §6.4.15 `intra_block_mode_info` (the `y_mode` /
-   `uv_mode` decode against the §10 `default_intra_mode_probs` table
-   and the §10.5 `kf_y_mode_probs` / `kf_uv_mode_probs` for key
-   frames), and the §6.4.6 `intra_frame_mode_info()` orchestrator that
-   composes them into a `Vp9IntraMiBlock`. Once that lands, the
-   per-block `BoolCoder` token decode can replace the round-14
-   `TokenSource` callback to expose a public single-MI-block intra
-   decode path; the partition-tree walk (§6.4.3) closes the per-tile
-   loop.
+   `tree_decode` walker; round 16 added §6.4.7 `intra_segment_id` +
+   the §9.3.1 `segment_tree[14]`. The remaining pieces are §6.4.15
+   `intra_block_mode_info` (the `default_intra_mode` / `default_uv_mode`
+   decode against the §10.5 `kf_y_mode_probs` / `kf_uv_mode_probs`
+   tables for key frames, with the `abovemode` / `leftmode` neighbour
+   reads from the `SubModes[ ][ ]` frame-wide array per §9.3.2; this
+   includes the `MiSize < BLOCK_8X8` sub-block loop that decodes one
+   `default_intra_mode` per 4x4 sub-block and fans it into the
+   `sub_modes[ ]` array), and the §6.4.6 `intra_frame_mode_info()`
+   orchestrator that composes `intra_segment_id` + `read_skip` +
+   `read_tx_size` + `intra_block_mode_info` into a single
+   `Vp9IntraMiBlock`. Once that lands, the per-block `BoolCoder` token
+   decode can replace the round-14 `TokenSource` callback to expose a
+   public single-MI-block intra decode path; the partition-tree walk
+   (§6.4.3) closes the per-tile loop.
 2. Inter (non-intra-only) header path — `frame_size_with_refs`,
    `allow_high_precision_mv`, `read_interpolation_filter` — plus
    the inter-only §6.3.9–§6.3.16 syntax (`read_inter_mode_probs`,

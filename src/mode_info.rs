@@ -102,6 +102,24 @@ pub(crate) const TX_SIZE_32_TREE: [i32; 6] = [
 /// `single_ref_p2`, `mv_sign`, `mv_bit`, `mv_class0_bit`, `more_coefs`).
 pub(crate) const BINARY_TREE: [i32; 2] = [0, -1];
 
+/// `segment_tree[ 14 ]` per §9.3.1 — the 7-leaf binary tree used to
+/// decode `segment_id` (values `0..=7`, one per VP9 segment slot).
+///
+/// Verbatim from the §9.3.1 listing:
+///
+/// ```text
+/// segment_tree[ 14 ] = {
+///     2, 4, 6, 8, 10, 12,
+///     0, -1, -2, -3, -4, -5, -6, -7
+/// }
+/// ```
+///
+/// The first six pairs are inner branches (a `1` always advances by 2),
+/// and the seven `-i` leaves at positions `7..=13` map to segment ids
+/// `1..=7`. Position 6 stores the value `0` — the §9.3.3 walker returns
+/// `-n` at the end, so a tree slot of `0` produces segment id `0`.
+pub(crate) const SEGMENT_TREE: [i32; 14] = [2, 4, 6, 8, 10, 12, 0, -1, -2, -3, -4, -5, -6, -7];
+
 // ----- §9.3.3 tree decoding -----
 
 /// `Tree decoding process` per §9.3.3.
@@ -257,6 +275,72 @@ pub(crate) fn read_skip(
     let ctx = skip_context(nb);
     let value = tree_decode(coder, &BINARY_TREE, |_| skip_prob[ctx])?;
     Ok(value != 0)
+}
+
+// ----- §6.4.7 intra_segment_id + segment_id tree decode -----
+
+/// Decode a `segment_id` value (`0..=7`) via the §9.3.1 [`SEGMENT_TREE`]
+/// and per-node probability table `segmentation_tree_probs[node]` per
+/// the §9.3.2 listing
+///
+/// ```text
+/// segment_id: the probability is given by segmentation_tree_probs[ node ].
+/// ```
+///
+/// This is the call-site that materialises the `segment_id` token from
+/// the §9.2 bool coder once the §6.4.7 / §6.4.12 syntax decides a fresh
+/// decode is needed.
+pub(crate) fn read_segment_id(
+    coder: &mut BoolCoder<'_>,
+    tree_probs: &[u8; 7],
+) -> Result<u8, Error> {
+    let value = tree_decode(coder, &SEGMENT_TREE, |node| tree_probs[node])?;
+    // §9.3.1 lays the tree out so the leaves are `0..=7`; the §9.3.3
+    // post-loop `-n` already returns the segment id directly.
+    Ok(value as u8)
+}
+
+/// `intra_segment_id( )` per §6.4.7.
+///
+/// ```text
+/// intra_segment_id( ) {
+///     if ( segmentation_enabled && segmentation_update_map )
+///         segment_id                                                       T
+///     else
+///         segment_id = 0
+/// }
+/// ```
+///
+/// The intra path is simpler than the §6.4.12 inter version:
+///
+/// * No temporal prediction (`seg_id_predicted` and `predictedSegmentId`
+///   only apply to inter frames).
+/// * No `AboveSegPredContext` / `LeftSegPredContext` write-back.
+/// * No fall-back to `get_segment_id()`'s spatial neighbour — when the
+///   map isn't being updated on an intra frame the spec forces
+///   `segment_id = 0` (since intra frames are key-frame / intra-only,
+///   the previous map is meaningless).
+///
+/// `tree_probs` is the `segmentation_tree_probs[7]` table carried on
+/// [`crate::header::SegmentationParams::tree_probs`] (`Some([…; 7])`
+/// when the uncompressed header surfaced an `update_map == 1` /
+/// `prob_update` decode, or the `[255; 7]` no-probability-coded
+/// fallback the §6.2.12 `read_prob()` helper substitutes). When
+/// `update_map == 0` the spec doesn't read `segment_id`, so the absent
+/// `tree_probs` field is allowed to be `None` and this helper short-
+/// circuits before dereferencing it.
+pub(crate) fn intra_segment_id(
+    coder: &mut BoolCoder<'_>,
+    segmentation_enabled: bool,
+    segmentation_update_map: bool,
+    tree_probs: Option<&[u8; 7]>,
+) -> Result<u8, Error> {
+    if segmentation_enabled && segmentation_update_map {
+        let probs = tree_probs.ok_or(Error::InvalidBitstream)?;
+        read_segment_id(coder, probs)
+    } else {
+        Ok(0)
+    }
 }
 
 // ----- §6.4.10 read_tx_size -----
@@ -684,6 +768,133 @@ mod tests {
             }),
             2,
         );
+    }
+
+    // ----- segment_tree / read_segment_id / intra_segment_id -----
+
+    #[test]
+    fn segment_tree_matches_spec_listing() {
+        // §9.3.1 verbatim:
+        //   segment_tree[ 14 ] = {
+        //       2, 4, 6, 8, 10, 12,
+        //       0, -1, -2, -3, -4, -5, -6, -7
+        //   }
+        assert_eq!(
+            SEGMENT_TREE,
+            [2, 4, 6, 8, 10, 12, 0, -1, -2, -3, -4, -5, -6, -7]
+        );
+    }
+
+    #[test]
+    fn read_segment_id_zero_buffer_picks_segment_zero() {
+        // Zero coder pins every read_bool to 0. The walker therefore
+        // follows tree[0]=2 → tree[2]=4 → tree[4]=6 → tree[6]=0, exits
+        // with -0 = 0. Probability values don't affect the outcome
+        // along the all-bit-0 path.
+        let mut coder = zero_coder();
+        let id = read_segment_id(&mut coder, &[128, 128, 128, 128, 128, 128, 128]).unwrap();
+        assert_eq!(id, 0);
+    }
+
+    #[test]
+    fn read_segment_id_bias_buffer_all_255_picks_segment_four() {
+        // Bias buffer + probs `[255;7]`:
+        //   first read (p=255, value=127, range=128) → split=127,
+        //     value≥split → bit=1; renormalisation refills 7 zero bits
+        //     leaving range=128, value=0.
+        //   n=0 → tree[1]=4 → node=2.
+        //   second read (p=255, range=128, value=0) → split=127, value
+        //     <split → bit=0; n=tree[4]=10 → node=5.
+        //   third read (p=255, range=128 post-renorm, value=0) →
+        //     bit=0; n=tree[10]=-4 → returns segment id 4.
+        // Hand-traced against the §9.2 listing; no external decoder
+        // consulted.
+        let bytes = make_bias_buffer(0x7F);
+        let mut coder = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let id = read_segment_id(&mut coder, &[255; 7]).unwrap();
+        assert_eq!(id, 4);
+    }
+
+    #[test]
+    fn read_segment_id_calls_prob_with_node_index() {
+        // Confirms that the probability callback receives the §9.3.3
+        // `n >> 1` node index along the walk path. With the zero coder
+        // every bit is 0, so the walk is:
+        //   n=0 → node=0 → tree[0]=2
+        //   n=2 → node=1 → tree[2]=6
+        //   n=6 → node=3 → tree[6]=0 (leaf, returns 0)
+        // — note position 4 (node=2) is skipped because the left
+        // branch at n=2 jumps straight to position 6, not 4. The
+        // §9.3.1 segment_tree's inner-branch packing means a pure-
+        // left-bit walk visits node indices 0, 1, 3 (not the
+        // contiguous 0..3 a regular binary tree would).
+        let mut coder = zero_coder();
+        let probs = [1u8, 2, 3, 4, 5, 6, 7];
+        let calls = std::cell::RefCell::new(Vec::<usize>::new());
+        let value = tree_decode(&mut coder, &SEGMENT_TREE, |node| {
+            calls.borrow_mut().push(node);
+            probs[node]
+        })
+        .unwrap();
+        assert_eq!(value, 0);
+        assert_eq!(*calls.borrow(), vec![0, 1, 3]);
+    }
+
+    #[test]
+    fn intra_segment_id_disabled_returns_zero_without_reading() {
+        // When segmentation_enabled is false the spec hardwires
+        // segment_id = 0 and reads no bits.
+        let mut coder = zero_coder();
+        let id = intra_segment_id(&mut coder, false, true, Some(&[255; 7])).unwrap();
+        assert_eq!(id, 0);
+
+        // Likewise when enabled but update_map is false — the previous
+        // frame's segmentation map is reused (and on an intra frame
+        // the spec leaves segment_id pinned at 0 since there's no
+        // prior map to inherit from).
+        let mut coder = zero_coder();
+        let id = intra_segment_id(&mut coder, true, false, Some(&[255; 7])).unwrap();
+        assert_eq!(id, 0);
+
+        // Even passing a None tree_probs is fine in those branches —
+        // the helper short-circuits before dereferencing it. This
+        // matches the SegmentationParams shape where tree_probs is
+        // `None` unless update_map == 1 surfaced one.
+        let mut coder = zero_coder();
+        let id = intra_segment_id(&mut coder, false, false, None).unwrap();
+        assert_eq!(id, 0);
+    }
+
+    #[test]
+    fn intra_segment_id_enabled_with_update_map_decodes() {
+        // segmentation_enabled && segmentation_update_map → walks the
+        // §9.3.1 segment_tree. The zero-coder path picks segment 0.
+        let mut coder = zero_coder();
+        let id = intra_segment_id(&mut coder, true, true, Some(&[128; 7])).unwrap();
+        assert_eq!(id, 0);
+
+        // Bias buffer + all-255 probs picks segment 4 (see
+        // `read_segment_id_bias_buffer_all_255_picks_segment_four`).
+        let bytes = make_bias_buffer(0x7F);
+        let mut coder = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let id = intra_segment_id(&mut coder, true, true, Some(&[255; 7])).unwrap();
+        assert_eq!(id, 4);
+    }
+
+    #[test]
+    fn intra_segment_id_missing_tree_probs_when_active_is_invalid() {
+        // The caller-supplied `tree_probs` is required when the spec
+        // is going to decode segment_id. SegmentationParams keeps
+        // tree_probs as Option<[u8;7]> because it's None whenever
+        // update_map==0; a None reaching this branch indicates the
+        // caller forgot to thread the table through from the
+        // uncompressed header, which is a programming error rather
+        // than a stream error, but `Error::InvalidBitstream` is the
+        // closest match in the crate-local error set and surfaces
+        // loudly rather than panicking.
+        let mut coder = zero_coder();
+        let err = intra_segment_id(&mut coder, true, true, None).unwrap_err();
+        assert_eq!(err, Error::InvalidBitstream);
     }
 
     // ----- read_tx_size -----

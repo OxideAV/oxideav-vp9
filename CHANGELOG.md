@@ -6,6 +6,25 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 16: §6.4.7 `intra_segment_id( )` + §9.3.1 `segment_tree[14]`
+  (extending the crate-local `mode_info` module).** Lands the next
+  slice of the §6.4.6 `intra_frame_mode_info()` orchestrator's
+  primitives that round 15 left deferred:
+  * The §9.3.1 `segment_tree[14]` constant
+    `{ 2, 4, 6, 8, 10, 12, 0, -1, -2, -3, -4, -5, -6, -7 }` transcribed
+    verbatim — the 7-leaf binary tree used by every `segment_id`
+    decode site (intra §6.4.7 + inter §6.4.12).
+  * `read_segment_id( coder, tree_probs )` — the §9.3.3 walk over the
+    new `SEGMENT_TREE` with per-node probability
+    `segmentation_tree_probs[node]` per the §9.3.2 listing's
+    `segment_id` entry. Returns the decoded segment id in `0..=7`.
+  * `intra_segment_id( coder, segmentation_enabled,
+    segmentation_update_map, tree_probs )` (§6.4.7) — the
+    `segmentation_enabled && segmentation_update_map` gate around
+    `read_segment_id`, falling through to `segment_id = 0` otherwise
+    (the intra-only path has no `segmentation_temporal_update` /
+    `seg_id_predicted` machinery — that's inter-only and lands when
+    the §6.4.12 syntax does).
 * **Round 15: §6.4.8 `read_skip` + §6.4.10 `read_tx_size` + §9.3.3
   `tree_decode` (crate-local `mode_info` module).** The first slice of
   the §6.4 per-block mode-info decode that the round-14

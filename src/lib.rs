@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -187,6 +187,21 @@
 //!   `read_tx_size` + the deferred §6.4.7 `intra_segment_id` +
 //!   §6.4.15 `intra_block_mode_info` into a single `Vp9IntraMiBlock`
 //!   lands in a later round; the round-15 surface is internal-only.
+//! * Round 16 extends the round-15 `mode_info` module with the next
+//!   slice of the §6.4.6 orchestrator's primitives: the §9.3.1
+//!   `segment_tree[14]` transcribed verbatim (the 7-leaf binary tree
+//!   used by every `segment_id` decode site), `read_segment_id( coder,
+//!   tree_probs )` running the §9.3.3 walk over it with
+//!   `segmentation_tree_probs[node]` per the §9.3.2 listing, and
+//!   `intra_segment_id( coder, segmentation_enabled,
+//!   segmentation_update_map, tree_probs )` (§6.4.7) gating the decode
+//!   on `segmentation_enabled && segmentation_update_map` and falling
+//!   through to `segment_id = 0` otherwise (intra has no
+//!   `segmentation_temporal_update` / `seg_id_predicted` machinery —
+//!   that's inter-only and lands when §6.4.12 does). The §6.4.15
+//!   `intra_block_mode_info` and §6.4.6 `intra_frame_mode_info()`
+//!   orchestrator are deferred to the next round; the round-16
+//!   surface is internal-only.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return

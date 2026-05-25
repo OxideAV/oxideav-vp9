@@ -1,5 +1,15 @@
-//! VP9 per-block mode-info primitives per spec v0.7 — §6.4.6 / §6.4.7 /
-//! §6.4.8 / §6.4.10 / §9.3.1 / §9.3.2 / §9.3.3.
+//! VP9 per-block mode-info primitives per spec v0.7 — §6.4.5 / §6.4.6 /
+//! §6.4.7 / §6.4.8 / §6.4.10 / §6.4.15 / §9.3.1 / §9.3.2 / §9.3.3.
+//!
+//! The §6.4.15 [`intra_block_mode_info`] inter-frame intra-block reader
+//! is the companion to the §6.4.6 keyframe driver: it reads `intra_mode`
+//! / `sub_intra_mode` / `uv_mode` from the §9.3 compressed-header
+//! [`DEFAULT_Y_MODE_PROBS`] / [`DEFAULT_UV_MODE_PROBS`] tables (ctx
+//! `size_group_lookup[MiSize]` / `0` / `y_mode` per §9.3.2) rather than
+//! the §10.5 keyframe `kf_*_mode_probs`, fixes `ref_frame` to
+//! `INTRA_FRAME`, and handles the sub-8x8 `(idy, idx)` grid. The §6.4.5
+//! [`Vp9ModeInfo`] dispatch enum and [`inter_frame_intra_block_mode_info`]
+//! wire it alongside the keyframe path.
 //!
 //! Round 17 lands the §6.4.6 [`intra_frame_mode_info`] keyframe-only
 //! per-block mode-info reader on top of the round-15 / 16 primitives.
@@ -61,10 +71,10 @@
 //!   `counts_*` plumbing for the adaption round.
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7
-//! (`docs/video/vp9/vp9-spec.txt` §6.4.8 / §6.4.9 / §6.4.10 / §9.3.1 /
-//! §9.3.2 / §9.3.3). No external library source consulted; every
-//! formula and every tree array transcribed directly from the spec
-//! listing.
+//! (`docs/video/vp9/vp9-spec.txt` §6.4.5 / §6.4.6 / §6.4.8 / §6.4.9 /
+//! §6.4.10 / §6.4.15 / §9.3.1 / §9.3.2 / §9.3.3). No external library
+//! source consulted; every formula and every probability / tree array
+//! transcribed directly from the spec listing.
 
 // Helpers in this module are exercised exclusively from `#[cfg(test)]`
 // and the deferred §6.4.6 driver until the per-frame public decode path
@@ -74,7 +84,8 @@
 use crate::bool_coder::BoolCoder;
 use crate::compressed::{tx_mode_to_biggest_tx_size, TxMode};
 use crate::residual::{
-    BLOCK_8X8, MAX_TXSIZE_LOOKUP, NUM_4X4_BLOCKS_HIGH_LOOKUP, NUM_4X4_BLOCKS_WIDE_LOOKUP,
+    BLOCK_8X8, BLOCK_SIZES, MAX_TXSIZE_LOOKUP, NUM_4X4_BLOCKS_HIGH_LOOKUP,
+    NUM_4X4_BLOCKS_WIDE_LOOKUP,
 };
 use crate::Error;
 
@@ -662,6 +673,89 @@ pub(crate) const KF_UV_MODE_PROBS: [[u8; INTRA_MODES - 1]; INTRA_MODES] = [
     [102, 19, 66, 162, 182, 122, 35, 59, 128],  // y = tm
 ];
 
+// ----- §9.3.2 size_group_lookup / §9.3 default_y_mode_probs /
+//       default_uv_mode_probs (verbatim) -----
+
+/// `BLOCK_SIZE_GROUPS = 4` per §3 — number of contexts when decoding
+/// `intra_mode`. Indexes the first dimension of the §9.3
+/// `y_mode_probs[ BLOCK_SIZE_GROUPS ][ INTRA_MODES - 1 ]` table.
+pub(crate) const BLOCK_SIZE_GROUPS: usize = 4;
+
+/// `size_group_lookup[ BLOCK_SIZES ]` per §9.3.2 — maps a `BLOCK_*`
+/// size to the §9.3 `intra_mode` context `ctx = size_group_lookup[
+/// MiSize ]` (used to index `y_mode_probs[ ctx ]`).
+///
+/// Transcribed verbatim from `docs/video/vp9/vp9-spec.txt`:
+///
+/// ```text
+/// size_group_lookup[ BLOCK_SIZES ] = {0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3}
+/// ```
+///
+/// Indexed 0..=12 for the 13 `BLOCK_SIZES` (BLOCK_4X4..BLOCK_64X64).
+pub(crate) const SIZE_GROUP_LOOKUP: [u8; BLOCK_SIZES] = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3];
+
+/// `default_y_mode_probs[ BLOCK_SIZE_GROUPS ][ INTRA_MODES - 1 ]` per
+/// §9.3 — the inter-frame `intra_mode` / `sub_intra_mode` default
+/// probabilities loaded into the compressed-header `y_mode_probs[ ][ ]`
+/// before §6.3.14 `read_y_mode_probs( )` applies its per-frame
+/// `diff_update_prob( )` deltas.
+///
+/// Outer index is the §9.3.2 `ctx = size_group_lookup[ MiSize ]`
+/// (0 = block_size < 8x8, 1 = < 16x16, 2 = < 32x32, 3 = >= 32x32),
+/// inner index the §9.3.3 tree node (0..=8 for the 18-entry
+/// [`INTRA_MODE_TREE`]). Transcribed verbatim from
+/// `docs/video/vp9/vp9-spec.txt`:
+///
+/// ```text
+/// default_y_mode_probs[ BLOCK_SIZE_GROUPS ][ INTRA_MODES - 1 ] = {
+///     { 65, 32, 18, 144, 162, 194, 41, 51, 98 },    // block_size < 8x8
+///     { 132, 68, 18, 165, 217, 196, 45, 40, 78 },   // block_size < 16x16
+///     { 173, 80, 19, 176, 240, 193, 64, 35, 46 },   // block_size < 32x32
+///     { 221, 135, 38, 194, 248, 121, 96, 85, 29 }   // block_size >= 32x32
+/// }
+/// ```
+pub(crate) const DEFAULT_Y_MODE_PROBS: [[u8; INTRA_MODES - 1]; BLOCK_SIZE_GROUPS] = [
+    [65, 32, 18, 144, 162, 194, 41, 51, 98],   // block_size < 8x8
+    [132, 68, 18, 165, 217, 196, 45, 40, 78],  // block_size < 16x16
+    [173, 80, 19, 176, 240, 193, 64, 35, 46],  // block_size < 32x32
+    [221, 135, 38, 194, 248, 121, 96, 85, 29], // block_size >= 32x32
+];
+
+/// `default_uv_mode_probs[ INTRA_MODES ][ INTRA_MODES - 1 ]` per §9.3 —
+/// the inter-frame `uv_mode` default probabilities loaded into the
+/// compressed-header `uv_mode_probs[ ][ ]`.
+///
+/// Outer index is the §9.3.2 `ctx = y_mode` (the just-decoded luma
+/// mode, DC_PRED..TM_PRED), inner index the §9.3.3 tree node (0..=8).
+/// Transcribed verbatim from `docs/video/vp9/vp9-spec.txt`:
+///
+/// ```text
+/// default_uv_mode_probs[ INTRA_MODES ][ INTRA_MODES - 1 ] = {
+///     { 120, 7, 76, 176, 208, 126, 28, 54, 103 },   // y = dc
+///     { 48, 12, 154, 155, 139, 90, 34, 117, 119 },  // y = v
+///     { 67, 6, 25, 204, 243, 158, 13, 21, 96 },     // y = h
+///     { 97, 5, 44, 131, 176, 139, 48, 68, 97 },     // y = d45
+///     { 83, 5, 42, 156, 111, 152, 26, 49, 152 },    // y = d135
+///     { 80, 5, 58, 178, 74, 83, 33, 62, 145 },      // y = d117
+///     { 86, 5, 32, 154, 192, 168, 14, 22, 163 },    // y = d153
+///     { 85, 5, 32, 156, 216, 148, 19, 29, 73 },     // y = d207
+///     { 77, 7, 64, 116, 132, 122, 37, 126, 120 },   // y = d63
+///     { 101, 21, 107, 181, 192, 103, 19, 67, 125 }  // y = tm
+/// }
+/// ```
+pub(crate) const DEFAULT_UV_MODE_PROBS: [[u8; INTRA_MODES - 1]; INTRA_MODES] = [
+    [120, 7, 76, 176, 208, 126, 28, 54, 103],   // y = dc
+    [48, 12, 154, 155, 139, 90, 34, 117, 119],  // y = v
+    [67, 6, 25, 204, 243, 158, 13, 21, 96],     // y = h
+    [97, 5, 44, 131, 176, 139, 48, 68, 97],     // y = d45
+    [83, 5, 42, 156, 111, 152, 26, 49, 152],    // y = d135
+    [80, 5, 58, 178, 74, 83, 33, 62, 145],      // y = d117
+    [86, 5, 32, 154, 192, 168, 14, 22, 163],    // y = d153
+    [85, 5, 32, 156, 216, 148, 19, 29, 73],     // y = d207
+    [77, 7, 64, 116, 132, 122, 37, 126, 120],   // y = d63
+    [101, 21, 107, 181, 192, 103, 19, 67, 125], // y = tm
+];
+
 // ----- §6.4.6 intra_frame_mode_info -----
 
 /// Output of [`intra_frame_mode_info`].
@@ -962,6 +1056,259 @@ pub(crate) fn intra_frame_mode_info(
         sub_modes,
         uv_mode,
     })
+}
+
+// ----- §6.4.15 intra_block_mode_info -----
+
+/// `intra_mode` per §9.3.2 line 6298.
+///
+/// Walks the §9.3.1 [`INTRA_MODE_TREE`] with probabilities
+/// `y_mode_probs[ ctx ][ node ]` where `ctx = size_group_lookup[ MiSize ]`.
+/// `y_mode_probs` is the compressed-header table (defaults
+/// [`DEFAULT_Y_MODE_PROBS`] adapted by §6.3.14 `read_y_mode_probs( )`),
+/// **not** the keyframe `kf_y_mode_probs` used by
+/// [`default_intra_mode`]. Returns the decoded `PredMode` integer
+/// (0..=9).
+pub(crate) fn intra_mode(
+    coder: &mut BoolCoder<'_>,
+    y_mode_probs: &[[u8; INTRA_MODES - 1]; BLOCK_SIZE_GROUPS],
+    mi_size: u8,
+) -> Result<u8, Error> {
+    debug_assert!((mi_size as usize) < BLOCK_SIZES);
+    let ctx = SIZE_GROUP_LOOKUP[mi_size as usize] as usize;
+    let row = &y_mode_probs[ctx];
+    let value = tree_decode(coder, &INTRA_MODE_TREE, |node| row[node])?;
+    Ok(value as u8)
+}
+
+/// `sub_intra_mode` per §9.3.2 line 6302.
+///
+/// Walks the §9.3.1 [`INTRA_MODE_TREE`] with probabilities
+/// `y_mode_probs[ ctx ][ node ]` where `ctx` is fixed to `0`. Used for
+/// the §6.4.15 sub-8x8 `(idy, idx)` partition cells. Returns the
+/// decoded `PredMode` integer (0..=9).
+pub(crate) fn sub_intra_mode(
+    coder: &mut BoolCoder<'_>,
+    y_mode_probs: &[[u8; INTRA_MODES - 1]; BLOCK_SIZE_GROUPS],
+) -> Result<u8, Error> {
+    let row = &y_mode_probs[0];
+    let value = tree_decode(coder, &INTRA_MODE_TREE, |node| row[node])?;
+    Ok(value as u8)
+}
+
+/// `uv_mode` per §9.3.2 line 6303.
+///
+/// Walks the §9.3.1 [`INTRA_MODE_TREE`] with probabilities
+/// `uv_mode_probs[ ctx ][ node ]` where `ctx = y_mode` (the luma mode
+/// just decoded by [`intra_mode`] / [`sub_intra_mode`]). `uv_mode_probs`
+/// is the compressed-header table (defaults [`DEFAULT_UV_MODE_PROBS`]),
+/// **not** the keyframe `kf_uv_mode_probs` used by [`default_uv_mode`].
+/// Returns the decoded `PredMode` integer (0..=9).
+pub(crate) fn uv_mode(
+    coder: &mut BoolCoder<'_>,
+    uv_mode_probs: &[[u8; INTRA_MODES - 1]; INTRA_MODES],
+    y_mode: u8,
+) -> Result<u8, Error> {
+    debug_assert!((y_mode as usize) < INTRA_MODES);
+    let row = &uv_mode_probs[y_mode as usize];
+    let value = tree_decode(coder, &INTRA_MODE_TREE, |node| row[node])?;
+    Ok(value as u8)
+}
+
+/// Output of [`intra_block_mode_info`].
+///
+/// Mirrors the §6.4.15 free variables: the §6.4.15 fixed reference-frame
+/// pair (`INTRA_FRAME`, `NONE`), a single decoded luma `y_mode`, the
+/// 4-cell `sub_modes[ ]` (replicated from `y_mode` for `MiSize >=
+/// BLOCK_8X8`, filled cell-by-cell in the sub-8x8 walk), and a
+/// `uv_mode`. Unlike [`Vp9IntraMiBlock`], §6.4.15 does **not** decode
+/// `segment_id` / `skip` / `tx_size` — those are read by the §6.4.11
+/// `inter_frame_mode_info( )` driver *before* dispatching to
+/// `intra_block_mode_info( )`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Vp9IntraBlockModeInfo {
+    /// `ref_frame[0]` per §6.4.15. Always [`INTRA_FRAME`].
+    pub ref_frame_0: i32,
+    /// `ref_frame[1]` per §6.4.15. Always [`NONE_REF_FRAME`].
+    pub ref_frame_1: i32,
+    /// `y_mode` per §7.4.5 — the §6.4.15 final luma mode (from
+    /// `intra_mode` for `MiSize >= BLOCK_8X8`; from the last-decoded
+    /// `sub_intra_mode` in the sub-8x8 walk).
+    pub y_mode: u8,
+    /// `sub_modes[ 4 ]` per §6.4.15 / §7.4.5 — the four 4x4 luma
+    /// sub-block modes in `(idy + y2) * 2 + idx + x2` indexing.
+    pub sub_modes: [u8; 4],
+    /// `uv_mode` per §7.4.5 — the chroma mode from `uv_mode`.
+    pub uv_mode: u8,
+}
+
+/// `intra_block_mode_info( )` per §6.4.15.
+///
+/// The inter-frame intra-block mode reader — the companion to the
+/// §6.4.6 [`intra_frame_mode_info`] keyframe driver. Fired by the
+/// §6.4.11 `inter_frame_mode_info( )` driver when a block in a
+/// non-keyframe frame is coded intra (`is_inter == 0`). The spec
+/// listing is:
+///
+/// ```text
+/// intra_block_mode_info( ) {
+///     ref_frame[ 0 ] = INTRA_FRAME
+///     ref_frame[ 1 ] = NONE
+///     if ( MiSize >= BLOCK_8X8 ) {
+///         intra_mode                                                  T
+///         y_mode = intra_mode
+///         for( b = 0; b < 4; b++ )
+///             sub_modes[ b ] = y_mode
+///     } else {
+///         num4x4w = num_4x4_blocks_wide_lookup[ MiSize ]
+///         num4x4h = num_4x4_blocks_high_lookup[ MiSize ]
+///         for ( idy = 0; idy < 2; idy += num4x4h ) {
+///             for ( idx = 0; idx < 2; idx += num4x4w ) {
+///                 sub_intra_mode                                      T
+///                 for ( y2 = 0; y2 < num4x4h; y2++ )
+///                     for( x2 = 0; x2 < num4x4w; x2++ )
+///                         sub_modes[ (idy + y2) * 2 + idx + x2 ] = sub_intra_mode
+///             }
+///         }
+///         y_mode = sub_intra_mode
+///     }
+///     uv_mode                                                         T
+/// }
+/// ```
+///
+/// Differences from §6.4.6:
+///
+/// * Probabilities come from the §9.3 compressed-header `y_mode_probs`
+///   / `uv_mode_probs` (defaults [`DEFAULT_Y_MODE_PROBS`] /
+///   [`DEFAULT_UV_MODE_PROBS`], per-frame `diff_update_prob`'d), not
+///   the §10.5 keyframe `kf_*_mode_probs` tables.
+/// * The §9.3.2 context for `intra_mode` is `size_group_lookup[ MiSize ]`
+///   (not the keyframe `(abovemode, leftmode)` pair), `sub_intra_mode`
+///   uses context `0`, and `uv_mode` uses context `y_mode`. There is no
+///   neighbour-`SubModes` lookup, so [`intra_block_mode_info`] takes no
+///   neighbour bundle.
+/// * `segment_id` / `skip` / `tx_size` are decoded earlier by the
+///   §6.4.11 driver, so they are absent here.
+///
+/// Arguments:
+///
+/// * `coder` — the §9.2 entropy decoder positioned at the start of the
+///   block's intra-mode bits (after the §6.4.11 `read_is_inter( )` /
+///   `read_tx_size( )`).
+/// * `mi_size` — the §7.4.3 `MiSize` (`BLOCK_*` from [`crate::residual`]).
+/// * `y_mode_probs` / `uv_mode_probs` — the §9.3 compressed-header
+///   tables.
+pub(crate) fn intra_block_mode_info(
+    coder: &mut BoolCoder<'_>,
+    mi_size: u8,
+    y_mode_probs: &[[u8; INTRA_MODES - 1]; BLOCK_SIZE_GROUPS],
+    uv_mode_probs: &[[u8; INTRA_MODES - 1]; INTRA_MODES],
+) -> Result<Vp9IntraBlockModeInfo, Error> {
+    // §6.4.15: ref_frame[ 0 ] = INTRA_FRAME ; ref_frame[ 1 ] = NONE
+    let mut sub_modes = [DC_PRED; 4];
+    let y_mode;
+    if mi_size >= BLOCK_8X8 {
+        // §6.4.15 `MiSize >= BLOCK_8X8` arm:
+        //   intra_mode ; y_mode = intra_mode ; sub_modes[ b ] = y_mode
+        let mode = intra_mode(coder, y_mode_probs, mi_size)?;
+        y_mode = mode;
+        sub_modes = [mode; 4];
+    } else {
+        // §6.4.15 sub-8x8 arm: walk the (idy, idx) grid stepped by
+        // num4x4h / num4x4w, decoding one `sub_intra_mode` per cell and
+        // replicating it across the (num4x4h × num4x4w) `sub_modes[ ]`
+        // sub-grid. `y_mode` keeps the *last* decoded `sub_intra_mode`.
+        let num4x4w = NUM_4X4_BLOCKS_WIDE_LOOKUP[mi_size as usize] as usize;
+        let num4x4h = NUM_4X4_BLOCKS_HIGH_LOOKUP[mi_size as usize] as usize;
+        debug_assert!((1..=2).contains(&num4x4w));
+        debug_assert!((1..=2).contains(&num4x4h));
+
+        let mut last_mode = DC_PRED;
+        let mut idy = 0usize;
+        while idy < 2 {
+            let mut idx = 0usize;
+            while idx < 2 {
+                // §9.3.2 `sub_intra_mode` uses y_mode_probs[ 0 ] — no
+                // neighbour derivation.
+                let mode = sub_intra_mode(coder, y_mode_probs)?;
+                last_mode = mode;
+                for y2 in 0..num4x4h {
+                    for x2 in 0..num4x4w {
+                        sub_modes[(idy + y2) * 2 + idx + x2] = mode;
+                    }
+                }
+                idx += num4x4w;
+            }
+            idy += num4x4h;
+        }
+        y_mode = last_mode;
+    }
+
+    // §6.4.15 final line: uv_mode (context = y_mode).
+    let uv = uv_mode(coder, uv_mode_probs, y_mode)?;
+
+    Ok(Vp9IntraBlockModeInfo {
+        ref_frame_0: INTRA_FRAME,
+        ref_frame_1: NONE_REF_FRAME,
+        y_mode,
+        sub_modes,
+        uv_mode: uv,
+    })
+}
+
+// ----- §6.4.5 mode_info dispatch -----
+
+/// Outcome of the §6.4.5 `mode_info( )` dispatch.
+///
+/// §6.4.5 routes a per-block mode-info decode to [`intra_frame_mode_info`]
+/// when `FrameIsIntra`, else to the §6.4.11 `inter_frame_mode_info( )`
+/// driver. This enum carries the two intra-side products the round-134
+/// surface decodes today: the keyframe [`Vp9IntraMiBlock`] (full
+/// segment/skip/tx + modes) and the inter-frame intra-block
+/// [`Vp9IntraBlockModeInfo`] (modes only — the §6.4.11 driver reads
+/// segment/skip/tx before dispatching here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Vp9ModeInfo {
+    /// `FrameIsIntra` path — §6.4.6 `intra_frame_mode_info( )`.
+    IntraFrame(Vp9IntraMiBlock),
+    /// `!FrameIsIntra`, `is_inter == 0` path — §6.4.11
+    /// `inter_frame_mode_info( )` reaching §6.4.15
+    /// `intra_block_mode_info( )`.
+    InterFrameIntraBlock(Vp9IntraBlockModeInfo),
+}
+
+/// Dispatch the §6.4.15 inter-frame intra-block path of §6.4.5
+/// `mode_info( )`.
+///
+/// §6.4.5 reads:
+///
+/// ```text
+/// mode_info( ) {
+///     if ( FrameIsIntra )
+///         intra_frame_mode_info( )
+///     else
+///         inter_frame_mode_info( )
+/// }
+/// ```
+///
+/// The `FrameIsIntra` branch is [`intra_frame_mode_info`]. This helper
+/// covers the `else` branch's intra sub-path: the §6.4.11
+/// `inter_frame_mode_info( )` driver, after decoding
+/// `inter_segment_id( )` / `read_skip( )` / `read_is_inter( )` /
+/// `read_tx_size( )`, dispatches to [`intra_block_mode_info`] when the
+/// decoded `is_inter == 0`. Wiring it through [`Vp9ModeInfo`] keeps the
+/// §6.4.5 dispatch shape explicit alongside the keyframe path; the
+/// surrounding §6.4.11 prelude (`inter_segment_id` / `read_is_inter` /
+/// the inter-block `inter_block_mode_info( )` arm) lands once its
+/// reference-buffer-dependent primitives do.
+pub(crate) fn inter_frame_intra_block_mode_info(
+    coder: &mut BoolCoder<'_>,
+    mi_size: u8,
+    y_mode_probs: &[[u8; INTRA_MODES - 1]; BLOCK_SIZE_GROUPS],
+    uv_mode_probs: &[[u8; INTRA_MODES - 1]; INTRA_MODES],
+) -> Result<Vp9ModeInfo, Error> {
+    let block = intra_block_mode_info(coder, mi_size, y_mode_probs, uv_mode_probs)?;
+    Ok(Vp9ModeInfo::InterFrameIntraBlock(block))
 }
 
 #[cfg(test)]
@@ -2195,5 +2542,383 @@ mod tests {
         assert_eq!(INTRA_FRAME, 0);
         assert_eq!(NONE_REF_FRAME, -1);
         const _: () = assert!(NONE_REF_FRAME < INTRA_FRAME);
+    }
+
+    // ----- §9.3.2 size_group_lookup / §9.3 default_y_mode_probs /
+    //       default_uv_mode_probs tables -----
+
+    #[test]
+    fn size_group_lookup_table_matches_spec_listing() {
+        // §9.3.2 spec line 7120 verbatim:
+        //   size_group_lookup[ BLOCK_SIZES ] =
+        //     {0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3}
+        assert_eq!(SIZE_GROUP_LOOKUP.len(), BLOCK_SIZES);
+        assert_eq!(SIZE_GROUP_LOOKUP, [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3]);
+        // Block-size anchors: BLOCK_4X4..BLOCK_8X4 -> group 0,
+        // BLOCK_8X8..BLOCK_16X8 -> 1, BLOCK_16X16..BLOCK_32X16 -> 2,
+        // BLOCK_32X32..BLOCK_64X64 -> 3.
+        assert_eq!(SIZE_GROUP_LOOKUP[BLOCK_4X4 as usize], 0);
+        assert_eq!(SIZE_GROUP_LOOKUP[BLOCK_8X4 as usize], 0);
+        assert_eq!(SIZE_GROUP_LOOKUP[BLOCK_8X8 as usize], 1);
+        assert_eq!(SIZE_GROUP_LOOKUP[BLOCK_16X16 as usize], 2);
+        assert_eq!(SIZE_GROUP_LOOKUP[BLOCK_32X32 as usize], 3);
+        assert_eq!(SIZE_GROUP_LOOKUP[BLOCK_64X64 as usize], 3);
+        // Every group index must be a valid §9.3 y_mode_probs row.
+        for &g in SIZE_GROUP_LOOKUP.iter() {
+            assert!((g as usize) < BLOCK_SIZE_GROUPS);
+        }
+    }
+
+    #[test]
+    fn default_y_mode_probs_table_shape_and_anchors() {
+        // Shape: BLOCK_SIZE_GROUPS (4) × (INTRA_MODES - 1) (9).
+        assert_eq!(DEFAULT_Y_MODE_PROBS.len(), BLOCK_SIZE_GROUPS);
+        assert_eq!(DEFAULT_Y_MODE_PROBS[0].len(), INTRA_MODES - 1);
+
+        // §9.3 default_y_mode_probs listing (verbatim):
+        //   { 65, 32, 18, 144, 162, 194, 41, 51, 98 },   // < 8x8
+        //   { 132, 68, 18, 165, 217, 196, 45, 40, 78 },  // < 16x16
+        //   { 173, 80, 19, 176, 240, 193, 64, 35, 46 },  // < 32x32
+        //   { 221, 135, 38, 194, 248, 121, 96, 85, 29 }  // >= 32x32
+        assert_eq!(
+            DEFAULT_Y_MODE_PROBS[0],
+            [65, 32, 18, 144, 162, 194, 41, 51, 98]
+        );
+        assert_eq!(
+            DEFAULT_Y_MODE_PROBS[1],
+            [132, 68, 18, 165, 217, 196, 45, 40, 78]
+        );
+        assert_eq!(
+            DEFAULT_Y_MODE_PROBS[2],
+            [173, 80, 19, 176, 240, 193, 64, 35, 46]
+        );
+        assert_eq!(
+            DEFAULT_Y_MODE_PROBS[3],
+            [221, 135, 38, 194, 248, 121, 96, 85, 29]
+        );
+
+        // §9.2 minimum-probability sanity.
+        for row in DEFAULT_Y_MODE_PROBS.iter() {
+            for &p in row.iter() {
+                assert!(p >= 1, "default_y_mode_probs entry {p} below §9.2 min");
+            }
+        }
+    }
+
+    #[test]
+    fn default_uv_mode_probs_table_shape_and_anchors() {
+        // Shape: INTRA_MODES (10) × (INTRA_MODES - 1) (9).
+        assert_eq!(DEFAULT_UV_MODE_PROBS.len(), INTRA_MODES);
+        assert_eq!(DEFAULT_UV_MODE_PROBS[0].len(), INTRA_MODES - 1);
+
+        // §9.3 default_uv_mode_probs listing anchors (verbatim):
+        //   { 120, 7, 76, 176, 208, 126, 28, 54, 103 },  // y = dc
+        //   { 67, 6, 25, 204, 243, 158, 13, 21, 96 },    // y = h
+        //   { 101, 21, 107, 181, 192, 103, 19, 67, 125 } // y = tm (last)
+        assert_eq!(
+            DEFAULT_UV_MODE_PROBS[DC_PRED as usize],
+            [120, 7, 76, 176, 208, 126, 28, 54, 103]
+        );
+        assert_eq!(
+            DEFAULT_UV_MODE_PROBS[H_PRED as usize],
+            [67, 6, 25, 204, 243, 158, 13, 21, 96]
+        );
+        assert_eq!(
+            DEFAULT_UV_MODE_PROBS[TM_PRED as usize],
+            [101, 21, 107, 181, 192, 103, 19, 67, 125]
+        );
+
+        // §9.2 minimum-probability sanity.
+        for row in DEFAULT_UV_MODE_PROBS.iter() {
+            for &p in row.iter() {
+                assert!(p >= 1, "default_uv_mode_probs entry {p} below §9.2 min");
+            }
+        }
+    }
+
+    // ----- §9.3.2 intra_mode / sub_intra_mode / uv_mode readers -----
+
+    #[test]
+    fn intra_mode_zero_buffer_picks_dc_pred() {
+        // Zero coder pins every bit to 0; INTRA_MODE_TREE[0] = 0 = DC_PRED.
+        let mut coder = zero_coder();
+        let mode = intra_mode(&mut coder, &DEFAULT_Y_MODE_PROBS, BLOCK_16X16).unwrap();
+        assert_eq!(mode, DC_PRED);
+    }
+
+    #[test]
+    fn intra_mode_uses_size_group_lookup_ctx_row() {
+        // §9.3.2: ctx = size_group_lookup[ MiSize ]. With the zero coder
+        // the walk is a single read at node=0 of the selected row; we
+        // instrument tree_decode to confirm the row reached is
+        // y_mode_probs[ size_group_lookup[ MiSize ] ]. BLOCK_16X16 maps
+        // to group 2, whose node-0 prob is 173.
+        let ctx = SIZE_GROUP_LOOKUP[BLOCK_16X16 as usize] as usize;
+        assert_eq!(ctx, 2);
+        let mut coder = zero_coder();
+        let calls = std::cell::RefCell::new(Vec::<(usize, u8)>::new());
+        let row = &DEFAULT_Y_MODE_PROBS[ctx];
+        let value = tree_decode(&mut coder, &INTRA_MODE_TREE, |node| {
+            let p = row[node];
+            calls.borrow_mut().push((node, p));
+            p
+        })
+        .unwrap();
+        assert_eq!(value, 0); // DC_PRED.
+        assert_eq!(calls.borrow().len(), 1);
+        assert_eq!(calls.borrow()[0], (0, 173));
+    }
+
+    #[test]
+    fn intra_mode_bias_buffer_block_lt_8x8_picks_d207_pred() {
+        // DEFAULT_Y_MODE_PROBS[ size_group_lookup[BLOCK_4X4]=0 ] =
+        //   [65, 32, 18, 144, 162, 194, 41, 51, 98]. With the bias
+        // buffer (post-marker BoolValue=127, BoolRange=128) every node
+        // takes the right branch, walking INTRA_MODE_TREE to the
+        // -D207_PRED leaf (value 7). Derived from a direct §9.2.2
+        // stepping over the crate's own BoolCoder; no external library
+        // consulted.
+        let bytes = make_bias_buffer(0x7F);
+        let mut coder = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mode = intra_mode(&mut coder, &DEFAULT_Y_MODE_PROBS, BLOCK_4X4).unwrap();
+        assert_eq!(mode, D207_PRED);
+    }
+
+    #[test]
+    fn sub_intra_mode_uses_ctx_zero_row() {
+        // §9.3.2: sub_intra_mode ctx is fixed at 0. Instrument
+        // tree_decode to confirm the node-0 prob is y_mode_probs[0][0] =
+        // 65 (the group-0 row), independent of MiSize.
+        let mut coder = zero_coder();
+        let calls = std::cell::RefCell::new(Vec::<u8>::new());
+        let row = &DEFAULT_Y_MODE_PROBS[0];
+        let value = tree_decode(&mut coder, &INTRA_MODE_TREE, |node| {
+            let p = row[node];
+            calls.borrow_mut().push(p);
+            p
+        })
+        .unwrap();
+        assert_eq!(value, 0);
+        assert_eq!(calls.borrow()[0], 65);
+        // And the real reader picks DC_PRED on the zero buffer.
+        let mut coder = zero_coder();
+        assert_eq!(
+            sub_intra_mode(&mut coder, &DEFAULT_Y_MODE_PROBS).unwrap(),
+            DC_PRED
+        );
+    }
+
+    #[test]
+    fn uv_mode_zero_buffer_picks_dc_pred() {
+        // Zero coder -> first leaf DC_PRED, regardless of y_mode ctx.
+        let mut coder = zero_coder();
+        let uv = uv_mode(&mut coder, &DEFAULT_UV_MODE_PROBS, V_PRED).unwrap();
+        assert_eq!(uv, DC_PRED);
+    }
+
+    #[test]
+    fn uv_mode_uses_y_mode_as_ctx_row() {
+        // §9.3.2: uv_mode ctx = y_mode. With the zero coder, instrument
+        // to confirm the row reached is uv_mode_probs[ y_mode ]. For
+        // y_mode = H_PRED the node-0 prob is 67.
+        let mut coder = zero_coder();
+        let calls = std::cell::RefCell::new(Vec::<u8>::new());
+        let row = &DEFAULT_UV_MODE_PROBS[H_PRED as usize];
+        let value = tree_decode(&mut coder, &INTRA_MODE_TREE, |node| {
+            let p = row[node];
+            calls.borrow_mut().push(p);
+            p
+        })
+        .unwrap();
+        assert_eq!(value, 0);
+        assert_eq!(calls.borrow()[0], 67);
+    }
+
+    #[test]
+    fn uv_mode_bias_buffer_y_dc_picks_d207_pred() {
+        // DEFAULT_UV_MODE_PROBS[DC_PRED] =
+        //   [120, 7, 76, 176, 208, 126, 28, 54, 103]. Bias buffer walks
+        // every node right to the -D207_PRED leaf (value 7). Direct
+        // §9.2.2 stepping over the crate's BoolCoder.
+        let bytes = make_bias_buffer(0x7F);
+        let mut coder = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let uv = uv_mode(&mut coder, &DEFAULT_UV_MODE_PROBS, DC_PRED).unwrap();
+        assert_eq!(uv, D207_PRED);
+    }
+
+    // ----- §6.4.15 intra_block_mode_info -----
+
+    #[test]
+    fn intra_block_mode_info_zero_buffer_all_dc_pred() {
+        // §6.4.15 with MiSize >= BLOCK_8X8 and the zero coder:
+        //   ref_frame[0]=INTRA_FRAME, ref_frame[1]=NONE
+        //   intra_mode -> DC_PRED ; y_mode=DC_PRED ; sub_modes=[DC;4]
+        //   uv_mode -> DC_PRED
+        let mut coder = zero_coder();
+        let block = intra_block_mode_info(
+            &mut coder,
+            BLOCK_8X8,
+            &DEFAULT_Y_MODE_PROBS,
+            &DEFAULT_UV_MODE_PROBS,
+        )
+        .unwrap();
+        assert_eq!(block.ref_frame_0, INTRA_FRAME);
+        assert_eq!(block.ref_frame_1, NONE_REF_FRAME);
+        assert_eq!(block.y_mode, DC_PRED);
+        assert_eq!(block.sub_modes, [DC_PRED; 4]);
+        assert_eq!(block.uv_mode, DC_PRED);
+    }
+
+    #[test]
+    fn intra_block_mode_info_large_block_replicates_y_mode() {
+        // BLOCK_64X64: one intra_mode decode replicated into all four
+        // sub_modes[ ] per the §6.4.15 `for(b=0;b<4;b++) sub_modes[b]=
+        // y_mode` line.
+        let mut coder = zero_coder();
+        let block = intra_block_mode_info(
+            &mut coder,
+            BLOCK_64X64,
+            &DEFAULT_Y_MODE_PROBS,
+            &DEFAULT_UV_MODE_PROBS,
+        )
+        .unwrap();
+        for cell in block.sub_modes.iter() {
+            assert_eq!(*cell, block.y_mode);
+        }
+    }
+
+    #[test]
+    fn intra_block_mode_info_bias_buffer_decodes_d207_then_d153() {
+        // BLOCK_8X8 (ctx = size_group_lookup[BLOCK_8X8] = 1) with the
+        // bias buffer. The driver runs `intra_mode` (over
+        // y_mode_probs[1] = [132, 68, 18, 165, 217, 196, 45, 40, 78])
+        // then `uv_mode` (over uv_mode_probs[y_mode]) on the *same*
+        // coder, so the second walk continues from the first walk's
+        // post-renorm BoolValue/BoolRange — it is a single contiguous
+        // §9.2.2 stepping, not two independent ones.
+        //
+        // The first full INTRA_MODE_TREE walk (all-high-prob row pushing
+        // every node right) reaches the -D207_PRED leaf (value 7). The
+        // subsequent uv_mode walk over uv_mode_probs[7] =
+        // [85, 5, 32, 156, 216, 148, 19, 29, 73] continues the same
+        // stepping and lands on the -D153_PRED leaf (value 6). Both
+        // values were derived from a direct §9.2.2 stepping of the
+        // crate's own BoolCoder; no external library consulted.
+        let bytes = make_bias_buffer(0x7F);
+        let mut coder = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let block = intra_block_mode_info(
+            &mut coder,
+            BLOCK_8X8,
+            &DEFAULT_Y_MODE_PROBS,
+            &DEFAULT_UV_MODE_PROBS,
+        )
+        .unwrap();
+        assert_eq!(block.y_mode, D207_PRED);
+        assert_eq!(block.sub_modes, [D207_PRED; 4]);
+        assert_eq!(block.uv_mode, D153_PRED);
+    }
+
+    #[test]
+    fn intra_block_mode_info_sub_8x8_walks_grid() {
+        // BLOCK_4X4: num4x4w=num4x4h=1, four sub_intra_mode reads. Zero
+        // coder -> all DC_PRED, y_mode = last decoded = DC_PRED.
+        let mut coder = zero_coder();
+        let block = intra_block_mode_info(
+            &mut coder,
+            BLOCK_4X4,
+            &DEFAULT_Y_MODE_PROBS,
+            &DEFAULT_UV_MODE_PROBS,
+        )
+        .unwrap();
+        assert_eq!(block.sub_modes, [DC_PRED; 4]);
+        assert_eq!(block.y_mode, DC_PRED);
+        assert_eq!(block.uv_mode, DC_PRED);
+    }
+
+    #[test]
+    fn intra_block_mode_info_sub_8x8_rectangular_replicates_per_cell() {
+        // BLOCK_4X8: num4x4w=1, num4x4h=2 -> 2 sub_intra_mode reads
+        // (idx outer visits {0,1}; idy outer visits {0}). Each read
+        // covers two sub_modes[ ] cells. Zero coder -> all DC_PRED.
+        let mut coder = zero_coder();
+        let block = intra_block_mode_info(
+            &mut coder,
+            BLOCK_4X8,
+            &DEFAULT_Y_MODE_PROBS,
+            &DEFAULT_UV_MODE_PROBS,
+        )
+        .unwrap();
+        assert_eq!(block.sub_modes, [DC_PRED; 4]);
+        assert_eq!(block.y_mode, DC_PRED);
+    }
+
+    #[test]
+    fn intra_block_mode_info_no_segment_skip_tx_fields() {
+        // §6.4.15 (unlike §6.4.6) decodes only modes — the struct
+        // carries no segment_id/skip/tx_size. Confirm the ref-frame
+        // triple is intra-only.
+        let mut coder = zero_coder();
+        let block = intra_block_mode_info(
+            &mut coder,
+            BLOCK_32X32,
+            &DEFAULT_Y_MODE_PROBS,
+            &DEFAULT_UV_MODE_PROBS,
+        )
+        .unwrap();
+        assert_eq!(block.ref_frame_0, INTRA_FRAME);
+        assert_eq!(block.ref_frame_1, NONE_REF_FRAME);
+    }
+
+    // ----- §6.4.5 mode_info dispatch -----
+
+    #[test]
+    fn mode_info_dispatch_inter_frame_intra_block_wraps_intra_block() {
+        // The §6.4.5 dispatcher's `!FrameIsIntra` / `is_inter == 0`
+        // sub-path returns the §6.4.15 product wrapped in the
+        // InterFrameIntraBlock variant.
+        let mut coder = zero_coder();
+        let mi = inter_frame_intra_block_mode_info(
+            &mut coder,
+            BLOCK_8X8,
+            &DEFAULT_Y_MODE_PROBS,
+            &DEFAULT_UV_MODE_PROBS,
+        )
+        .unwrap();
+        match mi {
+            Vp9ModeInfo::InterFrameIntraBlock(block) => {
+                assert_eq!(block.ref_frame_0, INTRA_FRAME);
+                assert_eq!(block.y_mode, DC_PRED);
+                assert_eq!(block.uv_mode, DC_PRED);
+            }
+            other => panic!("expected InterFrameIntraBlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mode_info_dispatch_keyframe_path_uses_intra_frame_mode_info() {
+        // The §6.4.5 `FrameIsIntra` path is intra_frame_mode_info; pin
+        // that the keyframe driver still produces a Vp9IntraMiBlock the
+        // dispatcher's IntraFrame variant can carry.
+        let mut coder = zero_coder();
+        let block = intra_frame_mode_info(
+            &mut coder,
+            BLOCK_8X8,
+            false,
+            false,
+            None,
+            false,
+            TxMode::TxModeSelect,
+            &zero_tx_probs(),
+            &[128, 128, 128],
+            NeighbourSkips::default(),
+            NeighbourTxSizes::default(),
+            default_intra_nb(),
+        )
+        .unwrap();
+        let mi = Vp9ModeInfo::IntraFrame(block);
+        match mi {
+            Vp9ModeInfo::IntraFrame(b) => assert_eq!(b.y_mode, DC_PRED),
+            other => panic!("expected IntraFrame, got {other:?}"),
+        }
     }
 }

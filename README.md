@@ -5,6 +5,45 @@ Bitstream & Decoding Process Specification v0.7.
 
 ## Status — 2026-05-25
 
+**§6.4.15 `intra_block_mode_info()` inter-frame intra-block reader.**
+The companion to the §6.4.6 `intra_frame_mode_info()` keyframe driver,
+fired by the §6.4.11 `inter_frame_mode_info()` path when a block in a
+non-keyframe frame is coded intra (`is_inter == 0`):
+
+* §9.3.2 `size_group_lookup[BLOCK_SIZES]`
+  (`{0,0,0,1,1,1,2,2,2,3,3,3,3}`) and §9.3
+  `default_y_mode_probs[BLOCK_SIZE_GROUPS][INTRA_MODES - 1]` (4 × 9) /
+  `default_uv_mode_probs[INTRA_MODES][INTRA_MODES - 1]` (10 × 9)
+  transcribed verbatim — the compressed-header `y_mode_probs` /
+  `uv_mode_probs` defaults, distinct from the §10.5 keyframe
+  `kf_*_mode_probs`. Per-table shape + anchor + §9.2 min-prob tests.
+* `intra_mode( coder, y_mode_probs, mi_size )` — §9.3.3 walk over
+  `intra_mode_tree` with ctx `size_group_lookup[MiSize]`;
+  `sub_intra_mode( coder, y_mode_probs )` — ctx fixed at 0;
+  `uv_mode( coder, uv_mode_probs, y_mode )` — ctx `y_mode`. Each ctx
+  derivation has an instrumented-callback test pinning the row reached,
+  plus hand-traced bias-buffer cases (`intra_mode` / `uv_mode` →
+  `D207_PRED`).
+* `intra_block_mode_info()` (§6.4.15) → `Vp9IntraBlockModeInfo
+  { ref_frame_0, ref_frame_1, y_mode, sub_modes[4], uv_mode }`.
+  `ref_frame[0] = INTRA_FRAME`, `ref_frame[1] = NONE`; the
+  `MiSize >= BLOCK_8X8` arm decodes one `intra_mode` replicated across
+  `sub_modes[]`, the sub-8x8 arm walks the `(idy, idx)` grid decoding
+  one `sub_intra_mode` per cell (`y_mode` = last). Unlike §6.4.6 it
+  reads **only** modes — `segment_id` / `skip` / `tx_size` are decoded
+  by the §6.4.11 driver beforehand. A per-block bias-buffer scenario
+  pins the contiguous `intra_mode → uv_mode` decode
+  (`D207_PRED` then `D153_PRED`).
+* §6.4.5 `mode_info()` dispatch shape: a `Vp9ModeInfo` enum with
+  `IntraFrame(Vp9IntraMiBlock)` (the `FrameIsIntra` /
+  `intra_frame_mode_info()` path) and
+  `InterFrameIntraBlock(Vp9IntraBlockModeInfo)` (the `!FrameIsIntra`,
+  `is_inter == 0` / `intra_block_mode_info()` sub-path), plus
+  `inter_frame_intra_block_mode_info()` wiring the latter. The
+  surrounding §6.4.11 prelude (`inter_segment_id` / `read_is_inter` /
+  the `inter_block_mode_info()` arm) lands when its
+  reference-buffer-dependent primitives do.
+
 **Round 17: §6.4.6 `intra_frame_mode_info()` keyframe driver.** Round
 17 wires the rounds 15 / 16 primitives into the §6.4.6 per-block
 mode-info reader for keyframe (and intra-only) frames — the spec's
@@ -62,13 +101,8 @@ top-level entry point for an intra MI block:
   side; `DC_PRED` is substituted when `avail_u` / `avail_l` is false
   per the §9.3.2 fallback.
 
-Out of scope for round 17: the §6.4.15 `intra_block_mode_info` (used
-on intra blocks within **inter** frames — the §6.4.11
-`inter_frame_mode_info()` is the §6.4.6 counterpart for inter frames;
-the intra-block branch within that calls `intra_block_mode_info`
-which uses `y_mode_probs[size_group_lookup[MiSize]][node]` /
-`y_mode_probs[0][node]` / `uv_mode_probs[y_mode][node]` from the
-compressed header rather than the keyframe `kf_*_mode_probs` tables);
+Out of scope for round 17 (the §6.4.15 `intra_block_mode_info` reader
+itself landed subsequently — see the section above):
 inter-frame mode info (§6.4.11+, blocked on reference-buffer state);
 the §8.4 `counts_intra_mode` / `counts_uv_mode` probability-adaption
 accumulators (§9.3.4 bookkeeping); and the `SubModes[ ][ ][ ]` /

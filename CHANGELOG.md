@@ -6,6 +6,40 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **§6.4.15 `intra_block_mode_info( )` inter-frame intra-block reader
+  (extending the crate-local `mode_info` module).** The companion to
+  the §6.4.6 keyframe driver, for intra blocks within non-keyframe
+  frames:
+  * §9.3.2 `SIZE_GROUP_LOOKUP[BLOCK_SIZES]`
+    (`{0,0,0,1,1,1,2,2,2,3,3,3,3}`) plus §9.3
+    `DEFAULT_Y_MODE_PROBS[BLOCK_SIZE_GROUPS][INTRA_MODES - 1]` (4 × 9)
+    and `DEFAULT_UV_MODE_PROBS[INTRA_MODES][INTRA_MODES - 1]` (10 × 9)
+    transcribed verbatim from `docs/video/vp9/vp9-spec.txt` — the
+    compressed-header `y_mode_probs` / `uv_mode_probs` defaults
+    (distinct from the §10.5 keyframe `kf_*_mode_probs`).
+  * `intra_mode( coder, y_mode_probs, mi_size )` (§9.3.2 ctx =
+    `size_group_lookup[MiSize]`), `sub_intra_mode( coder, y_mode_probs )`
+    (ctx = 0), and `uv_mode( coder, uv_mode_probs, y_mode )` (ctx =
+    `y_mode`) — §9.3.3 walks over `INTRA_MODE_TREE` with the §9.3
+    compressed-header rows.
+  * `intra_block_mode_info( )` (§6.4.15) returning
+    `Vp9IntraBlockModeInfo { ref_frame_0, ref_frame_1, y_mode,
+    sub_modes[4], uv_mode }`. Sets `ref_frame[0] = INTRA_FRAME`,
+    `ref_frame[1] = NONE`; the `MiSize >= BLOCK_8X8` arm decodes one
+    `intra_mode` replicated across `sub_modes[ ]`, the sub-8x8 arm
+    walks the `(idy, idx)` grid decoding one `sub_intra_mode` per cell
+    (`y_mode` = last decoded). Reads modes only — `segment_id` / `skip`
+    / `tx_size` are decoded by the §6.4.11 driver beforehand.
+  * §6.4.5 `mode_info( )` dispatch: a `Vp9ModeInfo` enum
+    (`IntraFrame` / `InterFrameIntraBlock`) plus
+    `inter_frame_intra_block_mode_info( )` wiring the §6.4.15 path
+    alongside the existing §6.4.6 keyframe path.
+  * Per-table shape + anchor + §9.2 min-prob tests for
+    `SIZE_GROUP_LOOKUP` / `DEFAULT_Y_MODE_PROBS` / `DEFAULT_UV_MODE_PROBS`,
+    instrumented-callback ctx-row tests for each reader, hand-traced
+    bias-buffer decodes, and a per-block decode scenario (BLOCK_8X8
+    bias buffer → `y_mode = D207_PRED`, `uv_mode = D153_PRED`). The
+    surface stays crate-internal (`pub(crate)`).
 * **Round 17: §6.4.6 `intra_frame_mode_info( )` keyframe driver
   (extending the crate-local `mode_info` module).** Wires the rounds
   15 / 16 primitives into the top-level §6.4.6 per-block mode-info

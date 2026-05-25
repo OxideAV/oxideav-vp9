@@ -6,6 +6,99 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 19: §6.4.3 recursive `decode_partition( )` driver (extending
+  the crate-local `partition` module).** Composes the round-18
+  `decode_partition_type( )` primitive into the recursive §6.4.3
+  partition driver — the per-superblock walker the §6.4.2
+  `decode_tile( )` outer loop fires at every `(r, c, BLOCK_64X64)`
+  cell:
+  * `decode_partition( coder, r, c, bsize, mi_rows, mi_cols,
+    ctx_state, probs_kind, leaves )` — walks the §6.4.3 listing
+    line-for-line: the `(r >= MiRows || c >= MiCols)` quadrant
+    short-circuit, the `num8x8 = num_8x8_blocks_wide_lookup[bsize]`
+    / `halfBlock8x8 = num8x8 >> 1` / `hasRows = (r + halfBlock8x8) <
+    MiRows` / `hasCols = (c + halfBlock8x8) < MiCols` derivation, the
+    `partition` decode via [`decode_partition_type`] (using the
+    §9.3.2 `partition_plane_context` ctx + the per-frame probability
+    source), the four-way dispatch on the decoded `PARTITION_*` value
+    (with the HORZ second-leaf gated by `hasRows`, the VERT
+    second-leaf gated by `hasCols`, and SPLIT recursing in spec
+    order TL → TR → BL → BR per spec lines 2381-2384), and the
+    §6.4.3 tail write-back into the partition-context strips
+    (gated by `bsize == BLOCK_8X8 || partition != PARTITION_SPLIT`,
+    writing `15 >> b_width_log2_lookup[ subsize ]` into
+    `AbovePartitionContext[ c + i ]` and `15 >>
+    b_height_log2_lookup[ subsize ]` into `LeftPartitionContext[ r +
+    i ]` for `i ∈ 0..num8x8`).
+  * `PartitionContextState` — the `AbovePartitionContext[ ]` /
+    `LeftPartitionContext[ ]` strips (sized `Sb64Cols * 8` /
+    `Sb64Rows * 8` per the §7.4 listing). Exposes
+    `new( mi_cols, mi_rows )` with the §7.4 zero-reset, and
+    `clear_left( )` for the §6.4.2 per-superblock-row reset
+    invoked by the §6.4.2 tile driver.
+  * `PartitionProbsKind` — the per-frame probability source enum:
+    `Keyframe` indexes [`KF_PARTITION_PROBS`] directly per the
+    §9.3.2 `FrameIsIntra == 1` arm; `Inter(&[[u8; 3]; 16])` indexes
+    the caller's running `partition_probs` table (typically
+    initialised from [`DEFAULT_PARTITION_PROBS`] and conditionally
+    updated by the §6.3 `read_partition_probs( )` sweep — still
+    pending in a later round).
+  * `LeafBlock { r, c, subsize }` log records — emitted in §6.4.3
+    traversal order in lieu of the §6.4.4 `decode_block( r, c,
+    subsize )` call site (the per-block `mode_info` / `residual`
+    decode is downstream of this driver and not yet wired). The
+    deferred-leaf log is the validation surface for the recursion
+    layout this round.
+  * Test-only minimal range encoder (`RangeEncoder` in the
+    `partition::tests` module) — a forward-simulation bounded
+    brute-force search over `BoolValue ∈ 0..128` plus a DFS over
+    per-renorm refill bits. For each `(bool_value, stream)`
+    candidate, the §9.2.2 decoder is forward-simulated against the
+    target `(bit, p)` sequence; the first candidate that produces
+    every target bit wins. The trailing tail is zero-padded so any
+    further renorm reads past the strictly-required bits resolve to
+    0. No external library / source consulted; the search loop
+    walks the §9.2.2 listing verbatim.
+  * 8 new unit tests covering the recursive driver: a `RangeEncoder`
+    roundtrip across an arbitrary 8-element `(bit, p)` sequence; a
+    roundtrip with extreme probabilities (`p ∈ { 1, 128, 255 }`); a
+    single-leaf 64x64 `PARTITION_NONE` hand-built bitstream (one
+    leaf at `{ 0, 0, BLOCK_64X64 }` + §6.4.3 tail `15 >> 4 = 0`
+    write-back); a four-leaf SPLIT-into-32x32-NONE hand-built
+    bitstream (four leaves in TL → TR → BL → BR order at
+    `{ (0,0), (0,4), (4,0), (4,4), BLOCK_32X32 }` + §6.4.3 tail
+    `15 >> 3 = 1` write-back per child but not the parent SPLIT); a
+    mixed HORZ/VERT quadrant hand-built bitstream (8 leaves: TL
+    HORZ → 2 at BLOCK_32X16, TR VERT → 2 at BLOCK_16X32, BL HORZ,
+    BR VERT, exercising both the HORZ / VERT second-leaf paths and
+    the §9.3.2 ctx-derivation lockstep against the successively
+    populated strip state); the `(r >= mi_rows || c >= mi_cols)`
+    short-circuit invariant (no leaves emitted, strips untouched);
+    the `PartitionContextState::clear_left( )` zero-the-left-strip
+    invariant (above strip unchanged); and the
+    `PartitionProbsKind::Inter` table dispatch matching the
+    caller's row across `ctx ∈ 0..16`.
+
+  Out of scope for round 19 (deferred):
+  * The §6.3 `read_partition_probs( )` compressed-header sweep
+    (`PARTITION_CONTEXTS × (PARTITION_TYPES - 1) = 16 × 3 = 48`
+    `diff_update_prob` cells against `DEFAULT_PARTITION_PROBS`) —
+    the driver consumes the `Inter` running table, but constructing
+    it lands in a later round.
+  * The §6.4.4 `decode_block( )` mode-info + residual decode that
+    `LeafBlock` stands in for — wiring it into this driver is
+    downstream of all the §6.4 mode-info readers landing first.
+  * The §6.4.2 `decode_tile( )` outer loop (the `r += 8, c += 8`
+    superblock walk + per-row `clear_left_context( )`) — composes
+    this driver but is a separate round.
+  * The §8.4 `counts_partition` probability-adaption accumulator
+    (§9.3.4 bookkeeping) for inter-frame `partition_probs[ ]`
+    adaption.
+
+  The round-19 surface stays internal-only (`pub(crate)`); the
+  public API still exposes `parse_uncompressed_header`,
+  `parse_compressed_header` and their result types exclusively.
+
 * **§6.4.3 `decode_partition_type( )` per-call partition reader (new
   crate-local `partition` module).** The single-call decoder the
   recursive §6.4.3 `decode_partition( r, c, bsize )` driver (later

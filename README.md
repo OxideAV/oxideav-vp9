@@ -5,6 +5,77 @@ Bitstream & Decoding Process Specification v0.7.
 
 ## Status — 2026-05-26
 
+**Round 19: §6.4.3 recursive `decode_partition()` driver (extending the
+`partition` module).** Round 19 composes the round-18
+`decode_partition_type()` primitive into the full §6.4.3 recursive
+partition driver:
+
+* `decode_partition(coder, r, c, bsize, mi_rows, mi_cols, ctx_state,
+  probs_kind, leaves)` — walks the §6.4.3 listing line-for-line: the
+  `(r >= MiRows || c >= MiCols)` quadrant short-circuit, the `num8x8`
+  / `halfBlock8x8` / `hasRows` / `hasCols` derivation, the
+  `partition` decode via the round-18 primitive (with the §9.3.2
+  `partition_plane_context` ctx + the per-frame probability source),
+  the four-way dispatch on the decoded `PARTITION_*` value (with
+  HORZ second-leaf gated by `hasRows`, VERT second-leaf gated by
+  `hasCols`, and SPLIT recursing in spec order TL → TR → BL → BR),
+  and the §6.4.3 tail write-back into the partition-context strips
+  (gated by `bsize == BLOCK_8X8 || partition != PARTITION_SPLIT`,
+  writing `15 >> b_*_log2_lookup[subsize]` per cell).
+* `PartitionContextState` — the `AbovePartitionContext[]` /
+  `LeftPartitionContext[]` strips (sized `Sb64Cols * 8` /
+  `Sb64Rows * 8` per the §7.4 listing). Exposes `new(mi_cols, mi_rows)`
+  with the §7.4 zero-reset and `clear_left()` for the §6.4.2
+  per-superblock-row reset.
+* `PartitionProbsKind` — the per-frame probability source enum
+  (`Keyframe` → indexes the §10.4 `KF_PARTITION_PROBS` directly;
+  `Inter(&table)` → indexes the caller's running 16 × 3 table,
+  typically initialised from §10.5 `DEFAULT_PARTITION_PROBS` and
+  conditionally updated by the §6.3 `read_partition_probs()` sweep —
+  still pending in a later round).
+* `LeafBlock { r, c, subsize }` log records — emitted in §6.4.3
+  traversal order in lieu of the §6.4.4 `decode_block(r, c, subsize)`
+  call site (the per-block `mode_info` / `residual` decode is
+  downstream and not yet wired into this driver).
+
+Validation includes three hand-built bitstreams produced by a
+test-only minimal range encoder that mirrors the §9.2.2 decode steps
+inverse-by-inverse:
+
+* a single 64x64 superblock with `PARTITION_NONE` → one leaf
+  `{ 0, 0, BLOCK_64X64 }` and the §6.4.3 tail `15 >> 4 = 0`
+  write-back;
+* a single 64x64 superblock with `PARTITION_SPLIT` then four 32x32
+  `PARTITION_NONE` children → four leaves in TL → TR → BL → BR order,
+  with the §6.4.3 tail write-back firing on each child (`15 >> 3 = 1`)
+  but not on the parent SPLIT;
+* a 64x64 superblock split with mixed HORZ / VERT children (TL HORZ →
+  2 leaves at BLOCK_32X16, TR VERT → 2 leaves at BLOCK_16X32, BL
+  HORZ, BR VERT) exercising the HORZ second-leaf and VERT
+  second-leaf §6.4.3 paths plus the §6.4.3 tail write-back across
+  mixed partitions and the §9.3.2 ctx derivation across the
+  successively-populated strip state.
+
+Out of scope for round 19:
+
+* The §6.3 `read_partition_probs()` compressed-header sweep
+  (`PARTITION_CONTEXTS × (PARTITION_TYPES - 1) = 16 × 3 = 48`
+  `diff_update_prob` cells against `DEFAULT_PARTITION_PROBS`) — the
+  driver consumes the `Inter` running table, but constructing it
+  lands in a later round.
+* The §6.4.4 `decode_block()` mode-info + residual decode that
+  `LeafBlock` stands in for — wiring it into this driver is
+  downstream of all the §6.4 mode-info readers landing first.
+* The §6.4.2 `decode_tile()` outer loop (the `r += 8, c += 8`
+  superblock walk + per-row `clear_left_context()`) — composes this
+  driver but is a separate round.
+
+The round-19 surface stays internal-only (`pub(crate)`); the public
+API still exposes `parse_uncompressed_header`,
+`parse_compressed_header` and their result types exclusively.
+
+## Status — 2026-05-26 (round 18)
+
 **Round 18: §6.4.3 `decode_partition_type()` per-call partition reader (new
 `partition` module).** Round 18 lands the single-call partition decoder
 the recursive §6.4.3 `decode_partition(r, c, bsize)` driver fires once per

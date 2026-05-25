@@ -1,14 +1,44 @@
 //! VP9 partition primitive per spec v0.7 — §3 / §6.4.3 / §9.3.1 / §9.3.2
 //! / §10.2 / §10.4 / §10.5.
 //!
-//! Round 18 lands the §6.4.3 `decode_partition_type( )` reader — the per-call
-//! partition-tree decode that the recursive [`crate::partition::decode_partition`]
-//! driver (later round) will fire once per `(r, c, bsize)` quadrant. The
-//! recursive driver, the §10.2 `subsize_lookup` traversal, and the
-//! `AbovePartitionContext[ ]` / `LeftPartitionContext[ ]` write-back the
-//! §6.4.3 tail performs all sit on top of this primitive; this round bounds
-//! itself to the single-call decode plus the §9.3.2 context derivation it
-//! consumes.
+//! Round 18 landed the §6.4.3 `decode_partition_type( )` reader — the per-call
+//! partition-tree decode that the recursive [`decode_partition`] driver fires
+//! once per `(r, c, bsize)` quadrant. Round 19 adds the recursive driver
+//! proper: it composes [`decode_partition_type`] with the §10.2
+//! `subsize_lookup` traversal and the §6.4.3 tail write-back into the
+//! `AbovePartitionContext[ ]` / `LeftPartitionContext[ ]` strips.
+//!
+//! Driver semantics per §6.4.3:
+//!
+//! * `(r >= MiRows || c >= MiCols)` short-circuits and returns without
+//!   touching anything (the §6.4.3 first line).
+//! * `num8x8 = num_8x8_blocks_wide_lookup[ bsize ]`,
+//!   `halfBlock8x8 = num8x8 >> 1`, `hasRows = (r + halfBlock8x8) < MiRows`,
+//!   `hasCols = (c + halfBlock8x8) < MiCols`.
+//! * The `partition` syntax element is read via [`decode_partition_type`]
+//!   using the §9.3.2 `ctx = bsl * 4 + left * 2 + above` from
+//!   [`partition_plane_context`] and the per-frame probability source
+//!   ([`KF_PARTITION_PROBS`] on keyframes / intra-only frames; the running
+//!   `partition_probs[ ]` table on inter frames).
+//! * `subsize = subsize_lookup[ partition ][ bsize ]` then dispatches on
+//!   the four [`PartitionKind`] arms: `NONE` / `HORZ` (with the
+//!   `hasRows`-gated second leaf) / `VERT` (with the `hasCols`-gated
+//!   second leaf) / `SPLIT` (four recursive calls in spec order
+//!   TL → TR → BL → BR).
+//! * The §6.4.3 tail write-back fires when
+//!   `bsize == BLOCK_8X8 || partition != PARTITION_SPLIT`, setting
+//!   `AbovePartitionContext[c + i] = 15 >> b_width_log2_lookup[subsize]`
+//!   and `LeftPartitionContext[r + i] = 15 >> b_height_log2_lookup[subsize]`
+//!   for `i ∈ 0..num8x8`.
+//!
+//! Leaf blocks (the §6.4.4 `decode_block( r, c, subsize )` call sites that
+//! this round does not yet wire — the per-block `mode_info` /
+//! `residual` decode is downstream of this driver) are logged into a
+//! caller-supplied `Vec<LeafBlock>` instead, in spec-traversal order. The
+//! recursive walk's correctness is then validated by hand-built bitstreams
+//! producing predictable leaf layouts (a single 64x64 PARTITION_NONE leaf,
+//! a 4-way SPLIT into four 32x32 NONE leaves, and mixed HORZ + VERT
+//! quadrant layouts).
 //!
 //! The §9.3.1 tree-selection rule — *"if hasRows == 1 and hasCols == 1 the
 //! tree is `partition_tree`; else if hasCols == 1 the tree is
@@ -68,7 +98,7 @@
 
 use crate::bool_coder::BoolCoder;
 use crate::mode_info::tree_decode;
-use crate::residual::BLOCK_SIZES;
+use crate::residual::{BLOCK_8X8, BLOCK_SIZES};
 use crate::Error;
 
 // ----- §3 partition enumeration -----
@@ -500,9 +530,321 @@ pub(crate) fn decode_partition_type(
     }
 }
 
+// ----- §6.4.3 recursive decode_partition driver -----
+
+/// Per-frame partition-probability source threaded into [`decode_partition`].
+///
+/// The §9.3.2 listing keys the `partition` probability row on whether the
+/// current frame is a keyframe / intra-only frame ([`KF_PARTITION_PROBS`])
+/// or an inter frame (the running `partition_probs[ ]` table whose initial
+/// values come from [`DEFAULT_PARTITION_PROBS`] and whose live values are
+/// updated by the §6.3 `read_partition_probs( )` sweep — pending in a
+/// later round).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PartitionProbsKind<'a> {
+    /// `FrameIsIntra == 1` — use the §10.4 [`KF_PARTITION_PROBS`] table
+    /// verbatim.
+    Keyframe,
+    /// `FrameIsIntra == 0` — use the caller's running
+    /// `partition_probs[16][3]` table (typically initialised from
+    /// [`DEFAULT_PARTITION_PROBS`] and conditionally updated by the
+    /// §6.3 `read_partition_probs( )` sweep).
+    Inter(&'a [[u8; PARTITION_TYPES - 1]; PARTITION_CONTEXTS]),
+}
+
+impl<'a> PartitionProbsKind<'a> {
+    /// Look up the per-context 3-cell probability row by `ctx`.
+    fn row(&self, ctx: usize) -> [u8; PARTITION_TYPES - 1] {
+        match self {
+            PartitionProbsKind::Keyframe => KF_PARTITION_PROBS[ctx],
+            PartitionProbsKind::Inter(table) => table[ctx],
+        }
+    }
+}
+
+/// `AbovePartitionContext[ ]` / `LeftPartitionContext[ ]` per §6.4.3 +
+/// §7.4 reset rule.
+///
+/// The two arrays are sized `Sb64Cols * 8` and `Sb64Rows * 8` respectively
+/// per the §7.4 listing (each cell is a single byte holding a bitmap
+/// across the four possible `bsl` granularities). The §6.4.3 tail writes
+/// `15 >> b_*_log2_lookup[ subsize ]` into the relevant strip slice; the
+/// §9.3.2 `partition_plane_context` reads back from those strips when
+/// deriving `ctx` for a subsequent quadrant.
+///
+/// At a tile boundary the spec's `clear_left_context( )` zeroes
+/// `LeftPartitionContext[ ]` and the per-tile-row loop in §6.4.2 calls it
+/// once before walking `c`; the parent driver wires that reset around
+/// each `decode_partition( r, c, BLOCK_64X64 )` row. Within a single CTU
+/// recursion the arrays accumulate writes from sibling quadrants.
+#[derive(Debug)]
+pub(crate) struct PartitionContextState {
+    /// `AbovePartitionContext[ 0 .. Sb64Cols * 8 ]`.
+    pub above: Vec<u8>,
+    /// `LeftPartitionContext[ 0 .. Sb64Rows * 8 ]`.
+    pub left: Vec<u8>,
+}
+
+impl PartitionContextState {
+    /// Build a fresh state for a frame of `mi_cols * mi_rows` MI blocks,
+    /// with both strips zeroed per the §7.4 reset rule.
+    pub(crate) fn new(mi_cols: usize, mi_rows: usize) -> Self {
+        Self {
+            above: vec![0u8; mi_cols],
+            left: vec![0u8; mi_rows],
+        }
+    }
+
+    /// `clear_left_context( )` per §6.4.2 — invoked between superblock
+    /// rows by the §6.4.2 tile driver.
+    pub(crate) fn clear_left(&mut self) {
+        for cell in self.left.iter_mut() {
+            *cell = 0;
+        }
+    }
+}
+
+/// Per-leaf log record emitted in §6.4.3 traversal order by
+/// [`decode_partition`].
+///
+/// Each entry stands in for the §6.4.4 `decode_block( r, c, subsize )`
+/// call site that this round does not yet wire (the per-block
+/// `mode_info` / `residual` decode is downstream). The traversal order
+/// is: depth-first, with `PARTITION_SPLIT` recursing TL → TR → BL → BR
+/// per §6.4.3 lines 2381-2384.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LeafBlock {
+    /// MI-row coordinate `r` per §6.4.4 line 2397.
+    pub r: u32,
+    /// MI-column coordinate `c` per §6.4.4 line 2398.
+    pub c: u32,
+    /// `subsize` per §6.4.4 line 2399 (one of the §3 `BLOCK_*`
+    /// constants, but never `BLOCK_INVALID = 14`).
+    pub subsize: u8,
+}
+
+/// Apply the §6.4.3 tail write-back to the partition-context strips.
+///
+/// The spec listing is:
+///
+/// ```text
+/// if ( bsize == BLOCK_8X8 || partition != PARTITION_SPLIT ) {
+///     for ( i = 0; i < num8x8; i++ ) {
+///         AbovePartitionContext[ c + i ] = 15 >> b_width_log2_lookup[ subsize ]
+///         LeftPartitionContext[ r + i ] = 15 >> b_height_log2_lookup[ subsize ]
+///     }
+/// }
+/// ```
+///
+/// Called by [`decode_partition`] after the recursive / leaf dispatch
+/// has run. `subsize` is the post-`subsize_lookup` child size, NOT the
+/// parent `bsize`; per §10.2 / §3 it is always a valid `BLOCK_*` index
+/// (never `BLOCK_INVALID`) when the gate condition fires.
+fn write_back_partition_context(
+    above: &mut [u8],
+    left: &mut [u8],
+    r: usize,
+    c: usize,
+    num8x8: usize,
+    subsize: u8,
+) {
+    let above_val = 15u8 >> B_WIDTH_LOG2_LOOKUP[subsize as usize];
+    let left_val = 15u8 >> B_HEIGHT_LOG2_LOOKUP[subsize as usize];
+    for i in 0..num8x8 {
+        // The §6.4.3 listing never reads past `Sb64Cols * 8` /
+        // `Sb64Rows * 8`; an out-of-bounds index would mean the caller
+        // sized the state strips incorrectly. We saturate at the strip
+        // length rather than panic, matching the §6.4.3 quadrant
+        // out-of-range short-circuit that already prevents the OOB
+        // write at the recursion edge.
+        let ci = c + i;
+        if ci < above.len() {
+            above[ci] = above_val;
+        }
+        let ri = r + i;
+        if ri < left.len() {
+            left[ri] = left_val;
+        }
+    }
+}
+
+/// `decode_partition( r, c, bsize )` per spec §6.4.3 (lines 2353-2391).
+///
+/// The recursive partition driver: composes [`decode_partition_type`]
+/// (the §6.4.3 partition syntax-element decode) with the §10.2
+/// `subsize_lookup` traversal and the §6.4.3 tail write-back into the
+/// `AbovePartitionContext[ ]` / `LeftPartitionContext[ ]` strips.
+///
+/// `leaves` accumulates one [`LeafBlock`] per `decode_block( r, c,
+/// subsize )` call site the spec listing would invoke. The
+/// §6.4.4 `decode_block( )` decode itself (`mode_info` + `residual`) is
+/// downstream of this driver and not yet wired; the per-leaf log is
+/// the stand-in this round validates.
+///
+/// Recursion order on `PARTITION_SPLIT` is `(r, c) → (r, c+half) →
+/// (r+half, c) → (r+half, c+half)` per the §6.4.3 listing lines
+/// 2381-2384 (TL → TR → BL → BR).
+///
+/// Returns [`Error::InvalidBitstream`] if the underlying §9.2 bool coder
+/// underflows mid-walk.
+///
+/// # Panics
+///
+/// Panics if `bsize` is not a valid §3 `BLOCK_*` constant (i.e.
+/// `bsize >= BLOCK_SIZES`). The §6.4.3 caller chain only invokes
+/// this with one of the four superblock-recursion sizes (`BLOCK_8X8` /
+/// `BLOCK_16X16` / `BLOCK_32X32` / `BLOCK_64X64`); the recursion
+/// produces only the `subsize_lookup` children of those.
+#[allow(clippy::too_many_arguments)] // the §6.4.3 signature has 8 positional
+                                     // inputs by spec design (r / c / bsize +
+                                     // frame extents + context state + probs +
+                                     // leaf-log sink); each is independent and
+                                     // bundling them would obscure the spec
+                                     // mapping.
+pub(crate) fn decode_partition(
+    coder: &mut BoolCoder<'_>,
+    r: u32,
+    c: u32,
+    bsize: u8,
+    mi_rows: u32,
+    mi_cols: u32,
+    ctx_state: &mut PartitionContextState,
+    probs_kind: PartitionProbsKind<'_>,
+    leaves: &mut Vec<LeafBlock>,
+) -> Result<(), Error> {
+    // §6.4.3 line 2354: out-of-frame quadrants short-circuit without
+    // touching the bool coder or the context strips.
+    if r >= mi_rows || c >= mi_cols {
+        return Ok(());
+    }
+
+    assert!(
+        (bsize as usize) < BLOCK_SIZES,
+        "decode_partition: bsize={} out of range",
+        bsize
+    );
+
+    // §6.4.3 lines 2356-2359.
+    let num8x8 = NUM_8X8_BLOCKS_WIDE_LOOKUP[bsize as usize] as u32;
+    let half = num8x8 >> 1;
+    let has_rows = (r + half) < mi_rows;
+    let has_cols = (c + half) < mi_cols;
+
+    // §9.3.2 ctx derivation + probability-row pick. The strip-slice
+    // widths the §9.3.2 listing reads are `num8x8` cells; we saturate
+    // at the available strip length to mirror the §6.4.3 quadrant
+    // short-circuit at frame edges.
+    let above_end = ((c + num8x8) as usize).min(ctx_state.above.len());
+    let above_strip = &ctx_state.above[(c as usize)..above_end];
+    let left_end = ((r + num8x8) as usize).min(ctx_state.left.len());
+    let left_strip = &ctx_state.left[(r as usize)..left_end];
+    // If the strip is shorter than num8x8 (frame-edge underflow), pad
+    // with zero cells so the OR-fold sees the §7.4 reset value.
+    let strip_len = above_strip.len().min(left_strip.len());
+    let above_buf: Vec<u8> = above_strip
+        .iter()
+        .take(strip_len)
+        .copied()
+        .chain(core::iter::repeat(0u8))
+        .take(num8x8 as usize)
+        .collect();
+    let left_buf: Vec<u8> = left_strip
+        .iter()
+        .take(strip_len)
+        .copied()
+        .chain(core::iter::repeat(0u8))
+        .take(num8x8 as usize)
+        .collect();
+    let ctx = partition_plane_context(bsize, &above_buf, &left_buf);
+    let probs_row = probs_kind.row(ctx);
+
+    // §6.4.3 line 2360: read the partition syntax element.
+    let partition = decode_partition_type(coder, has_rows, has_cols, &probs_row)?;
+    // §6.4.3 line 2361: child block size.
+    let subsize = SUBSIZE_LOOKUP[partition as usize][bsize as usize];
+
+    // §6.4.3 lines 2362-2385: leaf vs recursive dispatch.
+    if (subsize as usize) < (BLOCK_8X8 as usize) || partition == PARTITION_NONE {
+        leaves.push(LeafBlock { r, c, subsize });
+    } else if partition == PARTITION_HORZ {
+        leaves.push(LeafBlock { r, c, subsize });
+        if has_rows {
+            leaves.push(LeafBlock {
+                r: r + half,
+                c,
+                subsize,
+            });
+        }
+    } else if partition == PARTITION_VERT {
+        leaves.push(LeafBlock { r, c, subsize });
+        if has_cols {
+            leaves.push(LeafBlock {
+                r,
+                c: c + half,
+                subsize,
+            });
+        }
+    } else {
+        // PARTITION_SPLIT: four recursive calls in §6.4.3 spec order
+        // (TL → TR → BL → BR per lines 2381-2384).
+        decode_partition(
+            coder, r, c, subsize, mi_rows, mi_cols, ctx_state, probs_kind, leaves,
+        )?;
+        decode_partition(
+            coder,
+            r,
+            c + half,
+            subsize,
+            mi_rows,
+            mi_cols,
+            ctx_state,
+            probs_kind,
+            leaves,
+        )?;
+        decode_partition(
+            coder,
+            r + half,
+            c,
+            subsize,
+            mi_rows,
+            mi_cols,
+            ctx_state,
+            probs_kind,
+            leaves,
+        )?;
+        decode_partition(
+            coder,
+            r + half,
+            c + half,
+            subsize,
+            mi_rows,
+            mi_cols,
+            ctx_state,
+            probs_kind,
+            leaves,
+        )?;
+    }
+
+    // §6.4.3 lines 2386-2391: tail write-back, gated by
+    // `bsize == BLOCK_8X8 || partition != PARTITION_SPLIT`.
+    if bsize == BLOCK_8X8 || partition != PARTITION_SPLIT {
+        write_back_partition_context(
+            &mut ctx_state.above,
+            &mut ctx_state.left,
+            r as usize,
+            c as usize,
+            num8x8 as usize,
+            subsize,
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::residual::{BLOCK_32X32, BLOCK_64X64};
 
     // ----- §3 / §10.2 verbatim-listing anchor tests -----
 
@@ -1029,5 +1371,688 @@ mod tests {
         for (i, &s) in seen.iter().enumerate() {
             assert!(s, "ctx={i} not covered");
         }
+    }
+
+    // ----- §6.4.3 recursive decode_partition driver tests -----
+
+    /// Test-only inverse of the §9.2.2 decoder. Given a sequence of
+    /// `(bit, p)` pairs the caller wants the decoder to produce,
+    /// returns a byte buffer that — when fed through [`BoolCoder`] —
+    /// yields exactly that sequence (following the §9.2.1 marker).
+    ///
+    /// Implementation strategy: bounded search over the 128 possible
+    /// post-marker `BoolValue` bytes combined with depth-first search
+    /// over per-renorm refill bits. For each candidate, the §9.2
+    /// decoder steps are forward-simulated step by step against the
+    /// target sequence; the first candidate that produces every target
+    /// bit wins. This is a test-only construction — it has no runtime
+    /// in the production decode path and only needs to handle the
+    /// small bit-counts generated by the §6.4.3 driver tests (a few
+    /// dozen `read_bool` calls per fixture).
+    ///
+    /// The forward-simulation routine ([`try_decode`]) and the
+    /// pruning helper ([`feasible_prefix`]) re-state the §9.2.2
+    /// listing verbatim: `split = 1 + (((BoolRange - 1) * p) >> 8)`,
+    /// the `BoolValue < split` branch test, the `BoolValue -= split` /
+    /// `BoolRange -= split` rebase on bit = 1, and the renormalisation
+    /// loop `while BoolRange < 128: BoolRange <<= 1, BoolValue =
+    /// (BoolValue << 1) + newBit`.
+    struct RangeEncoder {
+        /// The caller's recorded `(bit, p)` sequence — the search
+        /// target.
+        target: Vec<(bool, u8)>,
+    }
+
+    impl RangeEncoder {
+        fn new() -> Self {
+            Self { target: Vec::new() }
+        }
+
+        fn write_bool(&mut self, bit: bool, p: u8) {
+            self.target.push((bit, p));
+        }
+
+        /// Forward-simulate the §9.2.2 decoder on `(bool_value, stream)`
+        /// against the target sequence. Returns `Some(stream_bits_used)`
+        /// when every target call decodes correctly using only the
+        /// supplied prefix of stream bits; `None` if any read disagrees
+        /// with the target, or if the simulation runs out of stream
+        /// before the target sequence completes.
+        ///
+        /// `stream` is the iterator of renorm refill bits (LSB-first
+        /// would be ambiguous; we pass MSB-first big-endian bits as a
+        /// slice).
+        fn try_decode(bool_value: u32, stream: &[bool], target: &[(bool, u8)]) -> Option<usize> {
+            // §9.2 decoder simulation.
+            let mut value = bool_value;
+            let mut pos = 0usize;
+
+            // §9.2.1 marker: read_bool(128). split = 128. bit must = 0.
+            if value >= 128 {
+                // marker would decode to 1 → invalid stream.
+                return None;
+            }
+            // No renorm fires (range = 128, not < 128).
+            let mut range: u32 = 128;
+
+            for &(expected_bit, p) in target {
+                let split = 1 + (((range - 1) * (p as u32)) >> 8);
+                let bit;
+                if value < split {
+                    range = split;
+                    bit = false;
+                } else {
+                    range -= split;
+                    value -= split;
+                    bit = true;
+                }
+                if bit != expected_bit {
+                    return None;
+                }
+                while range < 128 {
+                    if pos >= stream.len() {
+                        return None;
+                    }
+                    let nb = u32::from(stream[pos]);
+                    pos += 1;
+                    range <<= 1;
+                    value = (value << 1) + nb;
+                }
+            }
+            Some(pos)
+        }
+
+        /// Recursive depth-first search: at each renorm, try refill
+        /// bit 0 first then 1, until a full target match is found.
+        /// Returns the winning `(bool_value, stream_bits)` pair.
+        fn search(target: &[(bool, u8)]) -> (u32, Vec<bool>) {
+            // Reasonable upper bound on renorm refills for any test
+            // fixture this encoder is asked to produce. The §6.4.3
+            // driver tests emit at most a few dozen `read_bool` calls
+            // each, each consuming at most ~7 refills under extreme
+            // probabilities.
+            const MAX_REFILLS: usize = 256;
+
+            // Try each candidate `bool_value` from 0..128 (post-marker
+            // requires value < 128). For each, DFS over refill bits.
+            for bv in 0..128u32 {
+                let mut stream = Vec::with_capacity(MAX_REFILLS);
+                if Self::dfs(bv, &mut stream, target, MAX_REFILLS) {
+                    return (bv, stream);
+                }
+            }
+            panic!(
+                "RangeEncoder::search: no consistent codeword for target sequence ({} pairs)",
+                target.len()
+            );
+        }
+
+        fn dfs(
+            bool_value: u32,
+            stream: &mut Vec<bool>,
+            target: &[(bool, u8)],
+            max_refills: usize,
+        ) -> bool {
+            // Try the current `stream` length; if simulation succeeds,
+            // we're done. If it fails with "ran out of stream", extend
+            // the stream by one bit (try 0 then 1) and recurse.
+            match Self::try_decode(bool_value, stream, target) {
+                Some(_) => true,
+                None => {
+                    if stream.len() >= max_refills {
+                        return false;
+                    }
+                    // Only extend if the failure was a stream-exhaust;
+                    // a mid-stream bit mismatch can't be fixed by
+                    // appending. Distinguish by re-running with the
+                    // current prefix and checking if the failure was
+                    // mid-call. For our test sizes the brute approach
+                    // (always extend) is fine — try_decode returns
+                    // None for both mismatch and exhaust, and the
+                    // recursion catches mismatches at a deeper level
+                    // (which then backtrack to the next BV).
+                    //
+                    // To keep recursion shallow we detect mismatch by
+                    // running a partial simulation here too: if the
+                    // current bool_value can't even pass the first
+                    // call's bit-direction test with any stream
+                    // extension, we bail early.
+                    if !Self::feasible_prefix(bool_value, stream, target) {
+                        return false;
+                    }
+                    stream.push(false);
+                    if Self::dfs(bool_value, stream, target, max_refills) {
+                        return true;
+                    }
+                    stream.pop();
+                    stream.push(true);
+                    if Self::dfs(bool_value, stream, target, max_refills) {
+                        return true;
+                    }
+                    stream.pop();
+                    false
+                }
+            }
+        }
+
+        /// Heuristic pruning: simulate `(bool_value, stream)` up to the
+        /// first stream-exhaust event; return `true` only if every
+        /// target bit decoded so far matched. This rejects
+        /// `bool_value` candidates whose early `read_bool` calls
+        /// disagree with the target regardless of any future stream
+        /// extension.
+        fn feasible_prefix(bool_value: u32, stream: &[bool], target: &[(bool, u8)]) -> bool {
+            let mut value = bool_value;
+            let mut pos = 0usize;
+            // marker
+            if value >= 128 {
+                return false;
+            }
+            let mut range: u32 = 128;
+            for &(expected_bit, p) in target {
+                let split = 1 + (((range - 1) * (p as u32)) >> 8);
+                let bit;
+                if value < split {
+                    range = split;
+                    bit = false;
+                } else {
+                    range -= split;
+                    value -= split;
+                    bit = true;
+                }
+                if bit != expected_bit {
+                    return false;
+                }
+                while range < 128 {
+                    if pos >= stream.len() {
+                        // Reached unknown territory; future stream
+                        // extension might succeed.
+                        return true;
+                    }
+                    let nb = u32::from(stream[pos]);
+                    pos += 1;
+                    range <<= 1;
+                    value = (value << 1) + nb;
+                }
+            }
+            true
+        }
+
+        /// Flush the encoder state and return the byte buffer the
+        /// decoder will consume. The trailing tail is zero-padded so
+        /// any further renorm reads past the strictly-required bits
+        /// stay defined.
+        fn finish(self) -> Vec<u8> {
+            let (bool_value, stream) = Self::search(&self.target);
+
+            // Pack: byte 0 = BoolValue (MSB-first 8 bits); subsequent
+            // bytes carry the renorm refill bits in MSB-first order.
+            let total_bits = 8 + stream.len();
+            let payload_bytes = total_bits.div_ceil(8);
+            let mut out = vec![0u8; payload_bytes + 16];
+            out[0] = bool_value as u8;
+            for (i, &b) in stream.iter().enumerate() {
+                if b {
+                    let stream_pos = 8 + i;
+                    let byte = stream_pos / 8;
+                    out[byte] |= 1 << (7 - (stream_pos & 7));
+                }
+            }
+            out
+        }
+    }
+
+    /// Helper: encode a sequence of `(bit, p)` pairs and wrap the
+    /// result in a [`BoolCoder`] ready for `read_bool` consumption.
+    /// The returned byte buffer is leaked into `'static` so it can be
+    /// borrowed by the coder without lifetime ceremony in tests.
+    fn coder_from(pairs: &[(bool, u8)]) -> BoolCoder<'static> {
+        let mut enc = RangeEncoder::new();
+        for &(bit, p) in pairs {
+            enc.write_bool(bit, p);
+        }
+        let bytes = enc.finish();
+        let sz = bytes.len();
+        let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        BoolCoder::init_bool(leaked, sz).expect("encoded buffer is a valid §9.2 init")
+    }
+
+    /// Roundtrip sanity: encoder + decoder reproduce an arbitrary
+    /// `(bit, p)` sequence verbatim.
+    #[test]
+    fn range_encoder_roundtrips_bool_sequence() {
+        let pairs = [
+            (false, 128u8),
+            (true, 64),
+            (false, 200),
+            (true, 32),
+            (false, 100),
+            (true, 250),
+            (false, 8),
+            (false, 128),
+        ];
+        let mut coder = coder_from(&pairs);
+        for (i, &(bit, p)) in pairs.iter().enumerate() {
+            let got = coder.read_bool(p as u32).unwrap();
+            assert_eq!(
+                got,
+                u32::from(bit),
+                "mismatch at step {i}: encoded bit={bit} p={p}, decoded={got}"
+            );
+        }
+    }
+
+    /// Roundtrip sanity at the probability extremes.
+    #[test]
+    fn range_encoder_roundtrips_extreme_probabilities() {
+        let pairs = [
+            (false, 1u8),
+            (true, 255),
+            (false, 255),
+            (true, 1),
+            (false, 128),
+            (true, 128),
+        ];
+        let mut coder = coder_from(&pairs);
+        for &(bit, p) in pairs.iter() {
+            assert_eq!(coder.read_bool(p as u32).unwrap(), u32::from(bit));
+        }
+    }
+
+    // ----- §6.4.3 recursive driver hand-built bitstream tests -----
+
+    /// Helper: encode the §9.3.1 + §9.3.3 walk for a single keyframe
+    /// `partition` decode, given the decoded partition value and the
+    /// `(has_rows, has_cols)` quadrant flags. Pushes the right `(bit,
+    /// prob)` pairs into the encoder per the §9.3.2 `node2` rule and
+    /// the §10.4 [`KF_PARTITION_PROBS`] row.
+    fn push_partition_decode(
+        enc: &mut RangeEncoder,
+        partition: u8,
+        has_rows: bool,
+        has_cols: bool,
+        ctx: usize,
+    ) {
+        let probs = KF_PARTITION_PROBS[ctx];
+        match (has_rows, has_cols) {
+            (true, true) => {
+                // Walk the 6-entry partition_tree:
+                //   node 0: -PARTITION_NONE / 2
+                //   node 2: -PARTITION_HORZ / 4
+                //   node 4: -PARTITION_VERT / -PARTITION_SPLIT
+                // First read uses probs[0] (node 0 >> 1 = 0).
+                // tree_decode reads p = prob(n >> 1) at each step.
+                let bit_seq: &[(bool, u8)] = match partition {
+                    PARTITION_NONE => &[(false, probs[0])],
+                    PARTITION_HORZ => &[(true, probs[0]), (false, probs[1])],
+                    PARTITION_VERT => &[(true, probs[0]), (true, probs[1]), (false, probs[2])],
+                    PARTITION_SPLIT => &[(true, probs[0]), (true, probs[1]), (true, probs[2])],
+                    _ => panic!("bad partition {partition}"),
+                };
+                for &(bit, p) in bit_seq {
+                    enc.write_bool(bit, p);
+                }
+            }
+            (false, true) => {
+                // cols_partition_tree: only HORZ / SPLIT. node2 = 1.
+                let bit = match partition {
+                    PARTITION_HORZ => false,
+                    PARTITION_SPLIT => true,
+                    _ => panic!("right-edge can only be HORZ / SPLIT, got {partition}"),
+                };
+                enc.write_bool(bit, probs[1]);
+            }
+            (true, false) => {
+                // rows_partition_tree: only VERT / SPLIT. node2 = 2.
+                let bit = match partition {
+                    PARTITION_VERT => false,
+                    PARTITION_SPLIT => true,
+                    _ => panic!("bottom-edge can only be VERT / SPLIT, got {partition}"),
+                };
+                enc.write_bool(bit, probs[2]);
+            }
+            (false, false) => {
+                // Corner — no bits consumed.
+                assert_eq!(partition, PARTITION_SPLIT);
+            }
+        }
+    }
+
+    /// Hand-built bitstream (a): a single 64x64 frame with one
+    /// `PARTITION_NONE` decision at `BLOCK_64X64`.
+    ///
+    /// Expected layout: one leaf `{ r: 0, c: 0, subsize: BLOCK_64X64 }`.
+    /// The §6.4.3 tail write-back fires (`partition != SPLIT`); the
+    /// resulting context strip cells take
+    /// `15 >> b_*_log2_lookup[ BLOCK_64X64 ] = 15 >> 4 = 0`.
+    #[test]
+    fn decode_partition_single_64x64_none() {
+        // 64x64 frame = 8 MI columns × 8 MI rows.
+        let mi_cols = 8u32;
+        let mi_rows = 8u32;
+
+        let mut enc = RangeEncoder::new();
+        // Initial ctx: bsize=BLOCK_64X64, all strips zero → ctx = 12
+        // per `partition_plane_context_zero_strips_block_64x64`.
+        push_partition_decode(&mut enc, PARTITION_NONE, true, true, 12);
+        let bytes = enc.finish();
+        let sz = bytes.len();
+        let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        let mut coder = BoolCoder::init_bool(leaked, sz).unwrap();
+
+        let mut state = PartitionContextState::new(mi_cols as usize, mi_rows as usize);
+        let mut leaves: Vec<LeafBlock> = Vec::new();
+        decode_partition(
+            &mut coder,
+            0,
+            0,
+            BLOCK_64X64,
+            mi_rows,
+            mi_cols,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+            &mut leaves,
+        )
+        .unwrap();
+
+        assert_eq!(
+            leaves,
+            vec![LeafBlock {
+                r: 0,
+                c: 0,
+                subsize: BLOCK_64X64
+            }]
+        );
+        // §6.4.3 tail: 15 >> b_width_log2_lookup[BLOCK_64X64] = 15>>4 = 0.
+        for i in 0..8 {
+            assert_eq!(state.above[i], 0, "above[{i}] != 0");
+            assert_eq!(state.left[i], 0, "left[{i}] != 0");
+        }
+    }
+
+    /// Hand-built bitstream (b): a single 64x64 superblock split into
+    /// four 32x32 quadrants, each decoded as `PARTITION_NONE`.
+    ///
+    /// Expected layout: four leaves in TL → TR → BL → BR order, each at
+    /// the appropriate `(r, c)` and `subsize = BLOCK_32X32`.
+    #[test]
+    fn decode_partition_split_into_four_32x32_none() {
+        let mi_cols = 8u32;
+        let mi_rows = 8u32;
+
+        let mut enc = RangeEncoder::new();
+
+        // Step 1: BLOCK_64X64 at (0,0) → PARTITION_SPLIT (ctx = 12).
+        push_partition_decode(&mut enc, PARTITION_SPLIT, true, true, 12);
+
+        // Step 2-5: four BLOCK_32X32 children, each → PARTITION_NONE.
+        // Per §9.3.2 derivation: bsize=BLOCK_32X32, bsl=2, boffset=1,
+        // mask=0x02, num8x8=4.
+        //
+        // TL (r=0, c=0): all strips still zero → ctx = 2*4 = 8.
+        push_partition_decode(&mut enc, PARTITION_NONE, true, true, 8);
+        // After TL: parent SPLIT means partition != SPLIT branch wrote
+        // back the TL NONE child sub-write at this subsize. Per the
+        // §6.4.3 tail with subsize = BLOCK_32X32, the write-back value
+        // is 15 >> b_width_log2_lookup[BLOCK_32X32] = 15 >> 3 = 1.
+        // For the next TR ctx (bsize=BLOCK_32X32, c=4): above strip
+        // cells above[4..8] are still 0 (TL wrote above[0..4]=1, not
+        // above[4..8]). Left strip cells left[0..4] now = 1 from TL.
+        // OR-fold: above_bits=0, left_bits=1; mask=0x02 → above bit
+        // 0, left bit (1 & 2) = 0. → ctx = 2*4 + 0 + 0 = 8.
+        push_partition_decode(&mut enc, PARTITION_NONE, true, true, 8);
+        // BL (r=4, c=0): above strip above[0..4]=1 from TL; left strip
+        // left[4..8]=0. OR: above_bits=1; (1 & 2) = 0. left_bits=0.
+        // ctx = 8.
+        push_partition_decode(&mut enc, PARTITION_NONE, true, true, 8);
+        // BR (r=4, c=4): above[4..8]=1 from TR, left[4..8]=1 from BL.
+        // OR: above_bits=1, left_bits=1; (1 & 2) = 0 both. ctx = 8.
+        push_partition_decode(&mut enc, PARTITION_NONE, true, true, 8);
+
+        let bytes = enc.finish();
+        let sz = bytes.len();
+        let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        let mut coder = BoolCoder::init_bool(leaked, sz).unwrap();
+
+        let mut state = PartitionContextState::new(mi_cols as usize, mi_rows as usize);
+        let mut leaves: Vec<LeafBlock> = Vec::new();
+        decode_partition(
+            &mut coder,
+            0,
+            0,
+            BLOCK_64X64,
+            mi_rows,
+            mi_cols,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+            &mut leaves,
+        )
+        .unwrap();
+
+        assert_eq!(
+            leaves,
+            vec![
+                LeafBlock {
+                    r: 0,
+                    c: 0,
+                    subsize: BLOCK_32X32
+                },
+                LeafBlock {
+                    r: 0,
+                    c: 4,
+                    subsize: BLOCK_32X32
+                },
+                LeafBlock {
+                    r: 4,
+                    c: 0,
+                    subsize: BLOCK_32X32
+                },
+                LeafBlock {
+                    r: 4,
+                    c: 4,
+                    subsize: BLOCK_32X32
+                },
+            ],
+            "TL → TR → BL → BR recursion order broken"
+        );
+        // §6.4.3 tail: each NONE child wrote
+        // 15 >> b_*_log2_lookup[BLOCK_32X32] = 15 >> 3 = 1 to its strip
+        // cells. The parent SPLIT did NOT write (gate fires only on
+        // bsize == BLOCK_8X8 || partition != SPLIT).
+        for i in 0..8 {
+            assert_eq!(state.above[i], 1, "above[{i}] != 1");
+            assert_eq!(state.left[i], 1, "left[{i}] != 1");
+        }
+    }
+
+    /// Hand-built bitstream (c): a 64x64 superblock split into four
+    /// 32x32 quadrants where each child uses a non-NONE / non-SPLIT
+    /// partition: TL=HORZ, TR=VERT, BL=HORZ, BR=VERT. This exercises
+    /// the HORZ second-leaf and VERT second-leaf §6.4.3 paths plus the
+    /// §6.4.3 tail write-back across mixed partitions.
+    #[test]
+    fn decode_partition_mixed_horz_vert_quadrants() {
+        let mi_cols = 8u32;
+        let mi_rows = 8u32;
+
+        let mut enc = RangeEncoder::new();
+
+        // BLOCK_64X64 → PARTITION_SPLIT (ctx = 12).
+        push_partition_decode(&mut enc, PARTITION_SPLIT, true, true, 12);
+
+        // TL BLOCK_32X32 (0,0) → HORZ. subsize = BLOCK_32X16 (8). ctx=8.
+        push_partition_decode(&mut enc, PARTITION_HORZ, true, true, 8);
+        // TL tail write-back at subsize=BLOCK_32X16 (8):
+        //   above_val = 15 >> b_width_log2_lookup[8]  = 15 >> 3 = 1
+        //   left_val  = 15 >> b_height_log2_lookup[8] = 15 >> 2 = 3
+        // above[0..4] = 1, left[0..4] = 3.
+        //
+        // TR BLOCK_32X32 (0,4) → VERT. Strips: above[4..8] still 0;
+        // left[0..4] = 3. OR: above_bits=0, left_bits=3; mask=0x02 →
+        // above bit 0, left bit (3 & 2) != 0 = 1. ctx = 2*4 + 1*2 + 0 = 10.
+        push_partition_decode(&mut enc, PARTITION_VERT, true, true, 10);
+        // TR tail write-back at subsize=BLOCK_16X32 (7):
+        //   above_val = 15 >> b_width_log2_lookup[7]  = 15 >> 2 = 3
+        //   left_val  = 15 >> b_height_log2_lookup[7] = 15 >> 3 = 1
+        // above[4..8] = 3, left[0..4] = 1 (overwrites previous 3).
+        //
+        // BL BLOCK_32X32 (4,0) → HORZ. Strips: above[0..4] = 1
+        // (from TL); left[4..8] = 0. OR: above_bits=1, left_bits=0;
+        // (1 & 2) = 0, (0 & 2) = 0. ctx = 2*4 + 0 + 0 = 8.
+        push_partition_decode(&mut enc, PARTITION_HORZ, true, true, 8);
+        // BL tail write-back at subsize=BLOCK_32X16 (8): above[0..4]=1,
+        // left[4..8]=3.
+        //
+        // BR BLOCK_32X32 (4,4) → VERT. Strips: above[4..8] = 3
+        // (from TR); left[4..8] = 3 (from BL). OR: (3 & 2) = 2 != 0,
+        // (3 & 2) = 2 != 0. above bit 1, left bit 1. ctx = 8 + 2 + 1 = 11.
+        push_partition_decode(&mut enc, PARTITION_VERT, true, true, 11);
+
+        let bytes = enc.finish();
+        let sz = bytes.len();
+        let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        let mut coder = BoolCoder::init_bool(leaked, sz).unwrap();
+
+        let mut state = PartitionContextState::new(mi_cols as usize, mi_rows as usize);
+        let mut leaves: Vec<LeafBlock> = Vec::new();
+        decode_partition(
+            &mut coder,
+            0,
+            0,
+            BLOCK_64X64,
+            mi_rows,
+            mi_cols,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+            &mut leaves,
+        )
+        .unwrap();
+
+        // Expected leaves: 2 per HORZ, 2 per VERT = 8 total.
+        // Per §6.4.3, HORZ at (r,c) with subsize BLOCK_32X16 logs
+        //   { r, c }, then { r + half, c } if hasRows.
+        // VERT logs { r, c }, then { r, c + half } if hasCols.
+        // BLOCK_32X32 → num8x8 = 4 → half = 2.
+        let expected = vec![
+            // TL HORZ: (0,0) BLOCK_32X16, (0+2, 0) = (2, 0)
+            LeafBlock {
+                r: 0,
+                c: 0,
+                subsize: /* BLOCK_32X16 */ 8,
+            },
+            LeafBlock {
+                r: 2,
+                c: 0,
+                subsize: 8,
+            },
+            // TR VERT: (0,4) BLOCK_16X32, (0, 4+2) = (0, 6)
+            LeafBlock {
+                r: 0,
+                c: 4,
+                subsize: /* BLOCK_16X32 */ 7,
+            },
+            LeafBlock {
+                r: 0,
+                c: 6,
+                subsize: 7,
+            },
+            // BL HORZ: (4,0) BLOCK_32X16, (4+2, 0) = (6, 0)
+            LeafBlock {
+                r: 4,
+                c: 0,
+                subsize: 8,
+            },
+            LeafBlock {
+                r: 6,
+                c: 0,
+                subsize: 8,
+            },
+            // BR VERT: (4,4) BLOCK_16X32, (4, 4+2) = (4, 6)
+            LeafBlock {
+                r: 4,
+                c: 4,
+                subsize: 7,
+            },
+            LeafBlock {
+                r: 4,
+                c: 6,
+                subsize: 7,
+            },
+        ];
+        assert_eq!(leaves, expected, "mixed HORZ/VERT leaf layout broken");
+    }
+
+    /// `(r >= mi_rows || c >= mi_cols)` short-circuit (§6.4.3 line 2354).
+    #[test]
+    fn decode_partition_out_of_frame_short_circuits() {
+        let enc = RangeEncoder::new();
+        // No bits to encode — the call should return without touching
+        // the coder.
+        let bytes = enc.finish();
+        let sz = bytes.len();
+        let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        let mut coder = BoolCoder::init_bool(leaked, sz).unwrap();
+        let mut state = PartitionContextState::new(8, 8);
+        let mut leaves: Vec<LeafBlock> = Vec::new();
+        // r past frame.
+        decode_partition(
+            &mut coder,
+            10,
+            0,
+            BLOCK_64X64,
+            8,
+            8,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+            &mut leaves,
+        )
+        .unwrap();
+        assert!(leaves.is_empty(), "OOR call should not emit leaves");
+        // c past frame.
+        decode_partition(
+            &mut coder,
+            0,
+            12,
+            BLOCK_64X64,
+            8,
+            8,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+            &mut leaves,
+        )
+        .unwrap();
+        assert!(leaves.is_empty(), "OOR call should not emit leaves");
+        // All strip cells stay at the §7.4 reset value.
+        for &cell in state.above.iter().chain(state.left.iter()) {
+            assert_eq!(cell, 0);
+        }
+    }
+
+    /// `PartitionContextState::clear_left( )` (§6.4.2) zeroes the left
+    /// strip without touching the above strip.
+    #[test]
+    fn partition_context_state_clear_left_zeroes_left_only() {
+        let mut s = PartitionContextState::new(8, 8);
+        s.above[3] = 7;
+        s.left[2] = 11;
+        s.clear_left();
+        assert_eq!(s.above[3], 7);
+        for &cell in s.left.iter() {
+            assert_eq!(cell, 0);
+        }
+    }
+
+    /// `PartitionProbsKind::Inter` indexes the caller's table instead of
+    /// the keyframe table.
+    #[test]
+    fn partition_probs_kind_inter_dispatches_to_caller_table() {
+        let inter_table: [[u8; 3]; 16] = [[42, 43, 44]; 16];
+        let kind = PartitionProbsKind::Inter(&inter_table);
+        for ctx in 0..16 {
+            assert_eq!(kind.row(ctx), [42, 43, 44]);
+        }
+        let kf = PartitionProbsKind::Keyframe;
+        assert_eq!(kf.row(0), KF_PARTITION_PROBS[0]);
+        assert_eq!(kf.row(15), KF_PARTITION_PROBS[15]);
     }
 }

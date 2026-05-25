@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -269,6 +269,34 @@
 //!   `15 >> b_*_log2_lookup[ subsize ]`) and the §6.3
 //!   `read_partition_probs( )` compressed-header sweep both land in a
 //!   later round; the round-18 surface is internal-only.
+//! * Round 19 lands the §6.4.3 recursive `decode_partition()` driver
+//!   itself, composing the round-18 [`partition::decode_partition_type`]
+//!   primitive with the §10.2 `subsize_lookup` traversal and the §6.4.3
+//!   tail write-back into the `AbovePartitionContext[ ]` /
+//!   `LeftPartitionContext[ ]` strips. The driver walks the §6.4.3
+//!   listing line-for-line: the `(r >= MiRows || c >= MiCols)` quadrant
+//!   short-circuit, the `num8x8` / `halfBlock8x8` / `hasRows` /
+//!   `hasCols` derivation, the partition decode via the round-18
+//!   primitive, the four-way dispatch on the `PARTITION_*` value (HORZ
+//!   second-leaf gated by `hasRows`; VERT second-leaf gated by
+//!   `hasCols`; SPLIT recursing in spec order TL → TR → BL → BR), and
+//!   the §6.4.3 tail write-back gated by `bsize == BLOCK_8X8 ||
+//!   partition != PARTITION_SPLIT`. `PartitionContextState` exposes the
+//!   `Sb64Cols * 8` / `Sb64Rows * 8` strips with the §7.4 zero-reset
+//!   and the §6.4.2 `clear_left( )` helper; `PartitionProbsKind` selects
+//!   between the keyframe [`partition::KF_PARTITION_PROBS`] direct path
+//!   and an inter-frame running `partition_probs[ ]` table per the
+//!   §9.3.2 listing. Leaf blocks (the §6.4.4 `decode_block( )` call
+//!   sites — `mode_info` / `residual` not yet wired) are accumulated
+//!   into a caller-supplied `Vec<LeafBlock>` log in §6.4.3 traversal
+//!   order; the recursion is validated against three hand-built
+//!   bitstreams (single-leaf 64x64 NONE, four-leaf SPLIT-into-32x32-NONE,
+//!   mixed HORZ + VERT quadrants), produced by a test-only minimal
+//!   range encoder mirroring the §9.2.2 decode steps inverse-by-inverse.
+//!   The §6.3 `read_partition_probs( )` compressed-header sweep, the
+//!   §6.4.4 `decode_block( )` mode-info + residual wiring, and the
+//!   §6.4.2 `decode_tile( )` outer loop all land in later rounds; the
+//!   round-19 surface is internal-only.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return

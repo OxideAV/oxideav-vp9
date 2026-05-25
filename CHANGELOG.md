@@ -6,6 +6,49 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 17: §6.4.6 `intra_frame_mode_info( )` keyframe driver
+  (extending the crate-local `mode_info` module).** Wires the rounds
+  15 / 16 primitives into the top-level §6.4.6 per-block mode-info
+  reader for keyframe (and intra-only) frames:
+  * §9.3.1 `intra_mode_tree[18]` constant
+    `{ -DC_PRED, 2, -TM_PRED, 4, -V_PRED, 6, 8, 12, -H_PRED, 10,
+    -D135_PRED, -D117_PRED, -D45_PRED, 14, -D63_PRED, 16, -D153_PRED,
+    -D207_PRED }` transcribed verbatim — the 18-entry / 10-leaf tree
+    shared by `default_intra_mode` / `default_uv_mode` / `intra_mode`
+    / `sub_intra_mode` / `uv_mode`.
+  * §10.5 `KF_Y_MODE_PROBS[10][10][9]` (a 900-byte 3D table indexed by
+    `[abovemode][leftmode][node]` per the §9.3.2 `default_intra_mode`
+    listing) transcribed verbatim from the spec listing
+    (lines 7463–7599).
+  * §10.5 `KF_UV_MODE_PROBS[10][9]` (a 90-byte 2D table indexed by
+    `[y_mode][node]` per the §9.3.2 `default_uv_mode` listing)
+    transcribed verbatim from the spec listing (lines 7602–7613).
+  * `default_intra_mode( coder, abovemode, leftmode )` and
+    `default_uv_mode( coder, y_mode )` — §9.3.3 walks over
+    `INTRA_MODE_TREE` with the respective `kf_*_mode_probs` row.
+  * `intra_frame_mode_info()` (§6.4.6) — the orchestrator threading
+    `intra_segment_id( )` + `read_skip( )` + `read_tx_size( 1 )` +
+    `default_intra_mode` + `default_uv_mode` into a
+    `Vp9IntraMiBlock { segment_id, skip, tx_size, ref_frame_0,
+    ref_frame_1, is_inter, y_mode, sub_modes[4], uv_mode }`. The
+    §6.4.6 `ref_frame[0] = INTRA_FRAME = 0` / `ref_frame[1] = NONE =
+    -1` / `is_inter = false` triple is hardwired per the spec
+    listing. Handles both the `MiSize >= BLOCK_8X8` single-mode
+    partition (one `default_intra_mode` decode replicated into all
+    four `sub_modes[ ]` cells) and the `MiSize < BLOCK_8X8` sub-mode
+    walk (the §6.4.6 `(idy, idx)` grid stepped by
+    `num_4x4_blocks_high_lookup[MiSize]` /
+    `num_4x4_blocks_wide_lookup[MiSize]` — 4 reads for BLOCK_4X4, 2
+    for BLOCK_4X8 / BLOCK_8X4 — with each cell receiving its own
+    decoded mode replicated across the (num4x4h × num4x4w)
+    `sub_modes[ ]` sub-grid; `y_mode` set to the *last* decoded
+    `default_intra_mode`).
+  * `IntraFrameNeighbours` bundle — per-MI-block neighbour state a
+    tile driver builds from its frame-wide `SubModes[ ][ ][ ]` array
+    (positions {2, 3} of the above neighbour, positions {1, 3} of the
+    left neighbour, plus the §7.4.4 `AvailU` / `AvailL` flags). The
+    §9.3.2 listing reads only those four cells; `DC_PRED` is
+    substituted when the corresponding `avail_*` flag is false.
 * **Round 16: §6.4.7 `intra_segment_id( )` + §9.3.1 `segment_tree[14]`
   (extending the crate-local `mode_info` module).** Lands the next
   slice of the §6.4.6 `intra_frame_mode_info()` orchestrator's

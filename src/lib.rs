@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -202,6 +202,41 @@
 //!   `intra_block_mode_info` and §6.4.6 `intra_frame_mode_info()`
 //!   orchestrator are deferred to the next round; the round-16
 //!   surface is internal-only.
+//! * Round 17 lands the §6.4.6 `intra_frame_mode_info()` keyframe-only
+//!   per-block driver on top of the rounds 15 / 16 primitives. The
+//!   driver wires `intra_segment_id` plus `read_skip` plus
+//!   `read_tx_size( 1 )` plus `default_intra_mode` plus
+//!   `default_uv_mode` into a single `Vp9IntraMiBlock` output
+//!   (`segment_id`, `skip`, `tx_size`, `y_mode`, `sub_modes[4]`,
+//!   `uv_mode`), plus the §6.4.6 fixed `ref_frame[0] = INTRA_FRAME =
+//!   0`, `ref_frame[1] = NONE = -1`, `is_inter = false` triple. The
+//!   `MiSize >= BLOCK_8X8` arm decodes one `default_intra_mode` and
+//!   replicates it into all four `sub_modes[ ]` cells; the
+//!   `MiSize < BLOCK_8X8` arm walks the §6.4.6 `(idy, idx)` grid
+//!   stepped by `num_4x4_blocks_high_lookup` and
+//!   `num_4x4_blocks_wide_lookup` (covering BLOCK_4X4 / BLOCK_4X8 /
+//!   BLOCK_8X4 with 4, 2, and 2 `default_intra_mode` decodes
+//!   respectively), with each cell receiving its own decoded mode
+//!   replicated across the (num4x4h × num4x4w) `sub_modes[ ]`
+//!   sub-grid, and `y_mode` set to the *last* decoded
+//!   `default_intra_mode`. `default_intra_mode` uses the §9.3.2
+//!   `kf_y_mode_probs[abovemode][leftmode][node]` row (with the
+//!   §9.3.2 above/left derivation handling both the
+//!   `MiSize >= BLOCK_8X8` `(SubModes[MiRow-1][MiCol][2],
+//!   SubModes[MiRow][MiCol-1][1])` path and the sub-8x8
+//!   `(SubModes[MiRow-1][MiCol][2 + idx], sub_modes[ idx ])` plus
+//!   `(sub_modes[ idy * 2 ], SubModes[MiRow][MiCol-1][1 + idy * 2])`
+//!   paths, with `DC_PRED` substituted when `AvailU` or `AvailL` is
+//!   false). `default_uv_mode` uses `kf_uv_mode_probs[y_mode][node]`.
+//!   The §9.3.1 `intra_mode_tree[18]` and the §10.5
+//!   `kf_y_mode_probs[10][10][9]` plus `kf_uv_mode_probs[10][9]`
+//!   tables are transcribed verbatim from `docs/video/vp9/vp9-spec.txt`.
+//!   The §6.4.15 `intra_block_mode_info` (used on intra blocks within
+//!   inter frames; uses `y_mode_probs[size_group_lookup[MiSize]]`,
+//!   `y_mode_probs[0]`, `uv_mode_probs[y_mode]` from the compressed
+//!   header rather than the keyframe `kf_*_mode_probs` tables) lands
+//!   alongside the §6.4.11 inter-frame driver in a later round; the
+//!   round-17 surface is internal-only.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return

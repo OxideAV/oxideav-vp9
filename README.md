@@ -5,6 +5,79 @@ Bitstream & Decoding Process Specification v0.7.
 
 ## Status — 2026-05-25
 
+**Round 17: §6.4.6 `intra_frame_mode_info()` keyframe driver.** Round
+17 wires the rounds 15 / 16 primitives into the §6.4.6 per-block
+mode-info reader for keyframe (and intra-only) frames — the spec's
+top-level entry point for an intra MI block:
+
+* §9.3.1 `intra_mode_tree[18]` — the 18-entry / 10-leaf tree shared by
+  `default_intra_mode` / `default_uv_mode` / `intra_mode` /
+  `sub_intra_mode` / `uv_mode`. Transcribed verbatim
+  (`{ -DC_PRED, 2, -TM_PRED, 4, -V_PRED, 6, 8, 12, -H_PRED, 10,
+  -D135_PRED, -D117_PRED, -D45_PRED, 14, -D63_PRED, 16, -D153_PRED,
+  -D207_PRED }`); the all-bit-0 walk lands on the `-DC_PRED` leaf
+  (= 0).
+* §10.5 `kf_y_mode_probs[INTRA_MODES][INTRA_MODES][INTRA_MODES - 1]`
+  (a 10 × 10 × 9 = 900-byte table indexed by `[abovemode][leftmode]
+  [node]` per the §9.3.2 `default_intra_mode` listing) transcribed
+  verbatim from the §10.5 listing. Anchor checks pin five rows
+  including `[dc][dc]`, `[dc][tm]`, `[h][h]`, and the last row
+  `[tm][tm]`.
+* §10.5 `kf_uv_mode_probs[INTRA_MODES][INTRA_MODES - 1]` (10 × 9 = 90
+  bytes, indexed by `[y_mode][node]` per the §9.3.2 `default_uv_mode`
+  listing) transcribed verbatim. Anchor checks pin the `[dc]`, `[h]`
+  and `[tm]` rows.
+* `default_intra_mode( coder, abovemode, leftmode )` — the §9.3.3
+  walk over `intra_mode_tree` with `kf_y_mode_probs[above][left][node]`
+  per row. Hand-traced bias-buffer test pins
+  `default_intra_mode( DC_PRED, DC_PRED ) -> D207_PRED` (right-branch
+  on every node, terminating at the §9.3.1 `-D207_PRED` leaf).
+* `default_uv_mode( coder, y_mode )` — the §9.3.3 walk with
+  `kf_uv_mode_probs[y_mode][node]`. Same hand-traced bias-buffer test
+  pins `default_uv_mode( DC_PRED ) -> D207_PRED`.
+* `intra_frame_mode_info()` (§6.4.6) — the orchestrator threading
+  `intra_segment_id( )` (round 16) + `read_skip( )` (round 15) +
+  `read_tx_size( 1 )` (round 15) + `default_intra_mode` +
+  `default_uv_mode` into a `Vp9IntraMiBlock { segment_id, skip,
+  tx_size, ref_frame_0, ref_frame_1, is_inter, y_mode, sub_modes[4],
+  uv_mode }`. `ref_frame[0] = INTRA_FRAME = 0`, `ref_frame[1] = NONE
+  = -1`, `is_inter = false` are hardwired per the §6.4.6 listing
+  (NONE = -1 derived from `isCompound = ref_frame[1] > NONE` plus
+  `ref_frame[1] > INTRA_FRAME = 0` for compound; the unique integer
+  strictly below INTRA_FRAME). The `MiSize >= BLOCK_8X8` arm decodes
+  one `default_intra_mode` and replicates it into all four
+  `sub_modes[ ]` cells; the `MiSize < BLOCK_8X8` arm walks the §6.4.6
+  `(idy, idx)` grid stepped by `num_4x4_blocks_high_lookup[MiSize]` /
+  `num_4x4_blocks_wide_lookup[MiSize]` — 4 reads for BLOCK_4X4, 2 for
+  BLOCK_4X8 / BLOCK_8X4 — with each cell receiving its own decoded
+  mode replicated across the (num4x4h × num4x4w) `sub_modes[ ]`
+  sub-grid, and `y_mode` set to the *last* decoded
+  `default_intra_mode` per the spec listing.
+* `IntraFrameNeighbours { avail_u, avail_l, above_sub_modes_23[2],
+  left_sub_modes_13[2] }` — the per-MI-block neighbour bundle a tile
+  driver builds from its frame-wide `SubModes[ ][ ][ ]` array. The
+  §9.3.2 listing reads only positions {2, 3} of the above neighbour's
+  `sub_modes[ ]` and positions {1, 3} of the left neighbour's
+  `sub_modes[ ]`, so the bundle only carries those two cells per
+  side; `DC_PRED` is substituted when `avail_u` / `avail_l` is false
+  per the §9.3.2 fallback.
+
+Out of scope for round 17: the §6.4.15 `intra_block_mode_info` (used
+on intra blocks within **inter** frames — the §6.4.11
+`inter_frame_mode_info()` is the §6.4.6 counterpart for inter frames;
+the intra-block branch within that calls `intra_block_mode_info`
+which uses `y_mode_probs[size_group_lookup[MiSize]][node]` /
+`y_mode_probs[0][node]` / `uv_mode_probs[y_mode][node]` from the
+compressed header rather than the keyframe `kf_*_mode_probs` tables);
+inter-frame mode info (§6.4.11+, blocked on reference-buffer state);
+the §8.4 `counts_intra_mode` / `counts_uv_mode` probability-adaption
+accumulators (§9.3.4 bookkeeping); and the `SubModes[ ][ ][ ]` /
+`YModes[ ][ ]` frame-wide write-back the next MI block consumes from
+the just-decoded `Vp9IntraMiBlock` (left to the §6.4.4 driver). The
+round-17 surface is internal-only; the public API still exposes
+`parse_uncompressed_header`, `parse_compressed_header` and their
+result types exclusively.
+
 **Round 16: §6.4.7 `intra_segment_id` + §9.3.1 `segment_tree`.** Round
 16 extends the round-15 `mode_info` module (crate-internal,
 `pub(crate)`) with the next slice of the §6.4.6

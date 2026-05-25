@@ -6,6 +6,66 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **§6.4.3 `decode_partition( r, c, bsize )` recursive partition
+  driver.** Composes the round-18
+  [`decode_partition_type( )`](src/partition.rs) primitive into the
+  full §6.4.3 recursion that walks the partition tree rooted at a
+  superblock and dispatches to the §6.4.4 `decode_block( )` orchestrator
+  at every leaf:
+  * `PartitionContext { above: Vec<u8>, left: Vec<u8> }` —
+    `AbovePartitionContext[ ]` / `LeftPartitionContext[ ]` strips per
+    §6.4.3, allocated `mi_cols` wide × `mi_rows` tall per the §7.4.2
+    "every cell zeroed before each tile" rule.
+  * `LeafBlock { r, c, subsize }` — one record per spec-listed
+    `decode_block( r, c, subsize )` call the recursion would have
+    issued. `decode_block( )` itself sits one layer up (it consumes
+    the §6.4.5 `mode_info( )` + §6.4.21 `residual( )` machinery and
+    lands in a later round); for now the driver appends every
+    `(r, c, subsize)` triple to a caller-owned `Vec<LeafBlock>` log
+    in spec recursion order.
+  * `PartitionProbsKind::{Keyframe, Inter(table)}` — selects the
+    §10.4 `KF_PARTITION_PROBS` (for `FrameIsIntra == 1`) vs a
+    caller-supplied 16x3 running `partition_probs` table (for
+    `FrameIsIntra == 0`).
+  * `decode_partition( coder, r, c, bsize, mi_rows, mi_cols, ctx_state,
+    probs_kind, leaves )` — the recursive driver itself. Implements
+    every step of the §6.4.3 listing (lines 2353-2392):
+    edge guard (`r >= mi_rows || c >= mi_cols` → no-op), `num8x8` /
+    `halfBlock8x8` / `hasRows` / `hasCols` geometry,
+    `partition_plane_context` ctx derivation, `decode_partition_type`
+    per-call read, dispatch on the four partition values
+    (`NONE` / `HORZ` / `VERT` / `SPLIT`) with the spec-order
+    four-way recursion for `SPLIT`, and the §6.4.3 tail context
+    write-back gated by `bsize == BLOCK_8X8 || partition !=
+    PARTITION_SPLIT` writing
+    `AbovePartitionContext[ c + i ] = 15 >> b_width_log2_lookup[
+    subsize ]` /
+    `LeftPartitionContext[ r + i ] = 15 >> b_height_log2_lookup[
+    subsize ]`.
+  * **Hand-built bitstream coverage.** A test-only range encoder
+    mirrors the §9.2 decoder so each scenario produces a buffer that
+    decodes back to a specific `(bit, p)` sequence; the encoder is
+    pinned by two round-trip self-tests under uniform and mixed
+    probabilities. The three §6.4.3 scenarios then walk the recursion
+    end-to-end:
+      * **Scenario (a)** — single 64x64 CTU coded as `PARTITION_NONE`:
+        one decoded leaf at `(0, 0, BLOCK_64X64)`.
+      * **Scenario (b)** — root `PARTITION_SPLIT` then four
+        `PARTITION_NONE` at each 32x32 quadrant: four decoded leaves
+        at `(0,0,9)`, `(0,4,9)`, `(4,0,9)`, `(4,4,9)` in spec
+        quadrant order.
+      * **Scenario (c)** — mixed `PARTITION_HORZ` + `PARTITION_VERT`
+        + 2× `PARTITION_NONE` under a root SPLIT: six leaves at
+        `(0,0,8)`, `(2,0,8)` (HORZ), `(0,4,7)`, `(0,6,7)` (VERT),
+        `(4,0,9)`, `(4,4,9)` (NONE) — with the §6.4.3 ctx /
+        write-back trace pinned step-by-step in the doc-comment.
+    Plus edge-guard, write-back-cell-value, and inter-frame
+    `Inter(table)` path tests.
+  * Whole-recursion surface remains internal-only (`pub(crate)`); the
+    §6.4.4 `decode_block( )` orchestrator + the §6.3
+    `read_partition_probs( )` compressed-header sweep land in
+    later rounds.
+
 * **§6.4.3 `decode_partition_type( )` per-call partition reader (new
   crate-local `partition` module).** The single-call decoder the
   recursive §6.4.3 `decode_partition( r, c, bsize )` driver (later

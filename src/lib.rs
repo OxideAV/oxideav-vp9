@@ -260,15 +260,35 @@
 //!   `BLOCK_INVALID = 14` for illegal combinations), and the §10.4
 //!   `kf_partition_probs[16][3]` keyframe fixed-probability table plus
 //!   the §10.5 `default_partition_probs[16][3]` inter-frame initial
-//!   probability table both transcribed verbatim. The recursive §6.4.3
-//!   driver itself (the `decode_partition( r, c, bsize )` function that
-//!   splits on the decoded `partition`, threads `subsize_lookup[
-//!   partition ][ bsize ]` into four recursive calls when
-//!   `PARTITION_SPLIT`, and writes back the
-//!   `AbovePartitionContext[ ]` / `LeftPartitionContext[ ]` strips with
-//!   `15 >> b_*_log2_lookup[ subsize ]`) and the §6.3
-//!   `read_partition_probs( )` compressed-header sweep both land in a
-//!   later round; the round-18 surface is internal-only.
+//!   probability table both transcribed verbatim.
+//! * Round 19 lands the §6.4.3 recursive `decode_partition( r, c, bsize )`
+//!   driver itself, composing round 18's `decode_partition_type( )`
+//!   into the full recursion. Implements every step of the §6.4.3
+//!   listing (lines 2353-2392): edge guard (`r >= mi_rows ||
+//!   c >= mi_cols`), `num8x8` / `halfBlock8x8` / `hasRows` / `hasCols`
+//!   geometry, ctx derivation via `partition_plane_context`, dispatch
+//!   on the four partition values, spec-order four-way recursion for
+//!   `PARTITION_SPLIT` (top-left → top-right → bottom-left →
+//!   bottom-right), and the §6.4.3 tail context write-back gated by
+//!   `bsize == BLOCK_8X8 || partition != PARTITION_SPLIT` writing
+//!   `AbovePartitionContext[ c + i ] = 15 >> b_width_log2_lookup[
+//!   subsize ]` and the symmetric `LeftPartitionContext[ r + i ]` per
+//!   `i in 0..num8x8`. The per-tile context strips ride on a
+//!   `PartitionContext { above: Vec<u8>, left: Vec<u8> }`, and the
+//!   §6.4.4 `decode_block( r, c, subsize )` orchestrator the spec
+//!   would call at every leaf is replaced by a `LeafBlock { r, c,
+//!   subsize }` record pushed onto a caller-owned `Vec<LeafBlock>` log
+//!   in spec recursion order — the orchestrator itself sits one layer
+//!   up and lands in a later round (it consumes §6.4.5 `mode_info( )`
+//!   plus §6.4.21 `residual( )` machinery). Probability sourcing is
+//!   selected via `PartitionProbsKind::Keyframe` (KF table) or
+//!   `PartitionProbsKind::Inter` with a caller-supplied 16x3 running
+//!   table. Hand-built bitstream tests (a single-CTU PARTITION_NONE,
+//!   a root-SPLIT-then-4× PARTITION_NONE, a mixed HORZ+VERT scenario)
+//!   pin the recursion's leaf-block log against the spec quadrant
+//!   order. The §6.3 `read_partition_probs( )` compressed-header
+//!   sweep populating the inter table lands in a later round; the
+//!   round-19 driver surface remains internal-only.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return

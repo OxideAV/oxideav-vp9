@@ -1,14 +1,13 @@
-//! VP9 partition primitive per spec v0.7 — §3 / §6.4.3 / §9.3.1 / §9.3.2
-//! / §10.2 / §10.4 / §10.5.
+//! VP9 partition primitive + recursive driver per spec v0.7 — §3 / §6.4.3
+//! / §9.3.1 / §9.3.2 / §10.2 / §10.4 / §10.5.
 //!
 //! Round 18 lands the §6.4.3 `decode_partition_type( )` reader — the per-call
-//! partition-tree decode that the recursive [`crate::partition::decode_partition`]
-//! driver (later round) will fire once per `(r, c, bsize)` quadrant. The
-//! recursive driver, the §10.2 `subsize_lookup` traversal, and the
-//! `AbovePartitionContext[ ]` / `LeftPartitionContext[ ]` write-back the
-//! §6.4.3 tail performs all sit on top of this primitive; this round bounds
-//! itself to the single-call decode plus the §9.3.2 context derivation it
-//! consumes.
+//! partition-tree decode that fires once per `(r, c, bsize)` quadrant.
+//! Round 19 lands the recursive [`decode_partition`] driver itself, which
+//! composes the round-18 primitive into the full §6.4.3 listing
+//! (lines 2353-2392): edge guard, geometry, `partition_plane_context`
+//! ctx derivation, four-way recursion on `PARTITION_SPLIT` in spec
+//! quadrant order, and the §6.4.3 tail context write-back.
 //!
 //! The §9.3.1 tree-selection rule — *"if hasRows == 1 and hasCols == 1 the
 //! tree is `partition_tree`; else if hasCols == 1 the tree is
@@ -47,13 +46,12 @@
 //!
 //! Deferred to later rounds (NOT in scope here):
 //!
-//! * The §6.4.3 recursive driver itself (the `decode_partition( r, c, bsize )`
-//!   function that splits on the decoded `partition`, threads the
-//!   `subsize_lookup[ partition ][ bsize ]` child block size into four
-//!   recursive calls when `PARTITION_SPLIT`, and writes back the
-//!   `AbovePartitionContext[ ]` / `LeftPartitionContext[ ]` strips with
-//!   `15 >> b_*_log2_lookup[ subsize ]`). It composes this primitive plus
-//!   the §6.4.4 `decode_block( )` orchestrator that lives one layer up.
+//! * The §6.4.4 `decode_block( r, c, subsize )` orchestrator that the
+//!   recursion's terminal step would call. The driver records each
+//!   `(r, c, subsize)` triple onto a [`LeafBlock`] log and lets the
+//!   caller iterate; the §6.4.5 `mode_info( )` + §6.4.21 `residual( )`
+//!   machinery the orchestrator consumes is wired one layer up in
+//!   a later round.
 //! * The §6.3 `read_partition_probs( )` compressed-header sweep
 //!   (`PARTITION_CONTEXTS × (PARTITION_TYPES - 1) = 16 × 3 = 48`
 //!   `diff_update_prob` cells against [`DEFAULT_PARTITION_PROBS`]).
@@ -64,7 +62,7 @@
 //! (`docs/video/vp9/vp9-spec.txt` §3 / §6.4.3 / §9.3.1 / §9.3.2 / §10.2 /
 //! §10.4 / §10.5). No external library source consulted.
 
-#![allow(dead_code)] // surfaces land in the next round's §6.4.3 driver
+#![allow(dead_code)] // surfaces consumed by the §6.4.2 tile-walk driver (later round)
 
 use crate::bool_coder::BoolCoder;
 use crate::mode_info::tree_decode;
@@ -498,6 +496,289 @@ pub(crate) fn decode_partition_type(
         // returns PARTITION_SPLIT directly without reading any bits.
         (false, false) => Ok(PARTITION_SPLIT),
     }
+}
+
+// ----- §6.4.3 recursive partition driver -----
+
+/// `BLOCK_8X8 = 3` per §3 — the recursion's terminal bsize at which the
+/// driver MUST stop subdividing (the partition decode itself is only
+/// valid for `bsize >= BLOCK_8X8`).
+const BLOCK_8X8: u8 = 3;
+
+/// Per-tile partition-context strips per §6.4.3.
+///
+/// The §6.4.3 driver materialises the §9.3.2 `above` / `left` bitmaps
+/// from two parallel arrays of `8x8`-block-resolution cells:
+///
+/// * `above[ c ]` is the `AbovePartitionContext` cell at column `c`
+///   (one per `8x8` block across the tile's width).
+/// * `left[ r ]` is the `LeftPartitionContext` cell at row `r`
+///   (one per `8x8` block across the tile's height).
+///
+/// Cells are written back by the §6.4.3 tail (spec lines 2386-2391):
+///
+/// ```text
+/// if ( bsize == BLOCK_8X8 || partition != PARTITION_SPLIT ) {
+///     for ( i = 0; i < num8x8 ; i ++ ) {
+///         AbovePartitionContext[ c + i ] = 15 >> b_width_log2_lookup[ subsize ]
+///         LeftPartitionContext[ r + i ] = 15 >> b_height_log2_lookup[ subsize ]
+///     }
+/// }
+/// ```
+///
+/// Per §7.4.2 lines 3825-3837 both arrays are zeroed before each tile
+/// (`AbovePartitionContext[ i ] = 0` for `i = 0..Sb64Cols*8 - 1`, and
+/// the symmetric statement for the row strip).
+#[derive(Debug, Clone)]
+pub(crate) struct PartitionContext {
+    /// `AbovePartitionContext[ ]` — one byte per 8x8-block column.
+    pub(crate) above: Vec<u8>,
+    /// `LeftPartitionContext[ ]` — one byte per 8x8-block row.
+    pub(crate) left: Vec<u8>,
+}
+
+impl PartitionContext {
+    /// Allocate strips wide / tall enough for `mi_cols` / `mi_rows`
+    /// 8x8-block columns / rows. Per §7.4.2 every cell starts zeroed.
+    pub(crate) fn new(mi_cols: usize, mi_rows: usize) -> Self {
+        Self {
+            above: vec![0u8; mi_cols],
+            left: vec![0u8; mi_rows],
+        }
+    }
+}
+
+/// One leaf-block record the §6.4.3 recursion would have dispatched to
+/// the §6.4.4 `decode_block( r, c, subsize )` orchestrator.
+///
+/// Used by [`decode_partition`] to log every terminal recursion step
+/// without actually invoking `decode_block` (that orchestrator depends
+/// on the §6.4.5 `mode_info( )` + §6.4.21 `residual( )` machinery one
+/// layer up and is wired in a later round). The order leaves are
+/// pushed is the spec's quadrant-walk order: PARTITION_NONE pushes a
+/// single leaf at `(r, c)`; PARTITION_HORZ pushes `(r, c)` then
+/// `(r + half, c)`; PARTITION_VERT pushes `(r, c)` then `(r, c + half)`;
+/// PARTITION_SPLIT recurses into top-left, top-right, bottom-left,
+/// bottom-right and the leaves pushed by those sub-calls preserve the
+/// spec's spatial ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LeafBlock {
+    /// Block row (8x8-block units).
+    pub(crate) r: usize,
+    /// Block column (8x8-block units).
+    pub(crate) c: usize,
+    /// `subsize` — the §3 `BLOCK_*` index the leaf occupies.
+    pub(crate) subsize: u8,
+}
+
+/// Which probability table the §9.3.2 lookup should consult — keyframe /
+/// intra-only frames use [`KF_PARTITION_PROBS`] (verbatim); inter
+/// frames use the running `partition_probs[ ]` table initialised from
+/// [`DEFAULT_PARTITION_PROBS`].
+///
+/// Per spec §6.4.3 the choice is governed by `FrameIsIntra`: keyframes
+/// (frame_type == KEY_FRAME) and intra-only inter frames both qualify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PartitionProbsKind<'a> {
+    /// Use the fixed §10.4 keyframe table (`FrameIsIntra == 1`).
+    Keyframe,
+    /// Use a caller-provided running table (`FrameIsIntra == 0`).
+    ///
+    /// `partition_probs[ctx][node2]` — 16 rows × 3 cells per §10.5
+    /// shape. The §6.3 `read_partition_probs( )` sweep populates this
+    /// from [`DEFAULT_PARTITION_PROBS`] in a later round; the driver
+    /// itself only reads it.
+    Inter(&'a [[u8; PARTITION_TYPES - 1]; PARTITION_CONTEXTS]),
+}
+
+impl<'a> PartitionProbsKind<'a> {
+    /// Return the per-context 3-cell row the §6.4.3 driver hands to
+    /// [`decode_partition_type`].
+    fn row(&self, ctx: usize) -> &[u8; PARTITION_TYPES - 1] {
+        match self {
+            Self::Keyframe => &KF_PARTITION_PROBS[ctx],
+            Self::Inter(table) => &table[ctx],
+        }
+    }
+}
+
+/// §6.4.3 `decode_partition( r, c, bsize )` — the recursive partition-tree
+/// driver.
+///
+/// Walks the per-tile partition tree rooted at `(r, c, bsize)` by:
+///
+/// 1. **Edge guard** — return immediately if `r >= mi_rows ||
+///    c >= mi_cols` (the spec listing's first line `return 0`); the
+///    caller's outer §6.4.2 sweep clips against frame edges.
+/// 2. **Geometry** — read `num8x8 = num_8x8_blocks_wide_lookup[ bsize ]`
+///    and `halfBlock8x8 = num8x8 >> 1`; compute `hasRows` /
+///    `hasCols`.
+/// 3. **Context derivation** — `partition_plane_context` materialises
+///    the §9.3.2 ctx from the [`PartitionContext`] strips.
+/// 4. **Per-call decode** — [`decode_partition_type`] reads the
+///    `partition` value off the bool coder using the probability row
+///    selected by `probs_kind`.
+/// 5. **Recursion** — for `PARTITION_NONE` / `HORZ` / `VERT` records
+///    the leaf block(s) the spec listing would have dispatched to
+///    `decode_block( )`; for `PARTITION_SPLIT` recurses four-way over
+///    the quadrants `( r, c )`, `( r, c + half )`, `( r + half, c )`,
+///    `( r + half, c + half )` with `subsize = subsize_lookup[ SPLIT
+///    ][ bsize ]`.
+/// 6. **Context write-back** — when `bsize == BLOCK_8X8 || partition !=
+///    PARTITION_SPLIT` writes
+///    `AbovePartitionContext[ c + i ] = 15 >> b_width_log2_lookup[
+///    subsize ]` and
+///    `LeftPartitionContext[ r + i ] = 15 >> b_height_log2_lookup[
+///    subsize ]` for `i in 0..num8x8`.
+///
+/// The §6.4.4 `decode_block( )` orchestrator the spec dispatches to at
+/// each leaf is NOT invoked here (it sits one layer up and consumes
+/// the §6.4.5 `mode_info( )` + §6.4.21 `residual( )` machinery). The
+/// driver instead pushes a [`LeafBlock`] record onto `leaves` for every
+/// `(r, c, subsize)` triple the §6.4.4 call would have received, in
+/// spec-order.
+///
+/// `mi_rows` / `mi_cols` are the tile's frame-relative MI extents
+/// (number of 8x8 blocks tall / wide). `ctx_state` is the per-tile
+/// partition strips; the driver mutates `above` / `left` in place per
+/// the §6.4.3 tail.
+///
+/// Returns `Ok(())` on success or [`Error::InvalidBitstream`] when the
+/// bool coder underflows during a `decode_partition_type` walk.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_partition(
+    coder: &mut BoolCoder<'_>,
+    r: usize,
+    c: usize,
+    bsize: u8,
+    mi_rows: usize,
+    mi_cols: usize,
+    ctx_state: &mut PartitionContext,
+    probs_kind: PartitionProbsKind<'_>,
+    leaves: &mut Vec<LeafBlock>,
+) -> Result<(), Error> {
+    // §6.4.3 line 2354: clip past frame edges.
+    if r >= mi_rows || c >= mi_cols {
+        return Ok(());
+    }
+
+    debug_assert!(
+        (bsize as usize) < BLOCK_SIZES,
+        "decode_partition: bsize={bsize} out of range"
+    );
+    // Only the four square superblock sizes ever feed the recursion
+    // (BLOCK_8X8 / BLOCK_16X16 / BLOCK_32X32 / BLOCK_64X64); the spec
+    // listing never recurses into a non-square parent.
+    debug_assert!(
+        matches!(bsize, BLOCK_8X8 | 6 | 9 | 12),
+        "decode_partition: non-superblock bsize={bsize}"
+    );
+
+    let num8x8 = NUM_8X8_BLOCKS_WIDE_LOOKUP[bsize as usize] as usize;
+    let half_block_8x8 = num8x8 >> 1;
+    let has_rows = (r + half_block_8x8) < mi_rows;
+    let has_cols = (c + half_block_8x8) < mi_cols;
+
+    // §9.3.2 ctx — OR-fold across the num8x8-wide strip starting at the
+    // current `(r, c)` offset.
+    let above_strip = &ctx_state.above[c..c + num8x8];
+    let left_strip = &ctx_state.left[r..r + num8x8];
+    let ctx = partition_plane_context(bsize, above_strip, left_strip);
+
+    // §6.4.3 line 2360: read the partition value.
+    let probs = probs_kind.row(ctx);
+    let partition = decode_partition_type(coder, has_rows, has_cols, probs)?;
+
+    // §6.4.3 line 2361: subsize_lookup feeds both the dispatch arm and
+    // the write-back tail.
+    let subsize = SUBSIZE_LOOKUP[partition as usize][bsize as usize];
+
+    // §6.4.3 lines 2362-2385: dispatch on `partition`.
+    if subsize < BLOCK_8X8 || partition == PARTITION_NONE {
+        // Single leaf at (r, c, subsize). The spec listing covers two
+        // cases here:
+        //   (a) PARTITION_NONE — subsize = bsize (identity lookup).
+        //   (b) Any partition at BLOCK_8X8 parent where the split would
+        //       produce a sub-8x8 child (`subsize < BLOCK_8X8`).
+        leaves.push(LeafBlock { r, c, subsize });
+    } else if partition == PARTITION_HORZ {
+        // Two leaves: (r, c) and (r + half, c). The §6.4.3 listing
+        // gates the second call on `hasRows` (no bottom half when the
+        // tile's bottom edge clips it).
+        leaves.push(LeafBlock { r, c, subsize });
+        if has_rows {
+            leaves.push(LeafBlock {
+                r: r + half_block_8x8,
+                c,
+                subsize,
+            });
+        }
+    } else if partition == PARTITION_VERT {
+        // Two leaves: (r, c) and (r, c + half). Right call gated on
+        // `hasCols`.
+        leaves.push(LeafBlock { r, c, subsize });
+        if has_cols {
+            leaves.push(LeafBlock {
+                r,
+                c: c + half_block_8x8,
+                subsize,
+            });
+        }
+    } else {
+        // PARTITION_SPLIT — recurse four-way in spec-order:
+        // top-left, top-right, bottom-left, bottom-right.
+        decode_partition(
+            coder, r, c, subsize, mi_rows, mi_cols, ctx_state, probs_kind, leaves,
+        )?;
+        decode_partition(
+            coder,
+            r,
+            c + half_block_8x8,
+            subsize,
+            mi_rows,
+            mi_cols,
+            ctx_state,
+            probs_kind,
+            leaves,
+        )?;
+        decode_partition(
+            coder,
+            r + half_block_8x8,
+            c,
+            subsize,
+            mi_rows,
+            mi_cols,
+            ctx_state,
+            probs_kind,
+            leaves,
+        )?;
+        decode_partition(
+            coder,
+            r + half_block_8x8,
+            c + half_block_8x8,
+            subsize,
+            mi_rows,
+            mi_cols,
+            ctx_state,
+            probs_kind,
+            leaves,
+        )?;
+    }
+
+    // §6.4.3 lines 2386-2391: context write-back. The gate excludes the
+    // PARTITION_SPLIT-at-non-BLOCK_8X8 case where each child wrote its
+    // own context; for BLOCK_8X8-parent SPLIT (child = BLOCK_4X4) the
+    // parent still writes back per the `bsize == BLOCK_8X8` clause.
+    if bsize == BLOCK_8X8 || partition != PARTITION_SPLIT {
+        let above_val = 15u8 >> B_WIDTH_LOG2_LOOKUP[subsize as usize];
+        let left_val = 15u8 >> B_HEIGHT_LOG2_LOOKUP[subsize as usize];
+        for i in 0..num8x8 {
+            ctx_state.above[c + i] = above_val;
+            ctx_state.left[r + i] = left_val;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -992,6 +1273,604 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ----- §6.4.3 decode_partition() recursive driver tests -----
+    //
+    // Hand-built bitstreams. The §9.2 bool coder is range-coded so we
+    // need a test-only encoder to produce buffers that decode back to
+    // a specific sequence of `read_bool( p )` outputs. The encoder
+    // below mirrors the §9.2.2 decoder one operation at a time and is
+    // exclusively a test convenience — production code never
+    // round-trips through it.
+
+    /// Minimal range encoder mirroring the §9.2 decoder, using the
+    /// classic libvpx-style "wide low register" pattern: `low` is
+    /// kept as a 32-bit accumulator with the *output* byte sliding
+    /// out the top whenever renormalisation has happened often enough
+    /// to fully define it.
+    ///
+    /// The encoder mirrors the inverse of the §9.2.2 split / branch:
+    ///   `split = 1 + ((range-1)*p >> 8)`
+    ///   bit=0 → `range = split`
+    ///   bit=1 → `low += split; range -= split`
+    /// Renormalisation doubles `range` whenever it drops below 128 and
+    /// tracks a `count` of pending shifts. When `count` reaches 8 the
+    /// top byte of `low` is shifted out as the next emitted byte
+    /// (with carry propagation handled by walking back through any
+    /// previously emitted `0xff` bytes).
+    ///
+    /// This matches the algorithm in RFC 6386 §7.4 (VP8 encoder),
+    /// which VP9 inherits unchanged for `read_bool` parsing — only the
+    /// `init_bool` shape and the `BoolMaxBits` underflow check differ.
+    #[derive(Debug)]
+    struct BoolEncoder {
+        low: u64,
+        range: u32,
+        count: i32,
+        out: Vec<u8>,
+    }
+
+    impl BoolEncoder {
+        fn new() -> Self {
+            Self {
+                low: 0,
+                range: 255,
+                // -24 means "we need 24 renorm shifts before we
+                // emit the first byte", which packs an 8-bit BoolValue
+                // followed by another 16 bits' worth of in-flight bits
+                // into the high half of `low` before any output flows.
+                // This is the libvpx VP8 starting condition (RFC 6386
+                // §7.4): it lets the encoder's first 8 emitted bits
+                // align with the decoder's `init_bool` f(8) BoolValue
+                // read.
+                count: -24,
+                out: Vec::new(),
+            }
+        }
+
+        fn encode_bool(&mut self, bit: u8, p: u32) {
+            let split: u32 = 1 + (((self.range - 1) * p) >> 8);
+            if bit == 0 {
+                self.range = split;
+            } else {
+                self.low += split as u64;
+                self.range -= split;
+            }
+            while self.range < 128 {
+                self.range <<= 1;
+                self.count += 1;
+                self.low <<= 1;
+                if self.count == 0 {
+                    // The top byte of `low` is now fully defined —
+                    // shift it out. If it's >=256 a carry propagates
+                    // into the previously emitted byte; walk back
+                    // through any pending 0xff bytes (which carry
+                    // through to 0x00) and increment the next live
+                    // byte.
+                    let carry = (self.low >> 32) & 1;
+                    if carry != 0 {
+                        // Propagate carry into the most recently
+                        // emitted byte (and 0xff chains).
+                        let mut i = self.out.len();
+                        while i > 0 {
+                            i -= 1;
+                            if self.out[i] != 0xff {
+                                self.out[i] = self.out[i].wrapping_add(1);
+                                break;
+                            } else {
+                                self.out[i] = 0;
+                            }
+                        }
+                    }
+                    let byte = ((self.low >> 24) & 0xff) as u8;
+                    self.out.push(byte);
+                    self.low &= (1u64 << 24) - 1;
+                    self.count = -8;
+                }
+            }
+        }
+
+        /// Flush — pump 32 final shifts to drain the in-flight bits,
+        /// then pad with zero bytes so the decoder never underflows
+        /// `BoolMaxBits` while walking renorm refills.
+        fn finish(mut self) -> Vec<u8> {
+            for _ in 0..32 {
+                self.encode_bool(0, 128);
+            }
+            while self.out.len() < 64 {
+                self.out.push(0);
+            }
+            self.out
+        }
+    }
+
+    /// Encode `(bit, p)` pairs and return the buffer + buffer-size the
+    /// decoder should be initialised with. The encoder always prepends
+    /// the implicit marker bit `bit=0, p=128` the §9.2.1 init consumes.
+    fn encode_bits(pairs: &[(u8, u32)]) -> Vec<u8> {
+        let mut enc = BoolEncoder::new();
+        // §9.2.1 marker: init_bool runs read_bool(128); for it to
+        // decode to 0 we encode a leading (bit=0, p=128).
+        enc.encode_bool(0, 128);
+        for &(bit, p) in pairs {
+            enc.encode_bool(bit, p);
+        }
+        enc.finish()
+    }
+
+    /// Verify the encoder round-trips: encode a sequence, decode it,
+    /// confirm the same bits come back out under the same probabilities.
+    /// This pins the encoder before we trust it for the §6.4.3 tests.
+    #[test]
+    fn bool_encoder_round_trips_under_uniform_probability() {
+        let pairs: Vec<(u8, u32)> = vec![
+            (0, 128),
+            (1, 128),
+            (0, 128),
+            (1, 128),
+            (1, 128),
+            (0, 128),
+            (0, 128),
+            (1, 128),
+        ];
+        let buf = encode_bits(&pairs);
+        let mut dec = BoolCoder::init_bool(&buf, buf.len()).expect("encoder buffer init");
+        for &(bit, p) in &pairs {
+            let got = dec.read_bool(p).unwrap();
+            assert_eq!(got as u8, bit, "bit mismatch under p={p}");
+        }
+    }
+
+    /// Verify the encoder round-trips under a mix of probabilities the
+    /// §6.4.3 driver actually uses (the §10.4 KF_PARTITION_PROBS rows
+    /// fall in the 3..=222 range; we sweep extremes plus a midrange).
+    #[test]
+    fn bool_encoder_round_trips_under_mixed_probabilities() {
+        let pairs: Vec<(u8, u32)> = vec![
+            (1, 200),
+            (0, 50),
+            (1, 50),
+            (0, 200),
+            (0, 128),
+            (1, 12),
+            (0, 12),
+            (1, 200),
+            (1, 200),
+            (0, 200),
+        ];
+        let buf = encode_bits(&pairs);
+        let mut dec = BoolCoder::init_bool(&buf, buf.len()).expect("encoder buffer init");
+        for &(bit, p) in &pairs {
+            let got = dec.read_bool(p).unwrap();
+            assert_eq!(got as u8, bit, "bit mismatch under p={p}");
+        }
+    }
+
+    // The §10.4 KF_PARTITION_PROBS rows the driver consults at each ctx:
+    //   ctx=12 (BLOCK_64X64, both not split) → [174, 35, 49]
+    //   ctx=8  (BLOCK_32X32, both not split) → [150, 40, 39]
+    //   ctx=4  (BLOCK_16X16, both not split) → [149, 53, 53]
+    //   ctx=0  (BLOCK_8X8,   both not split) → [158, 97, 94]
+    // (And the post-write-back ctx values shift to 13/9/5/1 once the
+    // top neighbour's bit is set, etc.)
+
+    /// Helper: drive `decode_partition` with `pairs` of (bit, p) values
+    /// that the §6.4.3 recursion is expected to consume in order, with
+    /// the keyframe probability table.
+    fn run_partition_with_pairs(
+        mi_rows: usize,
+        mi_cols: usize,
+        bsize: u8,
+        pairs: &[(u8, u32)],
+    ) -> Vec<LeafBlock> {
+        let buf = encode_bits(pairs);
+        let mut dec = BoolCoder::init_bool(&buf, buf.len()).expect("buffer init");
+        let mut ctx = PartitionContext::new(mi_cols, mi_rows);
+        let mut leaves = Vec::new();
+        decode_partition(
+            &mut dec,
+            0,
+            0,
+            bsize,
+            mi_rows,
+            mi_cols,
+            &mut ctx,
+            PartitionProbsKind::Keyframe,
+            &mut leaves,
+        )
+        .expect("decode_partition ok");
+        leaves
+    }
+
+    /// Scenario (a) — Single 64x64 CTU, PARTITION_NONE at root.
+    ///
+    /// Expected per §6.4.3:
+    ///   * ctx=12 (zero strips at BLOCK_64X64); probs row = [174, 35, 49].
+    ///   * decode_partition_type interior tree at node 0 reads
+    ///     read_bool(174); we encode (bit=0, p=174) → PARTITION_NONE.
+    ///   * Single leaf at (0, 0, BLOCK_64X64=12). No recursion.
+    ///   * Write-back: above_val = 15 >> b_width_log2[12] = 15>>4 = 0;
+    ///     same for left. Strips already 0, no observable change.
+    #[test]
+    fn scenario_a_single_64x64_partition_none() {
+        let leaves = run_partition_with_pairs(
+            /* mi_rows */ 8,
+            /* mi_cols */ 8,
+            /* bsize */ 12,          // BLOCK_64X64
+            &[(0, 174)], // KF_PARTITION_PROBS[12][0] interior tree node 0
+        );
+        assert_eq!(leaves.len(), 1, "PARTITION_NONE at 64x64 → 1 leaf");
+        assert_eq!(
+            leaves[0],
+            LeafBlock {
+                r: 0,
+                c: 0,
+                subsize: 12
+            }
+        );
+    }
+
+    /// Scenario (b) — PARTITION_SPLIT at 64x64 then 4× PARTITION_NONE
+    /// at each 32x32 quadrant.
+    ///
+    /// Trace:
+    ///   Root (0, 0, BLOCK_64X64=12) ctx=12, probs=KF[12]=[174,35,49].
+    ///     Walk interior tree to -SPLIT (1, 1, 1): (1,174),(1,35),(1,49).
+    ///     No write-back (bsize != BLOCK_8X8 + partition == SPLIT).
+    ///
+    ///   (0, 0, BLOCK_32X32=9) NONE:
+    ///     above_strip=[0;4], left_strip=[0;4]. bsl=2, mask=0x02.
+    ///     ctx=2*4=8. probs=KF[8]=[150,40,39]. NONE: (0, 150).
+    ///     subsize=9. above_val=left_val=15>>2=1.
+    ///     above[0..4]=1, left[0..4]=1.
+    ///
+    ///   (0, 4, BLOCK_32X32=9) NONE:
+    ///     above_strip=above[4..8]=[0;4], left_strip=left[0..4]=[1;4].
+    ///     above_bits=0; left_bits=1, &0x02=0 → left=0. ctx=8.
+    ///     NONE: (0, 150). Write-back: above[4..8]=1, left[0..4]=1
+    ///     (unchanged).
+    ///
+    ///   (4, 0, BLOCK_32X32=9) NONE:
+    ///     above_strip=above[0..4]=[1;4], left_strip=left[4..8]=[0;4].
+    ///     above_bits=1, &0x02=0 → above=0. left_bits=0. ctx=8.
+    ///     NONE: (0, 150). Write-back: above[0..4]=1, left[4..8]=1.
+    ///
+    ///   (4, 4, BLOCK_32X32=9) NONE:
+    ///     above_strip=above[4..8]=[1;4], left_strip=left[4..8]=[1;4].
+    ///     above_bits=1, &0x02=0 → 0. left_bits=1, &0x02=0 → 0.
+    ///     ctx=8. NONE: (0, 150).
+    ///
+    /// Note: every child happens to land in ctx=8 here — the §9.3.2
+    /// `(left, above)` bitmap only fires the `bsl=2` bit (mask=0x02),
+    /// and the parent NONE write-back value 1 (= `15>>3`) is BELOW
+    /// that bit, so subsequent ctx derivations all read (0, 0). A
+    /// non-square child (e.g. HORZ → subsize=BLOCK_32X16) writes back
+    /// `left_val = 15>>2 = 3` which sets bit 1, and downstream
+    /// neighbours then see `left = 1`. We exercise that in
+    /// scenario (c).
+    #[test]
+    fn scenario_b_split_then_four_partition_none() {
+        let leaves = run_partition_with_pairs(
+            8,
+            8,
+            12,
+            &[
+                // Root PARTITION_SPLIT at ctx=12.
+                (1, 174),
+                (1, 35),
+                (1, 49),
+                // 4× PARTITION_NONE at ctx=8 — all four children share
+                // ctx=8 because the parent's `15>>2=1` write-back
+                // doesn't set the `bsl=2` bit (mask=0x02).
+                (0, 150),
+                (0, 150),
+                (0, 150),
+                (0, 150),
+            ],
+        );
+        assert_eq!(leaves.len(), 4, "4 PARTITION_NONE children → 4 leaves");
+        // Spec-order: top-left, top-right, bottom-left, bottom-right.
+        assert_eq!(
+            leaves[0],
+            LeafBlock {
+                r: 0,
+                c: 0,
+                subsize: 9
+            }
+        );
+        assert_eq!(
+            leaves[1],
+            LeafBlock {
+                r: 0,
+                c: 4,
+                subsize: 9
+            }
+        );
+        assert_eq!(
+            leaves[2],
+            LeafBlock {
+                r: 4,
+                c: 0,
+                subsize: 9
+            }
+        );
+        assert_eq!(
+            leaves[3],
+            LeafBlock {
+                r: 4,
+                c: 4,
+                subsize: 9
+            }
+        );
+    }
+
+    /// Scenario (c) — Mixed PARTITION_HORZ + PARTITION_VERT under one
+    /// root PARTITION_SPLIT.
+    ///
+    /// Root 64x64 PARTITION_SPLIT then four 32x32 quadrants, each with
+    /// a different shape (HORZ / VERT / NONE / NONE). The trace walks
+    /// the §6.4.3 recursion and pins the ctx + probability row at
+    /// every step, then re-uses the §9.3.1 tree-decode rule to derive
+    /// the exact (bit, p) sequence the bool coder must produce.
+    ///
+    /// Root (0, 0, BLOCK_64X64=12):
+    ///   ctx=12 probs=KF[12]=[174,35,49]. Walk to -SPLIT:
+    ///     (1,174), (1,35), (1,49). No write-back (bsize != BLOCK_8X8 +
+    ///     partition == SPLIT).
+    ///
+    /// (0, 0, BLOCK_32X32=9) -> HORZ:
+    ///   above_strip=[0;4], left_strip=[0;4]. bsl=2, mask=0x02.
+    ///   above_bits=0, left_bits=0 → ctx=2*4 = 8. probs=KF[8]=[150,40,39].
+    ///   HORZ tree walk (1, 0): (1, 150), (0, 40). subsize=BLOCK_32X16=8.
+    ///   Write-back: above_val=15>>b_width_log2[8]=15>>3=1,
+    ///   left_val=15>>b_height_log2[8]=15>>2=3.
+    ///   above[0..4]=1, left[0..4]=3.
+    ///
+    /// (0, 4, BLOCK_32X32=9) -> VERT:
+    ///   above_strip=above[4..8]=[0;4], left_strip=left[0..4]=[3;4].
+    ///   above_bits=0; left_bits=3, &0x02=2 → left=1. ctx=2*4+2+0 = 10.
+    ///   probs=KF[10]=[67,33,11]. VERT tree walk (1, 1, 0): (1, 67),
+    ///   (1, 33), (0, 11). subsize=BLOCK_16X32=7.
+    ///   Write-back: above_val=15>>b_width_log2[7]=15>>2=3,
+    ///   left_val=15>>b_height_log2[7]=15>>3=1.
+    ///   above[4..8]=3, left[0..4]=1.
+    ///
+    /// (4, 0, BLOCK_32X32=9) -> NONE:
+    ///   above_strip=above[0..4]=[1;4], left_strip=left[4..8]=[0;4].
+    ///   above_bits=1, &0x02=0 → above=0. left_bits=0 → left=0.
+    ///   ctx=2*4=8. probs=KF[8]=[150,40,39]. NONE walk: (0, 150).
+    ///   subsize=9. Write-back: above[0..4]=1 (rewritten same),
+    ///   left[4..8]=1.
+    ///
+    /// (4, 4, BLOCK_32X32=9) -> NONE:
+    ///   above_strip=above[4..8]=[3;4], left_strip=left[4..8]=[1;4].
+    ///   above_bits=3, &0x02=2 → above=1. left_bits=1, &0x02=0 → left=0.
+    ///   ctx=2*4+0+1=9. probs=KF[9]=[78,12,26]. NONE walk: (0, 78).
+    ///
+    /// Expected leaves (in spec recursion order):
+    ///   HORZ children: (0,0,8), (2,0,8).
+    ///   VERT children: (0,4,7), (0,6,7).
+    ///   NONE  leaves: (4,0,9), (4,4,9).
+    #[test]
+    fn scenario_c_mixed_horz_and_vert() {
+        let pairs: &[(u8, u32)] = &[
+            // Root SPLIT at ctx=12.
+            (1, 174),
+            (1, 35),
+            (1, 49),
+            // (0,0) HORZ at ctx=8.
+            (1, 150),
+            (0, 40),
+            // (0,4) VERT at ctx=10.
+            (1, 67),
+            (1, 33),
+            (0, 11),
+            // (4,0) NONE at ctx=8.
+            (0, 150),
+            // (4,4) NONE at ctx=9.
+            (0, 78),
+        ];
+        // Self-test round-trip first — if the encoder can't reproduce
+        // the (bit, p) sequence, the recursion test wouldn't either.
+        {
+            let buf = encode_bits(pairs);
+            let mut dec = BoolCoder::init_bool(&buf, buf.len()).unwrap();
+            for (idx, &(bit, p)) in pairs.iter().enumerate() {
+                let got = dec.read_bool(p).unwrap();
+                assert_eq!(got as u8, bit, "round-trip failed at idx={idx} (p={p})");
+            }
+        }
+        let leaves = run_partition_with_pairs(8, 8, 12, pairs);
+        assert_eq!(leaves.len(), 6, "HORZ+HORZ + VERT+VERT + NONE + NONE = 6");
+        // (0,0) HORZ → two leaves at subsize BLOCK_32X16 (8).
+        assert_eq!(
+            leaves[0],
+            LeafBlock {
+                r: 0,
+                c: 0,
+                subsize: 8
+            }
+        );
+        assert_eq!(
+            leaves[1],
+            LeafBlock {
+                r: 2,
+                c: 0,
+                subsize: 8
+            }
+        );
+        // (0,4) VERT → two leaves at subsize BLOCK_16X32 (7).
+        assert_eq!(
+            leaves[2],
+            LeafBlock {
+                r: 0,
+                c: 4,
+                subsize: 7
+            }
+        );
+        assert_eq!(
+            leaves[3],
+            LeafBlock {
+                r: 0,
+                c: 6,
+                subsize: 7
+            }
+        );
+        // (4,0) NONE → one leaf at subsize BLOCK_32X32 (9).
+        assert_eq!(
+            leaves[4],
+            LeafBlock {
+                r: 4,
+                c: 0,
+                subsize: 9
+            }
+        );
+        // (4,4) NONE → one leaf at subsize BLOCK_32X32 (9).
+        assert_eq!(
+            leaves[5],
+            LeafBlock {
+                r: 4,
+                c: 4,
+                subsize: 9
+            }
+        );
+    }
+
+    /// Verify the §6.4.3 edge guard: a call at (r, c) past the
+    /// tile's MI extent returns immediately with no leaves and no
+    /// bits consumed.
+    #[test]
+    fn decode_partition_off_edge_returns_no_leaves() {
+        let buf = encode_bits(&[(0, 128)]); // unused
+        let mut dec = BoolCoder::init_bool(&buf, buf.len()).unwrap();
+        let mut ctx = PartitionContext::new(8, 8);
+        let mut leaves = Vec::new();
+        decode_partition(
+            &mut dec,
+            8, // r past mi_rows
+            0,
+            12,
+            8,
+            8,
+            &mut ctx,
+            PartitionProbsKind::Keyframe,
+            &mut leaves,
+        )
+        .unwrap();
+        assert!(leaves.is_empty());
+
+        let mut leaves = Vec::new();
+        decode_partition(
+            &mut dec,
+            0,
+            8, // c past mi_cols
+            12,
+            8,
+            8,
+            &mut ctx,
+            PartitionProbsKind::Keyframe,
+            &mut leaves,
+        )
+        .unwrap();
+        assert!(leaves.is_empty());
+    }
+
+    /// Verify the §6.4.3 write-back step: after four PARTITION_NONE
+    /// children at BLOCK_32X32 every cell of both strips equals
+    /// `15 >> b_width_log2[BLOCK_32X32] = 15 >> 3 = 1`.
+    ///
+    /// (`b_width_log2_lookup[9] = 3` because BLOCK_32X32 spans 8 cells
+    /// of `4x4`-block width and `log2(8) = 3`. Per §6.4.3 line 2388
+    /// `AbovePartitionContext[ c + i ] = 15 >> b_width_log2_lookup[
+    /// subsize ]` so the cell value is `15 >> 3 = 1`.)
+    #[test]
+    fn decode_partition_writes_back_context_strips() {
+        let buf = encode_bits(&[
+            (1, 174),
+            (1, 35),
+            (1, 49), // root SPLIT
+            (0, 150),
+            (0, 150),
+            (0, 150),
+            (0, 150), // 4 NONE at ctx=8
+        ]);
+        let mut dec = BoolCoder::init_bool(&buf, buf.len()).unwrap();
+        let mut ctx = PartitionContext::new(8, 8);
+        let mut leaves = Vec::new();
+        decode_partition(
+            &mut dec,
+            0,
+            0,
+            12,
+            8,
+            8,
+            &mut ctx,
+            PartitionProbsKind::Keyframe,
+            &mut leaves,
+        )
+        .unwrap();
+        // After four 32x32 PARTITION_NONE leaves, every cell of both
+        // strips should equal 15>>3 = 1.
+        for &cell in &ctx.above {
+            assert_eq!(cell, 1, "above strip not fully written");
+        }
+        for &cell in &ctx.left {
+            assert_eq!(cell, 1, "left strip not fully written");
+        }
+    }
+
+    /// Pin the inter-frame `PartitionProbsKind::Inter` path: the
+    /// driver MUST consult the caller-supplied running table rather
+    /// than [`KF_PARTITION_PROBS`]. We pick a probability of 0 in
+    /// every cell of the running table; with the §9.2 split
+    /// computation that drives read_bool() = 1 for every read at
+    /// p=0 (since split = 1, value ≥ 1), so the root walk traverses
+    /// every right branch → -PARTITION_SPLIT at the root, then four
+    /// recursive 32x32 PARTITION_SPLIT calls (each also p=0 → 1,1,1
+    /// → -SPLIT) and so on, recursing until BLOCK_8X8 parents are
+    /// reached and the BLOCK_8X8 → BLOCK_4X4 leaves drop in.
+    ///
+    /// Rather than fully unrolling that tree we test a small case:
+    /// at a BLOCK_8X8 parent, PARTITION_NONE under a custom prob
+    /// row [1, 1, 1] still selects NONE (p=1 → split=1, value=0 →
+    /// 0 < 1 → bit=0) — confirming the Inter path reads from our
+    /// table, not the static KF table whose ctx=0 row [158, 97, 94]
+    /// would also select NONE but via a different decode path.
+    #[test]
+    fn decode_partition_inter_path_uses_supplied_table() {
+        // Custom table where ctx=0 row is [1, 1, 1] (chosen to
+        // make the §9.2 split=1 path deterministic).
+        let mut table = [[1u8; PARTITION_TYPES - 1]; PARTITION_CONTEXTS];
+        table[0] = [1, 1, 1];
+        let probs_kind = PartitionProbsKind::Inter(&table);
+
+        // Encode one PARTITION_NONE read at p=1 for the BLOCK_8X8 root.
+        let buf = encode_bits(&[(0, 1)]);
+        let mut dec = BoolCoder::init_bool(&buf, buf.len()).unwrap();
+        let mut ctx = PartitionContext::new(1, 1);
+        let mut leaves = Vec::new();
+        decode_partition(
+            &mut dec,
+            0,
+            0,
+            /* BLOCK_8X8 */ 3,
+            1,
+            1,
+            &mut ctx,
+            probs_kind,
+            &mut leaves,
+        )
+        .expect("inter path decode ok");
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(
+            leaves[0],
+            LeafBlock {
+                r: 0,
+                c: 0,
+                subsize: 3
+            }
+        );
     }
 
     #[test]

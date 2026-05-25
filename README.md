@@ -5,7 +5,59 @@ Bitstream & Decoding Process Specification v0.7.
 
 ## Status — 2026-05-26
 
-**Round 18: §6.4.3 `decode_partition_type()` per-call partition reader (new
+**Round 19: §6.4.3 `decode_partition()` recursive partition driver.**
+Round 19 composes the round-18 `decode_partition_type()` primitive into
+the full §6.4.3 recursion that walks the partition tree rooted at a
+superblock:
+
+* `PartitionContext { above, left }` — the per-tile
+  `AbovePartitionContext[]` / `LeftPartitionContext[]` strips per §6.4.3,
+  one cell per 8x8 block. Zero-initialised per §7.4.2.
+* `LeafBlock { r, c, subsize }` — one record per spec-listed
+  `decode_block(r, c, subsize)` call. The §6.4.4 orchestrator itself is
+  deferred to a later round (it consumes the §6.4.5 `mode_info()` +
+  §6.4.21 `residual()` machinery); for now the recursion logs every
+  leaf the spec would dispatch to in spec recursion order
+  (top-left → top-right → bottom-left → bottom-right for SPLIT;
+  `(r, c)` then `(r + half, c)` for HORZ; `(r, c)` then `(r, c + half)`
+  for VERT).
+* `PartitionProbsKind::{Keyframe, Inter(table)}` — selects between
+  `KF_PARTITION_PROBS` (`FrameIsIntra == 1`) and a caller-supplied
+  16x3 running `partition_probs` table (`FrameIsIntra == 0`).
+* `decode_partition(coder, r, c, bsize, mi_rows, mi_cols, ctx_state,
+  probs_kind, leaves)` — the recursive driver itself. Implements the
+  §6.4.3 listing line-for-line: edge guard (`r >= mi_rows ||
+  c >= mi_cols`), `num8x8` / `halfBlock8x8` / `hasRows` / `hasCols`
+  geometry, ctx derivation via `partition_plane_context`,
+  `decode_partition_type` per-call read, four-way recursion in
+  spec quadrant order for SPLIT, and the §6.4.3 tail context
+  write-back gated by `bsize == BLOCK_8X8 || partition !=
+  PARTITION_SPLIT` writing `AbovePartitionContext[c + i] =
+  15 >> b_width_log2_lookup[subsize]` and the symmetric
+  `LeftPartitionContext[r + i]` per i in `0..num8x8`.
+
+A test-only range encoder mirrors the §9.2 decoder, pinned by two
+round-trip self-tests, and is used by three hand-built-bitstream
+scenarios that walk the recursion end-to-end:
+
+* **Scenario (a)** — single 64x64 CTU coded as `PARTITION_NONE` →
+  one leaf at `(0, 0, BLOCK_64X64)`.
+* **Scenario (b)** — root `PARTITION_SPLIT` then four `PARTITION_NONE`
+  at the 32x32 quadrants → four leaves at `(0,0)`, `(0,4)`, `(4,0)`,
+  `(4,4)` in spec recursion order, all `subsize = BLOCK_32X32`.
+* **Scenario (c)** — mixed `PARTITION_HORZ` + `PARTITION_VERT` +
+  2× `PARTITION_NONE` under a root SPLIT → six leaves at
+  `(0,0,BLOCK_32X16)`, `(2,0,BLOCK_32X16)`, `(0,4,BLOCK_16X32)`,
+  `(0,6,BLOCK_16X32)`, `(4,0,BLOCK_32X32)`, `(4,4,BLOCK_32X32)`.
+
+Plus edge-guard, write-back-cell-value, and `Inter(table)` path tests.
+The whole driver surface remains `pub(crate)`; the §6.4.4
+`decode_block()` orchestrator and the §6.3 `read_partition_probs()`
+compressed-header sweep land in later rounds.
+
+## Status — 2026-05-26 (round 18)
+
+**§6.4.3 `decode_partition_type()` per-call partition reader (new
 `partition` module).** Round 18 lands the single-call partition decoder
 the recursive §6.4.3 `decode_partition(r, c, bsize)` driver fires once per
 quadrant inside a tile, plus every §3 / §10.2 / §10.4 / §10.5 surface it

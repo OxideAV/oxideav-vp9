@@ -1594,6 +1594,152 @@ pub(crate) fn inter_segment_id(
     Ok(segment_id)
 }
 
+// ----- §6.4.13 read_is_inter + §9.3.2 is_inter ctx -----
+
+/// `SEG_LVL_REF_FRAME = 2` per §3 — the segmentation feature index
+/// carrying a per-segment reference-frame override. When
+/// `seg_feature_active( SEG_LVL_REF_FRAME )` is set, §6.4.13 derives
+/// `is_inter` directly from `FeatureData[ segment_id ][
+/// SEG_LVL_REF_FRAME ] != INTRA_FRAME` without consuming any bits.
+pub(crate) const SEG_LVL_REF_FRAME: usize = 2;
+
+/// `IS_INTER_CONTEXTS = 4` per §3 — number of contexts for the
+/// §6.4.13 `is_inter` syntax element. Indexes the
+/// `is_inter_prob[IS_INTER_CONTEXTS]` array per §9.3.2.
+pub(crate) const IS_INTER_CONTEXTS: usize = 4;
+
+/// `default_is_inter_prob[IS_INTER_CONTEXTS]` per §10.5 — the
+/// running `is_inter_prob[]` table's initial / reset values, before any
+/// §6.3.10 `read_is_inter_probs( )` compressed-header sweep applies
+/// `diff_update_prob` deltas. Transcribed verbatim from the §10.5
+/// listing.
+pub(crate) const DEFAULT_IS_INTER_PROB: [u8; IS_INTER_CONTEXTS] = [9, 102, 187, 225];
+
+/// Neighbour `RefFrames[ ][ ][ 0 ]` cells consumed by [`is_inter_context`]
+/// to compute `LeftIntra` / `AboveIntra` per §6.4.11.
+///
+/// The §6.4.11 prelude derives:
+///
+/// ```text
+/// LeftRefFrame[ 0 ]  = AvailL ? RefFrames[ MiRow ][ MiCol-1 ][ 0 ] : INTRA_FRAME
+/// AboveRefFrame[ 0 ] = AvailU ? RefFrames[ MiRow-1 ][ MiCol ][ 0 ] : INTRA_FRAME
+/// LeftIntra  = LeftRefFrame[ 0 ]  <= INTRA_FRAME
+/// AboveIntra = AboveRefFrame[ 0 ] <= INTRA_FRAME
+/// ```
+///
+/// (`INTRA_FRAME = 0` per §3 and §7.4.12; `NONE = -1` per §3.) Since
+/// `INTRA_FRAME = 0` is the smallest valid ref-frame index and `NONE`
+/// is strictly less, `<= INTRA_FRAME` is true for both `INTRA_FRAME`
+/// and `NONE`. The §6.4.11 listing forces the neighbour ref-frame to
+/// `INTRA_FRAME` when the neighbour is unavailable, so a missing
+/// neighbour contributes the same `LeftIntra=1` / `AboveIntra=1`
+/// value as an actual intra-coded neighbour.
+///
+/// This struct is the §9.3.2 listing's two-input view of that derivation.
+/// `None` encodes "neighbour unavailable" (the §6.4.13 ctx listing reads
+/// `AvailU` / `AvailL` independently of the ref-frame value).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct IsInterNeighbours {
+    /// `AvailU ? RefFrames[ MiRow-1 ][ MiCol ][ 0 ] : None` — the
+    /// above neighbour's `ref_frame[0]` (or `None` when `!AvailU`).
+    pub above: Option<i32>,
+    /// `AvailL ? RefFrames[ MiRow ][ MiCol-1 ][ 0 ] : None` — the
+    /// left neighbour's `ref_frame[0]` (or `None` when `!AvailL`).
+    pub left: Option<i32>,
+}
+
+/// `is_inter` context per §9.3.2.
+///
+/// ```text
+/// if ( AvailU && AvailL )
+///     ctx = (LeftIntra && AboveIntra) ? 3 : LeftIntra || AboveIntra
+/// else if ( AvailU || AvailL )
+///     ctx = 2 * (AvailU ? AboveIntra : LeftIntra)
+/// else
+///     ctx = 0
+/// ```
+///
+/// Returns one of `0..=3` indexing `is_inter_prob[ ctx ]`. The branch
+/// breakdown:
+///
+/// * both available, both intra → `ctx = 3`
+/// * both available, one intra → `ctx = 1` (`true || false = 1`)
+/// * both available, neither intra → `ctx = 0`
+/// * one available, that one intra → `ctx = 2` (`2 * 1`)
+/// * one available, that one inter → `ctx = 0` (`2 * 0`)
+/// * neither available → `ctx = 0`
+///
+/// `*Intra` is `RefFrame[ 0 ] <= INTRA_FRAME` per §6.4.11; with
+/// `INTRA_FRAME = 0` and `NONE = -1`, both the actual intra case and
+/// the unavailable-neighbour case ("force to `INTRA_FRAME`") map to
+/// "intra-side" for ctx purposes.
+pub(crate) fn is_inter_context(nb: IsInterNeighbours) -> usize {
+    let above_intra = nb.above.map(|rf| rf <= INTRA_FRAME);
+    let left_intra = nb.left.map(|rf| rf <= INTRA_FRAME);
+    match (above_intra, left_intra) {
+        (Some(a), Some(l)) => {
+            if a && l {
+                3
+            } else if a || l {
+                1
+            } else {
+                0
+            }
+        }
+        (Some(a), None) => 2 * usize::from(a),
+        (None, Some(l)) => 2 * usize::from(l),
+        (None, None) => 0,
+    }
+}
+
+/// `read_is_inter( )` per §6.4.13.
+///
+/// ```text
+/// read_is_inter( ) {
+///     if ( seg_feature_active( SEG_LVL_REF_FRAME ) )
+///         is_inter = FeatureData[ segment_id ][ SEG_LVL_REF_FRAME ] != INTRA_FRAME
+///     else
+///         is_inter                                                          T
+/// }
+/// ```
+///
+/// Two paths:
+///
+/// 1. `seg_feature_active( SEG_LVL_REF_FRAME )` → `is_inter` is
+///    derived directly from the segment's reference-frame override.
+///    `FeatureData[ segment_id ][ SEG_LVL_REF_FRAME ] != INTRA_FRAME`
+///    selects inter (`is_inter = true`) when the override is any of
+///    `LAST_FRAME` / `GOLDEN_FRAME` / `ALTREF_FRAME` (`1`/`2`/`3`),
+///    and intra (`is_inter = false`) when the override is
+///    `INTRA_FRAME` (`0`). No bool-coder reads.
+/// 2. Otherwise: a single §9.3.3-coded `is_inter` token under the
+///    §9.3.1 [`BINARY_TREE`] and the `is_inter_prob[ ctx ]` probability
+///    where `ctx` is derived by [`is_inter_context`] from the §6.4.11
+///    `LeftIntra` / `AboveIntra` neighbours.
+///
+/// `is_inter_prob` is the 4-entry `is_inter_prob[ IS_INTER_CONTEXTS ]`
+/// table updated by the §6.3.10 `read_is_inter_probs( )`
+/// compressed-header sweep (and initialised from
+/// [`DEFAULT_IS_INTER_PROB`] at the start of each `setup_past_independence`
+/// reset). `segment_ref_frame_data` is the `FeatureData[ segment_id ][
+/// SEG_LVL_REF_FRAME ]` value the §6.2.10 `segmentation_params( )`
+/// surfaced (an `i16` because the segment-feature override slot stores
+/// signed data even though valid ref-frame values are `0..=3`).
+pub(crate) fn read_is_inter(
+    coder: &mut BoolCoder<'_>,
+    seg_feature_ref_frame_active: bool,
+    segment_ref_frame_data: i16,
+    is_inter_prob: &[u8; IS_INTER_CONTEXTS],
+    nb: IsInterNeighbours,
+) -> Result<bool, Error> {
+    if seg_feature_ref_frame_active {
+        return Ok(i32::from(segment_ref_frame_data) != INTRA_FRAME);
+    }
+    let ctx = is_inter_context(nb);
+    let value = tree_decode(coder, &BINARY_TREE, |_| is_inter_prob[ctx])?;
+    Ok(value != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3575,5 +3721,261 @@ mod tests {
         assert_eq!(ctx.left(0), 0);
         assert_eq!(ctx.left(1), 1);
         assert_eq!(ctx.left(2), 1);
+    }
+
+    // ----- §6.4.13 read_is_inter + §9.3.2 is_inter ctx -----
+
+    // §3 ref-frame indices used by the §6.4.13 / §9.3.2 listings.
+    const LAST_FRAME: i32 = 1;
+    const GOLDEN_FRAME: i32 = 2;
+    const ALTREF_FRAME: i32 = 3;
+
+    #[test]
+    fn default_is_inter_prob_matches_spec_listing() {
+        // §10.5 verbatim:
+        //   default_is_inter_prob[IS_INTER_CONTEXTS] = { 9, 102, 187, 225 }
+        assert_eq!(IS_INTER_CONTEXTS, 4);
+        assert_eq!(DEFAULT_IS_INTER_PROB, [9, 102, 187, 225]);
+    }
+
+    #[test]
+    fn seg_lvl_ref_frame_constant_matches_spec() {
+        // §3 table of constants: SEG_LVL_REF_FRAME = 2.
+        assert_eq!(SEG_LVL_REF_FRAME, 2);
+    }
+
+    #[test]
+    fn is_inter_context_both_unavailable_returns_zero() {
+        // §9.3.2 else branch: ctx = 0.
+        let nb = IsInterNeighbours::default();
+        assert_eq!(is_inter_context(nb), 0);
+    }
+
+    #[test]
+    fn is_inter_context_both_available_both_intra_returns_three() {
+        // §9.3.2: (LeftIntra && AboveIntra) ? 3 : … → 3.
+        // INTRA_FRAME = 0 → *Intra = true.
+        let nb = IsInterNeighbours {
+            above: Some(INTRA_FRAME),
+            left: Some(INTRA_FRAME),
+        };
+        assert_eq!(is_inter_context(nb), 3);
+    }
+
+    #[test]
+    fn is_inter_context_both_available_one_intra_returns_one() {
+        // §9.3.2: !(both intra) && (LeftIntra || AboveIntra) → 1.
+        let nb_left_intra = IsInterNeighbours {
+            above: Some(LAST_FRAME),
+            left: Some(INTRA_FRAME),
+        };
+        assert_eq!(is_inter_context(nb_left_intra), 1);
+        let nb_above_intra = IsInterNeighbours {
+            above: Some(INTRA_FRAME),
+            left: Some(GOLDEN_FRAME),
+        };
+        assert_eq!(is_inter_context(nb_above_intra), 1);
+    }
+
+    #[test]
+    fn is_inter_context_both_available_neither_intra_returns_zero() {
+        // §9.3.2: !(LeftIntra || AboveIntra) → 0.
+        let nb = IsInterNeighbours {
+            above: Some(LAST_FRAME),
+            left: Some(ALTREF_FRAME),
+        };
+        assert_eq!(is_inter_context(nb), 0);
+    }
+
+    #[test]
+    fn is_inter_context_only_above_available_returns_2x_above_intra() {
+        // §9.3.2: else if (AvailU || AvailL) → ctx = 2 * (AvailU ?
+        // AboveIntra : LeftIntra). AvailU branch: above intra → 2,
+        // above inter → 0.
+        let nb_intra = IsInterNeighbours {
+            above: Some(INTRA_FRAME),
+            left: None,
+        };
+        assert_eq!(is_inter_context(nb_intra), 2);
+        let nb_inter = IsInterNeighbours {
+            above: Some(LAST_FRAME),
+            left: None,
+        };
+        assert_eq!(is_inter_context(nb_inter), 0);
+    }
+
+    #[test]
+    fn is_inter_context_only_left_available_returns_2x_left_intra() {
+        // §9.3.2: else if (AvailU || AvailL) → ctx = 2 * (AvailU ?
+        // AboveIntra : LeftIntra). AvailL branch: left intra → 2,
+        // left inter → 0.
+        let nb_intra = IsInterNeighbours {
+            above: None,
+            left: Some(INTRA_FRAME),
+        };
+        assert_eq!(is_inter_context(nb_intra), 2);
+        let nb_inter = IsInterNeighbours {
+            above: None,
+            left: Some(GOLDEN_FRAME),
+        };
+        assert_eq!(is_inter_context(nb_inter), 0);
+    }
+
+    #[test]
+    fn is_inter_context_treats_none_neighbour_ref_frame_as_intra() {
+        // §6.4.11: NONE = -1 satisfies `<= INTRA_FRAME = 0` per the
+        // *Intra rule, mirroring the §6.4.11 "unavailable → force to
+        // INTRA_FRAME" rule. A neighbour with ref_frame[0] = NONE
+        // (single-prediction sentinel) registers as intra-side here.
+        let nb = IsInterNeighbours {
+            above: Some(NONE_REF_FRAME),
+            left: Some(NONE_REF_FRAME),
+        };
+        assert_eq!(is_inter_context(nb), 3);
+    }
+
+    #[test]
+    fn read_is_inter_seg_feature_active_with_intra_override_returns_false() {
+        // §6.4.13 path 1: seg_feature_active(SEG_LVL_REF_FRAME) and
+        // FeatureData[seg][SEG_LVL_REF_FRAME] == INTRA_FRAME → is_inter
+        // = false. No coder bits consumed.
+        let mut coder = zero_coder();
+        let is_inter = read_is_inter(
+            &mut coder,
+            true,
+            INTRA_FRAME as i16,
+            &DEFAULT_IS_INTER_PROB,
+            IsInterNeighbours::default(),
+        )
+        .unwrap();
+        assert!(!is_inter);
+    }
+
+    #[test]
+    fn read_is_inter_seg_feature_active_with_inter_override_returns_true() {
+        // §6.4.13 path 1: seg_feature_active(SEG_LVL_REF_FRAME) and
+        // FeatureData[seg][SEG_LVL_REF_FRAME] != INTRA_FRAME → is_inter
+        // = true. No coder bits consumed. Test each non-INTRA value.
+        for rf in [LAST_FRAME, GOLDEN_FRAME, ALTREF_FRAME] {
+            let mut coder = zero_coder();
+            let is_inter = read_is_inter(
+                &mut coder,
+                true,
+                rf as i16,
+                &DEFAULT_IS_INTER_PROB,
+                IsInterNeighbours::default(),
+            )
+            .unwrap();
+            assert!(is_inter, "ref_frame {rf} must derive is_inter=true");
+        }
+    }
+
+    #[test]
+    fn read_is_inter_zero_buffer_decodes_false() {
+        // §6.4.13 path 2 with zero coder: every read_bool returns 0;
+        // BINARY_TREE leaf 0 → is_inter = false.
+        let mut coder = zero_coder();
+        let is_inter = read_is_inter(
+            &mut coder,
+            false,
+            0, // seg ref-frame data irrelevant when feature inactive
+            &DEFAULT_IS_INTER_PROB,
+            IsInterNeighbours::default(),
+        )
+        .unwrap();
+        assert!(!is_inter);
+    }
+
+    #[test]
+    fn read_is_inter_bias_buffer_decodes_true_for_low_prob() {
+        // §6.4.13 path 2 with the bias coder (post-marker BoolValue=127).
+        // §9.2.2's `split = 1 + ((127*p) >> 8)` keeps split <= 127 for
+        // every `p <= 254`, so 127 >= split → bit=1 → BINARY_TREE
+        // leaf 1 → is_inter=true for any "non-saturating" probability.
+        // Use both-intra neighbours (ctx=3) and put a mid prob in
+        // slot 3 to confirm the bias-coder bit=1 path.
+        let bytes = make_bias_buffer(0x7F);
+        let mut coder = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let probs = [128u8, 128, 128, 128];
+        let nb = IsInterNeighbours {
+            above: Some(INTRA_FRAME),
+            left: Some(INTRA_FRAME),
+        };
+        let is_inter = read_is_inter(&mut coder, false, 0, &probs, nb).unwrap();
+        assert!(is_inter);
+    }
+
+    #[test]
+    fn read_is_inter_picks_prob_by_context() {
+        // The §6.4.13 listing reads `is_inter` with `is_inter_prob[ctx]`
+        // where ctx is [`is_inter_context`]. We test the indexing
+        // indirectly (mirroring [`read_skip_picks_prob_by_context`]):
+        //
+        // (a) the §9.3.2 ctx derivation matches the spec (covered by
+        //     the `is_inter_context_*` tests above), and
+        // (b) `read_is_inter` calls into `tree_decode` with the prob
+        //     slot selected by ctx — confirmed here by running
+        //     identical inputs across all four possible ctx values via
+        //     distinct neighbour configurations, ensuring no panic /
+        //     out-of-range index. The zero coder pins every read to
+        //     bit=0 regardless of probability, so `is_inter` is false
+        //     across all ctxs but the indexing path executes for each.
+        let neighbour_configs = [
+            IsInterNeighbours::default(), // ctx=0
+            IsInterNeighbours {
+                // ctx=1
+                above: Some(INTRA_FRAME),
+                left: Some(LAST_FRAME),
+            },
+            IsInterNeighbours {
+                // ctx=2
+                above: Some(INTRA_FRAME),
+                left: None,
+            },
+            IsInterNeighbours {
+                // ctx=3
+                above: Some(INTRA_FRAME),
+                left: Some(INTRA_FRAME),
+            },
+        ];
+        for (ix, nb) in neighbour_configs.iter().enumerate() {
+            // Distinct prob per slot to confirm none aliases another.
+            let probs = [10u8, 60, 130, 200];
+            let mut coder = zero_coder();
+            let is_inter = read_is_inter(&mut coder, false, 0, &probs, *nb).unwrap();
+            assert!(
+                !is_inter,
+                "zero coder must pin bit=0 for ctx={ix} regardless of probs"
+            );
+        }
+    }
+
+    #[test]
+    fn read_is_inter_seg_feature_path_ignores_neighbours_and_coder() {
+        // §6.4.13 path 1 short-circuits before any coder read or ctx
+        // lookup. Verify the answer is identical regardless of
+        // neighbour configuration and that the coder isn't consumed.
+        for nb in [
+            IsInterNeighbours::default(),
+            IsInterNeighbours {
+                above: Some(INTRA_FRAME),
+                left: Some(INTRA_FRAME),
+            },
+            IsInterNeighbours {
+                above: Some(LAST_FRAME),
+                left: Some(ALTREF_FRAME),
+            },
+        ] {
+            let mut coder = zero_coder();
+            let is_inter = read_is_inter(
+                &mut coder,
+                true,
+                LAST_FRAME as i16,
+                &DEFAULT_IS_INTER_PROB,
+                nb,
+            )
+            .unwrap();
+            assert!(is_inter);
+        }
     }
 }

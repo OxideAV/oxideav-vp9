@@ -6,6 +6,37 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 21: §6.4.13 `read_is_inter( )` + §9.3.2 `is_inter` ctx +
+  §10.5 `default_is_inter_prob`.** Adds the per-block inter/intra
+  decoder the §6.4.11 `inter_frame_mode_info( )` driver fires after
+  `read_skip( )`:
+  * `SEG_LVL_REF_FRAME = 2` / `IS_INTER_CONTEXTS = 4` constants from §3.
+  * `default_is_inter_prob[IS_INTER_CONTEXTS] = {9, 102, 187, 225}`
+    transcribed verbatim from §10.5.
+  * `IsInterNeighbours { above: Option<i32>, left: Option<i32> }` —
+    the §6.4.11 above/left `RefFrames[ ][ ][ 0 ]` view (`None` = §6.4.11
+    "unavailable → force to `INTRA_FRAME`" rule).
+  * `is_inter_context( nb )` (§9.3.2) — the four-branch ctx derivation:
+    both available + both intra → 3; both available + one intra → 1;
+    both available + neither intra → 0; only above / only left →
+    `2 * intra_flag`; neither → 0. Returns `0..=3` indexing
+    `is_inter_prob[ ]`.
+  * `read_is_inter( coder, seg_feature_ref_frame_active,
+    segment_ref_frame_data, is_inter_prob, nb )` (§6.4.13) — the
+    two-path reader: when `seg_feature_active( SEG_LVL_REF_FRAME )` is
+    set, `is_inter = FeatureData[ segment_id ][ SEG_LVL_REF_FRAME ] !=
+    INTRA_FRAME` without consuming any coder bits; otherwise the §9.3.3
+    `BINARY_TREE` walk under `is_inter_prob[ ctx ]`.
+  * 15 unit tests pinning the §10.5 default constants, the §3
+    `SEG_LVL_REF_FRAME` value, every branch of `is_inter_context` (both
+    unavailable / both-intra / one-intra / neither-intra / only-above
+    intra-and-inter / only-left intra-and-inter / `NONE` ref-frame
+    sentinel treated as intra), the §6.4.13 seg-feature path for both
+    `INTRA_FRAME` and each of `LAST/GOLDEN/ALTREF_FRAME` overrides, the
+    zero-coder bit=0 path, the bias-coder bit=1 path with both-intra
+    neighbours, the ctx-indexes-into-`is_inter_prob` sweep across all
+    four ctxs, and the path-1 short-circuit ignoring both neighbours
+    and the coder.
 * **Round 20: §6.4.12 `inter_segment_id( )` + §6.4.14 `get_segment_id( )`
   + §7.4 segmentation-prediction context strips.** Lands the inter-frame
   companion to the round-16 `intra_segment_id` primitive — the per-block

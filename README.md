@@ -3,6 +3,65 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-05-26 (round 21)
+
+**Round 21: §6.4.13 `read_is_inter( )` + §9.3.2 `is_inter` context +
+§10.5 `default_is_inter_prob`.** Round 21 lands the per-block
+inter/intra reader the §6.4.11 `inter_frame_mode_info( )` driver fires
+between `read_skip( )` and `read_tx_size( !skip || !is_inter )`:
+
+* §3 constants `SEG_LVL_REF_FRAME = 2` and `IS_INTER_CONTEXTS = 4`
+  transcribed verbatim.
+* §10.5 `default_is_inter_prob[IS_INTER_CONTEXTS] = {9, 102, 187, 225}`
+  transcribed verbatim (the initial / reset table the §6.3.10
+  `read_is_inter_probs( )` compressed-header sweep updates with
+  `diff_update_prob` deltas — that sweep lands in a separate round
+  alongside the rest of §6.3.9..§6.3.16).
+* `IsInterNeighbours { above: Option<i32>, left: Option<i32> }` — the
+  §6.4.11 above/left `RefFrames[ ][ ][ 0 ]` view: `Some( rf )` carries
+  the neighbour's `ref_frame[0]` (`INTRA_FRAME` / `LAST_FRAME` /
+  `GOLDEN_FRAME` / `ALTREF_FRAME` / `NONE`), `None` encodes
+  `!AvailU` / `!AvailL` (the §6.4.11 listing forces the neighbour to
+  `INTRA_FRAME` when unavailable, so the §9.3.2 `*Intra` rule resolves
+  the same way).
+* `is_inter_context( nb )` (§9.3.2) — the four-branch ctx derivation:
+  - both available, both intra → `3`
+  - both available, exactly one intra → `1` (`true || false = 1`)
+  - both available, neither intra → `0`
+  - only one available, that one intra → `2`
+  - only one available, that one inter → `0`
+  - neither available → `0`
+  Returns one of `0..=3` indexing `is_inter_prob[ ctx ]`.
+* `read_is_inter( coder, seg_feature_ref_frame_active,
+  segment_ref_frame_data, is_inter_prob, nb )` (§6.4.13) — two paths:
+  - `seg_feature_active( SEG_LVL_REF_FRAME )` → `is_inter =
+    FeatureData[ segment_id ][ SEG_LVL_REF_FRAME ] != INTRA_FRAME`
+    without consuming any coder bits.
+  - otherwise → one §9.3.3 `BINARY_TREE` bit under
+    `is_inter_prob[ is_inter_context( nb ) ]`.
+
+Validation covers the §10.5 / §3 constants, every branch of the
+§9.3.2 ctx derivation (including the `NONE = -1` ref-frame sentinel
+which satisfies `<= INTRA_FRAME` and is treated as intra-side), the
+§6.4.13 seg-feature path for `INTRA_FRAME` (→ false) and each of
+`LAST_FRAME` / `GOLDEN_FRAME` / `ALTREF_FRAME` overrides (→ true), the
+zero-coder bit=0 path, the bias-coder bit=1 path with both-intra
+neighbours, an `is_inter_prob[ ctx ]` indexing sweep across all four
+ctxs that confirms no panic / out-of-range, and a `seg_feature_active`
+short-circuit test that ignores both neighbours and the coder.
+
+Out of scope for round 21: the §6.4.11 `inter_frame_mode_info( )`
+orchestrator itself (still composes this with `inter_segment_id( )` /
+`read_skip( )` / `read_tx_size( )` / `inter_block_mode_info( )` or
+`intra_block_mode_info( )`); the §6.3.10 `read_is_inter_probs( )`
+compressed-header sweep (lands with the rest of §6.3.9..§6.3.16);
+`inter_block_mode_info( )` (§6.4.16 — blocked on reference-buffer
+state and MV decode); the §8.4 `counts_is_inter` probability-adaption
+accumulator (§9.3.4 bookkeeping for end-of-frame adaption). The
+round-21 surface stays internal-only (`pub(crate)`); the public API
+still exposes `parse_uncompressed_header`, `parse_compressed_header`
+and their result types exclusively.
+
 ## Status — 2026-05-26 (round 20)
 
 **Round 20: §6.4.12 `inter_segment_id( )` + §6.4.14 `get_segment_id( )`

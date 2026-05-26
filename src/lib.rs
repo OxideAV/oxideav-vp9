@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19 + 20 + 21 + 22)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19 + 20 + 21 + 22 + 23)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -311,6 +311,25 @@
 //!   [`mode_info::DEFAULT_IS_INTER_PROB`] (round 21) into
 //!   `compressed::DEFAULT_IS_INTER_PROB_TABLE`. The round-22 surface
 //!   is internal-only.
+//! * Round 23 lands the §6.3.9 `read_inter_mode_probs( )` and §6.3.10
+//!   `read_interp_filter_probs( )` compressed-header sweeps — the two
+//!   nested-loop companions to the round-22 §6.3.11 primitive that
+//!   together front-load the inter-arm dispatch's first 33 cells.
+//!   §6.3.9 walks `INTER_MODE_CONTEXTS x (INTER_MODES - 1) = 7 x 3 =
+//!   21` cells of `inter_mode_probs[ ]` starting from the §10.5
+//!   `default_inter_mode_probs` listing (transcribed verbatim into
+//!   `DEFAULT_INTER_MODE_PROBS`). §6.3.10 walks
+//!   `INTERP_FILTER_CONTEXTS x (SWITCHABLE_FILTERS - 1) = 4 x 2 = 8`
+//!   cells of `interp_filter_probs[ ]` starting from the §10.5
+//!   `default_interp_filter_probs` listing (transcribed verbatim into
+//!   `DEFAULT_INTERP_FILTER_PROBS`). Both feed the per-block inter
+//!   decode the §6.4.16 `inter_block_mode_info( )` orchestrator
+//!   consumes once reference-buffer state lands. The
+//!   `FrameIsIntra == 0`-gated outer dispatch in
+//!   `parse_compressed_header` still skips the calls —
+//!   §6.3.12..§6.3.17 (`frame_reference_mode( )` / `mv_probs( )` / …)
+//!   must land first so the coder cursor lines up across the whole
+//!   inter branch. Round-23 surface is internal-only.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return

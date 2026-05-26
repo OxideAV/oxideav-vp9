@@ -6,6 +6,50 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 23: §6.3.9 `read_inter_mode_probs( )` + §6.3.10
+  `read_interp_filter_probs( )` compressed-header sweeps.** The two
+  nested-loop companions to the round-22 §6.3.11 primitive that
+  together front-load the inter-arm dispatch's first 33 cells:
+  * `INTER_MODES = 4` / `INTER_MODE_CONTEXTS = 7` constants from §3
+    (`vp9-spec.txt` lines 506-507).
+  * `DEFAULT_INTER_MODE_PROBS[INTER_MODE_CONTEXTS][INTER_MODES - 1]`
+    transcribed verbatim from the §10.5 listing (lines 7758-7766) and
+    re-exported from `mode_info` into `compressed` as the single source
+    of truth.
+  * `read_inter_mode_probs( coder, inter_mode_probs )` per §6.3.9
+    (`vp9-spec.txt` lines 2138-2143) — row-major
+    `INTER_MODE_CONTEXTS x (INTER_MODES - 1) = 21` cell sweep
+    consuming one `B(252)` `update_prob` flag per slot and, on 1, a
+    `decode_term_subexp` + `inv_remap_prob` cascade updating
+    `inter_mode_probs[ ][ ]` in place. Feeds the §6.4.16
+    `inter_block_mode_info( )` per-block decoder via the §9.3.2 ctx
+    once reference-buffer state lands.
+  * `SWITCHABLE_FILTERS = 3` / `INTERP_FILTER_CONTEXTS = 4` constants
+    from §3 (`vp9-spec.txt` lines 487, 495).
+  * `DEFAULT_INTERP_FILTER_PROBS[INTERP_FILTER_CONTEXTS][SWITCHABLE_FILTERS - 1]`
+    transcribed verbatim from the §10.5 listing (lines 7769-7775) and
+    re-exported from `mode_info` into `compressed`.
+  * `read_interp_filter_probs( coder, interp_filter_probs )` per
+    §6.3.10 (`vp9-spec.txt` lines 2146-2151) — row-major
+    `INTERP_FILTER_CONTEXTS x (SWITCHABLE_FILTERS - 1) = 8` cell
+    sweep updating `interp_filter_probs[ ][ ]` in place.
+  * 13 new unit tests covering: the §10.5 default-table re-export
+    equality for both sweeps, the §3 `INTER_MODES = 4` /
+    `INTER_MODE_CONTEXTS = 7` / `SWITCHABLE_FILTERS = 3` /
+    `INTERP_FILTER_CONTEXTS = 4` constant pins, the zero-buffer
+    `update_prob = 0` path passing every cell through unchanged on
+    both default and custom starting grids, row-major cursor + value
+    equivalence between each sweep and its explicit nested
+    `read_diff_update_prob` loop, single-`B(252)` flag consumption per
+    cell, and a cross-sweep §6.3.9 → §6.3.10 → §6.3.11 chain check
+    confirming the 21 + 8 + 4 = 33 cell total advances the cursor
+    identically to 33 explicit `read_diff_update_prob` calls (the
+    shape the §6.3 outer-dispatch inter arm will adopt once it grows).
+  * The `FrameIsIntra == 0`-gated outer dispatch in
+    `parse_compressed_header` still skips the calls — §6.3.12..§6.3.17
+    must land first so the coder cursor lines up across the whole
+    inter branch. Round-23 surface is internal-only.
+
 * **Round 22: §6.3.11 `read_is_inter_probs( )` compressed-header
   sweep.** Unconditional `IS_INTER_CONTEXTS = 4` `diff_update_prob`
   walk over the §10.5 `default_is_inter_prob[ IS_INTER_CONTEXTS ] =

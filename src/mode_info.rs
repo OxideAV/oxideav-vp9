@@ -1740,6 +1740,65 @@ pub(crate) fn read_is_inter(
     Ok(value != 0)
 }
 
+// ----- §3 inter-mode + interp-filter dimensions / §10.5 defaults -----
+
+/// `INTER_MODES = 4` per §3 (spec constants table, `vp9-spec.txt` line
+/// 506). Number of values for the §6.4.16 `inter_mode` syntax element
+/// (`NEAREST_MV` / `NEAR_MV` / `ZERO_MV` / `NEW_MV`).
+pub(crate) const INTER_MODES: usize = 4;
+
+/// `INTER_MODE_CONTEXTS = 7` per §3 (spec constants table,
+/// `vp9-spec.txt` line 507). Number of contexts for `inter_mode`.
+/// Indexes the `inter_mode_probs[INTER_MODE_CONTEXTS][INTER_MODES - 1]`
+/// array per §9.3.2.
+pub(crate) const INTER_MODE_CONTEXTS: usize = 7;
+
+/// `default_inter_mode_probs[INTER_MODE_CONTEXTS][INTER_MODES - 1]`
+/// per §10.5 (`vp9-spec.txt` lines 7758-7766) — the running
+/// `inter_mode_probs[][]` table's initial / reset values, before any
+/// §6.3.9 `read_inter_mode_probs( )` compressed-header sweep applies
+/// `diff_update_prob` deltas. Transcribed verbatim from the §10.5
+/// listing.
+///
+/// Rows (per §10.5 commentary):
+/// * `0` — both zero mv: `{2, 173, 34}`
+/// * `1` — one zero mv + one predicted mv: `{7, 145, 85}`
+/// * `2` — two predicted mvs: `{7, 166, 63}`
+/// * `3` — one predicted/zero and one new mv: `{7, 94, 66}`
+/// * `4` — two new mvs: `{8, 64, 46}`
+/// * `5` — one intra neighbor + x: `{17, 81, 31}`
+/// * `6` — two intra neighbors: `{25, 29, 30}`
+pub(crate) const DEFAULT_INTER_MODE_PROBS: [[u8; INTER_MODES - 1]; INTER_MODE_CONTEXTS] = [
+    [2, 173, 34],
+    [7, 145, 85],
+    [7, 166, 63],
+    [7, 94, 66],
+    [8, 64, 46],
+    [17, 81, 31],
+    [25, 29, 30],
+];
+
+/// `SWITCHABLE_FILTERS = 3` per §3 (spec constants table,
+/// `vp9-spec.txt` line 487). Number of values for the switchable
+/// `interp_filter` syntax element (the three subpel filter kernels —
+/// EIGHTTAP / EIGHTTAP_SMOOTH / EIGHTTAP_SHARP).
+pub(crate) const SWITCHABLE_FILTERS: usize = 3;
+
+/// `INTERP_FILTER_CONTEXTS = 4` per §3 (spec constants table,
+/// `vp9-spec.txt` line 495). Number of contexts for the per-block
+/// `interp_filter` decode. Indexes the
+/// `interp_filter_probs[INTERP_FILTER_CONTEXTS][SWITCHABLE_FILTERS - 1]`
+/// array per §9.3.2.
+pub(crate) const INTERP_FILTER_CONTEXTS: usize = 4;
+
+/// `default_interp_filter_probs[INTERP_FILTER_CONTEXTS][SWITCHABLE_FILTERS - 1]`
+/// per §10.5 (`vp9-spec.txt` lines 7769-7775) — the running
+/// `interp_filter_probs[][]` table's initial / reset values, before
+/// any §6.3.10 `read_interp_filter_probs( )` compressed-header sweep
+/// applies `diff_update_prob` deltas. Transcribed verbatim.
+pub(crate) const DEFAULT_INTERP_FILTER_PROBS: [[u8; SWITCHABLE_FILTERS - 1];
+    INTERP_FILTER_CONTEXTS] = [[235, 162], [36, 255], [34, 3], [149, 144]];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3977,5 +4036,62 @@ mod tests {
             .unwrap();
             assert!(is_inter);
         }
+    }
+
+    // ----- §3 + §10.5 inter-mode / interp-filter dimensions -----
+
+    #[test]
+    fn inter_mode_dimension_constants_match_spec() {
+        // §3 constants table: INTER_MODES = 4, INTER_MODE_CONTEXTS = 7
+        // (vp9-spec.txt lines 506-507).
+        assert_eq!(INTER_MODES, 4);
+        assert_eq!(INTER_MODE_CONTEXTS, 7);
+    }
+
+    #[test]
+    fn default_inter_mode_probs_matches_spec_listing() {
+        // §10.5 verbatim:
+        //   default_inter_mode_probs[INTER_MODE_CONTEXTS][INTER_MODES - 1] = {
+        //     {2,  173, 34},   // 0 = both zero mv
+        //     {7,  145, 85},   // 1 = one zero mv + one a predicted mv
+        //     {7,  166, 63},   // 2 = two predicted mvs
+        //     {7,  94,  66},   // 3 = one predicted/zero and one new mv
+        //     {8,  64,  46},   // 4 = two new mvs
+        //     {17, 81,  31},   // 5 = one intra neighbor + x
+        //     {25, 29,  30},   // 6 = two intra neighbors
+        //   }
+        let expected: [[u8; INTER_MODES - 1]; INTER_MODE_CONTEXTS] = [
+            [2, 173, 34],
+            [7, 145, 85],
+            [7, 166, 63],
+            [7, 94, 66],
+            [8, 64, 46],
+            [17, 81, 31],
+            [25, 29, 30],
+        ];
+        assert_eq!(DEFAULT_INTER_MODE_PROBS, expected);
+    }
+
+    #[test]
+    fn interp_filter_dimension_constants_match_spec() {
+        // §3 constants table: SWITCHABLE_FILTERS = 3 (line 487),
+        // INTERP_FILTER_CONTEXTS = 4 (line 495).
+        assert_eq!(SWITCHABLE_FILTERS, 3);
+        assert_eq!(INTERP_FILTER_CONTEXTS, 4);
+    }
+
+    #[test]
+    fn default_interp_filter_probs_matches_spec_listing() {
+        // §10.5 verbatim:
+        //   default_interp_filter_probs[INTERP_FILTER_CONTEXTS]
+        //                              [SWITCHABLE_FILTERS - 1] = {
+        //     { 235, 162 },
+        //     { 36, 255 },
+        //     { 34, 3 },
+        //     { 149, 144 }
+        //   }
+        let expected: [[u8; SWITCHABLE_FILTERS - 1]; INTERP_FILTER_CONTEXTS] =
+            [[235, 162], [36, 255], [34, 3], [149, 144]];
+        assert_eq!(DEFAULT_INTERP_FILTER_PROBS, expected);
     }
 }

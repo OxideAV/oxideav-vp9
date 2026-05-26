@@ -3,6 +3,64 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-05-26 (round 23)
+
+**Round 23: §6.3.9 `read_inter_mode_probs( )` + §6.3.10
+`read_interp_filter_probs( )` compressed-header sweeps.** Round 23
+lands the two nested-loop companions to the round-22 §6.3.11
+primitive, completing the first 33 cells of the §6.3 inter-arm
+dispatch (`read_inter_mode_probs` → `read_interp_filter_probs` →
+`read_is_inter_probs`):
+
+* `INTER_MODES = 4` / `INTER_MODE_CONTEXTS = 7` from §3 + the §10.5
+  `default_inter_mode_probs[INTER_MODE_CONTEXTS][INTER_MODES - 1] = {
+    {2,173,34}, {7,145,85}, {7,166,63}, {7,94,66}, {8,64,46},
+    {17,81,31}, {25,29,30} }` listing transcribed verbatim.
+* `read_inter_mode_probs( coder, inter_mode_probs )` per §6.3.9
+  (`vp9-spec.txt` lines 2138-2143) — row-major `7 x 3 = 21` cell
+  sweep, one `B(252)` `update_prob` per slot, and on 1 a
+  `decode_term_subexp` + `inv_remap_prob` cascade updating
+  `inter_mode_probs[ ][ ]` in place. Feeds the §6.4.16
+  `inter_block_mode_info( )` per-block decoder once reference-buffer
+  state lands.
+* `SWITCHABLE_FILTERS = 3` / `INTERP_FILTER_CONTEXTS = 4` from §3 +
+  the §10.5 `default_interp_filter_probs[INTERP_FILTER_CONTEXTS]
+  [SWITCHABLE_FILTERS - 1] = { {235,162}, {36,255}, {34,3},
+  {149,144} }` listing transcribed verbatim.
+* `read_interp_filter_probs( coder, interp_filter_probs )` per §6.3.10
+  (`vp9-spec.txt` lines 2146-2151) — row-major `4 x 2 = 8` cell sweep
+  updating `interp_filter_probs[ ][ ]` in place. Feeds the per-block
+  `interp_filter` decode once inter prediction lands.
+* Both `DEFAULT_*_PROBS` tables are re-exported from `mode_info`
+  into `compressed` as `DEFAULT_INTER_MODE_PROBS_TABLE` /
+  `DEFAULT_INTERP_FILTER_PROBS_TABLE` so the compressed-header sweep
+  and any per-block consumer share the single source of truth.
+
+Validation covers the §10.5 default re-exports matching the source
+constants, the §3 `INTER_MODES = 4` / `INTER_MODE_CONTEXTS = 7` /
+`SWITCHABLE_FILTERS = 3` / `INTERP_FILTER_CONTEXTS = 4` pinning, the
+zero-buffer `update_prob = 0` path passing every cell through
+unchanged on both default and custom starting grids, row-major
+sweep-vs-explicit-loop value + cursor equivalence for each primitive,
+21 / 8 `B(252)` flag consumption per primitive, and a cross-sweep
+§6.3.9 → §6.3.10 → §6.3.11 chain check confirming the 21 + 8 + 4 =
+33-cell total advances the coder cursor identically to 33 explicit
+`read_diff_update_prob` calls.
+
+Out of scope for round 23: the §6.3 outer-dispatch `FrameIsIntra == 0`
+arm itself — wiring §6.3.9 / §6.3.10 / §6.3.11 into
+`parse_compressed_header` ahead of §6.3.12..§6.3.17
+(`frame_reference_mode( )` / single-ref / comp-ref / y-mode /
+partition / mv probs) would mis-position the coder cursor; those
+primitives land in subsequent rounds. The §6.4.16
+`inter_block_mode_info( )` per-block consumer of `inter_mode_probs[ ]`
+remains blocked on reference-buffer / MV-decode state. The §8.4
+`counts_inter_mode` / `counts_interp_filter` probability-adaption
+accumulators (§9.3.4 end-of-frame bookkeeping) also land separately.
+The round-23 surface stays internal-only (`pub(crate)`); the public
+API still exposes `parse_uncompressed_header`,
+`parse_compressed_header` and their result types exclusively.
+
 ## Status — 2026-05-26 (round 22)
 
 **Round 22: §6.3.11 `read_is_inter_probs( )` compressed-header sweep.**
@@ -1181,10 +1239,14 @@ Future rounds, roughly in order:
    per-tile loop.
 2. Inter (non-intra-only) header path — `frame_size_with_refs`,
    `allow_high_precision_mv`, `read_interpolation_filter` — plus
-   the inter-only §6.3.9–§6.3.16 syntax (`read_inter_mode_probs`,
-   `read_interp_filter_probs`, `read_is_inter_probs`,
-   `frame_reference_mode`, `mv_probs`) once reference-buffer state
-   is in place.
+   the inter-only §6.3.9–§6.3.16 syntax. Rounds 22 / 23 land the
+   first three primitives standalone: `read_is_inter_probs` (r22),
+   `read_inter_mode_probs` + `read_interp_filter_probs` (r23).
+   `frame_reference_mode`, `frame_reference_mode_probs`,
+   `read_y_mode_probs`, `read_partition_probs`, `mv_probs` (§6.3.12
+   – §6.3.17) and the outer-dispatch `FrameIsIntra == 0` arm that
+   chains them all land subsequently, gated on reference-buffer
+   state.
 3. Per-tile partition-tree walk (§6.4) including the §6.4.21
    `residual()` driver that finally consumes the round-7 tokens and
    the round-6 `coef_probs` tables, plus the per-block mode-info

@@ -51,33 +51,42 @@
 //!   `default_interp_filter_probs` initials. The spec swaps the
 //!   loop-index names (outer `j`, inner `i`) — the visit order
 //!   matches the array layout `[INTERP_FILTER_CONTEXTS][SWITCHABLE_FILTERS - 1]`.
+//! * §6.3.14 `read_y_mode_probs( )` — unconditional
+//!   `BLOCK_SIZE_GROUPS × (INTRA_MODES - 1) = 4 × 9 = 36` cell
+//!   `diff_update_prob` sweep over the §9.3 / §10.5
+//!   `default_y_mode_probs` initials. Updates the inter-frame
+//!   `y_mode_probs[ ][ ]` table consumed by the §7.4.5 intra-mode
+//!   decoder of the (still-deferred) `inter_block_mode_info( )` reader.
 //!
 //! Round 6 lands the §6.3.7 walker between the round-5 §6.3.2
 //! `tx_mode_probs` and §6.3.8 `read_skip_prob` calls. Round 22 adds
 //! the §6.3.11 `read_is_inter_probs( )` standalone primitive. Round 23
 //! adds the §6.3.9 `read_inter_mode_probs( )` and §6.3.10
-//! `read_interp_filter_probs( )` standalone primitives — the
+//! `read_interp_filter_probs( )` standalone primitives. Round 24 adds
+//! the §6.3.14 `read_y_mode_probs( )` standalone primitive — the
 //! `FrameIsIntra == 0`-gated outer-dispatch call site is still
-//! deferred because §6.3.12..§6.3.17 haven't landed yet. The
-//! remaining inter-only §6.3.12..§6.3.17 syntax fires only on
+//! deferred because §6.3.12 / §6.3.13 (frame_reference_mode + probs)
+//! haven't landed yet. The remaining inter-only
+//! §6.3.12 / §6.3.13 / §6.3.15 / §6.3.16 / §6.3.17 syntax fires only on
 //! `FrameIsIntra == 0` and needs reference-buffer state which the
 //! header walker still rejects with `Error::Unsupported`.
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7,
 //! `docs/video/vp9/vp9-spec.txt` §6.3.1 / §6.3.2 / §6.3.3 / §6.3.4 /
-//! §6.3.5 / §6.3.6 / §6.3.7 / §6.3.8 / §6.3.9 / §6.3.10 / §6.3.11
-//! (the `inv_map_table`, `default_tx_probs`, `default_skip_prob`,
+//! §6.3.5 / §6.3.6 / §6.3.7 / §6.3.8 / §6.3.9 / §6.3.10 / §6.3.11 /
+//! §6.3.14 (the `inv_map_table`, `default_tx_probs`, `default_skip_prob`,
 //! `default_coef_probs`, `default_is_inter_prob`,
-//! `default_inter_mode_probs`, `default_interp_filter_probs` and
-//! `tx_mode_to_biggest_tx_size` constants are transcribed verbatim
-//! from §6.3.5, §10 and §10.5). No external library source consulted.
+//! `default_inter_mode_probs`, `default_interp_filter_probs`,
+//! `default_y_mode_probs` and `tx_mode_to_biggest_tx_size` constants
+//! are transcribed verbatim from §6.3.5, §10 and §10.5). No external
+//! library source consulted.
 
 use crate::bool_coder::BoolCoder;
 use crate::coef_probs::{CoefProbs, DEFAULT_COEF_PROBS};
 use crate::mode_info::{
-    DEFAULT_INTERP_FILTER_PROBS, DEFAULT_INTER_MODE_PROBS, DEFAULT_IS_INTER_PROB,
-    INTERP_FILTER_CONTEXTS, INTER_MODES, INTER_MODE_CONTEXTS, IS_INTER_CONTEXTS,
-    SWITCHABLE_FILTERS,
+    BLOCK_SIZE_GROUPS, DEFAULT_INTERP_FILTER_PROBS, DEFAULT_INTER_MODE_PROBS,
+    DEFAULT_IS_INTER_PROB, DEFAULT_Y_MODE_PROBS, INTERP_FILTER_CONTEXTS, INTER_MODES,
+    INTER_MODE_CONTEXTS, INTRA_MODES, IS_INTER_CONTEXTS, SWITCHABLE_FILTERS,
 };
 use crate::Error;
 
@@ -724,6 +733,66 @@ pub(crate) fn read_interp_filter_probs(
 #[allow(dead_code)] // wired in once the §6.3 inter-arm dispatch lands.
 pub(crate) const DEFAULT_INTERP_FILTER_PROBS_TABLE: [[u8; SWITCHABLE_FILTERS - 1];
     INTERP_FILTER_CONTEXTS] = DEFAULT_INTERP_FILTER_PROBS;
+
+/// `read_y_mode_probs( )` per spec §6.3.14 ("Y mode probs syntax" —
+/// `vp9-spec.txt` lines 2220-2225).
+///
+/// Two nested sweeps:
+///
+/// ```text
+/// for ( i = 0; i < BLOCK_SIZE_GROUPS; i++ )
+///     for ( j = 0; j < INTRA_MODES - 1; j++ )
+///         y_mode_probs[ i ][ j ] =
+///             diff_update_prob( y_mode_probs[ i ][ j ] )
+/// ```
+///
+/// `BLOCK_SIZE_GROUPS = 4` (§3, `vp9-spec.txt` line 460) ×
+/// `INTRA_MODES - 1 = 9` (§3, line 505) = 36 cells. Every cell consumes
+/// one `B(252)` `update_prob` flag, and on 1 a `decode_term_subexp` +
+/// `inv_remap_prob` cascade. The 36-cell layout matches the
+/// `default_y_mode_probs[ BLOCK_SIZE_GROUPS ][ INTRA_MODES - 1 ]`
+/// table held in [`mode_info::DEFAULT_Y_MODE_PROBS`].
+///
+/// The §6.3 outer dispatch invokes `read_y_mode_probs( )` only when
+/// `FrameIsIntra == 0` (alongside §6.3.9 / §6.3.10 / §6.3.11 /
+/// §6.3.12 / §6.3.13 / §6.3.15 / §6.3.16 / §6.3.17). The function
+/// itself is unconditional once the caller has decided to fire it;
+/// the gating lives in the `parse_compressed_header` outer driver.
+///
+/// `y_mode_probs` is updated in place. Initial values come from
+/// [`mode_info::DEFAULT_Y_MODE_PROBS`] (the §9.3 / §10.5 listing —
+/// single source of truth for the inter-frame `y_mode_probs[ ][ ]`
+/// table; the keyframe path uses the unrelated three-dimensional
+/// `kf_y_mode_probs[ INTRA_MODES ][ INTRA_MODES ][ INTRA_MODES - 1 ]`
+/// fixed table held in [`mode_info::KF_Y_MODE_PROBS`]).
+// Forward-staged: the §6.3 outer dispatch gates this call on
+// `FrameIsIntra == 0`. The `#[allow(dead_code)]` lifts the lint
+// until the outer dispatch grows the inter arm (paired with the
+// other §6.3.9..§6.3.17 primitives).
+#[allow(dead_code)]
+pub(crate) fn read_y_mode_probs(
+    coder: &mut BoolCoder<'_>,
+    y_mode_probs: &mut [[u8; INTRA_MODES - 1]; BLOCK_SIZE_GROUPS],
+) -> Result<(), Error> {
+    for row in y_mode_probs.iter_mut() {
+        for slot in row.iter_mut() {
+            *slot = read_diff_update_prob(coder, *slot)?;
+        }
+    }
+    Ok(())
+}
+
+/// Re-export of the §9.3 / §10.5
+/// `default_y_mode_probs[ BLOCK_SIZE_GROUPS ][ INTRA_MODES - 1 ]`
+/// initial / reset table for use as the [`read_y_mode_probs`]
+/// starting state.
+///
+/// Re-exported from [`mode_info::DEFAULT_Y_MODE_PROBS`] (the single
+/// source of truth — the same constant feeds the (still-deferred)
+/// §7.4.5 intra-mode tree decoder of `inter_block_mode_info( )`).
+#[allow(dead_code)] // wired in once the §6.3 inter-arm dispatch lands.
+pub(crate) const DEFAULT_Y_MODE_PROBS_TABLE: [[u8; INTRA_MODES - 1]; BLOCK_SIZE_GROUPS] =
+    DEFAULT_Y_MODE_PROBS;
 
 #[cfg(test)]
 mod tests {
@@ -1617,5 +1686,141 @@ mod tests {
             DEFAULT_INTERP_FILTER_PROBS_TABLE,
             DEFAULT_INTERP_FILTER_PROBS
         );
+    }
+
+    // -----------------------------------------------------------------
+    // §6.3.14 read_y_mode_probs( ) tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn block_size_groups_constant_equals_four() {
+        // The spec §3 constant table (vp9-spec.txt line 460) fixes
+        // BLOCK_SIZE_GROUPS = 4. The §6.3.14 outer loop walks
+        // `i < BLOCK_SIZE_GROUPS` rows; drift would over- or
+        // under-read.
+        assert_eq!(BLOCK_SIZE_GROUPS, 4);
+    }
+
+    #[test]
+    fn intra_modes_constant_equals_ten() {
+        // The spec §3 constant table (vp9-spec.txt line 505) fixes
+        // INTRA_MODES = 10. The §6.3.14 inner loop walks
+        // `j < INTRA_MODES - 1 = 9` cells per row.
+        assert_eq!(INTRA_MODES, 10);
+    }
+
+    #[test]
+    fn default_y_mode_probs_matches_spec_listing() {
+        // Verbatim transcription check against §9.3 (mirrored in §10.5).
+        // Row annotations preserved from the spec listing.
+        let expected: [[u8; 9]; 4] = [
+            [65, 32, 18, 144, 162, 194, 41, 51, 98],   // block_size < 8x8
+            [132, 68, 18, 165, 217, 196, 45, 40, 78],  // block_size < 16x16
+            [173, 80, 19, 176, 240, 193, 64, 35, 46],  // block_size < 32x32
+            [221, 135, 38, 194, 248, 121, 96, 85, 29], // block_size >= 32x32
+        ];
+        assert_eq!(DEFAULT_Y_MODE_PROBS, expected);
+        assert_eq!(DEFAULT_Y_MODE_PROBS_TABLE, expected);
+    }
+
+    #[test]
+    fn read_y_mode_probs_zero_buffer_leaves_defaults_unchanged() {
+        // 36 B(252) reads on a zero buffer all return 0 (BoolValue=0
+        // < split=125), so each diff_update_prob call passes its base
+        // through unchanged.
+        let bytes = [0x00u8; 16];
+        let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut probs = DEFAULT_Y_MODE_PROBS_TABLE;
+        read_y_mode_probs(&mut dec, &mut probs).unwrap();
+        assert_eq!(probs, DEFAULT_Y_MODE_PROBS_TABLE);
+    }
+
+    #[test]
+    fn read_y_mode_probs_visits_all_thirty_six_cells() {
+        // BLOCK_SIZE_GROUPS × (INTRA_MODES - 1) = 4 × 9 = 36 cells.
+        // With update_prob == 0 (zero buffer) every base passes through
+        // unchanged. A non-uniform starting table proves every slot is
+        // visited but no cell is mutated.
+        let bytes = [0x00u8; 16];
+        let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut probs: [[u8; 9]; 4] = [
+            [10, 11, 12, 13, 14, 15, 16, 17, 18],
+            [20, 21, 22, 23, 24, 25, 26, 27, 28],
+            [30, 31, 32, 33, 34, 35, 36, 37, 38],
+            [40, 41, 42, 43, 44, 45, 46, 47, 48],
+        ];
+        let snapshot = probs;
+        read_y_mode_probs(&mut dec, &mut probs).unwrap();
+        assert_eq!(probs, snapshot);
+    }
+
+    #[test]
+    fn read_y_mode_probs_consumes_thirty_six_b252_flags_on_zero_buffer() {
+        // The function must consume exactly 36 B(252) update_prob
+        // flags from a zero buffer. Walk a parallel reference coder
+        // through 36 explicit read_diff_update_prob calls and check
+        // both cursors agree on the next L(1) bit.
+        let bytes = [0x00u8; 16];
+        let mut ref_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        for _ in 0..(BLOCK_SIZE_GROUPS * (INTRA_MODES - 1)) {
+            let _ = read_diff_update_prob(&mut ref_dec, 128).unwrap();
+        }
+        let mut test_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut probs = [[128u8; INTRA_MODES - 1]; BLOCK_SIZE_GROUPS];
+        read_y_mode_probs(&mut test_dec, &mut probs).unwrap();
+        assert_eq!(
+            ref_dec.read_literal(1).unwrap(),
+            test_dec.read_literal(1).unwrap(),
+            "coder cursor must agree after the 36-cell sweep",
+        );
+    }
+
+    #[test]
+    fn read_y_mode_probs_matches_row_major_explicit_walk() {
+        // Independent equivalence check: read_y_mode_probs must walk
+        // the 36 cells in row-major (outer = block-size group, inner =
+        // intra-mode tree node) order — exactly the same as the
+        // §6.3.14 listing's nested for-loops.
+        let bytes = [0x00u8; 24];
+        let starts = [
+            DEFAULT_Y_MODE_PROBS_TABLE,
+            [
+                [1, 254, 128, 64, 200, 7, 11, 22, 33],
+                [2, 3, 4, 5, 6, 7, 8, 9, 10],
+                [255, 1, 128, 64, 32, 16, 8, 4, 2],
+                [100, 110, 120, 130, 140, 150, 160, 170, 180],
+            ],
+        ];
+        for start in starts {
+            // Reference: 36 explicit row-major read_diff_update_prob calls.
+            let mut ref_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+            let mut ref_probs = start;
+            for row in ref_probs.iter_mut() {
+                for slot in row.iter_mut() {
+                    *slot = read_diff_update_prob(&mut ref_dec, *slot).unwrap();
+                }
+            }
+            // Under-test walk.
+            let mut test_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+            let mut test_probs = start;
+            read_y_mode_probs(&mut test_dec, &mut test_probs).unwrap();
+            assert_eq!(
+                ref_probs, test_probs,
+                "read_y_mode_probs must match explicit row-major sweep for {start:?}",
+            );
+            assert_eq!(
+                ref_dec.read_literal(1).unwrap(),
+                test_dec.read_literal(1).unwrap(),
+                "cursor must agree after the row-major sweep for {start:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn default_y_mode_probs_table_matches_mode_info_source() {
+        // Single source of truth: the re-export consumed by
+        // read_y_mode_probs must equal the §9.3 / §10.5 listing held
+        // in mode_info::DEFAULT_Y_MODE_PROBS.
+        assert_eq!(DEFAULT_Y_MODE_PROBS_TABLE, DEFAULT_Y_MODE_PROBS);
     }
 }

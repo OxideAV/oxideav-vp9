@@ -3,6 +3,57 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-05-27 (round 24)
+
+**Round 24: §6.3.14 `read_y_mode_probs( )` compressed-header sweep.**
+Round 24 extends the §6.3 inter-arm primitives chain by one cell
+alongside the round-22 §6.3.11 `read_is_inter_probs( )` and round-23
+§6.3.9 / §6.3.10 sweeps:
+
+* `read_y_mode_probs( coder, y_mode_probs )` per §6.3.14
+  (`vp9-spec.txt` lines 2220-2225). A `BLOCK_SIZE_GROUPS = 4` (§3 line
+  460) × `INTRA_MODES - 1 = 9` (§3 line 505) = 36-cell row-major
+  sweep of `read_diff_update_prob` calls — one `B(252)` `update_prob`
+  flag per cell and, on 1, a `decode_term_subexp( )` +
+  `inv_remap_prob( )` cascade — updating `y_mode_probs[ ][ ]` in
+  place.
+* `DEFAULT_Y_MODE_PROBS` (`mode_info`, transcribed verbatim from §9.3 /
+  §10.5) carries the inter-frame `intra_mode` initial / reset
+  probabilities (row annotations preserved: 0 = block_size < 8x8,
+  1 = < 16x16, 2 = < 32x32, 3 = >= 32x32). The same constant feeds the
+  (still-deferred) §7.4.5 intra-mode tree decoder of
+  `inter_block_mode_info( )`.
+* `DEFAULT_Y_MODE_PROBS_TABLE` re-export in `compressed.rs` keeps
+  `mode_info` as the single source of truth (mirroring the round-22
+  `DEFAULT_IS_INTER_PROB_TABLE` and round-23 inter-mode / interp-filter
+  staging patterns).
+
+Validation (+8 tests, lib total 345 → 353; suite total 365 → 373)
+covers the §3 constant pinning for `BLOCK_SIZE_GROUPS = 4` and
+`INTRA_MODES = 10`; the verbatim transcription of the §9.3
+`default_y_mode_probs` table; the zero-buffer `update_prob = 0`
+pass-through preserving the starting table; an all-cells-visited
+check with a non-uniform custom starting table; a cursor-equivalence
+proof that the sweep consumes exactly 36 `B(252)` flags; explicit
+row-major walk equivalence against a parallel-coder reference (two
+starting tables); and a single-source-of-truth check that the
+`compressed.rs` re-export equals the `mode_info` constant.
+
+Out of scope for round 24: the §6.3 outer-dispatch `FrameIsIntra == 0`
+arm itself — the y-mode sweep lives alongside `read_is_inter_probs( )`
++ `read_inter_mode_probs( )` + `read_interp_filter_probs( )` between
+`read_skip_prob( )` (§6.3.8) and the (still-deferred) §6.3.15
+`read_partition_probs( )` / §6.3.16 `mv_probs( )` cells. Wiring any
+subset into `parse_compressed_header` before §6.3.12 / §6.3.13
+(`frame_reference_mode( )` + `frame_reference_mode_probs( )`) land
+would mis-position the coder cursor — and §6.3.12 needs
+`ref_frame_sign_bias[ ]` state the uncompressed-header walker still
+rejects with `Error::Unsupported`. The round-24 surface stays
+internal-only (`pub(crate)` with `#[allow(dead_code)]` until the
+outer dispatch grows the inter arm); the public API still exposes
+`parse_uncompressed_header`, `parse_compressed_header` and their
+result types exclusively.
+
 ## Status — 2026-05-26 (round 23)
 
 **Round 23: §6.3.9 `read_inter_mode_probs( )` + §6.3.10

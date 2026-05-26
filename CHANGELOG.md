@@ -6,6 +6,36 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 24: §6.3.14 `read_y_mode_probs( )` compressed-header
+  sweep.** Extends the §6.3 inter-arm primitives chain by one cell
+  alongside the round-22 §6.3.11 `read_is_inter_probs( )` and
+  round-23 §6.3.9 / §6.3.10 sweeps:
+  * `read_y_mode_probs( coder, y_mode_probs )` per §6.3.14
+    (`vp9-spec.txt` lines 2220-2225) — `BLOCK_SIZE_GROUPS = 4`
+    (§3 line 460) × `INTRA_MODES - 1 = 9` (§3 line 505) = 36-cell
+    row-major `read_diff_update_prob` sweep against the §9.3 / §10.5
+    `default_y_mode_probs[ BLOCK_SIZE_GROUPS ][ INTRA_MODES - 1 ]`
+    table.
+  * `DEFAULT_Y_MODE_PROBS_TABLE` re-export in `compressed.rs`
+    preserves `mode_info::DEFAULT_Y_MODE_PROBS` as the single source
+    of truth (same constant feeds the (still-deferred) §7.4.5
+    intra-mode tree decoder of `inter_block_mode_info( )`).
+  * 8 new unit tests covering: §3 `BLOCK_SIZE_GROUPS = 4` and
+    `INTRA_MODES = 10` constant pinning; verbatim §9.3 default-table
+    transcription (row annotations preserved 0 = block_size < 8x8 …
+    3 = block_size >= 32x32); zero-buffer `update_prob = 0`
+    pass-through; all-cells-visited check with a non-uniform custom
+    starting table; cursor-equivalence proof that the sweep consumes
+    exactly 36 `B(252)` flags; explicit row-major walk equivalence
+    against a parallel-coder reference (two starting tables); and
+    a single-source-of-truth check tying
+    `DEFAULT_Y_MODE_PROBS_TABLE` back to `mode_info::DEFAULT_Y_MODE_PROBS`.
+  * Surface stays `pub(crate) + #[allow(dead_code)]` — wiring into
+    `parse_compressed_header` waits on §6.3.12 (`frame_reference_mode( )`)
+    and §6.3.13 (`frame_reference_mode_probs( )`) which need
+    `ref_frame_sign_bias[ ]` state the uncompressed-header walker
+    still rejects with `Error::Unsupported`.
+
 * **Round 23: §6.3.9 `read_inter_mode_probs( )` + §6.3.10
   `read_interp_filter_probs( )` compressed-header sweeps.** Extends
   the §6.3 inter-arm primitives chain alongside the round-22 §6.3.11

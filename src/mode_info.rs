@@ -1615,6 +1615,63 @@ pub(crate) const IS_INTER_CONTEXTS: usize = 4;
 /// listing.
 pub(crate) const DEFAULT_IS_INTER_PROB: [u8; IS_INTER_CONTEXTS] = [9, 102, 187, 225];
 
+/// `INTER_MODES = 4` per spec §3 (`vp9-spec.txt` line 506). Number of
+/// values for the `inter_mode` syntax element. The `read_inter_mode_probs( )`
+/// sweep (§6.3.9) writes one probability per non-final mode → the inner
+/// loop walks `j ∈ [0, INTER_MODES - 1)`.
+pub(crate) const INTER_MODES: usize = 4;
+
+/// `INTER_MODE_CONTEXTS = 7` per spec §3 (`vp9-spec.txt` line 507).
+/// Number of contexts under which the `inter_mode` probabilities are
+/// indexed. The §6.3.9 sweep walks `i ∈ [0, INTER_MODE_CONTEXTS)`.
+pub(crate) const INTER_MODE_CONTEXTS: usize = 7;
+
+/// `default_inter_mode_probs[INTER_MODE_CONTEXTS][INTER_MODES - 1]`
+/// per spec §10.5 (`vp9-spec.txt` lines 7758-7766). The running
+/// `inter_mode_probs[ ][ ]` table's initial / reset values, before
+/// any §6.3.9 `read_inter_mode_probs( )` compressed-header sweep
+/// applies `diff_update_prob` deltas.
+///
+/// Row layout (per the spec's annotated listing):
+///   0 = both zero mv
+///   1 = one zero mv + one a predicted mv
+///   2 = two predicted mvs
+///   3 = one predicted/zero and one new mv
+///   4 = two new mvs
+///   5 = one intra neighbor + x
+///   6 = two intra neighbors
+///
+/// Transcribed verbatim from the §10.5 listing.
+pub(crate) const DEFAULT_INTER_MODE_PROBS: [[u8; INTER_MODES - 1]; INTER_MODE_CONTEXTS] = [
+    [2, 173, 34], // 0 = both zero mv
+    [7, 145, 85], // 1 = one zero mv + one a predicted mv
+    [7, 166, 63], // 2 = two predicted mvs
+    [7, 94, 66],  // 3 = one predicted/zero and one new mv
+    [8, 64, 46],  // 4 = two new mvs
+    [17, 81, 31], // 5 = one intra neighbor + x
+    [25, 29, 30], // 6 = two intra neighbors
+];
+
+/// `SWITCHABLE_FILTERS = 3` per spec §3 (`vp9-spec.txt` line 487).
+/// Number of interp_filter values the switchable path picks from. The
+/// §6.3.10 inner loop walks `i ∈ [0, SWITCHABLE_FILTERS - 1)`, so
+/// `SWITCHABLE_FILTERS - 1 = 2` probabilities per context.
+pub(crate) const SWITCHABLE_FILTERS: usize = 3;
+
+/// `INTERP_FILTER_CONTEXTS = 4` per spec §3 (`vp9-spec.txt` line 495).
+/// Number of contexts for interp_filter. The §6.3.10 outer loop walks
+/// `j ∈ [0, INTERP_FILTER_CONTEXTS)`.
+pub(crate) const INTERP_FILTER_CONTEXTS: usize = 4;
+
+/// `default_interp_filter_probs[INTERP_FILTER_CONTEXTS][SWITCHABLE_FILTERS - 1]`
+/// per spec §10.5 (`vp9-spec.txt` lines 7769-7775). The running
+/// `interp_filter_probs[ ][ ]` table's initial / reset values, before
+/// any §6.3.10 `read_interp_filter_probs( )` compressed-header sweep
+/// applies `diff_update_prob` deltas. Transcribed verbatim from the
+/// §10.5 listing.
+pub(crate) const DEFAULT_INTERP_FILTER_PROBS: [[u8; SWITCHABLE_FILTERS - 1];
+    INTERP_FILTER_CONTEXTS] = [[235, 162], [36, 255], [34, 3], [149, 144]];
+
 /// Neighbour `RefFrames[ ][ ][ 0 ]` cells consumed by [`is_inter_context`]
 /// to compute `LeftIntra` / `AboveIntra` per §6.4.11.
 ///

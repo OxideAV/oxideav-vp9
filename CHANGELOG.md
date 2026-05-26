@@ -6,6 +6,43 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 23: §6.3.9 `read_inter_mode_probs( )` + §6.3.10
+  `read_interp_filter_probs( )` compressed-header sweeps.** Extends
+  the §6.3 inter-arm primitives chain alongside the round-22 §6.3.11
+  `read_is_inter_probs( )`:
+  * `read_inter_mode_probs( coder, inter_mode_probs )` per §6.3.9
+    (`vp9-spec.txt` lines 2138-2143) — `INTER_MODE_CONTEXTS = 7`
+    × `INTER_MODES - 1 = 3` = 21-cell row-major
+    `read_diff_update_prob` sweep against the §10.5
+    `default_inter_mode_probs` table.
+  * `read_interp_filter_probs( coder, interp_filter_probs )` per
+    §6.3.10 (`vp9-spec.txt` lines 2146-2151) —
+    `INTERP_FILTER_CONTEXTS = 4` × `SWITCHABLE_FILTERS - 1 = 2`
+    = 8-cell row-major `read_diff_update_prob` sweep against the
+    §10.5 `default_interp_filter_probs` table. The §6.3.10 listing
+    swaps the loop-index names (outer `j`, inner `i`) — visit order
+    matches the `[INTERP_FILTER_CONTEXTS][SWITCHABLE_FILTERS - 1]`
+    layout.
+  * §3 constants `INTER_MODES = 4`, `INTER_MODE_CONTEXTS = 7`,
+    `SWITCHABLE_FILTERS = 3`, `INTERP_FILTER_CONTEXTS = 4`
+    transcribed verbatim from `vp9-spec.txt` lines 506-507 / 487 / 495.
+  * `DEFAULT_INTER_MODE_PROBS` (`mode_info`) transcribed verbatim
+    from §10.5 lines 7758-7766 — row annotations preserved
+    (0 = both zero mv … 6 = two intra neighbors).
+  * `DEFAULT_INTERP_FILTER_PROBS` (`mode_info`) transcribed verbatim
+    from §10.5 lines 7769-7775.
+  * `DEFAULT_INTER_MODE_PROBS_TABLE` and `DEFAULT_INTERP_FILTER_PROBS_TABLE`
+    re-exports in `compressed.rs` preserve `mode_info` as the single
+    source of truth.
+  * 16 new unit tests (+ 5 for inter-mode, 5 for interp-filter, plus
+    layout / constants / re-export equality) covering: §3
+    constant pinning; verbatim §10.5 default-table transcription;
+    zero-buffer `update_prob = 0` pass-through; all-cells visited
+    with custom starts; cursor-equivalence proofs that each sweep
+    consumes exactly its prescribed cell count of `B(252)` flags
+    (21 / 8); explicit row-major walk equivalence against a
+    parallel-coder reference; single-source-of-truth checks tying
+    the `compressed.rs` re-exports back to `mode_info`.
 * **Round 22: §6.3.11 `read_is_inter_probs( )` compressed-header
   sweep.** Unconditional `IS_INTER_CONTEXTS = 4` `diff_update_prob`
   walk over the §10.5 `default_is_inter_prob[ IS_INTER_CONTEXTS ] =

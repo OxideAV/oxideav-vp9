@@ -3,6 +3,58 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-05-26 (round 23)
+
+**Round 23: §6.3.9 `read_inter_mode_probs( )` + §6.3.10
+`read_interp_filter_probs( )` compressed-header sweeps.** Round 23
+extends the §6.3 inter-arm primitives chain by two cells alongside
+the round-22 §6.3.11 `read_is_inter_probs( )`:
+
+* `read_inter_mode_probs( coder, inter_mode_probs )` per §6.3.9
+  (`vp9-spec.txt` lines 2138-2143). An `INTER_MODE_CONTEXTS = 7` (§3
+  line 507) × `INTER_MODES - 1 = 3` (§3 line 506) = 21-cell
+  row-major sweep of `read_diff_update_prob` calls.
+* `read_interp_filter_probs( coder, interp_filter_probs )` per
+  §6.3.10 (`vp9-spec.txt` lines 2146-2151). An
+  `INTERP_FILTER_CONTEXTS = 4` (§3 line 495) × `SWITCHABLE_FILTERS - 1
+  = 2` (§3 line 487) = 8-cell row-major sweep. The spec swaps the
+  loop-index names (outer `j`, inner `i`) — the visit order still
+  matches the array layout `[INTERP_FILTER_CONTEXTS][SWITCHABLE_FILTERS - 1]`.
+* `DEFAULT_INTER_MODE_PROBS` (`mode_info`, transcribed verbatim from
+  §10.5 lines 7758-7766) and `DEFAULT_INTERP_FILTER_PROBS`
+  (`mode_info`, transcribed verbatim from §10.5 lines 7769-7775)
+  carry the spec's annotated initial / reset values. The same
+  constants will feed the (still-deferred) §6.4.16
+  `inter_block_mode_info( )` per-block reader once that lands.
+* `DEFAULT_INTER_MODE_PROBS_TABLE` and `DEFAULT_INTERP_FILTER_PROBS_TABLE`
+  re-exports in `compressed.rs` keep `mode_info` as the single source
+  of truth (mirroring the round-22 `DEFAULT_IS_INTER_PROB_TABLE`
+  staging pattern).
+
+Validation (+16 tests, lib total 329 → 345; suite total 349 → 365)
+covers the §3 constant pinning for `INTER_MODE_CONTEXTS = 7`,
+`INTER_MODES = 4`, `INTERP_FILTER_CONTEXTS = 4`, `SWITCHABLE_FILTERS = 3`;
+the verbatim transcription of each §10.5 default table; the
+zero-buffer `update_prob = 0` pass-through preserving each starting
+table; an all-cells-visited check with non-uniform starts (custom
+tables preserved across the sweep); cursor-equivalence proofs that
+each sweep consumes exactly its prescribed cell count of `B(252)`
+flags (21 for inter-mode, 8 for interp-filter); explicit row-major
+walk equivalence against a parallel-coder reference; and
+single-source-of-truth checks that the `compressed.rs` re-exports
+equal the `mode_info` constants.
+
+Out of scope for round 23: the §6.3 outer-dispatch `FrameIsIntra == 0`
+arm itself — the inter-mode / interp-filter sweeps live alongside
+`read_is_inter_probs( )` between `read_skip_prob( )` (§6.3.8) and
+`frame_reference_mode( )` (§6.3.12). Wiring any subset into
+`parse_compressed_header` before §6.3.12 / §6.3.13 land would
+mis-position the coder cursor. The round-23 surface stays
+internal-only (`pub(crate)` with `#[allow(dead_code)]` until the
+outer dispatch grows the inter arm); the public API still exposes
+`parse_uncompressed_header`, `parse_compressed_header` and their
+result types exclusively.
+
 ## Status — 2026-05-26 (round 22)
 
 **Round 22: §6.3.11 `read_is_inter_probs( )` compressed-header sweep.**

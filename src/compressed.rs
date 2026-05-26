@@ -40,28 +40,45 @@
 //!   §10.5 `default_is_inter_prob[ IS_INTER_CONTEXTS ] = { 9, 102,
 //!   187, 225 }` initials (the running table feeding the §6.4.13
 //!   `read_is_inter( )` per-block decoder).
+//! * §6.3.9 `read_inter_mode_probs( )` — unconditional
+//!   `INTER_MODE_CONTEXTS × (INTER_MODES - 1) = 7 × 3 = 21` cell
+//!   `diff_update_prob` sweep over the §10.5 `default_inter_mode_probs`
+//!   initials. Feeds the (still-deferred) §6.4.16
+//!   `inter_block_mode_info( )` per-block reader.
+//! * §6.3.10 `read_interp_filter_probs( )` — unconditional
+//!   `INTERP_FILTER_CONTEXTS × (SWITCHABLE_FILTERS - 1) = 4 × 2 = 8`
+//!   cell `diff_update_prob` sweep over the §10.5
+//!   `default_interp_filter_probs` initials. The spec swaps the
+//!   loop-index names (outer `j`, inner `i`) — the visit order
+//!   matches the array layout `[INTERP_FILTER_CONTEXTS][SWITCHABLE_FILTERS - 1]`.
 //!
 //! Round 6 lands the §6.3.7 walker between the round-5 §6.3.2
 //! `tx_mode_probs` and §6.3.8 `read_skip_prob` calls. Round 22 adds
-//! the §6.3.11 `read_is_inter_probs( )` standalone primitive — the
+//! the §6.3.11 `read_is_inter_probs( )` standalone primitive. Round 23
+//! adds the §6.3.9 `read_inter_mode_probs( )` and §6.3.10
+//! `read_interp_filter_probs( )` standalone primitives — the
 //! `FrameIsIntra == 0`-gated outer-dispatch call site is still
-//! deferred because §6.3.9 / §6.3.10 / §6.3.12..§6.3.17 haven't
-//! landed yet. The remaining inter-only §6.3.9 / §6.3.10 /
-//! §6.3.12..§6.3.17 syntax fires only on `FrameIsIntra == 0` and
-//! needs reference-buffer state which the header walker still
-//! rejects with `Error::Unsupported`.
+//! deferred because §6.3.12..§6.3.17 haven't landed yet. The
+//! remaining inter-only §6.3.12..§6.3.17 syntax fires only on
+//! `FrameIsIntra == 0` and needs reference-buffer state which the
+//! header walker still rejects with `Error::Unsupported`.
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7,
 //! `docs/video/vp9/vp9-spec.txt` §6.3.1 / §6.3.2 / §6.3.3 / §6.3.4 /
-//! §6.3.5 / §6.3.6 / §6.3.7 / §6.3.8 / §6.3.11 (the `inv_map_table`,
-//! `default_tx_probs`, `default_skip_prob`, `default_coef_probs`,
-//! `default_is_inter_prob`, and `tx_mode_to_biggest_tx_size` constants
-//! are transcribed verbatim from §6.3.5, §10 and §10.5). No external
-//! library source consulted.
+//! §6.3.5 / §6.3.6 / §6.3.7 / §6.3.8 / §6.3.9 / §6.3.10 / §6.3.11
+//! (the `inv_map_table`, `default_tx_probs`, `default_skip_prob`,
+//! `default_coef_probs`, `default_is_inter_prob`,
+//! `default_inter_mode_probs`, `default_interp_filter_probs` and
+//! `tx_mode_to_biggest_tx_size` constants are transcribed verbatim
+//! from §6.3.5, §10 and §10.5). No external library source consulted.
 
 use crate::bool_coder::BoolCoder;
 use crate::coef_probs::{CoefProbs, DEFAULT_COEF_PROBS};
-use crate::mode_info::{DEFAULT_IS_INTER_PROB, IS_INTER_CONTEXTS};
+use crate::mode_info::{
+    DEFAULT_INTERP_FILTER_PROBS, DEFAULT_INTER_MODE_PROBS, DEFAULT_IS_INTER_PROB,
+    INTERP_FILTER_CONTEXTS, INTER_MODES, INTER_MODE_CONTEXTS, IS_INTER_CONTEXTS,
+    SWITCHABLE_FILTERS,
+};
 use crate::Error;
 
 /// `tx_mode` per spec §3 (TX_MODES = 5).
@@ -588,6 +605,125 @@ pub(crate) fn read_is_inter_probs(
 /// §6.4.13 [`mode_info::read_is_inter`] per-block decoder).
 #[allow(dead_code)] // wired in once the §6.3 inter-arm dispatch lands.
 pub(crate) const DEFAULT_IS_INTER_PROB_TABLE: [u8; IS_INTER_CONTEXTS] = DEFAULT_IS_INTER_PROB;
+
+/// `read_inter_mode_probs( )` per spec §6.3.9 ("Inter mode probs
+/// syntax" — `vp9-spec.txt` lines 2138-2143).
+///
+/// Two nested sweeps:
+///
+/// ```text
+/// for ( i = 0; i < INTER_MODE_CONTEXTS; i++ )
+///     for ( j = 0; j < INTER_MODES - 1; j++ )
+///         inter_mode_probs[ i ][ j ] =
+///             diff_update_prob( inter_mode_probs[ i ][ j ] )
+/// ```
+///
+/// `INTER_MODE_CONTEXTS = 7` (§3, `vp9-spec.txt` line 507) × `INTER_MODES - 1 = 3`
+/// (§3, line 506) = 21 cells. Every cell consumes one `B(252)`
+/// `update_prob` flag, and on 1 a `decode_term_subexp` +
+/// `inv_remap_prob` cascade. The 21-cell layout matches the
+/// `default_inter_mode_probs` table in §10.5 lines 7758-7766.
+///
+/// The §6.3 outer dispatch invokes `read_inter_mode_probs( )` only
+/// when `FrameIsIntra == 0` (alongside §6.3.10 / §6.3.11 /
+/// §6.3.12..§6.3.17). The function itself is unconditional once the
+/// caller has decided to fire it; the gating lives in the
+/// `parse_compressed_header` outer driver.
+///
+/// `inter_mode_probs` is updated in place. Initial values come from
+/// [`mode_info::DEFAULT_INTER_MODE_PROBS`] (the §10.5 listing —
+/// single source of truth for the `inter_mode_probs[ ][ ]` table).
+// Forward-staged: the §6.3 outer dispatch gates this call on
+// `FrameIsIntra == 0`. The `#[allow(dead_code)]` lifts the lint
+// until the outer dispatch grows the inter arm (paired with the
+// other §6.3.9..§6.3.17 primitives).
+#[allow(dead_code)]
+pub(crate) fn read_inter_mode_probs(
+    coder: &mut BoolCoder<'_>,
+    inter_mode_probs: &mut [[u8; INTER_MODES - 1]; INTER_MODE_CONTEXTS],
+) -> Result<(), Error> {
+    for row in inter_mode_probs.iter_mut() {
+        for slot in row.iter_mut() {
+            *slot = read_diff_update_prob(coder, *slot)?;
+        }
+    }
+    Ok(())
+}
+
+/// Re-export of the §10.5
+/// `default_inter_mode_probs[ INTER_MODE_CONTEXTS ][ INTER_MODES - 1 ]`
+/// initial / reset table for use as the [`read_inter_mode_probs`]
+/// starting state.
+///
+/// Re-exported from [`mode_info::DEFAULT_INTER_MODE_PROBS`] (the
+/// single source of truth — the same constant will be consumed by
+/// the §6.4.16 `inter_block_mode_info( )` per-block decoder once
+/// that primitive lands).
+#[allow(dead_code)] // wired in once the §6.3 inter-arm dispatch lands.
+pub(crate) const DEFAULT_INTER_MODE_PROBS_TABLE: [[u8; INTER_MODES - 1]; INTER_MODE_CONTEXTS] =
+    DEFAULT_INTER_MODE_PROBS;
+
+/// `read_interp_filter_probs( )` per spec §6.3.10 ("Interp filter probs
+/// syntax" — `vp9-spec.txt` lines 2146-2151).
+///
+/// Two nested sweeps:
+///
+/// ```text
+/// for ( j = 0; j < INTERP_FILTER_CONTEXTS; j++ )
+///     for ( i = 0; i < SWITCHABLE_FILTERS - 1; i++ )
+///         interp_filter_probs[ j ][ i ] =
+///             diff_update_prob( interp_filter_probs[ j ][ i ] )
+/// ```
+///
+/// Note: the spec swaps the loop variable names relative to §6.3.9 —
+/// the outer index here is `j` (over `INTERP_FILTER_CONTEXTS`) and
+/// the inner index is `i` (over `SWITCHABLE_FILTERS - 1`), matching
+/// the array layout `interp_filter_probs[ INTERP_FILTER_CONTEXTS ][
+/// SWITCHABLE_FILTERS - 1 ]`. The visit order is still
+/// "all probabilities of context 0, then all of context 1, …",
+/// matching the `default_interp_filter_probs` layout in §10.5 lines
+/// 7769-7775.
+///
+/// `INTERP_FILTER_CONTEXTS = 4` (§3, `vp9-spec.txt` line 495) ×
+/// `SWITCHABLE_FILTERS - 1 = 2` (§3, line 487) = 8 cells. Every cell
+/// consumes one `B(252)` `update_prob` flag, and on 1 a
+/// `decode_term_subexp` + `inv_remap_prob` cascade.
+///
+/// The §6.3 outer dispatch invokes `read_interp_filter_probs( )` only
+/// when `FrameIsIntra == 0` (alongside §6.3.9 / §6.3.11 /
+/// §6.3.12..§6.3.17). The function itself is unconditional once the
+/// caller has decided to fire it; the gating lives in the
+/// `parse_compressed_header` outer driver.
+///
+/// `interp_filter_probs` is updated in place. Initial values come from
+/// [`mode_info::DEFAULT_INTERP_FILTER_PROBS`] (the §10.5 listing —
+/// single source of truth for the `interp_filter_probs[ ][ ]` table).
+// Forward-staged: the §6.3 outer dispatch gates this call on
+// `FrameIsIntra == 0`. The `#[allow(dead_code)]` lifts the lint
+// until the outer dispatch grows the inter arm.
+#[allow(dead_code)]
+pub(crate) fn read_interp_filter_probs(
+    coder: &mut BoolCoder<'_>,
+    interp_filter_probs: &mut [[u8; SWITCHABLE_FILTERS - 1]; INTERP_FILTER_CONTEXTS],
+) -> Result<(), Error> {
+    for row in interp_filter_probs.iter_mut() {
+        for slot in row.iter_mut() {
+            *slot = read_diff_update_prob(coder, *slot)?;
+        }
+    }
+    Ok(())
+}
+
+/// Re-export of the §10.5
+/// `default_interp_filter_probs[ INTERP_FILTER_CONTEXTS ][ SWITCHABLE_FILTERS - 1 ]`
+/// initial / reset table for use as the [`read_interp_filter_probs`]
+/// starting state.
+///
+/// Re-exported from [`mode_info::DEFAULT_INTERP_FILTER_PROBS`] (the
+/// single source of truth).
+#[allow(dead_code)] // wired in once the §6.3 inter-arm dispatch lands.
+pub(crate) const DEFAULT_INTERP_FILTER_PROBS_TABLE: [[u8; SWITCHABLE_FILTERS - 1];
+    INTERP_FILTER_CONTEXTS] = DEFAULT_INTERP_FILTER_PROBS;
 
 #[cfg(test)]
 mod tests {
@@ -1215,5 +1351,271 @@ mod tests {
                 "coder cursor must agree after the four-cell sweep for {start:?}",
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // §6.3.9 read_inter_mode_probs( ) tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn inter_mode_contexts_constant_equals_seven() {
+        // The spec §3 constant table (vp9-spec.txt line 507) fixes
+        // INTER_MODE_CONTEXTS = 7. The §6.3.9 outer loop walks
+        // `i < INTER_MODE_CONTEXTS` rows; drift would over- or
+        // under-read.
+        assert_eq!(INTER_MODE_CONTEXTS, 7);
+    }
+
+    #[test]
+    fn inter_modes_constant_equals_four() {
+        // The spec §3 constant table (vp9-spec.txt line 506) fixes
+        // INTER_MODES = 4. The §6.3.9 inner loop walks
+        // `j < INTER_MODES - 1` cells per row, i.e. 3 probabilities
+        // per row.
+        assert_eq!(INTER_MODES, 4);
+    }
+
+    #[test]
+    fn default_inter_mode_probs_matches_spec_listing() {
+        // Verbatim transcription check against §10.5 lines 7758-7766.
+        // Row annotations come from the spec listing itself.
+        let expected: [[u8; 3]; 7] = [
+            [2, 173, 34], // 0 = both zero mv
+            [7, 145, 85], // 1 = one zero mv + one a predicted mv
+            [7, 166, 63], // 2 = two predicted mvs
+            [7, 94, 66],  // 3 = one predicted/zero and one new mv
+            [8, 64, 46],  // 4 = two new mvs
+            [17, 81, 31], // 5 = one intra neighbor + x
+            [25, 29, 30], // 6 = two intra neighbors
+        ];
+        assert_eq!(DEFAULT_INTER_MODE_PROBS, expected);
+        assert_eq!(DEFAULT_INTER_MODE_PROBS_TABLE, expected);
+    }
+
+    #[test]
+    fn read_inter_mode_probs_zero_buffer_leaves_defaults_unchanged() {
+        // 21 B(252) reads on a zero buffer all return 0 (BoolValue=0
+        // < split=125), so each diff_update_prob call passes its base
+        // through unchanged.
+        let bytes = [0x00u8; 8];
+        let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut probs = DEFAULT_INTER_MODE_PROBS_TABLE;
+        read_inter_mode_probs(&mut dec, &mut probs).unwrap();
+        assert_eq!(probs, DEFAULT_INTER_MODE_PROBS_TABLE);
+    }
+
+    #[test]
+    fn read_inter_mode_probs_visits_all_twenty_one_cells() {
+        // INTER_MODE_CONTEXTS × (INTER_MODES - 1) = 7 × 3 = 21 cells.
+        // With update_prob == 0 (zero buffer) every base passes
+        // through unchanged. Picking a non-uniform starting table
+        // proves every slot is visited but no cell is mutated.
+        let bytes = [0x00u8; 8];
+        let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut probs: [[u8; 3]; 7] = [
+            [11, 12, 13],
+            [21, 22, 23],
+            [31, 32, 33],
+            [41, 42, 43],
+            [51, 52, 53],
+            [61, 62, 63],
+            [71, 72, 73],
+        ];
+        let snapshot = probs;
+        read_inter_mode_probs(&mut dec, &mut probs).unwrap();
+        assert_eq!(probs, snapshot);
+    }
+
+    #[test]
+    fn read_inter_mode_probs_consumes_twenty_one_b252_flags_on_zero_buffer() {
+        // The function must consume exactly 21 B(252) update_prob
+        // flags from a zero buffer. Walk a parallel reference coder
+        // through 21 explicit read_diff_update_prob calls and check
+        // both cursors agree on the next L(1) bit.
+        let bytes = [0x00u8; 8];
+        let mut ref_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        for _ in 0..(INTER_MODE_CONTEXTS * (INTER_MODES - 1)) {
+            let _ = read_diff_update_prob(&mut ref_dec, 128).unwrap();
+        }
+        let mut test_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut probs = [[128u8; INTER_MODES - 1]; INTER_MODE_CONTEXTS];
+        read_inter_mode_probs(&mut test_dec, &mut probs).unwrap();
+        assert_eq!(
+            ref_dec.read_literal(1).unwrap(),
+            test_dec.read_literal(1).unwrap(),
+            "coder cursor must agree after the 21-cell sweep",
+        );
+    }
+
+    #[test]
+    fn read_inter_mode_probs_matches_row_major_explicit_walk() {
+        // Independent equivalence check: read_inter_mode_probs must
+        // walk the 21 cells in row-major (outer = context, inner =
+        // mode) order — exactly the same as the §6.3.9 listing's
+        // nested for-loops.
+        let bytes = [0x00u8; 16];
+        let starts = [
+            DEFAULT_INTER_MODE_PROBS_TABLE,
+            [
+                [1, 254, 128],
+                [2, 3, 4],
+                [200, 100, 50],
+                [10, 20, 30],
+                [40, 50, 60],
+                [70, 80, 90],
+                [255, 1, 128],
+            ],
+        ];
+        for start in starts {
+            // Reference: 21 explicit row-major read_diff_update_prob calls.
+            let mut ref_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+            let mut ref_probs = start;
+            for row in ref_probs.iter_mut() {
+                for slot in row.iter_mut() {
+                    *slot = read_diff_update_prob(&mut ref_dec, *slot).unwrap();
+                }
+            }
+            // Under-test walk.
+            let mut test_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+            let mut test_probs = start;
+            read_inter_mode_probs(&mut test_dec, &mut test_probs).unwrap();
+            assert_eq!(
+                ref_probs, test_probs,
+                "read_inter_mode_probs must match explicit row-major sweep for {start:?}",
+            );
+            assert_eq!(
+                ref_dec.read_literal(1).unwrap(),
+                test_dec.read_literal(1).unwrap(),
+                "cursor must agree after the row-major sweep for {start:?}",
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // §6.3.10 read_interp_filter_probs( ) tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn interp_filter_contexts_constant_equals_four() {
+        // Spec §3 constant table (vp9-spec.txt line 495) fixes
+        // INTERP_FILTER_CONTEXTS = 4. The §6.3.10 outer loop walks
+        // `j < INTERP_FILTER_CONTEXTS` rows.
+        assert_eq!(INTERP_FILTER_CONTEXTS, 4);
+    }
+
+    #[test]
+    fn switchable_filters_constant_equals_three() {
+        // Spec §3 constant table (vp9-spec.txt line 487) fixes
+        // SWITCHABLE_FILTERS = 3. The §6.3.10 inner loop walks
+        // `i < SWITCHABLE_FILTERS - 1 = 2` cells per row.
+        assert_eq!(SWITCHABLE_FILTERS, 3);
+    }
+
+    #[test]
+    fn default_interp_filter_probs_matches_spec_listing() {
+        // Verbatim transcription check against §10.5 lines 7769-7775.
+        let expected: [[u8; 2]; 4] = [[235, 162], [36, 255], [34, 3], [149, 144]];
+        assert_eq!(DEFAULT_INTERP_FILTER_PROBS, expected);
+        assert_eq!(DEFAULT_INTERP_FILTER_PROBS_TABLE, expected);
+    }
+
+    #[test]
+    fn read_interp_filter_probs_zero_buffer_leaves_defaults_unchanged() {
+        // 8 B(252) reads on a zero buffer all return 0; every cell
+        // passes through unchanged.
+        let bytes = [0x00u8; 4];
+        let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut probs = DEFAULT_INTERP_FILTER_PROBS_TABLE;
+        read_interp_filter_probs(&mut dec, &mut probs).unwrap();
+        assert_eq!(probs, DEFAULT_INTERP_FILTER_PROBS_TABLE);
+    }
+
+    #[test]
+    fn read_interp_filter_probs_visits_all_eight_cells() {
+        // INTERP_FILTER_CONTEXTS × (SWITCHABLE_FILTERS - 1) = 4 × 2 = 8.
+        // With update_prob == 0 every base passes through; a custom
+        // starting table proves every slot is visited but unchanged.
+        let bytes = [0x00u8; 4];
+        let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut probs: [[u8; 2]; 4] = [[1, 2], [3, 4], [5, 6], [7, 8]];
+        let snapshot = probs;
+        read_interp_filter_probs(&mut dec, &mut probs).unwrap();
+        assert_eq!(probs, snapshot);
+    }
+
+    #[test]
+    fn read_interp_filter_probs_consumes_eight_b252_flags_on_zero_buffer() {
+        // Cursor equivalence: 8 explicit read_diff_update_prob calls
+        // on a parallel coder vs read_interp_filter_probs on the
+        // under-test coder. Both must leave the cursor identically
+        // positioned (next L(1) bit identical).
+        let bytes = [0x00u8; 4];
+        let mut ref_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        for _ in 0..(INTERP_FILTER_CONTEXTS * (SWITCHABLE_FILTERS - 1)) {
+            let _ = read_diff_update_prob(&mut ref_dec, 128).unwrap();
+        }
+        let mut test_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut probs = [[128u8; SWITCHABLE_FILTERS - 1]; INTERP_FILTER_CONTEXTS];
+        read_interp_filter_probs(&mut test_dec, &mut probs).unwrap();
+        assert_eq!(
+            ref_dec.read_literal(1).unwrap(),
+            test_dec.read_literal(1).unwrap(),
+            "coder cursor must agree after the 8-cell sweep",
+        );
+    }
+
+    #[test]
+    fn read_interp_filter_probs_matches_outer_context_inner_filter_walk() {
+        // The §6.3.10 listing uses `j` as the outer index (contexts)
+        // and `i` as the inner (filters) — the visit order is still
+        // row-major over the [INTERP_FILTER_CONTEXTS][SWITCHABLE_FILTERS - 1]
+        // array. Cross-check against an explicit row-major walk.
+        let bytes = [0x00u8; 8];
+        let starts = [
+            DEFAULT_INTERP_FILTER_PROBS_TABLE,
+            [[1, 254], [128, 64], [200, 7], [11, 22]],
+        ];
+        for start in starts {
+            // Reference: 8 explicit row-major read_diff_update_prob calls.
+            let mut ref_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+            let mut ref_probs = start;
+            for row in ref_probs.iter_mut() {
+                for slot in row.iter_mut() {
+                    *slot = read_diff_update_prob(&mut ref_dec, *slot).unwrap();
+                }
+            }
+            // Under-test walk.
+            let mut test_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+            let mut test_probs = start;
+            read_interp_filter_probs(&mut test_dec, &mut test_probs).unwrap();
+            assert_eq!(
+                ref_probs, test_probs,
+                "read_interp_filter_probs must match explicit row-major sweep for {start:?}",
+            );
+            assert_eq!(
+                ref_dec.read_literal(1).unwrap(),
+                test_dec.read_literal(1).unwrap(),
+                "cursor must agree after the row-major sweep for {start:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn default_inter_mode_probs_table_matches_mode_info_source() {
+        // Single source of truth: the re-export consumed by
+        // read_inter_mode_probs must equal the §10.5 listing held in
+        // mode_info::DEFAULT_INTER_MODE_PROBS.
+        assert_eq!(DEFAULT_INTER_MODE_PROBS_TABLE, DEFAULT_INTER_MODE_PROBS);
+    }
+
+    #[test]
+    fn default_interp_filter_probs_table_matches_mode_info_source() {
+        // Single source of truth: the re-export consumed by
+        // read_interp_filter_probs must equal the §10.5 listing held
+        // in mode_info::DEFAULT_INTERP_FILTER_PROBS.
+        assert_eq!(
+            DEFAULT_INTERP_FILTER_PROBS_TABLE,
+            DEFAULT_INTERP_FILTER_PROBS
+        );
     }
 }

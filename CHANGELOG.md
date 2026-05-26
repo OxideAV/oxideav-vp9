@@ -4,6 +4,37 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.10...v0.0.11) - 2026-05-26
+
+### Other
+
+- Round 23: §6.3.9 read_inter_mode_probs + §6.3.10 read_interp_filter_probs
+- Round 22: §6.3.11 read_is_inter_probs() compressed-header sweep
+- Round 21: §6.4.13 read_is_inter + §9.3.2 is_inter ctx + §10.5 default_is_inter_prob
+- Round 20: §6.4.12 inter_segment_id + §6.4.14 get_segment_id + §7.4 seg-pred ctx
+- Round 19: §6.4.3 recursive decode_partition() driver
+- Round 18: §6.4.3 decode_partition_type() per-call partition reader
+- §6.4.15 intra_block_mode_info() inter-frame intra-block reader
+- roadmap reflects round 17 landing intra_frame_mode_info()
+- Round 17: §6.4.6 intra_frame_mode_info() keyframe driver
+- Round 16: §6.4.7 intra_segment_id + §9.3.1 segment_tree
+- vp9 round 15: §6.4.8 read_skip + §6.4.10 read_tx_size + §9.3.3 tree_decode
+- vp9 round 14: §6.4.21 residual() intra driver
+- vp9 round 13: §6.4.24 tokens() per-block coefficient driver
+- vp9 round 12: §6.4.25 get_scan scan-order selection
+- round 11 — §8.6.2 reconstruct driver (reconstruct module)
+- round 10 — §8.5.1 intra prediction process (intra module)
+- round 9: §8.7 inverse transform process (idct module)
+- round 8: §8.6.1 dequantization functions (dequant module)
+- §6.4.24 / §6.4.26 coefficient-token decoder (round 7)
+- round 6: §6.3.7 read_coef_probs 6D sweep + default_coef_probs
+- Round 5: §6.3.2 tx_mode_probs + §6.3.8 read_skip_prob sweeps
+- round 4: §6.3.3 diff_update_prob chain + §6.3.4..§6.3.6 helpers + INV_MAP_TABLE
+- round 3: §9.2 Boolean decoder + §6.3.1 read_tx_mode walk
+- round 2: full §6.2 uncompressed-header walk + §6.1.1 trailing_bits
+- round 1: uncompressed-header walker per VP9 spec v0.7 §6.2
+- orphan rebuild: clean-room scaffold post 2026-05-20 audit
+
 ### Added
 
 * **Round 23: §6.3.9 `read_inter_mode_probs( )` + §6.3.10

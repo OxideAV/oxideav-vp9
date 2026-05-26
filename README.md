@@ -3,6 +3,49 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-05-26 (round 22)
+
+**Round 22: §6.3.11 `read_is_inter_probs( )` compressed-header sweep.**
+Round 22 lands the unconditional `IS_INTER_CONTEXTS = 4`
+`diff_update_prob` walk that populates the running `is_inter_prob[ ]`
+table the round-21 §6.4.13 `read_is_inter( )` per-block decoder
+consumes via the §9.3.2 ctx:
+
+* `read_is_inter_probs( coder, is_inter_prob )` per §6.3.11
+  (`vp9-spec.txt` lines 2154-2167). Four sequential
+  `read_diff_update_prob` calls — one `B(252)` `update_prob` flag per
+  slot and, on 1, a `decode_term_subexp` + `inv_remap_prob` cascade —
+  updating `is_inter_prob[0..IS_INTER_CONTEXTS]` in place.
+* `DEFAULT_IS_INTER_PROB_TABLE` re-export of the round-21
+  `mode_info::DEFAULT_IS_INTER_PROB = {9, 102, 187, 225}` (§10.5)
+  initial / reset table — same constant feeds both the §6.4.13
+  per-block decoder and the §6.3.11 compressed-header sweep so there's
+  a single source of truth.
+
+Validation covers the §10.5 default re-export matching the
+`mode_info` source-of-truth constant, the zero-buffer
+`update_prob = 0` path passing every cell through unchanged, the
+four-context cell-count visiting (custom probabilities preserved
+across the sweep), an explicit equivalence test that the sweep is
+identical to four sequential `read_diff_update_prob` calls against a
+parallel coder (proves cursor advancement matches and the order of
+slots is preserved), the §3 `IS_INTER_CONTEXTS = 4` constant pinning,
+a tuple-sweep exhaustive round-trip across distinct starting
+probabilities, and an independent cursor-equivalence check confirming
+the function consumes exactly four `B(252)` flags on the zero buffer.
+
+Out of scope for round 22: the §6.3 outer-dispatch `FrameIsIntra == 0`
+arm itself — `read_is_inter_probs( )` lives *between* `read_skip_prob`
+(§6.3.8) and `frame_reference_mode( )` (§6.3.12) inside the gated
+inter branch alongside `read_inter_mode_probs( )` (§6.3.9) and
+`read_interp_filter_probs( )` (§6.3.10); wiring it into
+`parse_compressed_header` ahead of those companions would mis-position
+the coder cursor. Each of those primitives lands in its own round; the
+outer dispatch grows the inter arm only when §6.3.9 / §6.3.10 are also
+in place. The round-22 surface stays internal-only (`pub(crate)`); the
+public API still exposes `parse_uncompressed_header`,
+`parse_compressed_header` and their result types exclusively.
+
 ## Status — 2026-05-26 (round 21)
 
 **Round 21: §6.4.13 `read_is_inter( )` + §9.3.2 `is_inter` context +

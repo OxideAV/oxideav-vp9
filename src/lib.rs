@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19 + 20 + 21 + 22)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -297,6 +297,20 @@
 //!   §6.4.4 `decode_block( )` mode-info + residual wiring, and the
 //!   §6.4.2 `decode_tile( )` outer loop all land in later rounds; the
 //!   round-19 surface is internal-only.
+//! * Round 22 lands the §6.3.11 `read_is_inter_probs( )`
+//!   compressed-header sweep — the unconditional 4-element
+//!   (`IS_INTER_CONTEXTS = 4`) `diff_update_prob` walk over the §10.5
+//!   `default_is_inter_prob[ IS_INTER_CONTEXTS ] = { 9, 102, 187, 225 }`
+//!   initials. Returns the post-sweep `is_inter_prob[ ]` table that
+//!   the round-21 §6.4.13 `read_is_inter( )` per-block decoder
+//!   consumes via the §9.3.2 ctx. The `FrameIsIntra == 0`-gated outer
+//!   dispatch in `parse_compressed_header` still skips the call —
+//!   §6.3.9 / §6.3.10 / §6.3.12..§6.3.17 must land first so the coder
+//!   cursor lines up across the whole inter branch. Single source of
+//!   truth: the §10.5 default table is re-exported from
+//!   [`mode_info::DEFAULT_IS_INTER_PROB`] (round 21) into
+//!   `compressed::DEFAULT_IS_INTER_PROB_TABLE`. The round-22 surface
+//!   is internal-only.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return

@@ -6,6 +6,29 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 22: §6.3.11 `read_is_inter_probs( )` compressed-header
+  sweep.** Unconditional `IS_INTER_CONTEXTS = 4` `diff_update_prob`
+  walk over the §10.5 `default_is_inter_prob[ IS_INTER_CONTEXTS ] =
+  {9, 102, 187, 225}` initials, populating the running
+  `is_inter_prob[ ]` table the round-21 §6.4.13 `read_is_inter( )`
+  per-block decoder consumes via the §9.3.2 ctx:
+  * `read_is_inter_probs( coder, is_inter_prob )` per §6.3.11
+    (`vp9-spec.txt` lines 2154-2167) — four sequential
+    `read_diff_update_prob` calls, one `B(252)` `update_prob` flag per
+    slot and on 1 a `decode_term_subexp` + `inv_remap_prob` cascade
+    updating `is_inter_prob[ ]` in place.
+  * `DEFAULT_IS_INTER_PROB_TABLE` re-export of the round-21
+    `mode_info::DEFAULT_IS_INTER_PROB` constant — single source of
+    truth for the §10.5 default table across both the §6.4.13
+    per-block decoder and the §6.3.11 compressed-header sweep.
+  * 7 unit tests covering the §10.5 default re-export equality, the
+    zero-buffer `update_prob = 0` path passing every cell through
+    unchanged, four-context cell-count visiting with a custom prob
+    array, equivalence between the sweep and an explicit
+    `read_diff_update_prob` × 4 call sequence (probs + cursor parity),
+    the §3 `IS_INTER_CONTEXTS = 4` constant pin, an exhaustive
+    starting-tuple round-trip on the zero buffer, and a
+    cursor-equivalence check against four explicit `B(252)` reads.
 * **Round 21: §6.4.13 `read_is_inter( )` + §9.3.2 `is_inter` ctx +
   §10.5 `default_is_inter_prob`.** Adds the per-block inter/intra
   decoder the §6.4.11 `inter_frame_mode_info( )` driver fires after

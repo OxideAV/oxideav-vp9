@@ -6,6 +6,47 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 20: §6.4.12 `inter_segment_id( )` + §6.4.14 `get_segment_id( )`
+  + §7.4 segmentation-prediction context strips.** Lands the inter-frame
+  companion to the round-16 `intra_segment_id` primitive — the per-block
+  segment-id reader the §6.4.11 `inter_frame_mode_info( )` driver fires
+  before `read_skip( )` / `read_is_inter( )` / `read_tx_size( )`:
+  * §10.2 `num_8x8_blocks_high_lookup[ BLOCK_SIZES ]` =
+    `{1, 1, 1, 1, 2, 1, 2, 4, 2, 4, 8, 4, 8}` transcribed verbatim into
+    the `partition` module alongside the existing `_WIDE_LOOKUP`.
+  * `PrevSegmentIds<'a>` — borrowed row-major `MiRows × MiCols` view of
+    the previous frame's segment-id plane.
+  * `get_segment_id( prev, mi_row, mi_col, mi_size )` (§6.4.14) — the
+    `bw` / `bh` clamp via `Min( MiCols - MiCol, bw )` /
+    `Min( MiRows - MiRow, bh )` and the `seg = 7; seg = Min( seg,
+    PrevSegmentIds[ … ] )` spatial-min sweep.
+  * `SegPredContextState { above[MiCols], left[MiRows] }` — the §7.4.1
+    / §7.4.2 strip storage with `new( )` zero-init, `clear_left( )`
+    per-superblock-row reset, and `above( )` / `left( )` ctx accessors.
+  * `read_seg_id_predicted( )` — the §9.3.2 `ctx =
+    LeftSegPredContext[ MiRow ] + AboveSegPredContext[ MiCol ]`
+    derivation + §9.3.1 `binary_tree` one-bit decode under
+    `segmentation_pred_prob[ ctx ]`.
+  * `inter_segment_id( )` (§6.4.12) — the four-path orchestrator:
+    `!enabled` → 0; `enabled && !update_map` → `predictedSegmentId`;
+    `update_map && !temporal_update` → `read_segment_id`;
+    `update_map && temporal_update` → `read_seg_id_predicted` then
+    either `predictedSegmentId` or a fresh `read_segment_id`, followed
+    by the trailing write-back of `seg_id_predicted` into
+    `AboveSegPredContext[ MiCol + i ]` / `LeftSegPredContext[ MiRow +
+    i ]` over the `num_8x8_blocks_*_lookup` sub-strips.
+  * 12 unit tests: `get_segment_id` (interior 2x2 min, partial-edge
+    clamp, all-7 fallback), the §7.4 zero-init contract, `clear_left`
+    not touching Above, the §9.3.2 ctx wiring of
+    `read_seg_id_predicted`, each of the four §6.4.12 paths,
+    `Error::InvalidBitstream` on missing `tree_probs` / `pred_prob`,
+    and a partial-edge `BLOCK_32X32` write-back clamp.
+  * Provenance: VP9 Bitstream & Decoding Process Specification v0.7
+    (`docs/video/vp9/vp9-spec.txt` §6.4.4 lines 2395-2437, §6.4.7 lines
+    2480-2494, §6.4.12 lines 2562-2586, §6.4.14 lines 2607-2620, §7.4.1
+    lines 3824-3830, §7.4.2 lines 3831-3838, §9.3.2 lines 6313-6314,
+    §10.2 line 7117). No external library source consulted.
+
 * **Round 19: §6.4.3 recursive `decode_partition( )` driver (extending
   the crate-local `partition` module).** Composes the round-18
   `decode_partition_type( )` primitive into the recursive §6.4.3

@@ -163,6 +163,16 @@ pub(crate) const MI_WIDTH_LOG2_LOOKUP: [u8; BLOCK_SIZES] = [0, 0, 0, 0, 0, 1, 1,
 pub(crate) const NUM_8X8_BLOCKS_WIDE_LOOKUP: [u8; BLOCK_SIZES] =
     [1, 1, 1, 1, 1, 2, 2, 2, 4, 4, 4, 8, 8];
 
+/// `num_8x8_blocks_high_lookup[ BLOCK_SIZES ]` per §10.2 spec line 7117 —
+/// `{1, 1, 1, 1, 2, 1, 2, 4, 2, 4, 8, 4, 8}`.
+///
+/// Indexed by the §3 `BLOCK_*` constant; the §6.4.12 / §6.4.14 listings
+/// read `bh = num_8x8_blocks_high_lookup[ MiSize ]` for the
+/// `LeftSegPredContext[ MiRow + i ]` strip write-back and the
+/// `get_segment_id( )` spatial sweep bounds.
+pub(crate) const NUM_8X8_BLOCKS_HIGH_LOOKUP: [u8; BLOCK_SIZES] =
+    [1, 1, 1, 1, 2, 1, 2, 4, 2, 4, 8, 4, 8];
+
 /// `mi_width_log2_lookup[ BLOCK_64X64 ]` — the §9.3.2 constant the
 /// `boffset = mi_width_log2_lookup[ BLOCK_64X64 ] - bsl` derivation
 /// subtracts from. Equals `3` per [`MI_WIDTH_LOG2_LOOKUP`].
@@ -898,6 +908,15 @@ mod tests {
         assert_eq!(
             NUM_8X8_BLOCKS_WIDE_LOOKUP,
             [1, 1, 1, 1, 1, 2, 2, 2, 4, 4, 4, 8, 8]
+        );
+    }
+
+    #[test]
+    fn num_8x8_blocks_high_lookup_matches_spec_listing() {
+        // §10.2 line 7117 verbatim.
+        assert_eq!(
+            NUM_8X8_BLOCKS_HIGH_LOOKUP,
+            [1, 1, 1, 1, 2, 1, 2, 4, 2, 4, 8, 4, 8]
         );
     }
 

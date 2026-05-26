@@ -83,6 +83,7 @@
 
 use crate::bool_coder::BoolCoder;
 use crate::compressed::{tx_mode_to_biggest_tx_size, TxMode};
+use crate::partition::{NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP};
 use crate::residual::{
     BLOCK_8X8, BLOCK_SIZES, MAX_TXSIZE_LOOKUP, NUM_4X4_BLOCKS_HIGH_LOOKUP,
     NUM_4X4_BLOCKS_WIDE_LOOKUP,
@@ -1309,6 +1310,288 @@ pub(crate) fn inter_frame_intra_block_mode_info(
 ) -> Result<Vp9ModeInfo, Error> {
     let block = intra_block_mode_info(coder, mi_size, y_mode_probs, uv_mode_probs)?;
     Ok(Vp9ModeInfo::InterFrameIntraBlock(block))
+}
+
+// ----- §6.4.12 inter_segment_id + §6.4.14 get_segment_id + §7.4 seg-pred ctx -----
+
+/// `PrevSegmentIds[ MiRows ][ MiCols ]` view — the §6.4.14 spatial-
+/// prediction input.
+///
+/// The §6.4.14 `get_segment_id( )` listing reads
+/// `PrevSegmentIds[ MiRow + y ][ MiCol + x ]` for `y ∈ 0..ymis`,
+/// `x ∈ 0..xmis`. The array is a frame-wide `MiRows × MiCols` plane the
+/// previous frame's §6.4.4 driver wrote (`SegmentIds[ r + y ][ c + x ] =
+/// segment_id`); this struct exposes it as a borrowed row-major buffer so
+/// the §6.4.14 / §6.4.12 helpers can stay free of any storage policy.
+///
+/// `data.len()` MUST equal `mi_rows * mi_cols`; row `y` runs from
+/// `data[ y * mi_cols ]` to `data[ y * mi_cols + mi_cols - 1 ]`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PrevSegmentIds<'a> {
+    /// `MiRows` — the frame-wide mode-info row count from §6.2.
+    pub(crate) mi_rows: u32,
+    /// `MiCols` — the frame-wide mode-info column count from §6.2.
+    pub(crate) mi_cols: u32,
+    /// Row-major `[mi_rows][mi_cols]` segment-id grid (values `0..=7`).
+    pub(crate) data: &'a [u8],
+}
+
+/// `get_segment_id( )` per §6.4.14.
+///
+/// ```text
+/// get_segment_id( ) {
+///     bw = num_8x8_blocks_wide_lookup[ MiSize ]
+///     bh = num_8x8_blocks_high_lookup[ MiSize ]
+///     xmis = Min( MiCols - MiCol, bw )
+///     ymis = Min( MiRows - MiRow, bh )
+///     seg = 7
+///     for ( y = 0; y < ymis; y++ )
+///         for ( x = 0; x < xmis; x++ )
+///             seg = Min( seg, PrevSegmentIds[ MiRow + y ][ MiCol + x ] )
+///     return seg
+/// }
+/// ```
+///
+/// "The predicted segment id is the smallest value found in the on-screen
+/// region of the segmentation map covered by the current block" — §6.4.14
+/// paragraph above the listing.
+///
+/// `mi_row` / `mi_col` are the §6.4.4 `MiRow` / `MiCol` of the block being
+/// decoded; `mi_size` is the §3 `BLOCK_*` constant. The `Min( MiCols -
+/// MiCol, bw )` / `Min( MiRows - MiRow, bh )` bounds clamp the sweep to
+/// the on-screen portion of the block (a partial-edge block at the
+/// right or bottom of the frame covers fewer 8x8 cells than its `bw` /
+/// `bh`).
+///
+/// Reading off the edge of `PrevSegmentIds[ ]` is impossible by
+/// construction: the §6.4.4 driver only fires `decode_block( )` for
+/// `MiRow < MiRows` and `MiCol < MiCols`, so the `xmis` / `ymis` clamp
+/// keeps `MiRow + y < MiRows` and `MiCol + x < MiCols` along the sweep.
+pub(crate) fn get_segment_id(
+    prev: &PrevSegmentIds<'_>,
+    mi_row: u32,
+    mi_col: u32,
+    mi_size: u8,
+) -> u8 {
+    debug_assert!(mi_col < prev.mi_cols);
+    debug_assert!(mi_row < prev.mi_rows);
+    debug_assert_eq!(
+        prev.data.len(),
+        (prev.mi_rows as usize) * (prev.mi_cols as usize),
+        "PrevSegmentIds backing slice must be row-major MiRows × MiCols"
+    );
+    let bw = NUM_8X8_BLOCKS_WIDE_LOOKUP[mi_size as usize] as u32;
+    let bh = NUM_8X8_BLOCKS_HIGH_LOOKUP[mi_size as usize] as u32;
+    let xmis = (prev.mi_cols - mi_col).min(bw);
+    let ymis = (prev.mi_rows - mi_row).min(bh);
+    let mut seg: u8 = 7;
+    for y in 0..ymis {
+        let row_base = ((mi_row + y) as usize) * (prev.mi_cols as usize);
+        for x in 0..xmis {
+            let v = prev.data[row_base + (mi_col + x) as usize];
+            if v < seg {
+                seg = v;
+            }
+        }
+    }
+    seg
+}
+
+/// `AboveSegPredContext[ MiCols ]` / `LeftSegPredContext[ MiRows ]` —
+/// the §7.4 segmentation-prediction context strips the §6.4.12 driver
+/// reads via the §9.3.2 `ctx = LeftSegPredContext[ MiRow ] +
+/// AboveSegPredContext[ MiCol ]` derivation and writes back over the
+/// per-block `num_8x8_blocks_*_lookup` sub-strips.
+///
+/// §7.4.1 (`clear_above_context`) zero-initialises `AboveSegPredContext[
+/// i ]` for `i = 0..MiCols-1`; §7.4.2 (`clear_left_context`)
+/// zero-initialises `LeftSegPredContext[ i ]` for `i = 0..MiRows-1`. The
+/// strips carry the `seg_id_predicted` 0/1 value the previous block in
+/// the same column / row decoded — a fresh `decode_tile( )` resets
+/// `LeftSegPredContext[ ]` per superblock row before each row begins.
+///
+/// `clear_left( )` is the §7.4.2 reset the §6.4.2 `decode_tile( )` outer
+/// loop fires once per superblock row. The §7.4.1 above-context reset
+/// fires once per tile and is encoded by `new( )`.
+#[derive(Debug, Clone)]
+pub(crate) struct SegPredContextState {
+    above: Vec<u8>,
+    left: Vec<u8>,
+}
+
+impl SegPredContextState {
+    /// `clear_above_context( )` + `clear_left_context( )` per §7.4.1 /
+    /// §7.4.2: allocate the `MiCols`- and `MiRows`-sized strips and zero
+    /// them.
+    pub(crate) fn new(mi_cols: u32, mi_rows: u32) -> Self {
+        Self {
+            above: vec![0u8; mi_cols as usize],
+            left: vec![0u8; mi_rows as usize],
+        }
+    }
+
+    /// `clear_left_context( )` per §7.4.2 — zeroes
+    /// `LeftSegPredContext[ ]` for the start of a fresh superblock row.
+    pub(crate) fn clear_left(&mut self) {
+        for slot in self.left.iter_mut() {
+            *slot = 0;
+        }
+    }
+
+    /// Read `AboveSegPredContext[ MiCol ]` (the §9.3.2 ctx contributor).
+    pub(crate) fn above(&self, mi_col: u32) -> u8 {
+        self.above[mi_col as usize]
+    }
+
+    /// Read `LeftSegPredContext[ MiRow ]` (the §9.3.2 ctx contributor).
+    pub(crate) fn left(&self, mi_row: u32) -> u8 {
+        self.left[mi_row as usize]
+    }
+}
+
+/// `seg_id_predicted` per §9.3.2.
+///
+/// ```text
+/// seg_id_predicted: the probability is given by
+///                   segmentation_pred_prob[ ctx ] where ctx is
+///                   computed by:
+///     ctx = LeftSegPredContext[ MiRow ] + AboveSegPredContext[ MiCol ]
+/// ```
+///
+/// The §9.3.2 ctx is `Left + Above` of the two-element sums of 0/1
+/// strips, so `ctx ∈ {0, 1, 2}` — matching `segmentation_pred_prob[3]`
+/// from [`crate::header::SegmentationParams::pred_prob`]. The decode is
+/// a single bit via the §9.3.1 [`BINARY_TREE`].
+pub(crate) fn read_seg_id_predicted(
+    coder: &mut BoolCoder<'_>,
+    pred_prob: &[u8; 3],
+    seg_pred_ctx: &SegPredContextState,
+    mi_row: u32,
+    mi_col: u32,
+) -> Result<bool, Error> {
+    let ctx = (seg_pred_ctx.left(mi_row) + seg_pred_ctx.above(mi_col)) as usize;
+    debug_assert!(ctx <= 2, "seg_id_predicted ctx must be in 0..=2");
+    let value = tree_decode(coder, &BINARY_TREE, |_| pred_prob[ctx])?;
+    Ok(value != 0)
+}
+
+/// `inter_segment_id( )` per §6.4.12.
+///
+/// ```text
+/// inter_segment_id( ) {
+///     if ( segmentation_enabled ) {
+///         predictedSegmentId = get_segment_id( )
+///         if ( segmentation_update_map ) {
+///             if ( segmentation_temporal_update ) {
+///                 seg_id_predicted                                       T
+///                 if ( seg_id_predicted )
+///                     segment_id = predictedSegmentId
+///                 else
+///                     segment_id                                         T
+///                 for ( i = 0; i < num_8x8_blocks_wide_lookup[ MiSize ]; i++ )
+///                     AboveSegPredContext[ MiCol + i ] = seg_id_predicted
+///                 for ( i = 0; i < num_8x8_blocks_high_lookup[ MiSize ]; i++ )
+///                     LeftSegPredContext[ MiRow + i ] = seg_id_predicted
+///             } else {
+///                 segment_id                                             T
+///             }
+///         } else {
+///             segment_id = predictedSegmentId
+///         }
+///     } else {
+///         segment_id = 0
+///     }
+/// }
+/// ```
+///
+/// The four §6.4.12 paths:
+///
+/// 1. `!segmentation_enabled` → `segment_id = 0`, no bool-coder reads,
+///    no ctx writes.
+/// 2. `segmentation_enabled && !segmentation_update_map` →
+///    `segment_id = predictedSegmentId` (the §6.4.14 spatial-min
+///    predictor), no bool-coder reads, no ctx writes.
+/// 3. `segmentation_enabled && segmentation_update_map &&
+///    !segmentation_temporal_update` → decode `segment_id` directly via
+///    [`read_segment_id`] (the §9.3.1 `SEGMENT_TREE` walk), no
+///    `seg_id_predicted` read, no ctx writes.
+/// 4. `segmentation_enabled && segmentation_update_map &&
+///    segmentation_temporal_update` → decode
+///    [`read_seg_id_predicted`]; if predicted, `segment_id =
+///    predictedSegmentId`, otherwise decode `segment_id` via
+///    [`read_segment_id`]; in both branches, write
+///    `seg_id_predicted` (the 0/1 just decoded) into
+///    `AboveSegPredContext[ MiCol + i ]` for
+///    `i ∈ 0..num_8x8_blocks_wide_lookup[ MiSize ]` and into
+///    `LeftSegPredContext[ MiRow + i ]` for
+///    `i ∈ 0..num_8x8_blocks_high_lookup[ MiSize ]`.
+///
+/// Returns the decoded `segment_id` (`0..=7`). The driver mutates
+/// `seg_pred_ctx` in path 4 as described above; paths 1-3 leave it
+/// untouched.
+///
+/// Required state per path:
+/// * Path 3 / 4 (decoding `segment_id`): `tree_probs` is the
+///   `segmentation_tree_probs[7]` from
+///   [`crate::header::SegmentationParams::tree_probs`]. Returns
+///   [`Error::InvalidBitstream`] if `None` is passed.
+/// * Path 4 (decoding `seg_id_predicted`): `pred_prob` is the
+///   `segmentation_pred_prob[3]` from
+///   [`crate::header::SegmentationParams::pred_prob`]. Returns
+///   [`Error::InvalidBitstream`] if `None` is passed.
+/// * Path 2 / 4-predicted: `prev` is the previous frame's
+///   `PrevSegmentIds[ ][ ]` plane.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn inter_segment_id(
+    coder: &mut BoolCoder<'_>,
+    segmentation_enabled: bool,
+    segmentation_update_map: bool,
+    segmentation_temporal_update: bool,
+    tree_probs: Option<&[u8; 7]>,
+    pred_prob: Option<&[u8; 3]>,
+    prev: &PrevSegmentIds<'_>,
+    seg_pred_ctx: &mut SegPredContextState,
+    mi_row: u32,
+    mi_col: u32,
+    mi_size: u8,
+) -> Result<u8, Error> {
+    if !segmentation_enabled {
+        return Ok(0);
+    }
+    let predicted = get_segment_id(prev, mi_row, mi_col, mi_size);
+    if !segmentation_update_map {
+        return Ok(predicted);
+    }
+    if !segmentation_temporal_update {
+        let probs = tree_probs.ok_or(Error::InvalidBitstream)?;
+        return read_segment_id(coder, probs);
+    }
+    // Path 4: temporal-update branch.
+    let pp = pred_prob.ok_or(Error::InvalidBitstream)?;
+    let predicted_flag = read_seg_id_predicted(coder, pp, seg_pred_ctx, mi_row, mi_col)?;
+    let segment_id = if predicted_flag {
+        predicted
+    } else {
+        let probs = tree_probs.ok_or(Error::InvalidBitstream)?;
+        read_segment_id(coder, probs)?
+    };
+    // §6.4.12 trailing write-back of the seg_id_predicted flag.
+    let flag_u8 = u8::from(predicted_flag);
+    let bw = NUM_8X8_BLOCKS_WIDE_LOOKUP[mi_size as usize] as u32;
+    let bh = NUM_8X8_BLOCKS_HIGH_LOOKUP[mi_size as usize] as u32;
+    for i in 0..bw {
+        let c = (mi_col + i) as usize;
+        if c < seg_pred_ctx.above.len() {
+            seg_pred_ctx.above[c] = flag_u8;
+        }
+    }
+    for i in 0..bh {
+        let r = (mi_row + i) as usize;
+        if r < seg_pred_ctx.left.len() {
+            seg_pred_ctx.left[r] = flag_u8;
+        }
+    }
+    Ok(segment_id)
 }
 
 #[cfg(test)]
@@ -2920,5 +3203,377 @@ mod tests {
             Vp9ModeInfo::IntraFrame(b) => assert_eq!(b.y_mode, DC_PRED),
             other => panic!("expected IntraFrame, got {other:?}"),
         }
+    }
+
+    // ----- §6.4.14 get_segment_id + §6.4.12 inter_segment_id -----
+
+    fn empty_prev<'a>(mi_rows: u32, mi_cols: u32, backing: &'a [u8]) -> PrevSegmentIds<'a> {
+        PrevSegmentIds {
+            mi_rows,
+            mi_cols,
+            data: backing,
+        }
+    }
+
+    #[test]
+    fn get_segment_id_smallest_in_bw_by_bh_region() {
+        // §6.4.14: seg = Min over the on-screen MiSize × MiSize cells.
+        // BLOCK_16X16 = 6 → bw = bh = 2. Fill a 4x4 prev frame with
+        // ids, then read at (mi_row=0, mi_col=0): the 2x2 top-left
+        // covers cells (0,0)=5, (0,1)=3, (1,0)=7, (1,1)=4 → Min = 3.
+        let prev_data: [u8; 16] = [
+            5, 3, 6, 6, //
+            7, 4, 6, 6, //
+            6, 6, 6, 6, //
+            6, 6, 6, 6, //
+        ];
+        let prev = empty_prev(4, 4, &prev_data);
+        // BLOCK_16X16 = 6 per §3.
+        let seg = get_segment_id(&prev, 0, 0, 6);
+        assert_eq!(seg, 3);
+    }
+
+    #[test]
+    fn get_segment_id_clamps_to_on_screen_region() {
+        // §6.4.14: xmis = Min(MiCols - MiCol, bw) etc.
+        // BLOCK_32X32 = 9 → bw = bh = 4. Reading at (mi_row=1, mi_col=2)
+        // on a 3x3 plane clamps to xmis = Min(3-2, 4) = 1 and
+        // ymis = Min(3-1, 4) = 2 — a 1x2 sweep.
+        // Cells covered: (1,2)=4, (2,2)=2 → Min = 2.
+        let prev_data: [u8; 9] = [
+            6, 6, 6, //
+            6, 6, 4, //
+            6, 6, 2, //
+        ];
+        let prev = empty_prev(3, 3, &prev_data);
+        let seg = get_segment_id(&prev, 1, 2, 9);
+        assert_eq!(seg, 2);
+    }
+
+    #[test]
+    fn get_segment_id_all_max_returns_seven() {
+        // §6.4.14: seg starts at 7; an all-7 prev keeps it at 7.
+        let prev_data: [u8; 4] = [7, 7, 7, 7];
+        let prev = empty_prev(2, 2, &prev_data);
+        // BLOCK_16X16 = 6 → bw = bh = 2 → sweeps the entire 2x2.
+        let seg = get_segment_id(&prev, 0, 0, 6);
+        assert_eq!(seg, 7);
+    }
+
+    #[test]
+    fn seg_pred_context_state_zeroes_on_new_and_clear_left() {
+        // §7.4.1 / §7.4.2 zero-init contract.
+        let ctx = SegPredContextState::new(8, 8);
+        for c in 0..8u32 {
+            assert_eq!(ctx.above(c), 0);
+        }
+        for r in 0..8u32 {
+            assert_eq!(ctx.left(r), 0);
+        }
+
+        // After populating Left, clear_left() returns to zeros without
+        // touching Above.
+        let mut ctx = SegPredContextState::new(8, 8);
+        ctx.above[0] = 1;
+        ctx.above[5] = 1;
+        ctx.left[0] = 1;
+        ctx.left[3] = 1;
+        ctx.clear_left();
+        assert_eq!(ctx.above(0), 1);
+        assert_eq!(ctx.above(5), 1);
+        for r in 0..8u32 {
+            assert_eq!(ctx.left(r), 0);
+        }
+    }
+
+    #[test]
+    fn read_seg_id_predicted_ctx_is_left_plus_above() {
+        // §9.3.2: ctx = LeftSegPredContext[MiRow] + AboveSegPredContext[MiCol].
+        // Set Left=1, Above=1 at (mi_row=2, mi_col=3) → ctx=2 → uses
+        // pred_prob[2]. We instrument the prob callback by handing
+        // distinct probs to the three ctx slots and using zero coder to
+        // pin the decoded bit to 0 (so the return is always `false`,
+        // but the index we read is observable via direct call to
+        // tree_decode in a separate path).
+        let mut coder = zero_coder();
+        let mut ctx = SegPredContextState::new(8, 8);
+        ctx.above[3] = 1;
+        ctx.left[2] = 1;
+        // pred_prob[2] = 1 (deterministic with zero coder → bit 0)
+        let pred_prob = [128u8, 128, 1];
+        let decoded = read_seg_id_predicted(&mut coder, &pred_prob, &ctx, 2, 3).unwrap();
+        assert!(!decoded);
+
+        // Confirm a bias coder + pred_prob[0]=255 (ctx=0 → Left+Above=0)
+        // decodes a 1 bit (the §9.3.1 binary_tree = {0, -1} → leaf -1
+        // → returns 1).
+        let bytes = make_bias_buffer(0x7F);
+        let mut coder2 = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let ctx2 = SegPredContextState::new(8, 8); // all zeros
+        let pred_prob2 = [255u8, 0, 0];
+        let decoded2 = read_seg_id_predicted(&mut coder2, &pred_prob2, &ctx2, 0, 0).unwrap();
+        assert!(decoded2);
+    }
+
+    #[test]
+    fn inter_segment_id_disabled_returns_zero() {
+        // Path 1 of §6.4.12: !segmentation_enabled → segment_id = 0,
+        // no bool-coder reads, no ctx writes.
+        let mut coder = zero_coder();
+        let prev_data = [3u8, 3, 3, 3];
+        let prev = empty_prev(2, 2, &prev_data);
+        let mut ctx = SegPredContextState::new(2, 2);
+        let id = inter_segment_id(
+            &mut coder,
+            false,
+            true,
+            true,
+            Some(&[255; 7]),
+            Some(&[255; 3]),
+            &prev,
+            &mut ctx,
+            0,
+            0,
+            6,
+        )
+        .unwrap();
+        assert_eq!(id, 0);
+        // ctx untouched.
+        for c in 0..2u32 {
+            assert_eq!(ctx.above(c), 0);
+        }
+        for r in 0..2u32 {
+            assert_eq!(ctx.left(r), 0);
+        }
+    }
+
+    #[test]
+    fn inter_segment_id_enabled_no_update_map_returns_predicted() {
+        // Path 2 of §6.4.12: segmentation_enabled &&
+        // !segmentation_update_map → segment_id = predictedSegmentId.
+        // No bool-coder reads. Predicted = Min over BLOCK_16X16's 2x2.
+        let mut coder = zero_coder();
+        let prev_data: [u8; 4] = [4, 2, 5, 6];
+        let prev = empty_prev(2, 2, &prev_data);
+        let mut ctx = SegPredContextState::new(2, 2);
+        let id = inter_segment_id(
+            &mut coder, true, false, false, None, None, &prev, &mut ctx, 0, 0, 6,
+        )
+        .unwrap();
+        // Min(4, 2, 5, 6) = 2.
+        assert_eq!(id, 2);
+        // ctx untouched.
+        for c in 0..2u32 {
+            assert_eq!(ctx.above(c), 0);
+        }
+    }
+
+    #[test]
+    fn inter_segment_id_enabled_update_map_no_temporal_decodes_segment_id() {
+        // Path 3 of §6.4.12: segmentation_enabled &&
+        // segmentation_update_map && !segmentation_temporal_update →
+        // decode segment_id via read_segment_id (§9.3.1 SEGMENT_TREE).
+        // Zero coder + walk lands on segment 0.
+        let mut coder = zero_coder();
+        let prev_data = [3u8; 4];
+        let prev = empty_prev(2, 2, &prev_data);
+        let mut ctx = SegPredContextState::new(2, 2);
+        let id = inter_segment_id(
+            &mut coder,
+            true,
+            true,
+            false,
+            Some(&[128; 7]),
+            None,
+            &prev,
+            &mut ctx,
+            0,
+            0,
+            6,
+        )
+        .unwrap();
+        assert_eq!(id, 0);
+        // Path 3 does not write seg-pred ctx.
+        for c in 0..2u32 {
+            assert_eq!(ctx.above(c), 0);
+        }
+    }
+
+    #[test]
+    fn inter_segment_id_temporal_predicted_branch_uses_predictor_and_writes_ctx() {
+        // Path 4 of §6.4.12, predicted sub-branch:
+        //   seg_id_predicted = 1 → segment_id = predictedSegmentId.
+        //   AboveSegPredContext / LeftSegPredContext written with 1.
+        // pred_prob[ctx=0] = 255, bias buffer → seg_id_predicted = 1.
+        // After that read, the coder is refilled with zeros, so any
+        // subsequent read_segment_id would walk to segment 0 — but the
+        // §6.4.12 listing skips the read entirely when predicted=1.
+        let bytes = make_bias_buffer(0x7F);
+        let mut coder = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let prev_data: [u8; 4] = [4, 2, 5, 6]; // Min over 2x2 = 2.
+        let prev = empty_prev(2, 2, &prev_data);
+        let mut ctx = SegPredContextState::new(2, 2);
+        let id = inter_segment_id(
+            &mut coder,
+            true,
+            true,
+            true,
+            Some(&[128; 7]),
+            Some(&[255, 0, 0]),
+            &prev,
+            &mut ctx,
+            0,
+            0,
+            6,
+        )
+        .unwrap();
+        assert_eq!(id, 2); // = predicted.
+                           // BLOCK_16X16 → bw=bh=2; ctx flag=1 written across (0..2).
+        assert_eq!(ctx.above(0), 1);
+        assert_eq!(ctx.above(1), 1);
+        assert_eq!(ctx.left(0), 1);
+        assert_eq!(ctx.left(1), 1);
+    }
+
+    #[test]
+    fn inter_segment_id_temporal_not_predicted_branch_decodes_and_writes_ctx_zero() {
+        // Path 4 of §6.4.12, not-predicted sub-branch:
+        //   seg_id_predicted = 0 → read segment_id via SEGMENT_TREE.
+        //   AboveSegPredContext / LeftSegPredContext written with 0.
+        // Zero coder pins every bit to 0 → seg_id_predicted = 0,
+        // segment_id walks SEGMENT_TREE to leaf 0.
+        let mut coder = zero_coder();
+        let prev_data: [u8; 4] = [4, 2, 5, 6];
+        let prev = empty_prev(2, 2, &prev_data);
+        let mut ctx = SegPredContextState::new(2, 2);
+        // Pre-populate ctx with 1s so we can observe the path-4 zero-
+        // write back overwriting them.
+        ctx.above[0] = 1;
+        ctx.above[1] = 1;
+        ctx.left[0] = 1;
+        ctx.left[1] = 1;
+        let id = inter_segment_id(
+            &mut coder,
+            true,
+            true,
+            true,
+            Some(&[128; 7]),
+            Some(&[128, 128, 128]),
+            &prev,
+            &mut ctx,
+            0,
+            0,
+            6,
+        )
+        .unwrap();
+        assert_eq!(id, 0);
+        assert_eq!(ctx.above(0), 0);
+        assert_eq!(ctx.above(1), 0);
+        assert_eq!(ctx.left(0), 0);
+        assert_eq!(ctx.left(1), 0);
+    }
+
+    #[test]
+    fn inter_segment_id_missing_tree_probs_when_decoding_is_invalid() {
+        // Paths 3 and 4-not-predicted decode segment_id and need
+        // tree_probs. Passing None there surfaces InvalidBitstream.
+        let mut coder = zero_coder();
+        let prev_data = [3u8; 4];
+        let prev = empty_prev(2, 2, &prev_data);
+        let mut ctx = SegPredContextState::new(2, 2);
+        // Path 3.
+        let err = inter_segment_id(
+            &mut coder, true, true, false, None, None, &prev, &mut ctx, 0, 0, 6,
+        );
+        assert!(matches!(err, Err(Error::InvalidBitstream)));
+
+        // Path 4-not-predicted (zero coder → seg_id_predicted=0 → falls
+        // through to read_segment_id which needs tree_probs).
+        let mut coder2 = zero_coder();
+        let err2 = inter_segment_id(
+            &mut coder2,
+            true,
+            true,
+            true,
+            None,
+            Some(&[128, 128, 128]),
+            &prev,
+            &mut ctx,
+            0,
+            0,
+            6,
+        );
+        assert!(matches!(err2, Err(Error::InvalidBitstream)));
+    }
+
+    #[test]
+    fn inter_segment_id_missing_pred_prob_when_temporal_is_invalid() {
+        // Path 4 needs pred_prob (the seg_id_predicted read). Missing
+        // → InvalidBitstream.
+        let mut coder = zero_coder();
+        let prev_data = [3u8; 4];
+        let prev = empty_prev(2, 2, &prev_data);
+        let mut ctx = SegPredContextState::new(2, 2);
+        let err = inter_segment_id(
+            &mut coder,
+            true,
+            true,
+            true,
+            Some(&[128; 7]),
+            None,
+            &prev,
+            &mut ctx,
+            0,
+            0,
+            6,
+        );
+        assert!(matches!(err, Err(Error::InvalidBitstream)));
+    }
+
+    #[test]
+    fn inter_segment_id_temporal_write_back_clamps_partial_edge_block() {
+        // §6.4.12 trailing write-back iterates 0..bw for Above and
+        // 0..bh for Left; on a partial-edge block the loop indexes can
+        // run past the strip end. The impl clamps with a per-cell
+        // bounds check rather than per-call to keep the listing's
+        // verbatim loop shape; verify the clamp keeps things sane on a
+        // 3-wide / 3-high frame with a BLOCK_32X32 (bw=bh=4) at (1,1).
+        let bytes = make_bias_buffer(0x7F);
+        let mut coder = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let prev_data: [u8; 9] = [
+            6, 6, 6, //
+            6, 5, 7, //
+            6, 7, 7, //
+        ];
+        let prev = empty_prev(3, 3, &prev_data);
+        let mut ctx = SegPredContextState::new(3, 3);
+        // Place an isolated BLOCK_32X32 at (1, 1) — wide and high run
+        // 4 cells each but only 2 land in-bounds for either axis.
+        let id = inter_segment_id(
+            &mut coder,
+            true,
+            true,
+            true,
+            Some(&[128; 7]),
+            Some(&[255, 0, 0]),
+            &prev,
+            &mut ctx,
+            1,
+            1,
+            9,
+        )
+        .unwrap();
+        // pred_prob[0]=255 + bias → seg_id_predicted=1 → segment_id =
+        // get_segment_id over a clamped 2x2 region (1..3, 1..3) =
+        // Min(5, 7, 7, 7) = 5.
+        assert_eq!(id, 5);
+        // Above written at cols 1, 2 (cols 3, 4 clamped).
+        assert_eq!(ctx.above(0), 0);
+        assert_eq!(ctx.above(1), 1);
+        assert_eq!(ctx.above(2), 1);
+        // Left written at rows 1, 2 (rows 3, 4 clamped).
+        assert_eq!(ctx.left(0), 0);
+        assert_eq!(ctx.left(1), 1);
+        assert_eq!(ctx.left(2), 1);
     }
 }

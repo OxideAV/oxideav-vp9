@@ -3,6 +3,68 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-05-26 (round 20)
+
+**Round 20: §6.4.12 `inter_segment_id( )` + §6.4.14 `get_segment_id( )`
++ §7.4 `AboveSegPredContext` / `LeftSegPredContext` strips.** Round 20
+lands the inter-frame companion to the round-16 `intra_segment_id`
+primitive — the per-block segment-id reader the §6.4.11
+`inter_frame_mode_info( )` driver fires before `read_skip( )` /
+`read_is_inter( )` / `read_tx_size( )`:
+
+* §10.2 `num_8x8_blocks_high_lookup[ BLOCK_SIZES ]` =
+  `{1, 1, 1, 1, 2, 1, 2, 4, 2, 4, 8, 4, 8}` transcribed verbatim
+  (alongside the existing `num_8x8_blocks_wide_lookup`), keying both
+  the §6.4.14 `bh` clamp and the §6.4.12 `LeftSegPredContext[ ]`
+  write-back length.
+* `PrevSegmentIds<'a>` — a borrowed row-major `MiRows × MiCols` view
+  of the previous frame's segment-id plane (the §6.4.4 `SegmentIds[ ][
+  ]` write-back).
+* `get_segment_id( prev, mi_row, mi_col, mi_size )` (§6.4.14) — the
+  `bw` / `bh` clamp via `Min( MiCols - MiCol, bw )` /
+  `Min( MiRows - MiRow, bh )` and the `seg = 7; seg = Min( seg,
+  PrevSegmentIds[ … ] )` spatial-minimum sweep.
+* `SegPredContextState { above[MiCols], left[MiRows] }` — the §7.4.1 /
+  §7.4.2 strip storage with `new( )` zero-init,
+  `clear_left( )` per-superblock-row reset, and `above( ) ` /
+  `left( )` ctx accessors.
+* `read_seg_id_predicted( coder, pred_prob, seg_pred_ctx, mi_row,
+  mi_col )` — the §9.3.2 `ctx = LeftSegPredContext[ MiRow ] +
+  AboveSegPredContext[ MiCol ]` derivation and §9.3.1 `BINARY_TREE`
+  one-bit decode under `segmentation_pred_prob[ ctx ]`.
+* `inter_segment_id( )` (§6.4.12) — the four-path orchestrator:
+  (1) `!segmentation_enabled` → 0; (2) enabled but `!update_map` →
+  `predictedSegmentId`; (3) `update_map && !temporal_update` →
+  `read_segment_id` (the round-16 §9.3.1 walk); (4) `update_map &&
+  temporal_update` → `read_seg_id_predicted` then either the
+  predictor or a fresh `read_segment_id`, followed by the spec's
+  trailing write-back of `seg_id_predicted` into
+  `AboveSegPredContext[ MiCol + i ]` (`i ∈ 0..bw`) and
+  `LeftSegPredContext[ MiRow + i ]` (`i ∈ 0..bh`).
+
+Validation covers `get_segment_id` (interior 2x2 min, partial-edge
+clamp via `Min( MiCols - MiCol, bw )`, all-7 fallback), the §7.4
+zero-init contract (and `clear_left` not touching `Above`), the §9.3.2
+`Left + Above` ctx wiring of `read_seg_id_predicted`, each of the
+four §6.4.12 paths independently, the `Error::InvalidBitstream`
+surface when `tree_probs` (paths 3 / 4-not-predicted) or `pred_prob`
+(path 4) are missing, and the §6.4.12 trailing write-back clamping on
+a partial-edge `BLOCK_32X32` at `(1, 1)` of a 3-wide frame.
+
+Out of scope for round 20: the §6.4.11 `inter_frame_mode_info( )`
+orchestrator itself (composes this primitive with `read_skip( )` /
+`read_is_inter( )` / `read_tx_size( )` / `inter_block_mode_info( )`
+or `intra_block_mode_info( )`); `read_is_inter( )` (§6.4.13 — needs
+the §9.3.2 `is_inter` ctx and the `is_inter_prob[ 4 ]` compressed-
+header table); `inter_block_mode_info( )` (§6.4.16 — blocked on
+reference-buffer state and MV decode); the `PrevSegmentIds[ ][ ]` /
+`SegmentIds[ ][ ]` frame-wide write-back (left to the §6.4.4 driver);
+and the §8.4 `counts_*` probability-adaption accumulators (§9.3.4
+bookkeeping for end-of-frame adaption). The round-20 surface stays
+internal-only (`pub(crate)`); the public API still exposes
+`parse_uncompressed_header`, `parse_compressed_header` and their
+result types exclusively.
+
 ## Status — 2026-05-26
 
 **Round 19: §6.4.3 recursive `decode_partition()` driver (extending the

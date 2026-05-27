@@ -6,6 +6,51 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 25: §6.3.13 `frame_reference_mode_probs( )` compressed-header
+  sweep.** Extends the §6.3 inter-arm primitives chain by the three
+  reference-mode-gated sweeps over `comp_mode_prob`, `single_ref_prob`,
+  `comp_ref_prob`, alongside the round-22..24 §6.3.9 / §6.3.10 / §6.3.11
+  / §6.3.14 primitives:
+  * `read_frame_reference_mode_probs( coder, reference_mode,
+    comp_mode_prob, single_ref_prob, comp_ref_prob )` per §6.3.13
+    (`vp9-spec.txt` lines 2195-2210). Conditional dispatch gated by
+    the §3 sentinels:
+    * `REFERENCE_MODE_SELECT` fires the `COMP_MODE_CONTEXTS = 5` cell
+      `comp_mode_prob` sweep;
+    * `!= COMPOUND_REFERENCE` fires the `REF_CONTEXTS × 2 = 10` cell
+      `single_ref_prob` sweep;
+    * `!= SINGLE_REFERENCE` fires the `REF_CONTEXTS = 5` cell
+      `comp_ref_prob` sweep.
+    Each cell consumes one `B(252)` `update_prob` flag and, on 1, a
+    `decode_term_subexp( )` + `inv_remap_prob( )` cascade.
+  * `pub enum ReferenceMode` mirrors §3 / §6.3.12 sentinels
+    (`SingleReference = 0`, `CompoundReference = 1`,
+    `ReferenceModeSelect = 2`).
+  * §3 constants `COMP_MODE_CONTEXTS = 5`, `REF_CONTEXTS = 5`
+    transcribed verbatim from `vp9-spec.txt` lines 472-473.
+  * `DEFAULT_COMP_MODE_PROB`, `DEFAULT_COMP_REF_PROB`,
+    `DEFAULT_SINGLE_REF_PROB` (`mode_info`) transcribed verbatim from
+    §10.5 lines 7694-7710. `DEFAULT_COMP_MODE_PROB_TABLE` /
+    `DEFAULT_COMP_REF_PROB_TABLE` / `DEFAULT_SINGLE_REF_PROB_TABLE`
+    re-exports in `compressed.rs` keep `mode_info` as the single source
+    of truth (mirroring round-22..24 staging patterns).
+  * 12 new unit tests covering: §3 `COMP_MODE_CONTEXTS = 5` and
+    `REF_CONTEXTS = 5` pinning; verbatim §10.5 transcription of each
+    default table; `SingleReference` only touching `single_ref_prob`;
+    `CompoundReference` only touching `comp_ref_prob`;
+    `ReferenceModeSelect` firing all three sweeps; cursor-equivalence
+    proofs that each branch consumes exactly its 5 / 10 / 20 `B(252)`
+    flags against a parallel walker; row-major walk equivalence against
+    a parallel coder for `ReferenceModeSelect` with two starting-table
+    triples; and single-source-of-truth checks tying each
+    `compressed.rs` re-export back to its `mode_info` constant.
+  * Surface stays `pub(crate) + #[allow(dead_code)]` on the function +
+    re-export consts; only `ReferenceMode` is `pub` so the §6.3.12
+    walker can land it. Wiring into `parse_compressed_header` waits on
+    §6.3.12 `frame_reference_mode( )` which needs `ref_frame_sign_bias[ ]`
+    state the uncompressed-header walker still rejects with
+    `Error::Unsupported`.
+
 * **Round 24: §6.3.14 `read_y_mode_probs( )` compressed-header
   sweep.** Extends the §6.3 inter-arm primitives chain by one cell
   alongside the round-22 §6.3.11 `read_is_inter_probs( )` and

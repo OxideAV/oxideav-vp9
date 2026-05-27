@@ -1672,6 +1672,43 @@ pub(crate) const INTERP_FILTER_CONTEXTS: usize = 4;
 pub(crate) const DEFAULT_INTERP_FILTER_PROBS: [[u8; SWITCHABLE_FILTERS - 1];
     INTERP_FILTER_CONTEXTS] = [[235, 162], [36, 255], [34, 3], [149, 144]];
 
+/// `COMP_MODE_CONTEXTS = 5` per spec §3 (`vp9-spec.txt` line 472). Number
+/// of contexts for the §6.4 `comp_mode` syntax element. Sized the
+/// `comp_mode_prob[ COMP_MODE_CONTEXTS ]` array swept by §6.3.13
+/// `frame_reference_mode_probs( )` and consumed by §7.4.7 / §9.3 once
+/// the `inter_block_mode_info( )` reader lands.
+pub(crate) const COMP_MODE_CONTEXTS: usize = 5;
+
+/// `REF_CONTEXTS = 5` per spec §3 (`vp9-spec.txt` line 473). Number
+/// of contexts for `single_ref` and `comp_ref`. Sizes the
+/// `single_ref_prob[ REF_CONTEXTS ][ 2 ]` and `comp_ref_prob[ REF_CONTEXTS ]`
+/// arrays swept by §6.3.13.
+pub(crate) const REF_CONTEXTS: usize = 5;
+
+/// `default_comp_mode_prob[ COMP_MODE_CONTEXTS ]` per spec §10.5
+/// (`vp9-spec.txt` lines 7694-7696). Initial / reset values for the
+/// running `comp_mode_prob[ ]` table swept by §6.3.13
+/// `frame_reference_mode_probs( )` on the `reference_mode ==
+/// REFERENCE_MODE_SELECT` branch. Transcribed verbatim from the §10.5
+/// listing.
+pub(crate) const DEFAULT_COMP_MODE_PROB: [u8; COMP_MODE_CONTEXTS] = [239, 183, 119, 96, 41];
+
+/// `default_comp_ref_prob[ REF_CONTEXTS ]` per spec §10.5
+/// (`vp9-spec.txt` lines 7699-7701). Initial / reset values for the
+/// running `comp_ref_prob[ ]` table swept by §6.3.13
+/// `frame_reference_mode_probs( )` on the `reference_mode !=
+/// SINGLE_REFERENCE` branch. Transcribed verbatim.
+pub(crate) const DEFAULT_COMP_REF_PROB: [u8; REF_CONTEXTS] = [50, 126, 123, 221, 226];
+
+/// `default_single_ref_prob[ REF_CONTEXTS ][ 2 ]` per spec §10.5
+/// (`vp9-spec.txt` lines 7704-7710). Initial / reset values for the
+/// running `single_ref_prob[ ][ ]` table swept by §6.3.13
+/// `frame_reference_mode_probs( )` on the `reference_mode !=
+/// COMPOUND_REFERENCE` branch. Transcribed verbatim from the §10.5
+/// listing.
+pub(crate) const DEFAULT_SINGLE_REF_PROB: [[u8; 2]; REF_CONTEXTS] =
+    [[33, 16], [77, 74], [142, 142], [172, 170], [238, 247]];
+
 /// Neighbour `RefFrames[ ][ ][ 0 ]` cells consumed by [`is_inter_context`]
 /// to compute `LeftIntra` / `AboveIntra` per §6.4.11.
 ///

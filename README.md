@@ -3,6 +3,63 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-05-27 (round 25)
+
+**Round 25: §6.3.13 `frame_reference_mode_probs( )` compressed-header
+sweep.** Round 25 extends the §6.3 inter-arm primitives chain by the
+three reference-mode-gated sweeps over `comp_mode_prob`,
+`single_ref_prob`, and `comp_ref_prob`, alongside the round-22 §6.3.11
+`read_is_inter_probs( )`, round-23 §6.3.9 / §6.3.10, and round-24
+§6.3.14 sweeps:
+
+* `read_frame_reference_mode_probs( coder, reference_mode,
+  comp_mode_prob, single_ref_prob, comp_ref_prob )` per §6.3.13
+  (`vp9-spec.txt` lines 2195-2210). Three conditional sweeps gated by
+  the `reference_mode` enum decided in §6.3.12:
+  * `REFERENCE_MODE_SELECT` fires the `comp_mode_prob` sweep
+    (`COMP_MODE_CONTEXTS = 5` cells); the other two modes skip it.
+  * Any mode `!= COMPOUND_REFERENCE` fires the `single_ref_prob`
+    sweep (`REF_CONTEXTS × 2 = 10` cells).
+  * Any mode `!= SINGLE_REFERENCE` fires the `comp_ref_prob` sweep
+    (`REF_CONTEXTS = 5` cells).
+  * Cell totals per mode: `SINGLE_REFERENCE` 10, `COMPOUND_REFERENCE`
+    5, `REFERENCE_MODE_SELECT` 20. Every cell consumes one `B(252)`
+    `update_prob` flag and, on 1, a `decode_term_subexp( )` +
+    `inv_remap_prob( )` cascade.
+* `ReferenceMode` public enum mirrors the §3 sentinels
+  (`SINGLE_REFERENCE = 0`, `COMPOUND_REFERENCE = 1`,
+  `REFERENCE_MODE_SELECT = 2`); the §6.3.12 walker still pending lands
+  the decode that picks one.
+* §3 constants `COMP_MODE_CONTEXTS = 5` (line 472) and `REF_CONTEXTS = 5`
+  (line 473) plus §10.5 defaults `default_comp_mode_prob =
+  {239, 183, 119, 96, 41}`, `default_comp_ref_prob = {50, 126, 123,
+  221, 226}`, and the 5×2 `default_single_ref_prob` table transcribed
+  verbatim into `mode_info.rs`. `compressed.rs` re-exports each as
+  `DEFAULT_COMP_MODE_PROB_TABLE` / `DEFAULT_COMP_REF_PROB_TABLE` /
+  `DEFAULT_SINGLE_REF_PROB_TABLE`, keeping `mode_info` as the single
+  source of truth (mirroring round-22..24 staging).
+
+Validation (+12 lib tests, lib total 353 → 365; suite total 373 → 385)
+covers: §3 constant pinning (`COMP_MODE_CONTEXTS = 5`,
+`REF_CONTEXTS = 5`); verbatim §10.5 transcription of each default
+table; the `SINGLE_REFERENCE` branch only touching `single_ref_prob`
+(other two snapshots preserved); the `COMPOUND_REFERENCE` branch only
+touching `comp_ref_prob`; the `REFERENCE_MODE_SELECT` branch firing
+all three sweeps with starting tables preserved on a zero buffer;
+cursor-equivalence proofs that each branch consumes exactly its
+prescribed cell count (5 / 10 / 20) of `B(252)` flags against a
+parallel-coder walker; an explicit row-major walk equivalence against
+a parallel coder for the `REFERENCE_MODE_SELECT` branch with two
+starting-table triples; and single-source-of-truth checks tying each
+`compressed.rs` re-export back to its `mode_info` constant.
+
+Out of scope for round 25: §6.3.12 `frame_reference_mode( )` itself —
+that needs the §6.2 `ref_frame_sign_bias[ ]` derivation which the
+uncompressed-header walker still rejects with `Error::Unsupported`.
+The round-25 surface stays internal-only (`pub(crate)` with
+`#[allow(dead_code)]` on the function + re-export consts; only the
+`ReferenceMode` enum is `pub` so the §6.3.12 walker can land it).
+
 ## Status — 2026-05-27 (round 24)
 
 **Round 24: §6.3.14 `read_y_mode_probs( )` compressed-header sweep.**

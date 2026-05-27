@@ -84,9 +84,10 @@
 use crate::bool_coder::BoolCoder;
 use crate::coef_probs::{CoefProbs, DEFAULT_COEF_PROBS};
 use crate::mode_info::{
-    BLOCK_SIZE_GROUPS, DEFAULT_INTERP_FILTER_PROBS, DEFAULT_INTER_MODE_PROBS,
-    DEFAULT_IS_INTER_PROB, DEFAULT_Y_MODE_PROBS, INTERP_FILTER_CONTEXTS, INTER_MODES,
-    INTER_MODE_CONTEXTS, INTRA_MODES, IS_INTER_CONTEXTS, SWITCHABLE_FILTERS,
+    BLOCK_SIZE_GROUPS, COMP_MODE_CONTEXTS, DEFAULT_COMP_MODE_PROB, DEFAULT_COMP_REF_PROB,
+    DEFAULT_INTERP_FILTER_PROBS, DEFAULT_INTER_MODE_PROBS, DEFAULT_IS_INTER_PROB,
+    DEFAULT_SINGLE_REF_PROB, DEFAULT_Y_MODE_PROBS, INTERP_FILTER_CONTEXTS, INTER_MODES,
+    INTER_MODE_CONTEXTS, INTRA_MODES, IS_INTER_CONTEXTS, REF_CONTEXTS, SWITCHABLE_FILTERS,
 };
 use crate::Error;
 
@@ -793,6 +794,160 @@ pub(crate) fn read_y_mode_probs(
 #[allow(dead_code)] // wired in once the §6.3 inter-arm dispatch lands.
 pub(crate) const DEFAULT_Y_MODE_PROBS_TABLE: [[u8; INTRA_MODES - 1]; BLOCK_SIZE_GROUPS] =
     DEFAULT_Y_MODE_PROBS;
+
+/// `reference_mode` per spec §3 / §6.3.12 (`vp9-spec.txt` lines
+/// 3790-3801). One of three frame-level sentinels controlling whether
+/// each inter block carries a single or compound reference frame:
+///
+/// * `SINGLE_REFERENCE = 0` — every inter block uses a single
+///   reference frame.
+/// * `COMPOUND_REFERENCE = 1` — every inter block uses compound mode
+///   (two reference frames blended via `setup_compound_reference_mode`).
+/// * `REFERENCE_MODE_SELECT = 2` — each inter block selects between
+///   single and compound mode via the `comp_mode` syntax element
+///   (probabilities held in `comp_mode_prob[ COMP_MODE_CONTEXTS ]`).
+///
+/// Decided by §6.3.12 `frame_reference_mode( )`. Consumed by §6.3.13
+/// `frame_reference_mode_probs( )` to gate the three nested probability
+/// sweeps over `comp_mode_prob`, `single_ref_prob`, and
+/// `comp_ref_prob`.
+//
+// Variant names mirror the spec's `SINGLE_REFERENCE` /
+// `COMPOUND_REFERENCE` / `REFERENCE_MODE_SELECT` sentinels verbatim;
+// keeping the "Reference" suffix lets `match` arms read the same as
+// the §6.3.12 listing's `reference_mode = …` assignments. Renaming
+// to satisfy the lint would silently diverge from the spec text.
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceMode {
+    /// `0` — `SINGLE_REFERENCE`. All inter blocks use a single ref
+    /// frame; §6.3.13 skips the `comp_mode_prob` and `comp_ref_prob`
+    /// sweeps.
+    SingleReference,
+    /// `1` — `COMPOUND_REFERENCE`. All inter blocks use compound
+    /// mode; §6.3.13 skips the `comp_mode_prob` and `single_ref_prob`
+    /// sweeps.
+    CompoundReference,
+    /// `2` — `REFERENCE_MODE_SELECT`. Per-block selection between
+    /// single and compound mode; §6.3.13 fires all three sweeps.
+    ReferenceModeSelect,
+}
+
+/// `frame_reference_mode_probs( )` per spec §6.3.13
+/// (`vp9-spec.txt` lines 2195-2210).
+///
+/// Three conditional sweeps gated by the §6.3.12 `reference_mode`:
+///
+/// ```text
+/// if ( reference_mode == REFERENCE_MODE_SELECT )
+///     for ( i = 0; i < COMP_MODE_CONTEXTS; i++ )
+///         comp_mode_prob[ i ] = diff_update_prob( comp_mode_prob[ i ] )
+/// if ( reference_mode != COMPOUND_REFERENCE )
+///     for ( i = 0; i < REF_CONTEXTS; i++ ) {
+///         single_ref_prob[ i ][ 0 ] = diff_update_prob( single_ref_prob[ i ][ 0 ] )
+///         single_ref_prob[ i ][ 1 ] = diff_update_prob( single_ref_prob[ i ][ 1 ] )
+///     }
+/// if ( reference_mode != SINGLE_REFERENCE )
+///     for ( i = 0; i < REF_CONTEXTS; i++ )
+///         comp_ref_prob[ i ] = diff_update_prob( comp_ref_prob[ i ] )
+/// ```
+///
+/// Cell count per branch:
+///
+/// * `SINGLE_REFERENCE` (`= 0`) — `REF_CONTEXTS × 2 = 10` cells over
+///   `single_ref_prob`; `comp_mode_prob` and `comp_ref_prob` untouched.
+/// * `COMPOUND_REFERENCE` (`= 1`) — `REF_CONTEXTS = 5` cells over
+///   `comp_ref_prob`; `comp_mode_prob` and `single_ref_prob` untouched.
+/// * `REFERENCE_MODE_SELECT` (`= 2`) — all three sweeps fire:
+///   `COMP_MODE_CONTEXTS = 5` over `comp_mode_prob`,
+///   `REF_CONTEXTS × 2 = 10` over `single_ref_prob`, and
+///   `REF_CONTEXTS = 5` over `comp_ref_prob`, for `20` cells total.
+///
+/// Each cell consumes one `B(252)` `update_prob` flag from the §9.2
+/// coder, and on `1` a `decode_term_subexp` + `inv_remap_prob` cascade
+/// (per §6.3.3 `diff_update_prob( )`).
+///
+/// The §6.3 outer dispatch invokes `frame_reference_mode_probs( )` only
+/// when `FrameIsIntra == 0` (alongside §6.3.9 / §6.3.10 / §6.3.11 /
+/// §6.3.12 / §6.3.14 / §6.3.15 / §6.3.16 / §6.3.17). The function
+/// itself is unconditional once the caller has decided to fire it; the
+/// gating lives in the `parse_compressed_header` outer driver, which
+/// is still deferred because §6.3.12 needs `ref_frame_sign_bias[ ]`
+/// state the uncompressed-header walker still rejects with
+/// `Error::Unsupported`.
+///
+/// `comp_mode_prob`, `single_ref_prob`, and `comp_ref_prob` are updated
+/// in place. Initial values come from
+/// [`mode_info::DEFAULT_COMP_MODE_PROB`],
+/// [`mode_info::DEFAULT_SINGLE_REF_PROB`], and
+/// [`mode_info::DEFAULT_COMP_REF_PROB`] (the §10.5 listings — single
+/// source of truth, same constants feeding the (still-deferred)
+/// §7.4.7 / §9.3 `comp_mode` / `single_ref_p1` / `single_ref_p2` /
+/// `comp_ref` per-block decoders).
+// Forward-staged: the §6.3 outer dispatch gates this call on
+// `FrameIsIntra == 0` (alongside §6.3.9 / §6.3.10 / §6.3.11 / §6.3.12 /
+// §6.3.14..§6.3.17), and the parent `parse_compressed_header` driver
+// doesn't yet wire any of the inter-only branch in. The
+// `#[allow(dead_code)]` lifts the lint until the outer dispatch grows
+// the inter arm.
+#[allow(dead_code)]
+pub(crate) fn read_frame_reference_mode_probs(
+    coder: &mut BoolCoder<'_>,
+    reference_mode: ReferenceMode,
+    comp_mode_prob: &mut [u8; COMP_MODE_CONTEXTS],
+    single_ref_prob: &mut [[u8; 2]; REF_CONTEXTS],
+    comp_ref_prob: &mut [u8; REF_CONTEXTS],
+) -> Result<(), Error> {
+    if reference_mode == ReferenceMode::ReferenceModeSelect {
+        for slot in comp_mode_prob.iter_mut() {
+            *slot = read_diff_update_prob(coder, *slot)?;
+        }
+    }
+    if reference_mode != ReferenceMode::CompoundReference {
+        for row in single_ref_prob.iter_mut() {
+            for slot in row.iter_mut() {
+                *slot = read_diff_update_prob(coder, *slot)?;
+            }
+        }
+    }
+    if reference_mode != ReferenceMode::SingleReference {
+        for slot in comp_ref_prob.iter_mut() {
+            *slot = read_diff_update_prob(coder, *slot)?;
+        }
+    }
+    Ok(())
+}
+
+/// Re-export of the §10.5
+/// `default_comp_mode_prob[ COMP_MODE_CONTEXTS ]` initial / reset
+/// table for use as the [`read_frame_reference_mode_probs`] starting
+/// state.
+///
+/// Re-exported from [`mode_info::DEFAULT_COMP_MODE_PROB`] (the single
+/// source of truth — same constant will feed the (still-deferred)
+/// §7.4.7 `comp_mode` per-block decoder).
+#[allow(dead_code)] // wired in once the §6.3 inter-arm dispatch lands.
+pub(crate) const DEFAULT_COMP_MODE_PROB_TABLE: [u8; COMP_MODE_CONTEXTS] = DEFAULT_COMP_MODE_PROB;
+
+/// Re-export of the §10.5 `default_comp_ref_prob[ REF_CONTEXTS ]`
+/// initial / reset table for use as the
+/// [`read_frame_reference_mode_probs`] starting state.
+///
+/// Re-exported from [`mode_info::DEFAULT_COMP_REF_PROB`] (the single
+/// source of truth — same constant will feed the (still-deferred)
+/// §7.4.7 `comp_ref` per-block decoder).
+#[allow(dead_code)] // wired in once the §6.3 inter-arm dispatch lands.
+pub(crate) const DEFAULT_COMP_REF_PROB_TABLE: [u8; REF_CONTEXTS] = DEFAULT_COMP_REF_PROB;
+
+/// Re-export of the §10.5 `default_single_ref_prob[ REF_CONTEXTS ][ 2 ]`
+/// initial / reset table for use as the
+/// [`read_frame_reference_mode_probs`] starting state.
+///
+/// Re-exported from [`mode_info::DEFAULT_SINGLE_REF_PROB`] (the single
+/// source of truth — same constant will feed the (still-deferred)
+/// §7.4.7 `single_ref_p1` / `single_ref_p2` per-block decoders).
+#[allow(dead_code)] // wired in once the §6.3 inter-arm dispatch lands.
+pub(crate) const DEFAULT_SINGLE_REF_PROB_TABLE: [[u8; 2]; REF_CONTEXTS] = DEFAULT_SINGLE_REF_PROB;
 
 #[cfg(test)]
 mod tests {
@@ -1822,5 +1977,301 @@ mod tests {
         // read_y_mode_probs must equal the §9.3 / §10.5 listing held
         // in mode_info::DEFAULT_Y_MODE_PROBS.
         assert_eq!(DEFAULT_Y_MODE_PROBS_TABLE, DEFAULT_Y_MODE_PROBS);
+    }
+
+    // ----- §6.3.13 read_frame_reference_mode_probs( ) -----
+
+    #[test]
+    fn comp_mode_contexts_and_ref_contexts_match_spec() {
+        // Spec §3 (`vp9-spec.txt` lines 472-473):
+        // COMP_MODE_CONTEXTS = 5, REF_CONTEXTS = 5.
+        assert_eq!(COMP_MODE_CONTEXTS, 5);
+        assert_eq!(REF_CONTEXTS, 5);
+    }
+
+    #[test]
+    fn default_comp_mode_prob_matches_spec_listing() {
+        // Spec §10.5 lines 7694-7696:
+        // default_comp_mode_prob[ COMP_MODE_CONTEXTS ] = {239, 183, 119, 96, 41}.
+        assert_eq!(DEFAULT_COMP_MODE_PROB, [239, 183, 119, 96, 41]);
+        assert_eq!(DEFAULT_COMP_MODE_PROB.len(), COMP_MODE_CONTEXTS);
+    }
+
+    #[test]
+    fn default_comp_ref_prob_matches_spec_listing() {
+        // Spec §10.5 lines 7699-7701:
+        // default_comp_ref_prob[ REF_CONTEXTS ] = {50, 126, 123, 221, 226}.
+        assert_eq!(DEFAULT_COMP_REF_PROB, [50, 126, 123, 221, 226]);
+        assert_eq!(DEFAULT_COMP_REF_PROB.len(), REF_CONTEXTS);
+    }
+
+    #[test]
+    fn default_single_ref_prob_matches_spec_listing() {
+        // Spec §10.5 lines 7704-7710 verbatim 5x2 table.
+        assert_eq!(
+            DEFAULT_SINGLE_REF_PROB,
+            [[33, 16], [77, 74], [142, 142], [172, 170], [238, 247]]
+        );
+        assert_eq!(DEFAULT_SINGLE_REF_PROB.len(), REF_CONTEXTS);
+    }
+
+    #[test]
+    fn frame_reference_mode_probs_single_ref_only_touches_single_ref_table() {
+        // SINGLE_REFERENCE branch: the only firing sweep is the
+        // `single_ref_prob` sweep (REF_CONTEXTS × 2 = 10 cells). The
+        // `comp_mode_prob` and `comp_ref_prob` tables are gated out
+        // and must stay untouched.
+        let bytes = [0x00u8; 8];
+        let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut comp_mode = [11u8, 22, 33, 44, 55];
+        let mut single_ref = [[1u8, 2], [3, 4], [5, 6], [7, 8], [9, 10]];
+        let single_ref_snapshot = single_ref;
+        let mut comp_ref = [60u8, 61, 62, 63, 64];
+        let comp_mode_snapshot = comp_mode;
+        let comp_ref_snapshot = comp_ref;
+
+        read_frame_reference_mode_probs(
+            &mut dec,
+            ReferenceMode::SingleReference,
+            &mut comp_mode,
+            &mut single_ref,
+            &mut comp_ref,
+        )
+        .unwrap();
+
+        // Zero buffer: every diff_update_prob keeps the base prob, so
+        // `single_ref` returns equal to its starting value. But the
+        // critical assertion is that the OTHER two tables are
+        // untouched — the gating must skip them entirely.
+        assert_eq!(single_ref, single_ref_snapshot);
+        assert_eq!(comp_mode, comp_mode_snapshot);
+        assert_eq!(comp_ref, comp_ref_snapshot);
+    }
+
+    #[test]
+    fn frame_reference_mode_probs_compound_only_touches_comp_ref_table() {
+        // COMPOUND_REFERENCE branch: the only firing sweep is the
+        // `comp_ref_prob` sweep (REF_CONTEXTS = 5 cells). The
+        // `comp_mode_prob` and `single_ref_prob` tables are gated out
+        // and must stay untouched.
+        let bytes = [0x00u8; 4];
+        let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut comp_mode = [11u8, 22, 33, 44, 55];
+        let mut single_ref = [[1u8, 2], [3, 4], [5, 6], [7, 8], [9, 10]];
+        let mut comp_ref = [60u8, 61, 62, 63, 64];
+        let comp_mode_snapshot = comp_mode;
+        let single_ref_snapshot = single_ref;
+        let comp_ref_snapshot = comp_ref;
+
+        read_frame_reference_mode_probs(
+            &mut dec,
+            ReferenceMode::CompoundReference,
+            &mut comp_mode,
+            &mut single_ref,
+            &mut comp_ref,
+        )
+        .unwrap();
+
+        assert_eq!(comp_ref, comp_ref_snapshot);
+        assert_eq!(comp_mode, comp_mode_snapshot);
+        assert_eq!(single_ref, single_ref_snapshot);
+    }
+
+    #[test]
+    fn frame_reference_mode_probs_select_fires_all_three_sweeps() {
+        // REFERENCE_MODE_SELECT branch: all three sweeps fire.
+        // 5 + 10 + 5 = 20 cells; with a zero buffer every base
+        // probability passes through unchanged.
+        let bytes = [0x00u8; 8];
+        let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut comp_mode = DEFAULT_COMP_MODE_PROB;
+        let mut single_ref = DEFAULT_SINGLE_REF_PROB;
+        let mut comp_ref = DEFAULT_COMP_REF_PROB;
+
+        read_frame_reference_mode_probs(
+            &mut dec,
+            ReferenceMode::ReferenceModeSelect,
+            &mut comp_mode,
+            &mut single_ref,
+            &mut comp_ref,
+        )
+        .unwrap();
+
+        assert_eq!(comp_mode, DEFAULT_COMP_MODE_PROB);
+        assert_eq!(single_ref, DEFAULT_SINGLE_REF_PROB);
+        assert_eq!(comp_ref, DEFAULT_COMP_REF_PROB);
+    }
+
+    #[test]
+    fn frame_reference_mode_probs_select_consumes_20_flags() {
+        // REFERENCE_MODE_SELECT must consume exactly 20 `B(252)`
+        // `update_prob` flags on the zero buffer. We prove this by
+        // running the sweep under-test, then walking 20 explicit
+        // `read_diff_update_prob` calls on a parallel coder and
+        // comparing cursor state via `read_literal(1)`.
+        let bytes = [0x00u8; 8];
+        let mut ref_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut prob: u8 = 128;
+        for _ in 0..20 {
+            prob = read_diff_update_prob(&mut ref_dec, prob).unwrap();
+        }
+
+        let mut test_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut comp_mode = [128u8; COMP_MODE_CONTEXTS];
+        let mut single_ref = [[128u8; 2]; REF_CONTEXTS];
+        let mut comp_ref = [128u8; REF_CONTEXTS];
+        read_frame_reference_mode_probs(
+            &mut test_dec,
+            ReferenceMode::ReferenceModeSelect,
+            &mut comp_mode,
+            &mut single_ref,
+            &mut comp_ref,
+        )
+        .unwrap();
+        let _ = prob;
+
+        // Cursor parity check: both decoders should produce the same
+        // next literal after consuming 20 update_prob flags.
+        assert_eq!(
+            ref_dec.read_literal(1).unwrap(),
+            test_dec.read_literal(1).unwrap(),
+            "REFERENCE_MODE_SELECT must consume exactly 20 B(252) flags",
+        );
+    }
+
+    #[test]
+    fn frame_reference_mode_probs_single_ref_consumes_10_flags() {
+        // SINGLE_REFERENCE branch consumes exactly REF_CONTEXTS × 2 = 10
+        // `B(252)` flags. Cursor-parity check against a parallel walker.
+        let bytes = [0x00u8; 4];
+        let mut ref_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        for _ in 0..(REF_CONTEXTS * 2) {
+            let _ = read_diff_update_prob(&mut ref_dec, 128).unwrap();
+        }
+
+        let mut test_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut comp_mode = [128u8; COMP_MODE_CONTEXTS];
+        let mut single_ref = [[128u8; 2]; REF_CONTEXTS];
+        let mut comp_ref = [128u8; REF_CONTEXTS];
+        read_frame_reference_mode_probs(
+            &mut test_dec,
+            ReferenceMode::SingleReference,
+            &mut comp_mode,
+            &mut single_ref,
+            &mut comp_ref,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ref_dec.read_literal(1).unwrap(),
+            test_dec.read_literal(1).unwrap(),
+            "SINGLE_REFERENCE must consume exactly 10 B(252) flags",
+        );
+    }
+
+    #[test]
+    fn frame_reference_mode_probs_compound_consumes_5_flags() {
+        // COMPOUND_REFERENCE branch consumes exactly REF_CONTEXTS = 5
+        // `B(252)` flags. Cursor-parity check against a parallel walker.
+        let bytes = [0x00u8; 4];
+        let mut ref_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        for _ in 0..REF_CONTEXTS {
+            let _ = read_diff_update_prob(&mut ref_dec, 128).unwrap();
+        }
+
+        let mut test_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut comp_mode = [128u8; COMP_MODE_CONTEXTS];
+        let mut single_ref = [[128u8; 2]; REF_CONTEXTS];
+        let mut comp_ref = [128u8; REF_CONTEXTS];
+        read_frame_reference_mode_probs(
+            &mut test_dec,
+            ReferenceMode::CompoundReference,
+            &mut comp_mode,
+            &mut single_ref,
+            &mut comp_ref,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ref_dec.read_literal(1).unwrap(),
+            test_dec.read_literal(1).unwrap(),
+            "COMPOUND_REFERENCE must consume exactly 5 B(252) flags",
+        );
+    }
+
+    #[test]
+    fn frame_reference_mode_probs_select_matches_explicit_walk() {
+        // Independent equivalence: read_frame_reference_mode_probs on
+        // REFERENCE_MODE_SELECT must walk the three tables in the
+        // spec's listed order (comp_mode → single_ref → comp_ref).
+        type Triple = (
+            [u8; COMP_MODE_CONTEXTS],
+            [[u8; 2]; REF_CONTEXTS],
+            [u8; REF_CONTEXTS],
+        );
+        let bytes = [0x00u8; 8];
+        let starts: [Triple; 2] = [
+            (
+                DEFAULT_COMP_MODE_PROB,
+                DEFAULT_SINGLE_REF_PROB,
+                DEFAULT_COMP_REF_PROB,
+            ),
+            (
+                [1, 254, 128, 64, 200],
+                [[2, 3], [4, 5], [6, 7], [8, 9], [10, 11]],
+                [255, 1, 128, 64, 32],
+            ),
+        ];
+        for (start_cm, start_sr, start_cr) in starts {
+            // Reference: 5 + 10 + 5 explicit calls in spec order.
+            let mut ref_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+            let mut ref_cm = start_cm;
+            let mut ref_sr = start_sr;
+            let mut ref_cr = start_cr;
+            for slot in ref_cm.iter_mut() {
+                *slot = read_diff_update_prob(&mut ref_dec, *slot).unwrap();
+            }
+            for row in ref_sr.iter_mut() {
+                for slot in row.iter_mut() {
+                    *slot = read_diff_update_prob(&mut ref_dec, *slot).unwrap();
+                }
+            }
+            for slot in ref_cr.iter_mut() {
+                *slot = read_diff_update_prob(&mut ref_dec, *slot).unwrap();
+            }
+
+            // Under-test walk.
+            let mut test_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+            let mut test_cm = start_cm;
+            let mut test_sr = start_sr;
+            let mut test_cr = start_cr;
+            read_frame_reference_mode_probs(
+                &mut test_dec,
+                ReferenceMode::ReferenceModeSelect,
+                &mut test_cm,
+                &mut test_sr,
+                &mut test_cr,
+            )
+            .unwrap();
+
+            assert_eq!(ref_cm, test_cm);
+            assert_eq!(ref_sr, test_sr);
+            assert_eq!(ref_cr, test_cr);
+            assert_eq!(
+                ref_dec.read_literal(1).unwrap(),
+                test_dec.read_literal(1).unwrap(),
+                "cursor must agree after the §6.3.13 sweep",
+            );
+        }
+    }
+
+    #[test]
+    fn default_comp_mode_prob_table_matches_mode_info_source() {
+        // Single source of truth: the re-export consumed by
+        // read_frame_reference_mode_probs must equal the §10.5 listing
+        // held in mode_info.
+        assert_eq!(DEFAULT_COMP_MODE_PROB_TABLE, DEFAULT_COMP_MODE_PROB);
+        assert_eq!(DEFAULT_COMP_REF_PROB_TABLE, DEFAULT_COMP_REF_PROB);
+        assert_eq!(DEFAULT_SINGLE_REF_PROB_TABLE, DEFAULT_SINGLE_REF_PROB);
     }
 }

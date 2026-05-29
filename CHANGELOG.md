@@ -6,6 +6,42 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 27: §6.3.17 `update_mv_prob( prob )` compressed-header
+  per-cell primitive.** Lands the per-call MV-probability-update
+  helper consumed by every cell of the still-deferred §6.3.16
+  `mv_probs( )` sweep:
+  * `update_mv_prob( coder, prob )` per §6.3.17 (`vp9-spec.txt` lines
+    2261-2275). Two-stage primitive — read one `B(252)`
+    `update_mv_prob` flag and, on 1, pull a 7-bit `L(7)` `mv_prob`
+    literal and rewrite `prob = (mv_prob << 1) | 1`. Otherwise the
+    caller's `prob` is returned unchanged.
+  * Distinct from §6.3.3 `read_diff_update_prob`: the diff-update
+    primitive uses `decode_term_subexp` + `inv_remap_prob` and the
+    output depends on the previous probability; the MV-update
+    primitive ignores the previous probability entirely on the
+    flag-set branch and produces a fresh value purely from the 7-bit
+    literal. The `<< 1 | 1` rewrite forces odd parity and the
+    `[1, 255]` step-2 range (MV probabilities can't be 0 because the
+    §6.5.x MV tree decode treats 0 as an unconditional branch).
+  * 8 new unit tests covering: zero-buffer pass-through (each base in
+    `{0, 1, 7, 64, 127, 128, 129, 200, 254, 255}` returned unchanged);
+    cursor-equivalence on the zero-buffer fast path (one `B(252)`
+    consumed); brute-forced flag-set buffer producing a deterministic
+    output independent of input base; cursor-equivalence on the
+    flag-set branch (one `B(252)` + one `L(7)` consumed); a parity +
+    range invariant sweep across every L(7) value 0..=127; baseline
+    cross-check confirming the flag-set output is input-independent;
+    a direct distinction test against §6.3.3 `read_diff_update_prob`
+    proving the two primitives are not aliases (different output on
+    the same flag-set buffer with the same base prob); and an explicit
+    step-walk equivalence against a hand-coded §6.3.17 listing walker
+    (zero buffer + flag-set buffer × 6 base values).
+  * Surface stays internal-only (`pub(crate)` with
+    `#[allow(dead_code)]`). Wiring into `parse_compressed_header`
+    waits on §6.3.16 `mv_probs( )` and §6.3.12 `frame_reference_mode( )`,
+    which need reference-buffer + `ref_frame_sign_bias[ ]` state the
+    uncompressed-header walker still rejects with `Error::Unsupported`.
+
 * **Round 26: §6.3.15 `read_partition_probs( )` compressed-header
   sweep.** Lands the unconditional `PARTITION_CONTEXTS = 16` ×
   `PARTITION_TYPES - 1 = 3` = 48-cell `diff_update_prob` walk that

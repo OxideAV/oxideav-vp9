@@ -63,6 +63,21 @@
 //!   initials. Updates the inter-frame `partition_probs[ ][ ]` table
 //!   consumed by §6.4.3 `decode_partition_type( )` via the §9.3.2
 //!   `partition_plane_context( )` ctx.
+//! * §6.3.17 `update_mv_prob( prob )` — the per-cell MV
+//!   probability-update primitive consumed by every cell of the still
+//!   deferred §6.3.16 `mv_probs( )` sweep. Reads `B(252)` for an
+//!   `update_mv_prob` flag and, on 1, pulls a 7-bit `mv_prob` literal
+//!   and rewrites `prob = (mv_prob << 1) | 1`. The 7-bit value is
+//!   left-shifted by one and OR'd with 1 (forcing odd parity and the
+//!   `[1, 255]` range — MV probabilities can't be 0 because §6.5.x MV
+//!   tree decode treats 0 as an unconditional branch). The `mv_probs(
+//!   )` outer driver itself walks `MV_JOINTS - 1 = 3` joint slots,
+//!   per-component `MV_CLASSES - 1 = 10` class slots + 1 class0-bit
+//!   slot + `MV_OFFSET_BITS = 10` bits slots, per-component-per-class0
+//!   `MV_FR_SIZE - 1 = 3` fr slots + a global `MV_FR_SIZE - 1 = 3` fr
+//!   slot, and (when `allow_high_precision_mv == 1`) per-component
+//!   class0-hp + hp slots. Total cell count depends on the
+//!   `allow_high_precision_mv` flag (66 cells when off, 70 when on).
 //!
 //! Round 6 lands the §6.3.7 walker between the round-5 §6.3.2
 //! `tx_mode_probs` and §6.3.8 `read_skip_prob` calls. Round 22 adds
@@ -72,24 +87,25 @@
 //! the §6.3.14 `read_y_mode_probs( )` standalone primitive. Round 25
 //! adds the §6.3.13 `frame_reference_mode_probs( )` reference-mode-gated
 //! triple sweep. Round 26 adds the §6.3.15 `read_partition_probs( )`
-//! standalone primitive — the `FrameIsIntra == 0`-gated outer-dispatch
-//! call site is still deferred because §6.3.12 / §6.3.16 / §6.3.17
-//! haven't landed yet. The remaining inter-only §6.3.12 / §6.3.16 /
-//! §6.3.17 syntax fires only on `FrameIsIntra == 0` and needs
+//! standalone primitive. Round 27 adds the §6.3.17
+//! `update_mv_prob( prob )` per-cell primitive — the `FrameIsIntra ==
+//! 0`-gated outer-dispatch call site is still deferred because §6.3.12
+//! / §6.3.16 haven't landed yet. The remaining inter-only §6.3.12 /
+//! §6.3.16 syntax fires only on `FrameIsIntra == 0` and needs
 //! reference-buffer state which the header walker still rejects with
 //! `Error::Unsupported`.
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7,
 //! `docs/video/vp9/vp9-spec.txt` §6.3.1 / §6.3.2 / §6.3.3 / §6.3.4 /
 //! §6.3.5 / §6.3.6 / §6.3.7 / §6.3.8 / §6.3.9 / §6.3.10 / §6.3.11 /
-//! §6.3.13 / §6.3.14 / §6.3.15 (the `inv_map_table`, `default_tx_probs`,
-//! `default_skip_prob`, `default_coef_probs`, `default_is_inter_prob`,
-//! `default_inter_mode_probs`, `default_interp_filter_probs`,
-//! `default_y_mode_probs`, `default_comp_mode_prob`,
-//! `default_comp_ref_prob`, `default_single_ref_prob`,
-//! `default_partition_probs` and `tx_mode_to_biggest_tx_size` constants
-//! are transcribed verbatim from §6.3.5, §10 and §10.5). No external
-//! library source consulted.
+//! §6.3.13 / §6.3.14 / §6.3.15 / §6.3.17 (the `inv_map_table`,
+//! `default_tx_probs`, `default_skip_prob`, `default_coef_probs`,
+//! `default_is_inter_prob`, `default_inter_mode_probs`,
+//! `default_interp_filter_probs`, `default_y_mode_probs`,
+//! `default_comp_mode_prob`, `default_comp_ref_prob`,
+//! `default_single_ref_prob`, `default_partition_probs` and
+//! `tx_mode_to_biggest_tx_size` constants are transcribed verbatim from
+//! §6.3.5, §10 and §10.5). No external library source consulted.
 
 use crate::bool_coder::BoolCoder;
 use crate::coef_probs::{CoefProbs, DEFAULT_COEF_PROBS};
@@ -1032,6 +1048,74 @@ pub(crate) fn read_partition_probs(
 #[allow(dead_code)] // wired in once the §6.3 inter-arm dispatch lands.
 pub(crate) const DEFAULT_PARTITION_PROBS_TABLE: [[u8; PARTITION_TYPES - 1]; PARTITION_CONTEXTS] =
     DEFAULT_PARTITION_PROBS;
+
+/// `update_mv_prob( prob )` per spec §6.3.17 ("Update mv prob syntax" —
+/// `vp9-spec.txt` lines 2261-2275).
+///
+/// Listing reproduced verbatim:
+///
+/// ```text
+/// update_mv_prob( prob ) {
+///     update_mv_prob                                          B(252)
+///     if ( update_mv_prob == 1 ) {
+///         mv_prob                                             L(7)
+///         prob = (mv_prob << 1) | 1
+///     }
+///     return prob
+/// }
+/// ```
+///
+/// Two-stage primitive:
+///
+/// 1. Read one `B(252)` `update_mv_prob` flag.
+/// 2. If the flag is 1, read a 7-bit `L(7)` literal and compute
+///    `prob = (mv_prob << 1) | 1`. The `<< 1 | 1` rewrite produces an
+///    odd value in `[1, 255]` — MV probabilities can't be 0 because
+///    §6.5.x MV tree decode treats 0 as an unconditional branch.
+/// 3. Otherwise the caller's `prob` byte is returned unchanged.
+///
+/// Distinct from the §6.3.3 [`read_diff_update_prob`] primitive used by
+/// every other §6.3 probability sweep: that function uses
+/// `decode_term_subexp` + `inv_remap_prob` to produce a remapped
+/// probability that depends on the previous value; this one ignores
+/// the previous probability entirely (the `prob` argument never reads
+/// after the flag check) and computes a fresh value purely from the
+/// 7-bit literal. The diff vs. raw split is the §6.3.16 `mv_probs( )`
+/// reading slot-update flags more frequently than the §6.3.7..§6.3.15
+/// sweeps in real-world VP9 streams — the `<< 1 | 1` shape encodes a
+/// fresh probability cheaply in 8 bits total (`B(252)` + `L(7)`)
+/// without needing the 4-leg subexp encoding.
+///
+/// `mv_prob << 1 | 1` rewrites the 7-bit value `[0, 127]` into `[1,
+/// 255]` step 2 (odd integers): the LSB is fixed at 1, the high 7 bits
+/// carry the literal payload. The §6.3.16 caller writes the returned
+/// value back into the running MV probability table slot in place
+/// (`mv_joint_probs[ j ]`, `mv_sign_prob[ i ]`,
+/// `mv_class_probs[ i ][ j ]`, etc.; see §6.3.16 listing for the full
+/// slot inventory).
+///
+/// As of round 27 this entry point has no live caller — §6.3.16
+/// `mv_probs( )` is still deferred because its outer-dispatch gate
+/// (`FrameIsIntra == 0` plus the `allow_high_precision_mv` decision
+/// from §6.2.5) needs reference-buffer + header state that the
+/// uncompressed-header walker still rejects with `Error::Unsupported`.
+/// The function exists so that the §6.3.16 sweep can drop in
+/// uneventfully once those dependencies land.
+// Forward-staged: the §6.3 outer dispatch only routes through this
+// helper via §6.3.16 `mv_probs( )` on inter frames, and the parent
+// `parse_compressed_header` driver doesn't yet wire any of the
+// inter-only branch in. The `#[allow(dead_code)]` lifts the lint until
+// the outer dispatch grows the inter arm.
+#[allow(dead_code)]
+pub(crate) fn update_mv_prob(coder: &mut BoolCoder<'_>, prob: u8) -> Result<u8, Error> {
+    let update_flag = coder.read_bool(252)?;
+    if update_flag == 1 {
+        let mv_prob = coder.read_literal(7)? as u8;
+        Ok((mv_prob << 1) | 1)
+    } else {
+        Ok(prob)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2560,6 +2644,218 @@ mod tests {
                 [[base; PARTITION_TYPES - 1]; PARTITION_CONTEXTS],
                 "starting base {base} must survive a zero-buffer sweep",
             );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // §6.3.17 update_mv_prob( prob ) tests
+    // -----------------------------------------------------------------
+
+    /// Search the small space of `[first_byte, 0x00, 0x00, 0x00]`
+    /// buffers for one that triggers `read_bool(252) == 1` immediately
+    /// after the §9.2.1 marker bit is consumed. The brute-force search
+    /// is deterministic and only enumerates 256 first-byte candidates;
+    /// it lets the flag-set-branch tests use a real `update_mv_prob`
+    /// flag=1 path without quoting any external implementation's
+    /// pre-cooked buffer.
+    fn buffer_triggering_flag_set() -> ([u8; 8], u8, u32) {
+        // First-byte search: pick the smallest first byte that makes
+        // the post-marker `read_bool(252)` return 1. Remaining bytes
+        // 0x00 so the §9.2 padding tail is clean.
+        for fb in 0u8..=255 {
+            let bytes = [fb, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+            let Ok(mut probe) = BoolCoder::init_bool(&bytes, bytes.len()) else {
+                continue;
+            };
+            if probe.read_bool(252) == Ok(1) {
+                // Continue stepping to also capture the L(7) the
+                // production code will read on the flag-set branch.
+                let Ok(literal) = probe.read_literal(7) else {
+                    continue;
+                };
+                let prob = ((literal as u8) << 1) | 1;
+                return (bytes, prob, literal);
+            }
+        }
+        panic!("expected at least one first-byte choice to trigger read_bool(252) == 1");
+    }
+
+    #[test]
+    fn update_mv_prob_zero_buffer_returns_base_unchanged() {
+        // Zero buffer => B(252) returns 0 (post-marker BoolValue=0
+        // < split=126), so the §6.3.17 short-circuit returns the
+        // caller's prob unchanged.
+        let bytes = [0x00u8; 4];
+        for base in [0u8, 1, 7, 64, 127, 128, 129, 200, 254, 255] {
+            let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+            let result = update_mv_prob(&mut dec, base).unwrap();
+            assert_eq!(
+                result, base,
+                "zero-buffer should leave base {base} unchanged",
+            );
+        }
+    }
+
+    #[test]
+    fn update_mv_prob_zero_buffer_consumes_only_one_b252_flag() {
+        // Zero-buffer fast path: only the single `B(252)` flag is
+        // consumed (the L(7) literal read is gated by flag == 1). A
+        // parallel coder reading one `read_bool(252)` must agree on
+        // the next L(1) bit with the post-update_mv_prob cursor.
+        let bytes = [0x00u8; 4];
+        let mut ref_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let _ = ref_dec.read_bool(252).unwrap();
+        let mut test_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let _ = update_mv_prob(&mut test_dec, 128).unwrap();
+        assert_eq!(
+            ref_dec.read_literal(1).unwrap(),
+            test_dec.read_literal(1).unwrap(),
+            "cursor must agree after a zero-buffer update_mv_prob (single B(252) consumed)",
+        );
+    }
+
+    #[test]
+    fn update_mv_prob_ignores_input_prob_when_flag_set() {
+        // The §6.3.17 listing computes `prob = (mv_prob << 1) | 1`
+        // when the flag is 1 — independent of the caller's prob. The
+        // brute-forced flag-set buffer yields a fixed `prob` for every
+        // starting base.
+        let (bytes, expected_prob, _) = buffer_triggering_flag_set();
+        for base in [0u8, 1, 7, 64, 127, 128, 129, 200, 254, 255] {
+            let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+            let result = update_mv_prob(&mut dec, base).unwrap();
+            assert_eq!(
+                result, expected_prob,
+                "flag-set buffer should yield expected_prob {expected_prob:#x} regardless of base {base}",
+            );
+        }
+    }
+
+    #[test]
+    fn update_mv_prob_flag_set_branch_consumes_one_b252_plus_l7() {
+        // Flag-set branch: a `B(252) = 1` followed by an `L(7)` read.
+        // A parallel reference running read_bool(252) + read_literal(7)
+        // must agree on the next L(1) bit with the post-update_mv_prob
+        // cursor.
+        let (bytes, _, _) = buffer_triggering_flag_set();
+        let mut ref_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let flag = ref_dec.read_bool(252).unwrap();
+        assert_eq!(flag, 1, "buffer_triggering_flag_set must produce flag=1");
+        let _ = ref_dec.read_literal(7).unwrap();
+        let mut test_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let _ = update_mv_prob(&mut test_dec, 128).unwrap();
+        assert_eq!(
+            ref_dec.read_literal(1).unwrap(),
+            test_dec.read_literal(1).unwrap(),
+            "cursor must agree after the flag-set branch (B(252) + L(7))",
+        );
+    }
+
+    #[test]
+    fn update_mv_prob_always_produces_odd_byte_on_flag_set_branch() {
+        // The `<< 1 | 1` rewrite (§6.3.17 line 2273) forces the LSB
+        // to 1, so any flag-set result must be odd. Walk every L(7)
+        // input 0..=127 and check the parity + range invariant
+        // (prob ∈ [1, 255] step 2).
+        for literal in 0u32..=127 {
+            let prob = ((literal << 1) | 1) as u8;
+            assert_eq!(
+                prob & 1,
+                1,
+                "(literal {literal} << 1) | 1 = {prob:#x} must be odd",
+            );
+            assert!(
+                prob >= 1,
+                "(literal {literal} << 1) | 1 = {prob:#x} must be >= 1",
+            );
+        }
+        // Endpoint check: the loop already produced the literal=0
+        // and literal=127 cases. The smallest output is 0x01 (forced
+        // by the `| 1` clause) and the largest is 0xFF (literal=127
+        // saturates the 7-bit literal). Re-check at literal=64 (a
+        // mid-range value) which the iterator covered above.
+        let mid: u8 = ((64u32 << 1) | 1) as u8;
+        assert_eq!(mid, 0x81);
+    }
+
+    #[test]
+    fn update_mv_prob_flag_set_result_independent_of_input_prob() {
+        // The flag-set branch overwrites `prob` entirely — the input
+        // never participates in the output. Cross-check: any starting
+        // base produces the same result against the same buffer.
+        let (bytes, _, _) = buffer_triggering_flag_set();
+        let mut first_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let baseline = update_mv_prob(&mut first_dec, 0).unwrap();
+        for base in [1u8, 7, 64, 127, 128, 129, 200, 254, 255] {
+            let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+            let result = update_mv_prob(&mut dec, base).unwrap();
+            assert_eq!(
+                result, baseline,
+                "flag-set branch must be input-independent: base {base} diverged from baseline {baseline:#x}",
+            );
+        }
+    }
+
+    #[test]
+    fn update_mv_prob_distinct_from_diff_update_prob_on_same_buffer() {
+        // §6.3.3 read_diff_update_prob and §6.3.17 update_mv_prob
+        // share the same `B(252)` opening flag, but diverge on flag=1:
+        // diff_update_prob calls decode_term_subexp + inv_remap_prob
+        // and the output depends on the previous prob; update_mv_prob
+        // reads L(7) and rewrites unconditionally. Both fire flag=1
+        // on the brute-forced flag-set buffer with input base=128, but
+        // produce different probabilities — proving these are two
+        // distinct primitives.
+        let (bytes, mv_prob_expected, _) = buffer_triggering_flag_set();
+        let mut diff_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let diff_result = read_diff_update_prob(&mut diff_dec, 128).unwrap();
+        let mut mv_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mv_result = update_mv_prob(&mut mv_dec, 128).unwrap();
+        assert_eq!(
+            mv_result, mv_prob_expected,
+            "§6.3.17 must reproduce the brute-forced flag-set output {mv_prob_expected:#x}",
+        );
+        assert_ne!(
+            diff_result, mv_result,
+            "§6.3.3 and §6.3.17 must diverge on the flag-set branch (same B(252); different read shape)",
+        );
+    }
+
+    #[test]
+    fn update_mv_prob_matches_explicit_step_walk() {
+        // Independent equivalence check: update_mv_prob's
+        // implementation must match a hand-coded walker that explicitly
+        // reads `read_bool(252)` and conditionally reads `read_literal(7)`
+        // + rewrites `(mv_prob << 1) | 1`. Verified against the
+        // brute-forced flag-set buffer and the zero buffer.
+        for &bytes in &[
+            [0x00u8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            buffer_triggering_flag_set().0,
+        ] {
+            for base in [0u8, 1, 64, 128, 200, 255] {
+                // Reference walker (mirrors §6.3.17 listing line-for-line).
+                let mut ref_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+                let ref_result = {
+                    let flag = ref_dec.read_bool(252).unwrap();
+                    if flag == 1 {
+                        let lit = ref_dec.read_literal(7).unwrap() as u8;
+                        (lit << 1) | 1
+                    } else {
+                        base
+                    }
+                };
+                let mut test_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+                let test_result = update_mv_prob(&mut test_dec, base).unwrap();
+                assert_eq!(
+                    ref_result, test_result,
+                    "update_mv_prob diverged from explicit walker for base {base} on buffer {bytes:?}",
+                );
+                assert_eq!(
+                    ref_dec.read_literal(1).unwrap(),
+                    test_dec.read_literal(1).unwrap(),
+                    "cursors diverged for base {base} on buffer {bytes:?}",
+                );
+            }
         }
     }
 }

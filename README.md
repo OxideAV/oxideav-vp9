@@ -3,6 +3,73 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-05-29 (round 27)
+
+**Round 27: §6.3.17 `update_mv_prob( prob )` compressed-header per-cell
+primitive.** Round 27 extends the §6.3 inter-arm primitives chain by
+the per-call MV-probability-update helper that the still-deferred
+§6.3.16 `mv_probs( )` sweep will call once per cell. The primitive is
+a stand-alone leaf (no per-cell cascade like §6.3.3
+`read_diff_update_prob`):
+
+* `update_mv_prob( coder, prob )` per §6.3.17 (`vp9-spec.txt` lines
+  2261-2275). Reads one `B(252)` `update_mv_prob` flag and, on 1,
+  pulls a 7-bit `L(7)` `mv_prob` literal and rewrites
+  `prob = (mv_prob << 1) | 1`. Otherwise returns the caller's `prob`
+  unchanged. The `<< 1 | 1` rewrite forces odd parity and the
+  `[1, 255]` step-2 range — MV probabilities can't be 0 because
+  §6.5.x MV tree decode treats 0 as an unconditional branch.
+* Distinct from the §6.3.3 `read_diff_update_prob` chain consumed by
+  every other §6.3 probability sweep (rounds 4..26). That chain uses
+  `decode_term_subexp` (§6.3.4) + `inv_remap_prob` (§6.3.5) and the
+  output depends on the previous probability. The §6.3.17 primitive
+  ignores the input `prob` entirely on the flag-set branch and
+  computes a fresh value purely from the 7-bit literal — the
+  `B(252)` + `L(7)` flag-set path is 8 bits of bool-coder state.
+* The §6.3.16 caller — still deferred because §6.3.12 needs
+  `ref_frame_sign_bias[ ]` state the uncompressed-header walker still
+  rejects with `Error::Unsupported` — walks `MV_JOINTS - 1 = 3` joint
+  slots, per-component `MV_CLASSES - 1 = 10` class slots + 1
+  `class0-bit` slot + `MV_OFFSET_BITS = 10` bits slots,
+  per-component-per-`class0` `MV_FR_SIZE - 1 = 3` fr slots + a global
+  `MV_FR_SIZE - 1 = 3` fr slot, and (when `allow_high_precision_mv ==
+  1`) per-component `class0-hp` + hp slots — 66 or 70 cells per frame
+  depending on the high-precision-MV flag. Each cell calls
+  `update_mv_prob( )` once.
+
+Validation (+8 lib tests, lib total 374 → 382; suite total 394 → 402)
+covers: zero-buffer pass-through preserving each base in
+`{0, 1, 7, 64, 127, 128, 129, 200, 254, 255}`; a cursor-equivalence
+proof that the zero-buffer fast path consumes exactly one `B(252)`
+flag against a parallel-coder walker; a brute-forced flag-set buffer
+(deterministic 256-candidate search for the smallest first byte that
+triggers `read_bool(252) == 1` after the §9.2.1 marker) producing a
+deterministic output independent of input base; a cursor-equivalence
+proof that the flag-set branch consumes exactly one `B(252)` + one
+`L(7)` against a parallel-coder walker; a parity + range invariant
+sweep across every L(7) value 0..=127 (`(literal << 1) | 1` always
+odd and in `[1, 255]`); a baseline cross-check confirming the
+flag-set output is input-prob-independent; a direct distinction test
+against §6.3.3 `read_diff_update_prob` proving the two primitives are
+not aliases (different outputs on the same flag-set buffer with the
+same base); and an explicit step-walk equivalence against a hand-coded
+§6.3.17 listing walker (zero buffer + flag-set buffer × 6 base values).
+
+Out of scope for round 27: §6.3.16 `mv_probs( )` itself — that needs
+the §3 MV constants (`MV_JOINTS = 4`, `MV_CLASSES = 11`,
+`MV_OFFSET_BITS = 10`, `CLASS0_SIZE = 2`, `MV_FR_SIZE = 4`), the
+§10.5 default MV-probability tables (`default_mv_joint_probs`,
+`default_mv_sign_prob`, `default_mv_class_probs`,
+`default_mv_class0_bit_prob`, `default_mv_bits_prob`,
+`default_mv_class0_fr_probs`, `default_mv_fr_probs`,
+`default_mv_class0_hp_prob`, `default_mv_hp_prob`), and the
+`allow_high_precision_mv` flag from §6.2.5 which the
+uncompressed-header walker still rejects with `Error::Unsupported`.
+The round-27 surface stays internal-only (`pub(crate)` with
+`#[allow(dead_code)]`); the public API still exposes
+`parse_uncompressed_header`, `parse_compressed_header` and their
+result types exclusively.
+
 ## Status — 2026-05-29 (round 26)
 
 **Round 26: §6.3.15 `read_partition_probs( )` compressed-header

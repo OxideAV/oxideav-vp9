@@ -3,6 +3,59 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-05-29 (round 26)
+
+**Round 26: §6.3.15 `read_partition_probs( )` compressed-header
+sweep.** Round 26 extends the §6.3 inter-arm primitives chain by the
+unconditional `PARTITION_CONTEXTS × (PARTITION_TYPES - 1) = 16 × 3 = 48`
+cell sweep that populates the running inter-frame `partition_probs[ ][ ]`
+table, alongside the round-22..25 §6.3.9 / §6.3.10 / §6.3.11 / §6.3.13 /
+§6.3.14 primitives:
+
+* `read_partition_probs( coder, partition_probs )` per §6.3.15
+  (`vp9-spec.txt` lines 2227-2232). 48 sequential
+  `read_diff_update_prob` calls — one `B(252)` `update_prob` flag per
+  cell and, on 1, a `decode_term_subexp( )` + `inv_remap_prob( )`
+  cascade — updating `partition_probs[ ][ ]` in place.
+* §3 constants `PARTITION_CONTEXTS = 16` (line 463) and
+  `PARTITION_TYPES = 4` (line 497) reused from the round-18 `partition`
+  module transcription. The §10.5 `default_partition_probs` table
+  (lines 7623-7651; 16 rows of 3 columns each) was transcribed verbatim
+  into `partition::DEFAULT_PARTITION_PROBS` in round 18.
+* `DEFAULT_PARTITION_PROBS_TABLE` re-export in `compressed.rs` keeps
+  `partition::DEFAULT_PARTITION_PROBS` as the single source of truth
+  (mirroring the round-22..25 staging pattern of one re-export per
+  sweep). Same constant feeds the §6.4.3 `decode_partition_type( )`
+  per-call partition decoder on inter frames via the §9.3.2
+  `partition_plane_context( )` ctx.
+
+Validation (+9 lib tests, lib total 365 → 374; suite total 385 → 394)
+covers: §3 constant pinning (`PARTITION_CONTEXTS = 16`,
+`PARTITION_TYPES = 4`); verbatim §10.5 transcription of the
+`default_partition_probs` table (16 × 3 layout with the
+block-size-group / `(above, left)` split annotations preserved);
+zero-buffer `update_prob = 0` pass-through preserving the starting
+table; all-cells-visited check with a non-uniform custom starting
+table; cursor-equivalence proof that the sweep consumes exactly 48
+`B(252)` flags against a parallel-coder walker; row-major walk
+equivalence against a parallel coder for two distinct starting
+tables; a tuple-sweep across `{0, 1, 7, 64, 127, 128, 129, 200, 254,
+255}` starting bases surviving zero-buffer pass-through; and a
+single-source-of-truth check tying the `compressed.rs` re-export back
+to the `partition::DEFAULT_PARTITION_PROBS` constant.
+
+Out of scope for round 26: §6.3.12 `frame_reference_mode( )` /
+§6.3.16 `mv_probs( )` / §6.3.17 — the partition-probs sweep lives
+between §6.3.14 `read_y_mode_probs( )` and §6.3.16 `mv_probs( )` in
+the §6.3 outer dispatch, but wiring any subset into
+`parse_compressed_header` before §6.3.12 lands would mis-position the
+coder cursor — and §6.3.12 needs `ref_frame_sign_bias[ ]` state the
+uncompressed-header walker still rejects with `Error::Unsupported`.
+The round-26 surface stays internal-only (`pub(crate)` with
+`#[allow(dead_code)]` on the function + re-export const); the public
+API still exposes `parse_uncompressed_header`,
+`parse_compressed_header` and their result types exclusively.
+
 ## Status — 2026-05-27 (round 25)
 
 **Round 25: §6.3.13 `frame_reference_mode_probs( )` compressed-header

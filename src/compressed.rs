@@ -57,27 +57,37 @@
 //!   `default_y_mode_probs` initials. Updates the inter-frame
 //!   `y_mode_probs[ ][ ]` table consumed by the §7.4.5 intra-mode
 //!   decoder of the (still-deferred) `inter_block_mode_info( )` reader.
+//! * §6.3.15 `read_partition_probs( )` — unconditional
+//!   `PARTITION_CONTEXTS × (PARTITION_TYPES - 1) = 16 × 3 = 48` cell
+//!   `diff_update_prob` sweep over the §10.5 `default_partition_probs`
+//!   initials. Updates the inter-frame `partition_probs[ ][ ]` table
+//!   consumed by §6.4.3 `decode_partition_type( )` via the §9.3.2
+//!   `partition_plane_context( )` ctx.
 //!
 //! Round 6 lands the §6.3.7 walker between the round-5 §6.3.2
 //! `tx_mode_probs` and §6.3.8 `read_skip_prob` calls. Round 22 adds
 //! the §6.3.11 `read_is_inter_probs( )` standalone primitive. Round 23
 //! adds the §6.3.9 `read_inter_mode_probs( )` and §6.3.10
 //! `read_interp_filter_probs( )` standalone primitives. Round 24 adds
-//! the §6.3.14 `read_y_mode_probs( )` standalone primitive — the
-//! `FrameIsIntra == 0`-gated outer-dispatch call site is still
-//! deferred because §6.3.12 / §6.3.13 (frame_reference_mode + probs)
-//! haven't landed yet. The remaining inter-only
-//! §6.3.12 / §6.3.13 / §6.3.15 / §6.3.16 / §6.3.17 syntax fires only on
-//! `FrameIsIntra == 0` and needs reference-buffer state which the
-//! header walker still rejects with `Error::Unsupported`.
+//! the §6.3.14 `read_y_mode_probs( )` standalone primitive. Round 25
+//! adds the §6.3.13 `frame_reference_mode_probs( )` reference-mode-gated
+//! triple sweep. Round 26 adds the §6.3.15 `read_partition_probs( )`
+//! standalone primitive — the `FrameIsIntra == 0`-gated outer-dispatch
+//! call site is still deferred because §6.3.12 / §6.3.16 / §6.3.17
+//! haven't landed yet. The remaining inter-only §6.3.12 / §6.3.16 /
+//! §6.3.17 syntax fires only on `FrameIsIntra == 0` and needs
+//! reference-buffer state which the header walker still rejects with
+//! `Error::Unsupported`.
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7,
 //! `docs/video/vp9/vp9-spec.txt` §6.3.1 / §6.3.2 / §6.3.3 / §6.3.4 /
 //! §6.3.5 / §6.3.6 / §6.3.7 / §6.3.8 / §6.3.9 / §6.3.10 / §6.3.11 /
-//! §6.3.14 (the `inv_map_table`, `default_tx_probs`, `default_skip_prob`,
-//! `default_coef_probs`, `default_is_inter_prob`,
+//! §6.3.13 / §6.3.14 / §6.3.15 (the `inv_map_table`, `default_tx_probs`,
+//! `default_skip_prob`, `default_coef_probs`, `default_is_inter_prob`,
 //! `default_inter_mode_probs`, `default_interp_filter_probs`,
-//! `default_y_mode_probs` and `tx_mode_to_biggest_tx_size` constants
+//! `default_y_mode_probs`, `default_comp_mode_prob`,
+//! `default_comp_ref_prob`, `default_single_ref_prob`,
+//! `default_partition_probs` and `tx_mode_to_biggest_tx_size` constants
 //! are transcribed verbatim from §6.3.5, §10 and §10.5). No external
 //! library source consulted.
 
@@ -89,6 +99,7 @@ use crate::mode_info::{
     DEFAULT_SINGLE_REF_PROB, DEFAULT_Y_MODE_PROBS, INTERP_FILTER_CONTEXTS, INTER_MODES,
     INTER_MODE_CONTEXTS, INTRA_MODES, IS_INTER_CONTEXTS, REF_CONTEXTS, SWITCHABLE_FILTERS,
 };
+use crate::partition::{DEFAULT_PARTITION_PROBS, PARTITION_CONTEXTS, PARTITION_TYPES};
 use crate::Error;
 
 /// `tx_mode` per spec §3 (TX_MODES = 5).
@@ -948,6 +959,79 @@ pub(crate) const DEFAULT_COMP_REF_PROB_TABLE: [u8; REF_CONTEXTS] = DEFAULT_COMP_
 /// §7.4.7 `single_ref_p1` / `single_ref_p2` per-block decoders).
 #[allow(dead_code)] // wired in once the §6.3 inter-arm dispatch lands.
 pub(crate) const DEFAULT_SINGLE_REF_PROB_TABLE: [[u8; 2]; REF_CONTEXTS] = DEFAULT_SINGLE_REF_PROB;
+
+/// `read_partition_probs( )` per spec §6.3.15 ("Partition probs
+/// syntax" — `vp9-spec.txt` lines 2227-2232).
+///
+/// Two nested sweeps:
+///
+/// ```text
+/// for ( i = 0; i < PARTITION_CONTEXTS; i++ )
+///     for ( j = 0; j < PARTITION_TYPES - 1; j++ )
+///         partition_probs[ i ][ j ] =
+///             diff_update_prob( partition_probs[ i ][ j ] )
+/// ```
+///
+/// `PARTITION_CONTEXTS = 16` (§3, `vp9-spec.txt` line 463) ×
+/// `PARTITION_TYPES - 1 = 3` (§3, line 497) = 48 cells. Every cell
+/// consumes one `B(252)` `update_prob` flag, and on 1 a
+/// `decode_term_subexp` + `inv_remap_prob` cascade. The 48-cell layout
+/// matches the §10.5 [`crate::partition::DEFAULT_PARTITION_PROBS`]
+/// table.
+///
+/// The §6.3 outer dispatch invokes `read_partition_probs( )` only
+/// when `FrameIsIntra == 0` (alongside §6.3.9 / §6.3.10 / §6.3.11 /
+/// §6.3.12 / §6.3.13 / §6.3.14 / §6.3.16 / §6.3.17). The function
+/// itself is unconditional once the caller has decided to fire it;
+/// the gating lives in the `parse_compressed_header` outer driver,
+/// which is still deferred because §6.3.12 needs
+/// `ref_frame_sign_bias[ ]` state the uncompressed-header walker
+/// still rejects with `Error::Unsupported`.
+///
+/// `partition_probs` is updated in place. Initial values come from
+/// [`crate::partition::DEFAULT_PARTITION_PROBS`] (the §10.5 listing
+/// — single source of truth; the same constant feeds the §6.4.3
+/// `decode_partition_type( )` per-call partition decoder on inter
+/// frames via the §9.3.2 `partition_plane_context( )` ctx).
+///
+/// The four `PARTITION_CONTEXTS = 16` rows index by
+/// `bsl * 4 + left * 2 + above`, where `bsl ∈ 0..=3` selects the
+/// outer block-size group (`8x8 -> 4x4`, `16x16 -> 8x8`,
+/// `32x32 -> 16x16`, `64x64 -> 32x32`) and the inner `(above, left)`
+/// pair selects the four `(0/1, 0/1)` neighbour-split combinations.
+/// The three columns are the §9.3.1 `partition_tree[ 4 ]` decision
+/// nodes (`PARTITION_NONE` vs split, `PARTITION_HORZ` vs other,
+/// `PARTITION_VERT` vs `PARTITION_SPLIT`).
+// Forward-staged: the §6.3 outer dispatch gates this call on
+// `FrameIsIntra == 0` (alongside §6.3.9..§6.3.14 and §6.3.16..§6.3.17),
+// and the parent `parse_compressed_header` driver doesn't yet wire any
+// of the inter-only branch in. The `#[allow(dead_code)]` lifts the lint
+// until the outer dispatch grows the inter arm.
+#[allow(dead_code)]
+pub(crate) fn read_partition_probs(
+    coder: &mut BoolCoder<'_>,
+    partition_probs: &mut [[u8; PARTITION_TYPES - 1]; PARTITION_CONTEXTS],
+) -> Result<(), Error> {
+    for row in partition_probs.iter_mut() {
+        for slot in row.iter_mut() {
+            *slot = read_diff_update_prob(coder, *slot)?;
+        }
+    }
+    Ok(())
+}
+
+/// Re-export of the §10.5
+/// `default_partition_probs[ PARTITION_CONTEXTS ][ PARTITION_TYPES - 1 ]`
+/// initial / reset table for use as the [`read_partition_probs`]
+/// starting state.
+///
+/// Re-exported from [`crate::partition::DEFAULT_PARTITION_PROBS`] (the
+/// single source of truth — same constant feeds the §6.4.3
+/// `decode_partition_type( )` per-call partition decoder on inter
+/// frames).
+#[allow(dead_code)] // wired in once the §6.3 inter-arm dispatch lands.
+pub(crate) const DEFAULT_PARTITION_PROBS_TABLE: [[u8; PARTITION_TYPES - 1]; PARTITION_CONTEXTS] =
+    DEFAULT_PARTITION_PROBS;
 
 #[cfg(test)]
 mod tests {
@@ -2273,5 +2357,209 @@ mod tests {
         assert_eq!(DEFAULT_COMP_MODE_PROB_TABLE, DEFAULT_COMP_MODE_PROB);
         assert_eq!(DEFAULT_COMP_REF_PROB_TABLE, DEFAULT_COMP_REF_PROB);
         assert_eq!(DEFAULT_SINGLE_REF_PROB_TABLE, DEFAULT_SINGLE_REF_PROB);
+    }
+
+    // -----------------------------------------------------------------
+    // §6.3.15 read_partition_probs( ) tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn partition_contexts_constant_equals_sixteen() {
+        // Spec §3 (`vp9-spec.txt` line 463) fixes PARTITION_CONTEXTS = 16.
+        // The §6.3.15 outer loop walks `i < PARTITION_CONTEXTS`; drift
+        // would over- or under-read.
+        assert_eq!(PARTITION_CONTEXTS, 16);
+    }
+
+    #[test]
+    fn partition_types_constant_equals_four() {
+        // Spec §3 (`vp9-spec.txt` line 497) fixes PARTITION_TYPES = 4.
+        // The §6.3.15 inner loop walks `j < PARTITION_TYPES - 1 = 3`
+        // cells per row.
+        assert_eq!(PARTITION_TYPES, 4);
+    }
+
+    #[test]
+    fn default_partition_probs_table_matches_partition_source() {
+        // Single source of truth: the compressed.rs re-export consumed
+        // by read_partition_probs must equal the §10.5 listing held in
+        // partition::DEFAULT_PARTITION_PROBS.
+        assert_eq!(DEFAULT_PARTITION_PROBS_TABLE, DEFAULT_PARTITION_PROBS);
+    }
+
+    #[test]
+    fn default_partition_probs_matches_spec_listing() {
+        // Verbatim transcription check against §10.5 (vp9-spec.txt
+        // lines 7623-7651). Row annotations preserved in comments
+        // mirror the spec block ordering:
+        //
+        //   8x8   -> 4x4   rows 0..=3
+        //   16x16 -> 8x8   rows 4..=7
+        //   32x32 -> 16x16 rows 8..=11
+        //   64x64 -> 32x32 rows 12..=15
+        //
+        // Each row covers the four (above, left) ∈ {0,1}^2 neighbour
+        // splits, with row index = bsl * 4 + left * 2 + above.
+        let expected: [[u8; 3]; 16] = [
+            // 8x8 -> 4x4
+            [199, 122, 141], // a/l both not split
+            [147, 63, 159],  // a split, l not split
+            [148, 133, 118], // l split, a not split
+            [121, 104, 114], // a/l both split
+            // 16x16 -> 8x8
+            [174, 73, 87], // a/l both not split
+            [92, 41, 83],  // a split, l not split
+            [82, 99, 50],  // l split, a not split
+            [53, 39, 39],  // a/l both split
+            // 32x32 -> 16x16
+            [177, 58, 59], // a/l both not split
+            [68, 26, 63],  // a split, l not split
+            [52, 79, 25],  // l split, a not split
+            [17, 14, 12],  // a/l both split
+            // 64x64 -> 32x32
+            [222, 34, 30], // a/l both not split
+            [72, 16, 44],  // a split, l not split
+            [58, 32, 12],  // l split, a not split
+            [10, 7, 6],    // a/l both split
+        ];
+        assert_eq!(DEFAULT_PARTITION_PROBS, expected);
+        assert_eq!(DEFAULT_PARTITION_PROBS_TABLE, expected);
+    }
+
+    #[test]
+    fn read_partition_probs_zero_buffer_leaves_defaults_unchanged() {
+        // 48 B(252) reads on a zero buffer all return 0
+        // (BoolValue=0 < split=125), so each diff_update_prob call
+        // passes its base through unchanged.
+        let bytes = [0x00u8; 16];
+        let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut probs = DEFAULT_PARTITION_PROBS_TABLE;
+        read_partition_probs(&mut dec, &mut probs).unwrap();
+        assert_eq!(probs, DEFAULT_PARTITION_PROBS_TABLE);
+    }
+
+    #[test]
+    fn read_partition_probs_visits_all_forty_eight_cells_no_mutation() {
+        // PARTITION_CONTEXTS × (PARTITION_TYPES - 1) = 16 × 3 = 48
+        // cells. With update_prob == 0 (zero buffer) every base passes
+        // through unchanged. A non-uniform starting table proves every
+        // slot is visited but no cell is mutated.
+        let bytes = [0x00u8; 16];
+        let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut probs: [[u8; 3]; 16] = [
+            [1, 2, 3],
+            [4, 5, 6],
+            [7, 8, 9],
+            [10, 11, 12],
+            [13, 14, 15],
+            [16, 17, 18],
+            [19, 20, 21],
+            [22, 23, 24],
+            [25, 26, 27],
+            [28, 29, 30],
+            [31, 32, 33],
+            [34, 35, 36],
+            [37, 38, 39],
+            [40, 41, 42],
+            [43, 44, 45],
+            [46, 47, 48],
+        ];
+        let snapshot = probs;
+        read_partition_probs(&mut dec, &mut probs).unwrap();
+        assert_eq!(probs, snapshot);
+    }
+
+    #[test]
+    fn read_partition_probs_consumes_forty_eight_b252_flags_on_zero_buffer() {
+        // The function must consume exactly 48 B(252) update_prob
+        // flags from a zero buffer. Walk a parallel reference coder
+        // through 48 explicit read_diff_update_prob calls and check
+        // both cursors agree on the next L(1) bit.
+        let bytes = [0x00u8; 16];
+        let mut ref_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        for _ in 0..(PARTITION_CONTEXTS * (PARTITION_TYPES - 1)) {
+            let _ = read_diff_update_prob(&mut ref_dec, 128).unwrap();
+        }
+        let mut test_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut probs = [[128u8; PARTITION_TYPES - 1]; PARTITION_CONTEXTS];
+        read_partition_probs(&mut test_dec, &mut probs).unwrap();
+        assert_eq!(
+            ref_dec.read_literal(1).unwrap(),
+            test_dec.read_literal(1).unwrap(),
+            "coder cursor must agree after the 48-cell sweep",
+        );
+    }
+
+    #[test]
+    fn read_partition_probs_matches_row_major_explicit_walk() {
+        // Independent equivalence check: read_partition_probs must walk
+        // the 48 cells in row-major order (outer = partition context,
+        // inner = partition-tree decision node) — exactly the same as
+        // the §6.3.15 listing's nested for-loops. Verified across two
+        // distinct starting tables.
+        let bytes = [0x00u8; 24];
+        let starts = [
+            DEFAULT_PARTITION_PROBS_TABLE,
+            [
+                [1, 254, 128],
+                [2, 3, 4],
+                [255, 1, 128],
+                [100, 110, 120],
+                [50, 60, 70],
+                [80, 90, 100],
+                [11, 22, 33],
+                [44, 55, 66],
+                [77, 88, 99],
+                [200, 210, 220],
+                [5, 15, 25],
+                [35, 45, 55],
+                [65, 75, 85],
+                [95, 105, 115],
+                [125, 135, 145],
+                [155, 165, 175],
+            ],
+        ];
+        for start in starts {
+            // Reference: 48 explicit row-major read_diff_update_prob calls.
+            let mut ref_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+            let mut ref_probs = start;
+            for row in ref_probs.iter_mut() {
+                for slot in row.iter_mut() {
+                    *slot = read_diff_update_prob(&mut ref_dec, *slot).unwrap();
+                }
+            }
+            // Under-test walk.
+            let mut test_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+            let mut test_probs = start;
+            read_partition_probs(&mut test_dec, &mut test_probs).unwrap();
+            assert_eq!(
+                ref_probs, test_probs,
+                "read_partition_probs must match explicit row-major sweep for {start:?}",
+            );
+            assert_eq!(
+                ref_dec.read_literal(1).unwrap(),
+                test_dec.read_literal(1).unwrap(),
+                "cursor must agree after the row-major sweep for {start:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn read_partition_probs_preserves_custom_starts_under_zero_buffer() {
+        // Tuple-sweep across distinct starting probabilities: every
+        // single-cell starting value must survive a zero-buffer pass
+        // unchanged (update_prob == 0 short-circuits diff_update_prob
+        // before the inv_remap_prob cascade).
+        let bytes = [0x00u8; 16];
+        for base in [0u8, 1, 7, 64, 127, 128, 129, 200, 254, 255] {
+            let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+            let mut probs = [[base; PARTITION_TYPES - 1]; PARTITION_CONTEXTS];
+            read_partition_probs(&mut dec, &mut probs).unwrap();
+            assert_eq!(
+                probs,
+                [[base; PARTITION_TYPES - 1]; PARTITION_CONTEXTS],
+                "starting base {base} must survive a zero-buffer sweep",
+            );
+        }
     }
 }

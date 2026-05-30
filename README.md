@@ -3,6 +3,70 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-05-31 (round 28)
+
+**Round 28: §6.3.18 `setup_compound_reference_mode( )` compressed-header
+pure-compute leaf.** Round 28 closes the §6.3.x primitives chain modulo
+the still-deferred §6.3.12 `frame_reference_mode( )` and §6.3.16
+`mv_probs( )` outer drivers, landing the final §6.3.x leaf — a pure
+compute function that takes no bool-coder reads:
+
+* `setup_compound_reference_mode( ref_frame_sign_bias )` per §6.3.18
+  (`vp9-spec.txt` lines 2279-2296). Partitions the three §3 inter
+  reference frames (`LAST_FRAME = 1`, `GOLDEN_FRAME = 2`,
+  `ALTREF_FRAME = 3`) into a `CompFixedRef` plus `CompVarRef[ 0 ]` /
+  `CompVarRef[ 1 ]` pair, based on the §6.2.5 `ref_frame_sign_bias[ ]`
+  `f(1)` flags. The §6.3.18 listing has three branches:
+  * Branch 1 (`LAST == GOLDEN`): `fixed = ALTREF`; var = `{LAST,
+    GOLDEN}`. Fires on 4 of the 8 sign-bias tuples — including the
+    all-agree cases `(0,0,0)` and `(1,1,1)`, where branch 1 takes
+    precedence over branch 2 by the listing's if/else order.
+  * Branch 2 (`LAST != GOLDEN AND LAST == ALTREF`): `fixed = GOLDEN`;
+    var = `{LAST, ALTREF}`. Fires on 2 of 8 tuples.
+  * Branch 3 (else: `LAST != GOLDEN AND LAST != ALTREF`, which
+    implies `GOLDEN == ALTREF`): `fixed = LAST`; var = `{GOLDEN,
+    ALTREF}`. Fires on the remaining 2 of 8 tuples.
+* §3 ref-frame enumeration transcribed verbatim into `mode_info.rs`
+  alongside the existing `INTRA_FRAME = 0`: `LAST_FRAME = 1`,
+  `GOLDEN_FRAME = 2`, `ALTREF_FRAME = 3`, `MAX_REF_FRAMES = 4` (spec
+  line 470). The four sentinels match the §7.4.12 `ref_frame[ 0 ]` /
+  `ref_frame[ 1 ]` enumeration tables (lines 3990-4006).
+* `RefFrameSignBias` newtype around `[u8; MAX_REF_FRAMES]` enforces
+  the §6.2.5 "inter slots only" populated-by-`f(1)` invariant via a
+  `from_inter_biases(last, golden, altref)` constructor with debug
+  assertions on the two-state range. The `INTRA_FRAME` slot is held
+  at zero internally (§6.3.18 never reads it).
+* `CompoundReferenceConfig { fixed_ref: i32, var_ref: [i32; 2] }`
+  bundles the §6.3.18 output for downstream §6.4.16
+  `inter_block_mode_info( )` `comp_ref` per-block decode and §6.5
+  MV-reference search consumption.
+
+Validation (+9 lib tests, lib total 382 → 391; suite total 402 →
+411) covers: §3 sentinel pinning (`LAST_FRAME = 1`, `GOLDEN_FRAME =
+2`, `ALTREF_FRAME = 3`, `MAX_REF_FRAMES = 4`, monotonic order via
+`const { assert!(..) }`); each of the three §6.3.18 branches against
+its prescribed tuple set (branch 1 on 4 tuples, branch 2 on 2,
+branch 3 on 2); an exhaustive 8-tuple truth-table sweep
+cross-checking every input maps to the expected
+`(fixed_ref, var_ref[0], var_ref[1])` triple and branch ID; explicit
+precedence pinning that the all-agree `(0,0,0)` / `(1,1,1)` tuples
+fire branch 1 (ALTREF fixed) not branch 2 (GOLDEN fixed); a
+pairwise-distinct-and-permutation-of-inter-set invariant proving
+every output is a permutation of `{LAST_FRAME, GOLDEN_FRAME,
+ALTREF_FRAME}` (never collapsing or mixing in INTRA_FRAME); the
+inter-only-population invariant on `RefFrameSignBias`; and a
+pure-compute / type-level signature pin (no `BoolCoder` parameter,
+function is reentrant on the same input).
+
+Out of scope for round 28: §6.3.12 `frame_reference_mode( )` and
+§6.3.16 `mv_probs( )` outer drivers — both need `ref_frame_sign_bias[
+]` state the §6.2.5 uncompressed-header walker still rejects with
+`Error::Unsupported`, plus (for §6.3.16) the `allow_high_precision_mv`
+flag. The round-28 surface stays internal-only (`pub(crate)` with
+`#[allow(dead_code)]` on the function, struct, and helper); the
+public API still exposes `parse_uncompressed_header`,
+`parse_compressed_header` and their result types exclusively.
+
 ## Status — 2026-05-29 (round 27)
 
 **Round 27: §6.3.17 `update_mv_prob( prob )` compressed-header per-cell

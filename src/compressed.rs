@@ -78,6 +78,19 @@
 //!   slot, and (when `allow_high_precision_mv == 1`) per-component
 //!   class0-hp + hp slots. Total cell count depends on the
 //!   `allow_high_precision_mv` flag (66 cells when off, 70 when on).
+//! * §6.3.18 `setup_compound_reference_mode( )` — the pure-compute
+//!   leaf that closes the §6.3.x chain. Reads no bool-coder state;
+//!   partitions the three §3 inter references (`LAST_FRAME`,
+//!   `GOLDEN_FRAME`, `ALTREF_FRAME`) into a fixed-vs-variable pair
+//!   based on the §6.2.5 `ref_frame_sign_bias[ ]` `f(1)` flags. Three
+//!   branches: `LAST == GOLDEN => fixed = ALTREF`; else `LAST ==
+//!   ALTREF => fixed = GOLDEN`; else `fixed = LAST`. The two-bit-each
+//!   input space is 8 tuples and the output is always a permutation
+//!   of `{LAST, GOLDEN, ALTREF}` into `(fixed, var[0], var[1])`. Fed
+//!   by §6.3.12 `frame_reference_mode( )` (still deferred) gating on
+//!   `reference_mode != SINGLE_REFERENCE`; output consumed by the
+//!   §6.4.16 `inter_block_mode_info( )` `comp_ref` per-block decode
+//!   and §6.5 MV-reference search.
 //!
 //! Round 6 lands the §6.3.7 walker between the round-5 §6.3.2
 //! `tx_mode_probs` and §6.3.8 `read_skip_prob` calls. Round 22 adds
@@ -88,32 +101,39 @@
 //! adds the §6.3.13 `frame_reference_mode_probs( )` reference-mode-gated
 //! triple sweep. Round 26 adds the §6.3.15 `read_partition_probs( )`
 //! standalone primitive. Round 27 adds the §6.3.17
-//! `update_mv_prob( prob )` per-cell primitive — the `FrameIsIntra ==
-//! 0`-gated outer-dispatch call site is still deferred because §6.3.12
-//! / §6.3.16 haven't landed yet. The remaining inter-only §6.3.12 /
-//! §6.3.16 syntax fires only on `FrameIsIntra == 0` and needs
-//! reference-buffer state which the header walker still rejects with
-//! `Error::Unsupported`.
+//! `update_mv_prob( prob )` per-cell primitive. Round 28 adds the
+//! §6.3.18 `setup_compound_reference_mode( )` pure-compute leaf —
+//! closing the §6.3.x primitives chain modulo the still-deferred
+//! §6.3.12 `frame_reference_mode( )` and §6.3.16 `mv_probs( )` outer
+//! drivers. The `FrameIsIntra == 0`-gated outer-dispatch call sites
+//! are still deferred because §6.3.12 / §6.3.16 haven't landed yet.
+//! The remaining inter-only §6.3.12 / §6.3.16 syntax fires only on
+//! `FrameIsIntra == 0` and needs reference-buffer state which the
+//! header walker still rejects with `Error::Unsupported`.
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7,
 //! `docs/video/vp9/vp9-spec.txt` §6.3.1 / §6.3.2 / §6.3.3 / §6.3.4 /
 //! §6.3.5 / §6.3.6 / §6.3.7 / §6.3.8 / §6.3.9 / §6.3.10 / §6.3.11 /
-//! §6.3.13 / §6.3.14 / §6.3.15 / §6.3.17 (the `inv_map_table`,
+//! §6.3.13 / §6.3.14 / §6.3.15 / §6.3.17 / §6.3.18 (the `inv_map_table`,
 //! `default_tx_probs`, `default_skip_prob`, `default_coef_probs`,
 //! `default_is_inter_prob`, `default_inter_mode_probs`,
 //! `default_interp_filter_probs`, `default_y_mode_probs`,
 //! `default_comp_mode_prob`, `default_comp_ref_prob`,
 //! `default_single_ref_prob`, `default_partition_probs` and
 //! `tx_mode_to_biggest_tx_size` constants are transcribed verbatim from
-//! §6.3.5, §10 and §10.5). No external library source consulted.
+//! §6.3.5, §10 and §10.5; the §3 ref-frame enumeration is the source
+//! of the `INTRA_FRAME` / `LAST_FRAME` / `GOLDEN_FRAME` /
+//! `ALTREF_FRAME` / `MAX_REF_FRAMES` values consumed by §6.3.18). No
+//! external library source consulted.
 
 use crate::bool_coder::BoolCoder;
 use crate::coef_probs::{CoefProbs, DEFAULT_COEF_PROBS};
 use crate::mode_info::{
-    BLOCK_SIZE_GROUPS, COMP_MODE_CONTEXTS, DEFAULT_COMP_MODE_PROB, DEFAULT_COMP_REF_PROB,
-    DEFAULT_INTERP_FILTER_PROBS, DEFAULT_INTER_MODE_PROBS, DEFAULT_IS_INTER_PROB,
-    DEFAULT_SINGLE_REF_PROB, DEFAULT_Y_MODE_PROBS, INTERP_FILTER_CONTEXTS, INTER_MODES,
-    INTER_MODE_CONTEXTS, INTRA_MODES, IS_INTER_CONTEXTS, REF_CONTEXTS, SWITCHABLE_FILTERS,
+    ALTREF_FRAME, BLOCK_SIZE_GROUPS, COMP_MODE_CONTEXTS, DEFAULT_COMP_MODE_PROB,
+    DEFAULT_COMP_REF_PROB, DEFAULT_INTERP_FILTER_PROBS, DEFAULT_INTER_MODE_PROBS,
+    DEFAULT_IS_INTER_PROB, DEFAULT_SINGLE_REF_PROB, DEFAULT_Y_MODE_PROBS, GOLDEN_FRAME,
+    INTERP_FILTER_CONTEXTS, INTER_MODES, INTER_MODE_CONTEXTS, INTRA_MODES, IS_INTER_CONTEXTS,
+    LAST_FRAME, MAX_REF_FRAMES, REF_CONTEXTS, SWITCHABLE_FILTERS,
 };
 use crate::partition::{DEFAULT_PARTITION_PROBS, PARTITION_CONTEXTS, PARTITION_TYPES};
 use crate::Error;
@@ -1115,6 +1135,221 @@ pub(crate) fn update_mv_prob(coder: &mut BoolCoder<'_>, prob: u8) -> Result<u8, 
     } else {
         Ok(prob)
     }
+}
+
+/// `setup_compound_reference_mode( )` per spec §6.3.18 ("Setup
+/// compound reference mode syntax" — `vp9-spec.txt` lines 2279-2296).
+///
+/// Listing reproduced verbatim:
+///
+/// ```text
+/// setup_compound_reference_mode( ) {
+///     if ( ref_frame_sign_bias[ LAST_FRAME ] ==
+///                      ref_frame_sign_bias[ GOLDEN_FRAME ] ) {
+///         CompFixedRef = ALTREF_FRAME
+///         CompVarRef[ 0 ] = LAST_FRAME
+///         CompVarRef[ 1 ] = GOLDEN_FRAME
+///     } else if ( ref_frame_sign_bias[ LAST_FRAME ] ==
+///                        ref_frame_sign_bias[ ALTREF_FRAME ] ) {
+///         CompFixedRef = GOLDEN_FRAME
+///         CompVarRef[ 0 ] = LAST_FRAME
+///         CompVarRef[ 1 ] = ALTREF_FRAME
+///     } else {
+///         CompFixedRef = LAST_FRAME
+///         CompVarRef[ 0 ] = GOLDEN_FRAME
+///         CompVarRef[ 1 ] = ALTREF_FRAME
+///     }
+/// }
+/// ```
+///
+/// Pure compute — no bool-coder reads, no probability sweep. The
+/// function inspects the §6.2.5 `ref_frame_sign_bias[ ]` array (one
+/// flag per inter reference frame: `LAST_FRAME = 1`, `GOLDEN_FRAME =
+/// 2`, `ALTREF_FRAME = 3` per §3) and partitions the three inter
+/// references into a single `CompFixedRef` plus a `CompVarRef[ 2 ]`
+/// pair. The §3 commentary above the listing (lines 3984-3989)
+/// explains the rationale: compound prediction always blends the
+/// fixed reference with one of the two variable references, and the
+/// fixed reference is the one whose sign bias differs from the other
+/// two (or, when all three agree, `ALTREF_FRAME` is the conventional
+/// choice).
+///
+/// Branch-coverage table (the eight possible
+/// `(ref_frame_sign_bias[LAST_FRAME], ref_frame_sign_bias[GOLDEN_FRAME],
+/// ref_frame_sign_bias[ALTREF_FRAME])` tuples):
+///
+/// | LAST | GOLDEN | ALTREF | CompFixedRef | CompVarRef[0] | CompVarRef[1] | Branch |
+/// |------|--------|--------|--------------|---------------|---------------|--------|
+/// | 0    | 0      | 0      | ALTREF_FRAME | LAST_FRAME    | GOLDEN_FRAME  | 1      |
+/// | 0    | 0      | 1      | ALTREF_FRAME | LAST_FRAME    | GOLDEN_FRAME  | 1      |
+/// | 0    | 1      | 0      | GOLDEN_FRAME | LAST_FRAME    | ALTREF_FRAME  | 2      |
+/// | 0    | 1      | 1      | LAST_FRAME   | GOLDEN_FRAME  | ALTREF_FRAME  | 3      |
+/// | 1    | 0      | 0      | LAST_FRAME   | GOLDEN_FRAME  | ALTREF_FRAME  | 3      |
+/// | 1    | 0      | 1      | GOLDEN_FRAME | LAST_FRAME    | ALTREF_FRAME  | 2      |
+/// | 1    | 1      | 0      | ALTREF_FRAME | LAST_FRAME    | GOLDEN_FRAME  | 1      |
+/// | 1    | 1      | 1      | ALTREF_FRAME | LAST_FRAME    | GOLDEN_FRAME  | 1      |
+///
+/// Branch 1 takes precedence when `LAST == GOLDEN` (regardless of
+/// `ALTREF`); branch 2 fires only when `LAST != GOLDEN` AND `LAST ==
+/// ALTREF`; branch 3 fires only when `LAST != GOLDEN` AND `LAST !=
+/// ALTREF` (which by the if/else chain implies `GOLDEN == ALTREF`).
+/// In every branch the three outputs are pairwise distinct elements of
+/// `{LAST_FRAME, GOLDEN_FRAME, ALTREF_FRAME}` — the function permutes
+/// the three inter references into a fixed-vs-variable partition,
+/// never collapsing them or mixing in `INTRA_FRAME`.
+///
+/// Input layout: `ref_frame_sign_bias` is the §6.2.5 array indexed by
+/// the §3 ref-frame enumeration `INTRA_FRAME..MAX_REF_FRAMES - 1`,
+/// i.e. positions `0..=3`. Only the three inter slots (`LAST_FRAME` /
+/// `GOLDEN_FRAME` / `ALTREF_FRAME`) are read; the `INTRA_FRAME` slot
+/// is unused (its value never appears in the §6.3.18 listing). The
+/// spec stores these as `f(1)` values (line 1625), so each element is
+/// `0` or `1`.
+///
+/// Output is a [`CompoundReferenceConfig`] bundle carrying the three
+/// `i32` ref-frame indices the §6.4.18 `assign_mv( )` / §6.5
+/// `find_mv_refs( )` / §6.4.19 MV-prediction sites consume.
+///
+/// As of round 28 this entry point has no live caller — the §6.3
+/// outer dispatch invokes `setup_compound_reference_mode( )`
+/// immediately after §6.3.13 `frame_reference_mode_probs( )` and only
+/// when `FrameIsIntra == 0` AND `reference_mode != SINGLE_REFERENCE`
+/// (the compound machinery is dormant on single-reference frames).
+/// Both of those gates need the §6.3.12 `frame_reference_mode( )`
+/// decode and the §6.2.5 `ref_frame_sign_bias[ ]` derivation, which
+/// the uncompressed-header walker still rejects with
+/// `Error::Unsupported`. The function exists so that the §6.3 outer
+/// dispatch can drop in uneventfully once those dependencies land.
+//
+// Forward-staged: the §6.3 outer dispatch only routes through this
+// helper on inter frames with `reference_mode != SINGLE_REFERENCE`,
+// and the parent `parse_compressed_header` driver doesn't yet wire
+// any of the inter-only branch in. The `#[allow(dead_code)]` lifts
+// the lint until the outer dispatch grows the inter arm.
+#[allow(dead_code)]
+pub(crate) fn setup_compound_reference_mode(
+    ref_frame_sign_bias: &RefFrameSignBias,
+) -> CompoundReferenceConfig {
+    let last = ref_frame_sign_bias.get(LAST_FRAME);
+    let golden = ref_frame_sign_bias.get(GOLDEN_FRAME);
+    let altref = ref_frame_sign_bias.get(ALTREF_FRAME);
+
+    if last == golden {
+        // Branch 1: LAST and GOLDEN agree on sign bias => ALTREF is
+        // the fixed reference, LAST/GOLDEN are the variable pair.
+        CompoundReferenceConfig {
+            fixed_ref: ALTREF_FRAME,
+            var_ref: [LAST_FRAME, GOLDEN_FRAME],
+        }
+    } else if last == altref {
+        // Branch 2: LAST and ALTREF agree on sign bias (and LAST
+        // disagrees with GOLDEN by the prior arm) => GOLDEN is the
+        // fixed reference, LAST/ALTREF are the variable pair.
+        CompoundReferenceConfig {
+            fixed_ref: GOLDEN_FRAME,
+            var_ref: [LAST_FRAME, ALTREF_FRAME],
+        }
+    } else {
+        // Branch 3: LAST disagrees with both GOLDEN and ALTREF
+        // (which implies GOLDEN == ALTREF) => LAST is the fixed
+        // reference, GOLDEN/ALTREF are the variable pair.
+        CompoundReferenceConfig {
+            fixed_ref: LAST_FRAME,
+            var_ref: [GOLDEN_FRAME, ALTREF_FRAME],
+        }
+    }
+}
+
+/// `ref_frame_sign_bias[ MAX_REF_FRAMES ]` per spec §6.2.5
+/// (`vp9-spec.txt` line 1625). One `f(1)` flag per ref-frame slot
+/// indexed by the §3 ref-frame enumeration (`INTRA_FRAME = 0`,
+/// `LAST_FRAME = 1`, `GOLDEN_FRAME = 2`, `ALTREF_FRAME = 3`,
+/// `MAX_REF_FRAMES = 4`).
+///
+/// Used as the input bundle for §6.3.18 [`setup_compound_reference_mode`]
+/// and as the per-frame state read by §6.4.17 `ref_frames( )` and §6.5
+/// MV-reference search.
+///
+/// The `INTRA_FRAME` slot is unused by §6.3.18 (the listing only reads
+/// `LAST_FRAME` / `GOLDEN_FRAME` / `ALTREF_FRAME`), so the constructor
+/// accepts only the three inter slots. The fourth slot is held at
+/// zero internally.
+//
+// Forward-staged: populated by the §6.2.5 uncompressed-header walker
+// (still deferred behind `Error::Unsupported`) and read by §6.3.18 and
+// the §6.4.17 / §6.5 MV machinery (also still deferred). The
+// `#[allow(dead_code)]` lifts the lint until either side grows a
+// caller.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RefFrameSignBias {
+    biases: [u8; MAX_REF_FRAMES],
+}
+
+#[allow(dead_code)]
+impl RefFrameSignBias {
+    /// Build a sign-bias array from the three inter ref-frame flags.
+    /// Each input is the `f(1)` value `0` or `1` from §6.2.5.
+    ///
+    /// Panics in debug builds if any input is outside `{0, 1}` — §6.2.5
+    /// reads each via `f(1)` so two-state is a structural invariant.
+    pub(crate) fn from_inter_biases(last: u8, golden: u8, altref: u8) -> Self {
+        debug_assert!(last <= 1, "ref_frame_sign_bias[LAST_FRAME] must be f(1)");
+        debug_assert!(
+            golden <= 1,
+            "ref_frame_sign_bias[GOLDEN_FRAME] must be f(1)"
+        );
+        debug_assert!(
+            altref <= 1,
+            "ref_frame_sign_bias[ALTREF_FRAME] must be f(1)"
+        );
+        let mut biases = [0u8; MAX_REF_FRAMES];
+        biases[LAST_FRAME as usize] = last;
+        biases[GOLDEN_FRAME as usize] = golden;
+        biases[ALTREF_FRAME as usize] = altref;
+        Self { biases }
+    }
+
+    /// Read the `f(1)` sign-bias flag for the given §3 ref-frame
+    /// index. Returns `0` for `INTRA_FRAME` (never populated by
+    /// §6.2.5).
+    ///
+    /// Panics if `ref_frame` is outside the §3 enumeration `0..=3`.
+    pub(crate) fn get(&self, ref_frame: i32) -> u8 {
+        let idx = ref_frame as usize;
+        assert!(
+            idx < MAX_REF_FRAMES,
+            "ref_frame index {ref_frame} out of §3 range 0..{MAX_REF_FRAMES}",
+        );
+        self.biases[idx]
+    }
+}
+
+/// Output of §6.3.18 [`setup_compound_reference_mode`] — the
+/// fixed-vs-variable partition of the three inter reference frames.
+///
+/// `fixed_ref` is the §3 ref-frame index (`LAST_FRAME` / `GOLDEN_FRAME`
+/// / `ALTREF_FRAME`, i.e. `1` / `2` / `3`) used as the always-on
+/// compound-prediction reference. `var_ref[ 0 ]` / `var_ref[ 1 ]` are
+/// the other two inter references the §6.4.16 `inter_block_mode_info(
+/// )` per-block `comp_ref` decode picks between.
+///
+/// In every output, the three indices are pairwise distinct elements
+/// of `{LAST_FRAME, GOLDEN_FRAME, ALTREF_FRAME}` — see the
+/// branch-coverage table in [`setup_compound_reference_mode`].
+//
+// Forward-staged: consumed by §6.4.16 / §6.4.18 / §6.5 — none of which
+// have landed yet. The `#[allow(dead_code)]` lifts the lint until
+// those consumers land.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompoundReferenceConfig {
+    /// The fixed reference frame (always one of `LAST_FRAME` /
+    /// `GOLDEN_FRAME` / `ALTREF_FRAME`).
+    pub fixed_ref: i32,
+    /// The two variable reference frames (always distinct, both in
+    /// `{LAST_FRAME, GOLDEN_FRAME, ALTREF_FRAME} \ {fixed_ref}`).
+    pub var_ref: [i32; 2],
 }
 
 #[cfg(test)]
@@ -2857,5 +3092,230 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // §6.3.18 setup_compound_reference_mode( ) tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn ref_frame_sentinels_match_section_3_enumeration() {
+        // §3 ref_frame[ ] enumeration (vp9-spec.txt lines 3990-4006):
+        // INTRA_FRAME = 0, LAST_FRAME = 1, GOLDEN_FRAME = 2,
+        // ALTREF_FRAME = 3, MAX_REF_FRAMES = 4 (spec line 470).
+        use crate::mode_info::INTRA_FRAME;
+        assert_eq!(INTRA_FRAME, 0, "§3: INTRA_FRAME must be 0");
+        assert_eq!(LAST_FRAME, 1, "§3: LAST_FRAME must be 1");
+        assert_eq!(GOLDEN_FRAME, 2, "§3: GOLDEN_FRAME must be 2");
+        assert_eq!(ALTREF_FRAME, 3, "§3: ALTREF_FRAME must be 3");
+        assert_eq!(MAX_REF_FRAMES, 4, "§3: MAX_REF_FRAMES must be 4");
+        // Every inter ref-frame index must be > INTRA_FRAME (the §3
+        // enumeration is monotonic). Pinned at compile time via a
+        // `const { assert!(..) }` block — these are compile-time
+        // constants, so the lint rejects a plain `assert!`.
+        const _: () = assert!(LAST_FRAME > INTRA_FRAME);
+        const _: () = assert!(GOLDEN_FRAME > LAST_FRAME);
+        const _: () = assert!(ALTREF_FRAME > GOLDEN_FRAME);
+    }
+
+    #[test]
+    fn setup_compound_reference_mode_branch_1_last_equals_golden() {
+        // Branch 1 (§6.3.18 lines 2281-2285): ref_frame_sign_bias[LAST]
+        // == ref_frame_sign_bias[GOLDEN] => CompFixedRef = ALTREF_FRAME;
+        // CompVarRef = { LAST_FRAME, GOLDEN_FRAME }. ALTREF can be
+        // either 0 or 1 — branch 1 fires regardless.
+        let expected = CompoundReferenceConfig {
+            fixed_ref: ALTREF_FRAME,
+            var_ref: [LAST_FRAME, GOLDEN_FRAME],
+        };
+        for (last, golden, altref) in [(0, 0, 0), (0, 0, 1), (1, 1, 0), (1, 1, 1)] {
+            let bias = RefFrameSignBias::from_inter_biases(last, golden, altref);
+            let cfg = setup_compound_reference_mode(&bias);
+            assert_eq!(
+                cfg, expected,
+                "§6.3.18 branch 1 must fire on (LAST={last}, GOLDEN={golden}, ALTREF={altref})",
+            );
+        }
+    }
+
+    #[test]
+    fn setup_compound_reference_mode_branch_2_last_equals_altref() {
+        // Branch 2 (§6.3.18 lines 2286-2290): LAST != GOLDEN AND LAST
+        // == ALTREF => CompFixedRef = GOLDEN_FRAME; CompVarRef =
+        // { LAST_FRAME, ALTREF_FRAME }.
+        let expected = CompoundReferenceConfig {
+            fixed_ref: GOLDEN_FRAME,
+            var_ref: [LAST_FRAME, ALTREF_FRAME],
+        };
+        for (last, golden, altref) in [(0, 1, 0), (1, 0, 1)] {
+            let bias = RefFrameSignBias::from_inter_biases(last, golden, altref);
+            let cfg = setup_compound_reference_mode(&bias);
+            assert_eq!(
+                cfg, expected,
+                "§6.3.18 branch 2 must fire on (LAST={last}, GOLDEN={golden}, ALTREF={altref})",
+            );
+        }
+    }
+
+    #[test]
+    fn setup_compound_reference_mode_branch_3_last_unique() {
+        // Branch 3 (§6.3.18 lines 2291-2295): the else arm — LAST !=
+        // GOLDEN AND LAST != ALTREF (which implies GOLDEN == ALTREF
+        // since each is 0 or 1) => CompFixedRef = LAST_FRAME;
+        // CompVarRef = { GOLDEN_FRAME, ALTREF_FRAME }.
+        let expected = CompoundReferenceConfig {
+            fixed_ref: LAST_FRAME,
+            var_ref: [GOLDEN_FRAME, ALTREF_FRAME],
+        };
+        for (last, golden, altref) in [(0, 1, 1), (1, 0, 0)] {
+            let bias = RefFrameSignBias::from_inter_biases(last, golden, altref);
+            let cfg = setup_compound_reference_mode(&bias);
+            assert_eq!(
+                cfg, expected,
+                "§6.3.18 branch 3 must fire on (LAST={last}, GOLDEN={golden}, ALTREF={altref})",
+            );
+        }
+    }
+
+    #[test]
+    fn setup_compound_reference_mode_exhaustive_truth_table() {
+        // Exhaustively sweep the 2^3 = 8 sign-bias tuples and
+        // cross-check the branch-coverage table from the
+        // [`setup_compound_reference_mode`] docstring. This is the
+        // canonical proof that every input maps to exactly one of the
+        // three §6.3.18 outputs.
+        //
+        // Table rows: (last, golden, altref, expected_fixed,
+        // expected_var_0, expected_var_1, branch_id).
+        let truth_table = [
+            (0, 0, 0, ALTREF_FRAME, LAST_FRAME, GOLDEN_FRAME, 1),
+            (0, 0, 1, ALTREF_FRAME, LAST_FRAME, GOLDEN_FRAME, 1),
+            (0, 1, 0, GOLDEN_FRAME, LAST_FRAME, ALTREF_FRAME, 2),
+            (0, 1, 1, LAST_FRAME, GOLDEN_FRAME, ALTREF_FRAME, 3),
+            (1, 0, 0, LAST_FRAME, GOLDEN_FRAME, ALTREF_FRAME, 3),
+            (1, 0, 1, GOLDEN_FRAME, LAST_FRAME, ALTREF_FRAME, 2),
+            (1, 1, 0, ALTREF_FRAME, LAST_FRAME, GOLDEN_FRAME, 1),
+            (1, 1, 1, ALTREF_FRAME, LAST_FRAME, GOLDEN_FRAME, 1),
+        ];
+        for (last, golden, altref, exp_fixed, exp_var_0, exp_var_1, branch) in truth_table {
+            let bias = RefFrameSignBias::from_inter_biases(last, golden, altref);
+            let cfg = setup_compound_reference_mode(&bias);
+            assert_eq!(
+                cfg.fixed_ref, exp_fixed,
+                "§6.3.18 truth table: (LAST={last}, GOLDEN={golden}, ALTREF={altref}) expected branch {branch} fixed_ref={exp_fixed}",
+            );
+            assert_eq!(
+                cfg.var_ref,
+                [exp_var_0, exp_var_1],
+                "§6.3.18 truth table: (LAST={last}, GOLDEN={golden}, ALTREF={altref}) expected branch {branch} var_ref=[{exp_var_0}, {exp_var_1}]",
+            );
+        }
+    }
+
+    #[test]
+    fn setup_compound_reference_mode_branch_1_takes_precedence_when_all_agree() {
+        // The §6.3.18 if/else chain checks `LAST == GOLDEN` first
+        // (branch 1) and `LAST == ALTREF` only on the else arm
+        // (branch 2). When all three agree, the §6.3.18 listing fires
+        // branch 1 (ALTREF_FRAME is fixed), NOT branch 2 (GOLDEN_FRAME
+        // is fixed) — even though both conditions would individually
+        // match. Pin the precedence with the two all-equal tuples.
+        let bias_zeros = RefFrameSignBias::from_inter_biases(0, 0, 0);
+        let cfg_zeros = setup_compound_reference_mode(&bias_zeros);
+        assert_eq!(
+            cfg_zeros.fixed_ref, ALTREF_FRAME,
+            "branch 1 must win when LAST == GOLDEN == ALTREF == 0",
+        );
+        let bias_ones = RefFrameSignBias::from_inter_biases(1, 1, 1);
+        let cfg_ones = setup_compound_reference_mode(&bias_ones);
+        assert_eq!(
+            cfg_ones.fixed_ref, ALTREF_FRAME,
+            "branch 1 must win when LAST == GOLDEN == ALTREF == 1",
+        );
+    }
+
+    #[test]
+    fn setup_compound_reference_mode_outputs_pairwise_distinct_inter_refs() {
+        // §6.3.18 invariant: in every output, the three indices
+        // (fixed_ref, var_ref[0], var_ref[1]) are pairwise distinct
+        // and all live in {LAST_FRAME, GOLDEN_FRAME, ALTREF_FRAME} —
+        // i.e. the function permutes the three inter references into
+        // a fixed-vs-variable partition without ever collapsing them
+        // or pulling in INTRA_FRAME. Verified across all 8 §6.3.18
+        // inputs.
+        use crate::mode_info::INTRA_FRAME;
+        for last in 0u8..=1 {
+            for golden in 0u8..=1 {
+                for altref in 0u8..=1 {
+                    let bias = RefFrameSignBias::from_inter_biases(last, golden, altref);
+                    let cfg = setup_compound_reference_mode(&bias);
+                    // Pairwise distinct.
+                    assert_ne!(
+                        cfg.fixed_ref, cfg.var_ref[0],
+                        "fixed_ref == var_ref[0] on (LAST={last}, GOLDEN={golden}, ALTREF={altref})",
+                    );
+                    assert_ne!(
+                        cfg.fixed_ref, cfg.var_ref[1],
+                        "fixed_ref == var_ref[1] on (LAST={last}, GOLDEN={golden}, ALTREF={altref})",
+                    );
+                    assert_ne!(
+                        cfg.var_ref[0], cfg.var_ref[1],
+                        "var_ref[0] == var_ref[1] on (LAST={last}, GOLDEN={golden}, ALTREF={altref})",
+                    );
+                    // All three in the inter set {1, 2, 3} — never
+                    // INTRA_FRAME (0) and never out of range.
+                    for &idx in &[cfg.fixed_ref, cfg.var_ref[0], cfg.var_ref[1]] {
+                        assert!(
+                            idx > INTRA_FRAME,
+                            "output {idx} <= INTRA_FRAME on (LAST={last}, GOLDEN={golden}, ALTREF={altref})",
+                        );
+                        assert!(
+                            idx == LAST_FRAME || idx == GOLDEN_FRAME || idx == ALTREF_FRAME,
+                            "output {idx} not in inter set on (LAST={last}, GOLDEN={golden}, ALTREF={altref})",
+                        );
+                    }
+                    // Set equality: {fixed_ref, var_ref[0], var_ref[1]}
+                    // = {LAST_FRAME, GOLDEN_FRAME, ALTREF_FRAME}.
+                    let mut got = [cfg.fixed_ref, cfg.var_ref[0], cfg.var_ref[1]];
+                    got.sort_unstable();
+                    assert_eq!(
+                        got,
+                        [LAST_FRAME, GOLDEN_FRAME, ALTREF_FRAME],
+                        "output set != inter ref-frame set on (LAST={last}, GOLDEN={golden}, ALTREF={altref})",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ref_frame_sign_bias_only_populates_inter_slots() {
+        // The `RefFrameSignBias::from_inter_biases` constructor accepts
+        // only the three inter slots; the INTRA_FRAME slot is held at
+        // zero internally (§6.3.18 never reads it, and §6.2.5 only
+        // populates inter slots via the f(1) loop at line 1625).
+        use crate::mode_info::INTRA_FRAME;
+        let bias = RefFrameSignBias::from_inter_biases(1, 1, 1);
+        assert_eq!(bias.get(INTRA_FRAME), 0, "INTRA_FRAME slot must stay zero",);
+        assert_eq!(bias.get(LAST_FRAME), 1);
+        assert_eq!(bias.get(GOLDEN_FRAME), 1);
+        assert_eq!(bias.get(ALTREF_FRAME), 1);
+    }
+
+    #[test]
+    fn setup_compound_reference_mode_is_pure_compute() {
+        // §6.3.18 reads no bool-coder state; the function signature
+        // takes &RefFrameSignBias and returns CompoundReferenceConfig,
+        // with no BoolCoder parameter. This test pins that surface
+        // shape at the type level: a sweep of identical inputs always
+        // produces identical outputs (no hidden state).
+        let bias = RefFrameSignBias::from_inter_biases(0, 1, 0);
+        let cfg_a = setup_compound_reference_mode(&bias);
+        let cfg_b = setup_compound_reference_mode(&bias);
+        let cfg_c = setup_compound_reference_mode(&bias);
+        assert_eq!(cfg_a, cfg_b);
+        assert_eq!(cfg_b, cfg_c);
+        // The bias bundle is Copy, so the call doesn't consume it.
+        let _can_still_use = bias;
     }
 }

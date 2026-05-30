@@ -430,6 +430,44 @@ pub(crate) fn read_tx_size(
 /// `ref_frame[0]` for an intra-frame block.
 pub(crate) const INTRA_FRAME: i32 = 0;
 
+/// `LAST_FRAME = 1` per §3 / §7.4.12 — second entry of the §3
+/// `ref_frame[ ]` enumeration (`vp9-spec.txt` lines 3990-4006). Names
+/// the "last decoded inter frame" reference. Indexed by §6.3.18
+/// `setup_compound_reference_mode( )` against `ref_frame_sign_bias[ ]`
+/// to derive `CompFixedRef` / `CompVarRef[ ]`, by §6.4.17 `ref_frames(
+/// )` / §6.5 MV prediction, and by §8.8 loop-filter reference deltas
+/// (`loop_filter_ref_deltas[ LAST_FRAME ]`).
+pub(crate) const LAST_FRAME: i32 = 1;
+
+/// `GOLDEN_FRAME = 2` per §3 / §7.4.12 — third entry of the §3
+/// `ref_frame[ ]` enumeration (`vp9-spec.txt` lines 3990-4006). Names
+/// the "golden" long-term inter reference. Indexed by §6.3.18
+/// `setup_compound_reference_mode( )` against `ref_frame_sign_bias[ ]`
+/// to derive `CompFixedRef` / `CompVarRef[ ]`, by §6.4.17 `ref_frames(
+/// )` / §6.5 MV prediction, and by §8.8 loop-filter reference deltas
+/// (`loop_filter_ref_deltas[ GOLDEN_FRAME ]`).
+pub(crate) const GOLDEN_FRAME: i32 = 2;
+
+/// `ALTREF_FRAME = 3` per §3 / §7.4.12 — fourth and final entry of the
+/// §3 `ref_frame[ ]` enumeration (`vp9-spec.txt` lines 3990-4006).
+/// Names the "alternate" inter reference (typically a synthesized
+/// future frame in encoder layering). Indexed by §6.3.18
+/// `setup_compound_reference_mode( )` against `ref_frame_sign_bias[ ]`
+/// to derive `CompFixedRef` / `CompVarRef[ ]`, by §6.4.17 `ref_frames(
+/// )` / §6.5 MV prediction, and by §8.8 loop-filter reference deltas
+/// (`loop_filter_ref_deltas[ ALTREF_FRAME ]`).
+pub(crate) const ALTREF_FRAME: i32 = 3;
+
+/// `MAX_REF_FRAMES = 4` per §3 (`vp9-spec.txt` line 470 — "Number of
+/// values that can be derived for ref_frame"). The §3 `ref_frame[ ]`
+/// enumeration spans `INTRA_FRAME..MAX_REF_FRAMES - 1` (inclusive),
+/// i.e. the four values `{INTRA_FRAME, LAST_FRAME, GOLDEN_FRAME,
+/// ALTREF_FRAME}`. Used by §6.2.5 to size the
+/// `ref_frame_sign_bias[ MAX_REF_FRAMES ]` array, by §6.5 to bound the
+/// MV-reference search, and by §8.8 to bound the loop-filter
+/// reference-delta walk.
+pub(crate) const MAX_REF_FRAMES: usize = 4;
+
 /// `NONE = -1` per §3 — the sentinel sentinel value assigned to
 /// `ref_frame[1]` when the block is single-reference (or intra). The
 /// §6.4.16 / §6.4.21 `isCompound` test reads `ref_frame[1] > NONE`, so

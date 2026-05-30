@@ -4,6 +4,36 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+* **Round 28: §6.3.18 `setup_compound_reference_mode( )`
+  compressed-header pure-compute leaf.** Closes the §6.3.x primitives
+  chain modulo the still-deferred §6.3.12 `frame_reference_mode( )`
+  and §6.3.16 `mv_probs( )` outer drivers:
+  * `setup_compound_reference_mode( ref_frame_sign_bias )` per §6.3.18
+    (`vp9-spec.txt` lines 2279-2296). Pure compute — no bool-coder
+    reads. Partitions the three §3 inter reference frames
+    (`LAST_FRAME`, `GOLDEN_FRAME`, `ALTREF_FRAME`) into a
+    `CompFixedRef` plus `CompVarRef[ 2 ]` pair based on the §6.2.5
+    `ref_frame_sign_bias[ ]` `f(1)` flags via the three-arm if/else
+    chain: branch 1 (`LAST == GOLDEN` => fixed = `ALTREF`); branch 2
+    (`LAST != GOLDEN AND LAST == ALTREF` => fixed = `GOLDEN`); branch
+    3 (else => fixed = `LAST`).
+  * §3 ref-frame enumeration transcribed into `mode_info.rs` alongside
+    the existing `INTRA_FRAME = 0`: `LAST_FRAME = 1`, `GOLDEN_FRAME =
+    2`, `ALTREF_FRAME = 3`, `MAX_REF_FRAMES = 4` (spec line 470).
+  * `RefFrameSignBias` newtype + `from_inter_biases(last, golden,
+    altref)` constructor enforces the §6.2.5 "inter slots only"
+    invariant; `CompoundReferenceConfig { fixed_ref, var_ref }`
+    bundles the §6.3.18 output for downstream §6.4.16 `comp_ref` /
+    §6.5 MV-reference consumption.
+  * +9 lib tests covering §3 sentinel pinning, each of the three
+    branches, exhaustive 8-tuple truth-table sweep, branch-1
+    precedence on `(0,0,0)` / `(1,1,1)`, pairwise-distinct-and-
+    permutation-of-inter-set invariant, inter-only population on
+    `RefFrameSignBias`, and pure-compute / type-level signature pin.
+  * Lib test count 382 → 391; suite total 402 → 411.
+
 ## [0.0.11](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.10...v0.0.11) - 2026-05-29
 
 ### Other

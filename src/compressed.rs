@@ -104,17 +104,21 @@
 //! `update_mv_prob( prob )` per-cell primitive. Round 28 adds the
 //! §6.3.18 `setup_compound_reference_mode( )` pure-compute leaf —
 //! closing the §6.3.x primitives chain modulo the still-deferred
-//! §6.3.12 `frame_reference_mode( )` and §6.3.16 `mv_probs( )` outer
-//! drivers. The `FrameIsIntra == 0`-gated outer-dispatch call sites
-//! are still deferred because §6.3.12 / §6.3.16 haven't landed yet.
-//! The remaining inter-only §6.3.12 / §6.3.16 syntax fires only on
-//! `FrameIsIntra == 0` and needs reference-buffer state which the
-//! header walker still rejects with `Error::Unsupported`.
+//! §6.3.16 `mv_probs( )` outer driver. Round 29 adds the §6.3.12
+//! `frame_reference_mode( )` outer driver itself — the two-`L(1)`
+//! walker that decides `reference_mode` from the §6.2.5
+//! `ref_frame_sign_bias[ ]` array and invokes §6.3.18
+//! [`setup_compound_reference_mode`] on the non-`SingleReference` arm.
+//! The `FrameIsIntra == 0`-gated outer-dispatch call sites are still
+//! deferred — §6.3.12 needs the `ref_frame_sign_bias[ ]` bundle from
+//! §6.2.5 and the §6.3.16 sweep still needs its tables, both of which
+//! depend on the inter-frame branch of the uncompressed-header walker
+//! that currently rejects inter frames with `Error::Unsupported`.
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7,
 //! `docs/video/vp9/vp9-spec.txt` §6.3.1 / §6.3.2 / §6.3.3 / §6.3.4 /
 //! §6.3.5 / §6.3.6 / §6.3.7 / §6.3.8 / §6.3.9 / §6.3.10 / §6.3.11 /
-//! §6.3.13 / §6.3.14 / §6.3.15 / §6.3.17 / §6.3.18 (the `inv_map_table`,
+//! §6.3.12 / §6.3.13 / §6.3.14 / §6.3.15 / §6.3.17 / §6.3.18 (the `inv_map_table`,
 //! `default_tx_probs`, `default_skip_prob`, `default_coef_probs`,
 //! `default_is_inter_prob`, `default_inter_mode_probs`,
 //! `default_interp_filter_probs`, `default_y_mode_probs`,
@@ -133,7 +137,7 @@ use crate::mode_info::{
     DEFAULT_COMP_REF_PROB, DEFAULT_INTERP_FILTER_PROBS, DEFAULT_INTER_MODE_PROBS,
     DEFAULT_IS_INTER_PROB, DEFAULT_SINGLE_REF_PROB, DEFAULT_Y_MODE_PROBS, GOLDEN_FRAME,
     INTERP_FILTER_CONTEXTS, INTER_MODES, INTER_MODE_CONTEXTS, INTRA_MODES, IS_INTER_CONTEXTS,
-    LAST_FRAME, MAX_REF_FRAMES, REF_CONTEXTS, SWITCHABLE_FILTERS,
+    LAST_FRAME, MAX_REF_FRAMES, REFS_PER_FRAME, REF_CONTEXTS, SWITCHABLE_FILTERS,
 };
 use crate::partition::{DEFAULT_PARTITION_PROBS, PARTITION_CONTEXTS, PARTITION_TYPES};
 use crate::Error;
@@ -1210,16 +1214,17 @@ pub(crate) fn update_mv_prob(coder: &mut BoolCoder<'_>, prob: u8) -> Result<u8, 
 /// `i32` ref-frame indices the §6.4.18 `assign_mv( )` / §6.5
 /// `find_mv_refs( )` / §6.4.19 MV-prediction sites consume.
 ///
-/// As of round 28 this entry point has no live caller — the §6.3
-/// outer dispatch invokes `setup_compound_reference_mode( )`
-/// immediately after §6.3.13 `frame_reference_mode_probs( )` and only
-/// when `FrameIsIntra == 0` AND `reference_mode != SINGLE_REFERENCE`
-/// (the compound machinery is dormant on single-reference frames).
-/// Both of those gates need the §6.3.12 `frame_reference_mode( )`
-/// decode and the §6.2.5 `ref_frame_sign_bias[ ]` derivation, which
-/// the uncompressed-header walker still rejects with
-/// `Error::Unsupported`. The function exists so that the §6.3 outer
-/// dispatch can drop in uneventfully once those dependencies land.
+/// As of round 29 the §6.3.12 [`frame_reference_mode`] driver invokes
+/// `setup_compound_reference_mode( )` from the
+/// `non_single_reference == 1` arm — i.e. on the `CompoundReference`
+/// and `ReferenceModeSelect` modes only — passing the same
+/// `&RefFrameSignBias` it received from its caller. The §6.3 outer
+/// dispatch itself, however, is still deferred: it would invoke
+/// `frame_reference_mode( )` only when `FrameIsIntra == 0` and the
+/// `ref_frame_sign_bias[ ]` array is sourced from §6.2.5, which the
+/// uncompressed-header walker still rejects with `Error::Unsupported`.
+/// The function exists so that the §6.3 outer dispatch can drop in
+/// uneventfully once that uncompressed-header dependency lands.
 //
 // Forward-staged: the §6.3 outer dispatch only routes through this
 // helper on inter frames with `reference_mode != SINGLE_REFERENCE`,
@@ -1350,6 +1355,140 @@ pub(crate) struct CompoundReferenceConfig {
     /// The two variable reference frames (always distinct, both in
     /// `{LAST_FRAME, GOLDEN_FRAME, ALTREF_FRAME} \ {fixed_ref}`).
     pub var_ref: [i32; 2],
+}
+
+/// `frame_reference_mode( )` per spec §6.3.12 ("Frame reference mode
+/// syntax" — `vp9-spec.txt` lines 2170-2191).
+///
+/// Listing reproduced verbatim:
+///
+/// ```text
+/// frame_reference_mode( ) {
+///     compoundReferenceAllowed = 0
+///     for ( i = 1; i < REFS_PER_FRAME; i++ )
+///         if ( ref_frame_sign_bias[ i + 1 ] != ref_frame_sign_bias[ 1 ] )
+///             compoundReferenceAllowed = 1
+///     if ( compoundReferenceAllowed == 1 ) {
+///         non_single_reference                                 L(1)
+///         if ( non_single_reference == 0 ) {
+///             reference_mode = SINGLE_REFERENCE
+///         } else {
+///             reference_select                                 L(1)
+///             if ( reference_select == 0 )
+///                 reference_mode = COMPOUND_REFERENCE
+///             else
+///                 reference_mode = REFERENCE_MODE_SELECT
+///             setup_compound_reference_mode( )
+///         }
+///     } else {
+///         reference_mode = SINGLE_REFERENCE
+///     }
+/// }
+/// ```
+///
+/// Two bool-coder reads at most: one `L(1)` `non_single_reference` on
+/// the `compoundReferenceAllowed == 1` arm, and on a 1 a second `L(1)`
+/// `reference_select`. The `compoundReferenceAllowed == 0` arm short-
+/// circuits to `SingleReference` with zero bool-coder reads.
+///
+/// `compoundReferenceAllowed` is the §3 condition "at least one of the
+/// two non-`LAST_FRAME` inter references has a sign bias differing
+/// from `LAST_FRAME`'s". With `REFS_PER_FRAME = 3` the loop iterates
+/// `i = 1, 2` and reads `ref_frame_sign_bias[ i + 1 ]` at indices `2`
+/// (`GOLDEN_FRAME`) and `3` (`ALTREF_FRAME`) against
+/// `ref_frame_sign_bias[ 1 ]` (`LAST_FRAME`). The allowed-vs-not split
+/// is:
+///
+/// * `LAST == GOLDEN AND LAST == ALTREF` (all-agree tuples
+///   `(0,0,0)` and `(1,1,1)`) — `compoundReferenceAllowed = 0`,
+///   forcing `SingleReference` with no bits read. The two-frame
+///   compound machinery is dormant when every inter reference points
+///   the same temporal direction.
+/// * Any other sign-bias tuple — `compoundReferenceAllowed = 1`,
+///   reading at least one `L(1)` and potentially invoking
+///   [`setup_compound_reference_mode`] on the
+///   `non_single_reference == 1` arm.
+///
+/// Branch table (the 8 possible
+/// `(ref_frame_sign_bias[LAST], ref_frame_sign_bias[GOLDEN],
+/// ref_frame_sign_bias[ALTREF])` tuples × the at-most-2 `L(1)` reads):
+///
+/// | LAST | GOLDEN | ALTREF | allowed | non_single | select | reference_mode      | invokes setup |
+/// |------|--------|--------|---------|------------|--------|---------------------|---------------|
+/// | 0    | 0      | 0      | 0       | —          | —      | SingleReference     | no            |
+/// | 0    | 0      | 1      | 1       | 0          | —      | SingleReference     | no            |
+/// | 0    | 0      | 1      | 1       | 1          | 0      | CompoundReference   | yes           |
+/// | 0    | 0      | 1      | 1       | 1          | 1      | ReferenceModeSelect | yes           |
+/// | 1    | 1      | 1      | 0       | —          | —      | SingleReference     | no            |
+///
+/// (The remaining six allowed-arm tuples follow the same `(non_single,
+/// select)` × `reference_mode` table — the only thing the sign-bias
+/// tuple changes is which of the three branches of §6.3.18
+/// [`setup_compound_reference_mode`] fires when invoked.)
+///
+/// Returns `(ReferenceMode, Option<CompoundReferenceConfig>)`:
+///
+/// * `ReferenceMode::SingleReference` — `None` for the compound
+///   config, since the §6.3.18 caller invokes only when
+///   `reference_mode != SINGLE_REFERENCE`. Fires on both the
+///   `compoundReferenceAllowed == 0` short-circuit and the
+///   `non_single_reference == 0` arm.
+/// * `ReferenceMode::CompoundReference` /
+///   `ReferenceMode::ReferenceModeSelect` — `Some(cfg)` with the
+///   §6.3.18 partition of `{LAST_FRAME, GOLDEN_FRAME, ALTREF_FRAME}`
+///   into `(CompFixedRef, CompVarRef[ 2 ])`.
+///
+/// As of round 29 this entry point has no live caller — the §6.3
+/// outer dispatch invokes `frame_reference_mode( )` only when
+/// `FrameIsIntra == 0`, and the parent `parse_compressed_header`
+/// driver doesn't yet wire any of the inter-only branch in. The
+/// `ref_frame_sign_bias[ ]` input still comes from the §6.2.5
+/// uncompressed-header walker, which currently rejects inter frames
+/// with `Error::Unsupported`. The function exists so that the §6.3
+/// outer dispatch can drop in uneventfully once those dependencies
+/// land.
+//
+// Forward-staged: the §6.3 outer dispatch invokes
+// `frame_reference_mode( )` only on `FrameIsIntra == 0` frames after
+// the §6.3.11 `read_is_inter_probs( )` sweep and before the §6.3.13
+// `frame_reference_mode_probs( )` sweep. The parent
+// `parse_compressed_header` driver doesn't yet wire any of the inter-
+// only branch in. The `#[allow(dead_code)]` lifts the lint until the
+// outer dispatch grows the inter arm.
+#[allow(dead_code)]
+pub(crate) fn frame_reference_mode(
+    coder: &mut BoolCoder<'_>,
+    ref_frame_sign_bias: &RefFrameSignBias,
+) -> Result<(ReferenceMode, Option<CompoundReferenceConfig>), Error> {
+    // `compoundReferenceAllowed = 0`; then for i in 1..REFS_PER_FRAME
+    // (i.e. i = 1, 2 with REFS_PER_FRAME = 3) set it to 1 whenever
+    // `ref_frame_sign_bias[ i + 1 ] != ref_frame_sign_bias[ 1 ]`.
+    let last_bias = ref_frame_sign_bias.get(LAST_FRAME);
+    let mut compound_reference_allowed: u8 = 0;
+    for i in 1..(REFS_PER_FRAME as i32) {
+        let probe_ref = i + 1;
+        if ref_frame_sign_bias.get(probe_ref) != last_bias {
+            compound_reference_allowed = 1;
+        }
+    }
+
+    if compound_reference_allowed == 1 {
+        let non_single_reference = coder.read_literal(1)?;
+        if non_single_reference == 0 {
+            Ok((ReferenceMode::SingleReference, None))
+        } else {
+            let reference_select = coder.read_literal(1)?;
+            let mode = if reference_select == 0 {
+                ReferenceMode::CompoundReference
+            } else {
+                ReferenceMode::ReferenceModeSelect
+            };
+            let cfg = setup_compound_reference_mode(ref_frame_sign_bias);
+            Ok((mode, Some(cfg)))
+        }
+    } else {
+        Ok((ReferenceMode::SingleReference, None))
+    }
 }
 
 #[cfg(test)]
@@ -3317,5 +3456,395 @@ mod tests {
         assert_eq!(cfg_b, cfg_c);
         // The bias bundle is Copy, so the call doesn't consume it.
         let _can_still_use = bias;
+    }
+
+    // -----------------------------------------------------------------
+    // §6.3.12 frame_reference_mode( ) tests
+    // -----------------------------------------------------------------
+
+    /// Search the small space of `[first_byte, 0x00, 0x00, 0x00, ...]`
+    /// buffers for one whose first post-marker `read_literal(1)` (i.e.
+    /// `read_bool(128)`) returns 1. The brute-force search is
+    /// deterministic and only enumerates 256 first-byte candidates; it
+    /// lets the `non_single_reference == 1` branch tests use a real
+    /// flag-1 path without quoting any external implementation's
+    /// pre-cooked buffer.
+    fn buffer_triggering_l1_one() -> [u8; 8] {
+        for fb in 0u8..=255 {
+            let bytes = [fb, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+            let Ok(mut probe) = BoolCoder::init_bool(&bytes, bytes.len()) else {
+                continue;
+            };
+            if probe.read_literal(1) == Ok(1) {
+                return bytes;
+            }
+        }
+        panic!("expected at least one first-byte choice to make read_literal(1) == 1");
+    }
+
+    /// Search the small space of `[first_byte, second_byte, 0x00, ...]`
+    /// for a buffer where both successive `read_literal(1)` calls
+    /// return 1 — used for the `non_single_reference == 1 AND
+    /// reference_select == 1` ReferenceModeSelect arm.
+    fn buffer_triggering_two_l1_ones() -> [u8; 8] {
+        for fb in 0u8..=255 {
+            for sb in 0u8..=255 {
+                let bytes = [fb, sb, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+                let Ok(mut probe) = BoolCoder::init_bool(&bytes, bytes.len()) else {
+                    continue;
+                };
+                if probe.read_literal(1) != Ok(1) {
+                    continue;
+                }
+                if probe.read_literal(1) == Ok(1) {
+                    return bytes;
+                }
+            }
+        }
+        panic!("expected some (first_byte, second_byte) pair to yield L(1)=1 followed by L(1)=1");
+    }
+
+    /// Search for a buffer where `read_literal(1)` returns 1 then
+    /// `read_literal(1)` returns 0 — the `non_single_reference == 1
+    /// AND reference_select == 0` CompoundReference arm.
+    fn buffer_triggering_l1_one_then_l1_zero() -> [u8; 8] {
+        for fb in 0u8..=255 {
+            for sb in 0u8..=255 {
+                let bytes = [fb, sb, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+                let Ok(mut probe) = BoolCoder::init_bool(&bytes, bytes.len()) else {
+                    continue;
+                };
+                if probe.read_literal(1) != Ok(1) {
+                    continue;
+                }
+                if probe.read_literal(1) == Ok(0) {
+                    return bytes;
+                }
+            }
+        }
+        panic!("expected some (first_byte, second_byte) pair to yield L(1)=1 followed by L(1)=0");
+    }
+
+    #[test]
+    fn frame_reference_mode_all_agree_short_circuits_to_single() {
+        // `(LAST, GOLDEN, ALTREF)` tuples (0,0,0) and (1,1,1) — neither
+        // GOLDEN nor ALTREF differ from LAST, so
+        // `compoundReferenceAllowed = 0` and the spec hardwires
+        // `reference_mode = SINGLE_REFERENCE` with zero bool-coder
+        // reads. Use the smallest non-zero buffer that init_bool will
+        // accept; the function must not consume any of it.
+        let bytes = [0x00u8; 4];
+        for tuple in [(0u8, 0u8, 0u8), (1, 1, 1)] {
+            let bias = RefFrameSignBias::from_inter_biases(tuple.0, tuple.1, tuple.2);
+            let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+            let (mode, cfg) = frame_reference_mode(&mut dec, &bias).unwrap();
+            assert_eq!(
+                mode,
+                ReferenceMode::SingleReference,
+                "all-agree tuple {tuple:?} must force SingleReference",
+            );
+            assert!(
+                cfg.is_none(),
+                "all-agree tuple {tuple:?} must skip setup_compound_reference_mode",
+            );
+        }
+    }
+
+    #[test]
+    fn frame_reference_mode_all_agree_consumes_zero_bool_reads() {
+        // On the `compoundReferenceAllowed == 0` arm the function reads
+        // no bits. A parallel coder that has only stepped past the
+        // §9.2.1 marker must agree on the very next `read_literal(1)`
+        // with the post-`frame_reference_mode` cursor.
+        let bytes = [0x00u8; 4];
+        for tuple in [(0u8, 0u8, 0u8), (1, 1, 1)] {
+            let bias = RefFrameSignBias::from_inter_biases(tuple.0, tuple.1, tuple.2);
+            let ref_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+            let mut test_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+            let _ = frame_reference_mode(&mut test_dec, &bias).unwrap();
+            let mut ref_dec_mut = ref_dec;
+            assert_eq!(
+                ref_dec_mut.read_literal(1).unwrap(),
+                test_dec.read_literal(1).unwrap(),
+                "tuple {tuple:?}: cursor must agree after a zero-read short-circuit",
+            );
+        }
+    }
+
+    #[test]
+    fn frame_reference_mode_six_allowed_tuples_read_at_least_one_bit() {
+        // The six non-all-agree tuples set `compoundReferenceAllowed =
+        // 1` and read at least the `L(1) non_single_reference` flag. A
+        // zero buffer makes that flag 0 => SingleReference, but the
+        // cursor must advance by exactly one L(1) read.
+        let bytes = [0x00u8; 4];
+        for last in [0u8, 1] {
+            for golden in [0u8, 1] {
+                for altref in [0u8, 1] {
+                    // Skip the two all-agree tuples handled above.
+                    if last == golden && golden == altref {
+                        continue;
+                    }
+                    let bias = RefFrameSignBias::from_inter_biases(last, golden, altref);
+                    let mut ref_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+                    let _ = ref_dec.read_literal(1).unwrap();
+                    let mut test_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+                    let (mode, cfg) = frame_reference_mode(&mut test_dec, &bias).unwrap();
+                    assert_eq!(
+                        mode,
+                        ReferenceMode::SingleReference,
+                        "tuple ({last},{golden},{altref}) with zero buffer: \
+                         L(1)=0 should yield SingleReference",
+                    );
+                    assert!(
+                        cfg.is_none(),
+                        "tuple ({last},{golden},{altref}): SingleReference arm \
+                         must not invoke setup_compound_reference_mode",
+                    );
+                    assert_eq!(
+                        ref_dec.read_literal(1).unwrap(),
+                        test_dec.read_literal(1).unwrap(),
+                        "tuple ({last},{golden},{altref}): cursor must agree \
+                         after a single L(1) read on the non_single_reference=0 arm",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frame_reference_mode_non_single_zero_then_select_zero_yields_compound() {
+        // `non_single_reference == 1 AND reference_select == 0` =>
+        // `reference_mode = COMPOUND_REFERENCE` AND
+        // setup_compound_reference_mode( ) fires.
+        let bytes = buffer_triggering_l1_one_then_l1_zero();
+        // Use an allowed-arm sign-bias tuple (e.g. (0, 1, 0)).
+        let bias = RefFrameSignBias::from_inter_biases(0, 1, 0);
+        let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let (mode, cfg) = frame_reference_mode(&mut dec, &bias).unwrap();
+        assert_eq!(
+            mode,
+            ReferenceMode::CompoundReference,
+            "L(1)=1 then L(1)=0 must select CompoundReference",
+        );
+        let cfg = cfg.expect("CompoundReference arm must produce a compound config");
+        // The same bias fed through §6.3.18 directly must match.
+        let expected = setup_compound_reference_mode(&bias);
+        assert_eq!(
+            cfg, expected,
+            "CompoundReference arm must invoke setup_compound_reference_mode",
+        );
+    }
+
+    #[test]
+    fn frame_reference_mode_non_single_one_then_select_one_yields_select() {
+        // `non_single_reference == 1 AND reference_select == 1` =>
+        // `reference_mode = REFERENCE_MODE_SELECT` AND
+        // setup_compound_reference_mode( ) fires.
+        let bytes = buffer_triggering_two_l1_ones();
+        let bias = RefFrameSignBias::from_inter_biases(0, 1, 0);
+        let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let (mode, cfg) = frame_reference_mode(&mut dec, &bias).unwrap();
+        assert_eq!(
+            mode,
+            ReferenceMode::ReferenceModeSelect,
+            "L(1)=1 then L(1)=1 must select ReferenceModeSelect",
+        );
+        let cfg = cfg.expect("ReferenceModeSelect arm must produce a compound config");
+        let expected = setup_compound_reference_mode(&bias);
+        assert_eq!(
+            cfg, expected,
+            "ReferenceModeSelect arm must invoke setup_compound_reference_mode",
+        );
+    }
+
+    #[test]
+    fn frame_reference_mode_compound_arm_consumes_two_l1_reads() {
+        // The flag-set arm reads exactly two `L(1)` bits. A parallel
+        // coder that does two `read_literal(1)` calls must agree on
+        // the next L(1) bit with the post-`frame_reference_mode`
+        // cursor.
+        let bytes = buffer_triggering_l1_one_then_l1_zero();
+        let bias = RefFrameSignBias::from_inter_biases(0, 1, 0);
+        let mut ref_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let n0 = ref_dec.read_literal(1).unwrap();
+        let r0 = ref_dec.read_literal(1).unwrap();
+        assert_eq!(n0, 1, "buffer must produce non_single_reference == 1");
+        assert_eq!(r0, 0, "buffer must produce reference_select == 0");
+        let mut test_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let _ = frame_reference_mode(&mut test_dec, &bias).unwrap();
+        assert_eq!(
+            ref_dec.read_literal(1).unwrap(),
+            test_dec.read_literal(1).unwrap(),
+            "cursor must agree after a two-L(1) flag-set walk",
+        );
+    }
+
+    #[test]
+    fn frame_reference_mode_select_arm_consumes_two_l1_reads() {
+        // Same equivalence on the ReferenceModeSelect arm.
+        let bytes = buffer_triggering_two_l1_ones();
+        let bias = RefFrameSignBias::from_inter_biases(0, 1, 0);
+        let mut ref_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let n0 = ref_dec.read_literal(1).unwrap();
+        let r0 = ref_dec.read_literal(1).unwrap();
+        assert_eq!(n0, 1);
+        assert_eq!(r0, 1);
+        let mut test_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let _ = frame_reference_mode(&mut test_dec, &bias).unwrap();
+        assert_eq!(
+            ref_dec.read_literal(1).unwrap(),
+            test_dec.read_literal(1).unwrap(),
+            "cursor must agree after a two-L(1) flag-set walk on the SELECT arm",
+        );
+    }
+
+    #[test]
+    fn frame_reference_mode_non_single_zero_arm_consumes_one_l1_read() {
+        // The `non_single_reference == 0` arm reads exactly one L(1).
+        // Use the brute-forced L(1)=1 buffer on the non_single side to
+        // get to the assertion — but use a zero buffer where the first
+        // L(1) is 0 directly to exercise the early-return arm.
+        let bytes = [0x00u8; 4];
+        let bias = RefFrameSignBias::from_inter_biases(0, 1, 0);
+        let mut ref_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let n0 = ref_dec.read_literal(1).unwrap();
+        assert_eq!(n0, 0, "zero buffer must produce non_single_reference == 0");
+        let mut test_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let _ = frame_reference_mode(&mut test_dec, &bias).unwrap();
+        assert_eq!(
+            ref_dec.read_literal(1).unwrap(),
+            test_dec.read_literal(1).unwrap(),
+            "cursor must agree after a single-L(1) non_single_reference=0 walk",
+        );
+    }
+
+    #[test]
+    fn frame_reference_mode_compound_allowed_matches_explicit_loop() {
+        // Independent re-derivation: walk the §6.3.12
+        // `compoundReferenceAllowed` loop by hand over all 8 tuples
+        // and confirm the predicate matches the actual function's
+        // bool-coder consumption profile.
+        //
+        // The predicate is `compoundReferenceAllowed == 1` iff
+        // `ref_frame_sign_bias[GOLDEN] != ref_frame_sign_bias[LAST]
+        // OR ref_frame_sign_bias[ALTREF] != ref_frame_sign_bias[LAST]`.
+        // The only tuples failing both clauses are (0,0,0) and (1,1,1).
+        let bytes = [0x00u8; 4];
+        for last in [0u8, 1] {
+            for golden in [0u8, 1] {
+                for altref in [0u8, 1] {
+                    let expected_allowed = !(golden == last && altref == last);
+                    let bias = RefFrameSignBias::from_inter_biases(last, golden, altref);
+                    let mut ref_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+                    let mut test_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+                    let _ = frame_reference_mode(&mut test_dec, &bias).unwrap();
+                    if expected_allowed {
+                        // Allowed arm with zero buffer reads one L(1).
+                        let _ = ref_dec.read_literal(1).unwrap();
+                    }
+                    assert_eq!(
+                        ref_dec.read_literal(1).unwrap(),
+                        test_dec.read_literal(1).unwrap(),
+                        "tuple ({last},{golden},{altref}) expected_allowed={expected_allowed}: \
+                         actual bool-coder consumption disagrees with the §6.3.12 \
+                         compoundReferenceAllowed loop",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frame_reference_mode_step_walk_equivalence_against_hand_listing() {
+        // Direct step-walk: re-implement the §6.3.12 listing inline
+        // (independent of the production code) and assert it produces
+        // the same `(mode, cfg)` pair on every supported sign-bias
+        // tuple × every (L(1), L(1)) buffer combination we exercise
+        // elsewhere. This is a third independent path through the
+        // spec.
+        fn listing_walk(
+            coder: &mut BoolCoder<'_>,
+            bias: &RefFrameSignBias,
+        ) -> Result<(ReferenceMode, Option<CompoundReferenceConfig>), Error> {
+            let last = bias.get(LAST_FRAME);
+            let mut allowed = false;
+            let mut i = 1i32;
+            while i < REFS_PER_FRAME as i32 {
+                if bias.get(i + 1) != last {
+                    allowed = true;
+                }
+                i += 1;
+            }
+            if !allowed {
+                return Ok((ReferenceMode::SingleReference, None));
+            }
+            let non_single = coder.read_literal(1)?;
+            if non_single == 0 {
+                return Ok((ReferenceMode::SingleReference, None));
+            }
+            let select = coder.read_literal(1)?;
+            let mode = if select == 0 {
+                ReferenceMode::CompoundReference
+            } else {
+                ReferenceMode::ReferenceModeSelect
+            };
+            Ok((mode, Some(setup_compound_reference_mode(bias))))
+        }
+        // Sign-bias tuples × buffers covering all four
+        // (allowed?, non_single, select) reachable arms.
+        let zero_buf = [0u8; 4];
+        let one_zero_buf = buffer_triggering_l1_one_then_l1_zero();
+        let one_one_buf = buffer_triggering_two_l1_ones();
+        let one_only_buf = buffer_triggering_l1_one();
+        let buffers: [&[u8]; 4] = [&zero_buf, &one_only_buf, &one_zero_buf, &one_one_buf];
+        for last in [0u8, 1] {
+            for golden in [0u8, 1] {
+                for altref in [0u8, 1] {
+                    let bias = RefFrameSignBias::from_inter_biases(last, golden, altref);
+                    for (b_idx, buf) in buffers.iter().enumerate() {
+                        let mut prod = BoolCoder::init_bool(buf, buf.len()).unwrap();
+                        let p = frame_reference_mode(&mut prod, &bias).unwrap();
+                        let mut hand = BoolCoder::init_bool(buf, buf.len()).unwrap();
+                        let h = listing_walk(&mut hand, &bias).unwrap();
+                        assert_eq!(
+                            p, h,
+                            "tuple ({last},{golden},{altref}) buf #{b_idx}: \
+                             production disagrees with hand-walked §6.3.12 listing",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn frame_reference_mode_compound_config_matches_setup_for_allowed_tuples() {
+        // For every allowed-arm sign-bias tuple, the returned
+        // CompoundReferenceConfig on the COMPOUND or SELECT arm must
+        // equal the §6.3.18 [`setup_compound_reference_mode`] output
+        // on the same bias bundle. This pins the "fed through §6.3.18
+        // verbatim" contract.
+        let bytes = buffer_triggering_l1_one_then_l1_zero();
+        for last in [0u8, 1] {
+            for golden in [0u8, 1] {
+                for altref in [0u8, 1] {
+                    if last == golden && golden == altref {
+                        continue;
+                    }
+                    let bias = RefFrameSignBias::from_inter_biases(last, golden, altref);
+                    let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+                    let (mode, cfg) = frame_reference_mode(&mut dec, &bias).unwrap();
+                    assert_eq!(mode, ReferenceMode::CompoundReference);
+                    let expected = setup_compound_reference_mode(&bias);
+                    assert_eq!(
+                        cfg.unwrap(),
+                        expected,
+                        "tuple ({last},{golden},{altref}): compound config must \
+                         match §6.3.18 verbatim",
+                    );
+                }
+            }
+        }
     }
 }

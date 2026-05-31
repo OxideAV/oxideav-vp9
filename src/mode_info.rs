@@ -468,6 +468,17 @@ pub(crate) const ALTREF_FRAME: i32 = 3;
 /// reference-delta walk.
 pub(crate) const MAX_REF_FRAMES: usize = 4;
 
+/// `REFS_PER_FRAME = 3` per §3 (`vp9-spec.txt` line 457 — "Each inter
+/// frame can use up to 3 frames for reference"). Bounds the §6.3.12
+/// `frame_reference_mode( )` `compound_reference_allowed` loop
+/// `for ( i = 1; i < REFS_PER_FRAME; i++ )` — two iterations comparing
+/// `ref_frame_sign_bias[ GOLDEN_FRAME ]` and `ref_frame_sign_bias[
+/// ALTREF_FRAME ]` against `ref_frame_sign_bias[ LAST_FRAME ]`. Also
+/// names the size of the per-inter-frame active reference set
+/// `{LAST_FRAME, GOLDEN_FRAME, ALTREF_FRAME}` excluding the `INTRA_FRAME`
+/// sentinel — three of the four `MAX_REF_FRAMES` slots.
+pub(crate) const REFS_PER_FRAME: usize = 3;
+
 /// `NONE = -1` per §3 — the sentinel sentinel value assigned to
 /// `ref_frame[1]` when the block is single-reference (or intra). The
 /// §6.4.16 / §6.4.21 `isCompound` test reads `ref_frame[1] > NONE`, so

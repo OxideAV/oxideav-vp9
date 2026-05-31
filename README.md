@@ -3,6 +3,73 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-06-01 (round 29)
+
+**Round 29: §6.3.12 `frame_reference_mode( )` compressed-header outer
+driver.** Round 29 lands the two-`L(1)` outer driver that gates the
+§6.3.18 [`setup_compound_reference_mode`] caller and decides the
+frame-level `reference_mode` from the §6.2.5
+`ref_frame_sign_bias[ ]` array — closing the §6.3.x driver chain
+modulo §6.3.16 `mv_probs( )`:
+
+* `frame_reference_mode( coder, ref_frame_sign_bias )` per §6.3.12
+  (`vp9-spec.txt` lines 2170-2191). Computes
+  `compoundReferenceAllowed` from the §3 loop
+  `for ( i = 1; i < REFS_PER_FRAME; i++ ) if (
+  ref_frame_sign_bias[ i + 1 ] != ref_frame_sign_bias[ 1 ] )`. With
+  `REFS_PER_FRAME = 3` the loop iterates `i = 1, 2` and compares
+  `ref_frame_sign_bias[ GOLDEN_FRAME = 2 ]` and
+  `ref_frame_sign_bias[ ALTREF_FRAME = 3 ]` against
+  `ref_frame_sign_bias[ LAST_FRAME = 1 ]`. The all-agree sign-bias
+  tuples `(0, 0, 0)` and `(1, 1, 1)` short-circuit to
+  `SingleReference` with zero bool-coder reads; the other six
+  tuples enter the compound-allowed arm.
+* On the allowed arm: `L(1) non_single_reference`. On 0 →
+  `SingleReference` (one bit consumed total). On 1 → `L(1)
+  reference_select`; 0 → `CompoundReference`, 1 →
+  `ReferenceModeSelect`. Both 1-arms invoke the §6.3.18
+  [`setup_compound_reference_mode`] partitioner.
+* `REFS_PER_FRAME = 3` constant transcribed verbatim from §3
+  (`vp9-spec.txt` line 457) into `mode_info.rs`.
+* Returns `(ReferenceMode, Option<CompoundReferenceConfig>)`:
+  `SingleReference` → `None` (no compound machinery active);
+  `CompoundReference` / `ReferenceModeSelect` → `Some(cfg)` with the
+  §6.3.18 partition of `{LAST, GOLDEN, ALTREF}` into
+  `(CompFixedRef, CompVarRef[ 2 ])` directly consumable by §6.4.16
+  `inter_block_mode_info( )` `comp_ref` per-block decode and §6.5
+  MV-reference search.
+
+Validation (+11 lib tests, lib total 391 → 402; suite total 411 →
+422) covers: the all-agree short-circuit on `(0, 0, 0)` and
+`(1, 1, 1)` (no compound config, no bool-coder reads); a cursor-
+equivalence proof that the all-agree arm consumes exactly zero
+`L(1)` reads against a parallel-coder walker; the six
+compound-allowed tuples reading exactly one `L(1)` on the
+`non_single_reference == 0` zero-buffer path (SingleReference with
+no compound config); brute-forced 16-bit prefix-space searches for
+buffers producing `(L(1)=1, L(1)=0)` and `(L(1)=1, L(1)=1)` to
+exercise the CompoundReference and ReferenceModeSelect arms;
+cursor-equivalence proofs that each two-`L(1)` arm consumes exactly
+two bool-coder reads; a cross-check confirming the returned
+`CompoundReferenceConfig` matches the §6.3.18
+[`setup_compound_reference_mode`] output on the same bias bundle;
+an exhaustive 8-tuple allowed-vs-not predicate match against the
+inline §6.3.12 loop; and a step-walk equivalence asserting the
+production code matches an independently re-derived listing walker
+across all 32 (sign-bias × buffer) combinations.
+
+Out of scope for round 29: wiring `frame_reference_mode( )` into
+the `parse_compressed_header` outer dispatch — the call site is
+gated on `FrameIsIntra == 0` and needs the
+`ref_frame_sign_bias[ ]` array sourced from §6.2.5, which the
+uncompressed-header walker still rejects with `Error::Unsupported`.
+The round-29 surface stays internal-only (`pub(crate)` with
+`#[allow(dead_code)]` on the function); the public API still
+exposes `parse_uncompressed_header`, `parse_compressed_header` and
+their result types exclusively. §6.3.16 `mv_probs( )` remains
+deferred (needs §3 MV constants + §10.5 default MV tables + the
+`allow_high_precision_mv` flag from §6.2.5).
+
 ## Status — 2026-05-31 (round 28)
 
 **Round 28: §6.3.18 `setup_compound_reference_mode( )` compressed-header

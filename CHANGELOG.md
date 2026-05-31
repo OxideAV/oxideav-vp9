@@ -6,6 +6,40 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 29: §6.3.12 `frame_reference_mode( )` compressed-header
+  outer driver.** Two-`L(1)` walker that gates the §6.3.18
+  [`setup_compound_reference_mode`] caller and decides the frame-
+  level `reference_mode`:
+  * `frame_reference_mode( coder, ref_frame_sign_bias )` per §6.3.12
+    (`vp9-spec.txt` lines 2170-2191). Computes
+    `compoundReferenceAllowed` via the §3 loop
+    `for ( i = 1; i < REFS_PER_FRAME; i++ )` against
+    `ref_frame_sign_bias[ 1 ]` (`LAST_FRAME`). All-agree sign-bias
+    tuples `(0, 0, 0)` / `(1, 1, 1)` short-circuit to
+    `SingleReference` with zero bool-coder reads; other six tuples
+    read `L(1) non_single_reference` and, on 1, `L(1)
+    reference_select` then invoke §6.3.18
+    [`setup_compound_reference_mode`].
+  * Returns `(ReferenceMode, Option<CompoundReferenceConfig>)`:
+    `SingleReference` arms return `None`; `CompoundReference` and
+    `ReferenceModeSelect` arms return the §6.3.18 partition of
+    `{LAST_FRAME, GOLDEN_FRAME, ALTREF_FRAME}` into
+    `(CompFixedRef, CompVarRef[ 2 ])`.
+  * `REFS_PER_FRAME = 3` constant transcribed from §3
+    (`vp9-spec.txt` line 457) into `mode_info.rs`.
+  * +11 lib tests covering: all-agree short-circuit on `(0,0,0)` /
+    `(1,1,1)`, zero-bool-read cursor proof; the six allowed tuples'
+    one-`L(1)` SingleReference path with cursor-equivalence;
+    brute-forced 16-bit prefix-space searches for `(L(1)=1, L(1)=0)`
+    CompoundReference and `(L(1)=1, L(1)=1)` ReferenceModeSelect
+    buffers; two-`L(1)` cursor-equivalence proofs on each compound
+    arm; cross-check that the returned CompoundReferenceConfig
+    matches §6.3.18 directly; exhaustive 8-tuple allowed-vs-not
+    predicate match against the inline §6.3.12 loop; step-walk
+    equivalence between production code and a re-derived listing
+    walker across all 32 (sign-bias × buffer) combinations.
+  * Lib test count 391 → 402; suite total 411 → 422.
+
 * **Round 28: §6.3.18 `setup_compound_reference_mode( )`
   compressed-header pure-compute leaf.** Closes the §6.3.x primitives
   chain modulo the still-deferred §6.3.12 `frame_reference_mode( )`

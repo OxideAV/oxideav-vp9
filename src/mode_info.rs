@@ -1758,6 +1758,110 @@ pub(crate) const DEFAULT_COMP_REF_PROB: [u8; REF_CONTEXTS] = [50, 126, 123, 221,
 pub(crate) const DEFAULT_SINGLE_REF_PROB: [[u8; 2]; REF_CONTEXTS] =
     [[33, 16], [77, 74], [142, 142], [172, 170], [238, 247]];
 
+// ----- §3 / §10.5 MV-probability constants (consumed by §6.3.16 mv_probs sweep) -----
+
+/// `MV_JOINTS = 4` per spec §3 (`vp9-spec.txt` line 508 — "Number of
+/// values for `mv_joint`"). The §6.3.16 outer loop walks
+/// `j ∈ [0, MV_JOINTS - 1)`, so the `mv_joint_probs[ ]` slot count is
+/// `MV_JOINTS - 1 = 3`. The §6.5 `mv_joint` tree decode produces one
+/// of four values: `MV_JOINT_ZERO`, `MV_JOINT_HNZVZ`, `MV_JOINT_HZVNZ`,
+/// `MV_JOINT_HNZVNZ` (signalling which of the (h, v) MV components is
+/// nonzero).
+pub(crate) const MV_JOINTS: usize = 4;
+
+/// `MV_CLASSES = 11` per spec §3 (`vp9-spec.txt` line 509 — "Number of
+/// values for `mv_class`"). Per-component class count: `CLASS0`,
+/// `CLASS1`, …, `CLASS10`. The §6.3.16 inner loop walks
+/// `j ∈ [0, MV_CLASSES - 1)`, so the per-component class-prob count
+/// is `MV_CLASSES - 1 = 10`. The §6.5 MV-magnitude decoder ranks the
+/// magnitude into one of these classes before reading the offset bits.
+pub(crate) const MV_CLASSES: usize = 11;
+
+/// `CLASS0_SIZE = 2` per spec §3 (`vp9-spec.txt` line 510 — "Number of
+/// values for `mv_class0_bit`"). The smallest MV-magnitude class
+/// (`CLASS0`) splits into `CLASS0_SIZE` sub-bins, each producing a
+/// dedicated `mv_class0_fr_probs` row swept by §6.3.16.
+pub(crate) const CLASS0_SIZE: usize = 2;
+
+/// `MV_OFFSET_BITS = 10` per spec §3 (`vp9-spec.txt` line 511 —
+/// "Maximum number of bits for decoding motion vectors"). Per-component
+/// bit count for the offset-bits sweep: 10 cells. Bounds the §6.5
+/// `mv_bits[ ]` walker that fills the magnitude bits below the class
+/// boundary.
+pub(crate) const MV_OFFSET_BITS: usize = 10;
+
+/// `MV_FR_SIZE = 4` per spec §3 (`vp9-spec.txt` line 458 — "Number of
+/// values that can be decoded for `mv_fr`"). The §6.3.16 inner loop
+/// walks `k ∈ [0, MV_FR_SIZE - 1)`, so the per-component `mv_fr_probs`
+/// slot count is `MV_FR_SIZE - 1 = 3`, and the per-component-per-class0
+/// `mv_class0_fr_probs` row count is also `MV_FR_SIZE - 1 = 3`. The §6.5
+/// `mv_fr` tree decode produces a fractional-pel offset (quarter-pel
+/// precision; eighth-pel when `allow_high_precision_mv` is set).
+pub(crate) const MV_FR_SIZE: usize = 4;
+
+/// `default_mv_joint_probs[ MV_JOINTS - 1 ]` per spec §10.5
+/// (`vp9-spec.txt` lines 7778-7780). Initial / reset values for the
+/// running `mv_joint_probs[ ]` table swept by §6.3.16 `mv_probs( )`.
+/// Transcribed verbatim from the §10.5 listing.
+pub(crate) const DEFAULT_MV_JOINT_PROBS: [u8; MV_JOINTS - 1] = [32, 64, 96];
+
+/// `default_mv_sign_prob[ 2 ]` per spec §10.5 (`vp9-spec.txt` lines
+/// 7713-7715). Initial / reset per-component MV-sign probabilities
+/// swept by §6.3.16. Two cells — one per MV component (`comp = 0` is
+/// the row component, `comp = 1` is the column component, per §6.5).
+/// Transcribed verbatim.
+pub(crate) const DEFAULT_MV_SIGN_PROB: [u8; 2] = [128, 128];
+
+/// `default_mv_class_probs[ 2 ][ MV_CLASSES - 1 ]` per spec §10.5
+/// (`vp9-spec.txt` lines 7783-7786). Initial / reset per-component
+/// MV-class probabilities swept by §6.3.16. Two components × 10 cells.
+/// Transcribed verbatim from the §10.5 listing.
+pub(crate) const DEFAULT_MV_CLASS_PROBS: [[u8; MV_CLASSES - 1]; 2] = [
+    [224, 144, 192, 168, 192, 176, 192, 198, 198, 245],
+    [216, 128, 176, 160, 176, 176, 192, 198, 198, 208],
+];
+
+/// `default_mv_class0_bit_prob[ 2 ]` per spec §10.5 (`vp9-spec.txt`
+/// lines 7724-7726). Initial / reset per-component `class0_bit`
+/// probability swept by §6.3.16. Transcribed verbatim.
+pub(crate) const DEFAULT_MV_CLASS0_BIT_PROB: [u8; 2] = [216, 208];
+
+/// `default_mv_bits_prob[ 2 ][ MV_OFFSET_BITS ]` per spec §10.5
+/// (`vp9-spec.txt` lines 7718-7721). Initial / reset per-component
+/// offset-bit probabilities (10 cells per component) swept by §6.3.16.
+/// Transcribed verbatim.
+pub(crate) const DEFAULT_MV_BITS_PROB: [[u8; MV_OFFSET_BITS]; 2] = [
+    [136, 140, 148, 160, 176, 192, 224, 234, 234, 240],
+    [136, 140, 148, 160, 176, 192, 224, 234, 234, 240],
+];
+
+/// `default_mv_class0_fr_probs[ 2 ][ CLASS0_SIZE ][ MV_FR_SIZE - 1 ]`
+/// per spec §10.5 (`vp9-spec.txt` lines 7789-7792). Initial / reset
+/// per-component-per-class0 fractional-pel probabilities (2 components
+/// × 2 sub-bins × 3 cells) swept by §6.3.16. Transcribed verbatim.
+pub(crate) const DEFAULT_MV_CLASS0_FR_PROBS: [[[u8; MV_FR_SIZE - 1]; CLASS0_SIZE]; 2] = [
+    [[128, 128, 64], [96, 112, 64]],
+    [[128, 128, 64], [96, 112, 64]],
+];
+
+/// `default_mv_fr_probs[ 2 ][ MV_FR_SIZE - 1 ]` per spec §10.5
+/// (`vp9-spec.txt` lines 7808-7811). Initial / reset per-component
+/// fractional-pel probabilities (2 components × 3 cells) swept by
+/// §6.3.16. Transcribed verbatim.
+pub(crate) const DEFAULT_MV_FR_PROBS: [[u8; MV_FR_SIZE - 1]; 2] = [[64, 96, 64], [64, 96, 64]];
+
+/// `default_mv_class0_hp_prob[ 2 ]` per spec §10.5 (`vp9-spec.txt`
+/// lines 7795-7796). Initial / reset per-component high-precision
+/// `class0_hp` probability swept by §6.3.16 only when
+/// `allow_high_precision_mv == 1`. Transcribed verbatim.
+pub(crate) const DEFAULT_MV_CLASS0_HP_PROB: [u8; 2] = [160, 160];
+
+/// `default_mv_hp_prob[ 2 ]` per spec §10.5 (`vp9-spec.txt` lines
+/// 7814-7816). Initial / reset per-component high-precision `mv_hp`
+/// probability swept by §6.3.16 only when `allow_high_precision_mv == 1`.
+/// Transcribed verbatim.
+pub(crate) const DEFAULT_MV_HP_PROB: [u8; 2] = [128, 128];
+
 /// Neighbour `RefFrames[ ][ ][ 0 ]` cells consumed by [`is_inter_context`]
 /// to compute `LeftIntra` / `AboveIntra` per §6.4.11.
 ///

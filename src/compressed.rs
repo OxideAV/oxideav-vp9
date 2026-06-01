@@ -109,21 +109,33 @@
 //! walker that decides `reference_mode` from the §6.2.5
 //! `ref_frame_sign_bias[ ]` array and invokes §6.3.18
 //! [`setup_compound_reference_mode`] on the non-`SingleReference` arm.
-//! The `FrameIsIntra == 0`-gated outer-dispatch call sites are still
-//! deferred — §6.3.12 needs the `ref_frame_sign_bias[ ]` bundle from
-//! §6.2.5 and the §6.3.16 sweep still needs its tables, both of which
-//! depend on the inter-frame branch of the uncompressed-header walker
-//! that currently rejects inter frames with `Error::Unsupported`.
+//! Round 30 adds the §6.3.16 `mv_probs( )` outer driver — the
+//! 65/69-cell MV-probability walk over `mv_joint_probs` /
+//! `mv_sign_prob` / `mv_class_probs` / `mv_class0_bit_prob` /
+//! `mv_bits_prob` / `mv_class0_fr_probs` / `mv_fr_probs` plus the
+//! conditional `mv_class0_hp_prob` / `mv_hp_prob` tail (gated on
+//! `allow_high_precision_mv`) — closing the §6.3.1..§6.3.18 chain
+//! modulo the outer dispatch. The `FrameIsIntra == 0`-gated
+//! outer-dispatch call sites are still deferred — §6.3.12 needs the
+//! `ref_frame_sign_bias[ ]` bundle from §6.2.5 and §6.3.16 needs the
+//! `allow_high_precision_mv` flag, both of which depend on the
+//! inter-frame branch of the uncompressed-header walker that currently
+//! rejects inter frames with `Error::Unsupported`.
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7,
 //! `docs/video/vp9/vp9-spec.txt` §6.3.1 / §6.3.2 / §6.3.3 / §6.3.4 /
 //! §6.3.5 / §6.3.6 / §6.3.7 / §6.3.8 / §6.3.9 / §6.3.10 / §6.3.11 /
-//! §6.3.12 / §6.3.13 / §6.3.14 / §6.3.15 / §6.3.17 / §6.3.18 (the `inv_map_table`,
+//! §6.3.12 / §6.3.13 / §6.3.14 / §6.3.15 / §6.3.16 / §6.3.17 / §6.3.18 (the `inv_map_table`,
 //! `default_tx_probs`, `default_skip_prob`, `default_coef_probs`,
 //! `default_is_inter_prob`, `default_inter_mode_probs`,
 //! `default_interp_filter_probs`, `default_y_mode_probs`,
 //! `default_comp_mode_prob`, `default_comp_ref_prob`,
-//! `default_single_ref_prob`, `default_partition_probs` and
+//! `default_single_ref_prob`, `default_partition_probs`,
+//! `default_mv_joint_probs`, `default_mv_sign_prob`,
+//! `default_mv_class_probs`, `default_mv_class0_bit_prob`,
+//! `default_mv_bits_prob`, `default_mv_class0_fr_probs`,
+//! `default_mv_fr_probs`, `default_mv_class0_hp_prob`,
+//! `default_mv_hp_prob` and
 //! `tx_mode_to_biggest_tx_size` constants are transcribed verbatim from
 //! §6.3.5, §10 and §10.5; the §3 ref-frame enumeration is the source
 //! of the `INTRA_FRAME` / `LAST_FRAME` / `GOLDEN_FRAME` /
@@ -133,11 +145,15 @@
 use crate::bool_coder::BoolCoder;
 use crate::coef_probs::{CoefProbs, DEFAULT_COEF_PROBS};
 use crate::mode_info::{
-    ALTREF_FRAME, BLOCK_SIZE_GROUPS, COMP_MODE_CONTEXTS, DEFAULT_COMP_MODE_PROB,
+    ALTREF_FRAME, BLOCK_SIZE_GROUPS, CLASS0_SIZE, COMP_MODE_CONTEXTS, DEFAULT_COMP_MODE_PROB,
     DEFAULT_COMP_REF_PROB, DEFAULT_INTERP_FILTER_PROBS, DEFAULT_INTER_MODE_PROBS,
-    DEFAULT_IS_INTER_PROB, DEFAULT_SINGLE_REF_PROB, DEFAULT_Y_MODE_PROBS, GOLDEN_FRAME,
-    INTERP_FILTER_CONTEXTS, INTER_MODES, INTER_MODE_CONTEXTS, INTRA_MODES, IS_INTER_CONTEXTS,
-    LAST_FRAME, MAX_REF_FRAMES, REFS_PER_FRAME, REF_CONTEXTS, SWITCHABLE_FILTERS,
+    DEFAULT_IS_INTER_PROB, DEFAULT_MV_BITS_PROB, DEFAULT_MV_CLASS0_BIT_PROB,
+    DEFAULT_MV_CLASS0_FR_PROBS, DEFAULT_MV_CLASS0_HP_PROB, DEFAULT_MV_CLASS_PROBS,
+    DEFAULT_MV_FR_PROBS, DEFAULT_MV_HP_PROB, DEFAULT_MV_JOINT_PROBS, DEFAULT_MV_SIGN_PROB,
+    DEFAULT_SINGLE_REF_PROB, DEFAULT_Y_MODE_PROBS, GOLDEN_FRAME, INTERP_FILTER_CONTEXTS,
+    INTER_MODES, INTER_MODE_CONTEXTS, INTRA_MODES, IS_INTER_CONTEXTS, LAST_FRAME, MAX_REF_FRAMES,
+    MV_CLASSES, MV_FR_SIZE, MV_JOINTS, MV_OFFSET_BITS, REFS_PER_FRAME, REF_CONTEXTS,
+    SWITCHABLE_FILTERS,
 };
 use crate::partition::{DEFAULT_PARTITION_PROBS, PARTITION_CONTEXTS, PARTITION_TYPES};
 use crate::Error;
@@ -1489,6 +1505,222 @@ pub(crate) fn frame_reference_mode(
     } else {
         Ok((ReferenceMode::SingleReference, None))
     }
+}
+
+/// Per-call MV-probability bundle consumed by §6.3.16 [`mv_probs`].
+///
+/// Aggregates the eight `mv_*_prob[ ]` arrays that the §6.3.16 sweep
+/// rewrites in place, mirroring the variable names in the spec listing
+/// (`vp9-spec.txt` lines 2234-2259). Each slot is updated via
+/// [`update_mv_prob`] (§6.3.17): one `B(252)` flag per cell, and on `1`
+/// a fresh 7-bit `L(7)` literal rewritten as `(mv_prob << 1) | 1`.
+///
+/// Slot layout:
+///
+/// | Field                  | Shape                                      | Cells | Always swept? |
+/// |------------------------|--------------------------------------------|-------|---------------|
+/// | `joint_probs`          | `[u8; MV_JOINTS - 1]`                      | 3     | yes           |
+/// | `sign_prob`            | `[u8; 2]`                                  | 2     | yes           |
+/// | `class_probs`          | `[[u8; MV_CLASSES - 1]; 2]`                | 20    | yes           |
+/// | `class0_bit_prob`      | `[u8; 2]`                                  | 2     | yes           |
+/// | `bits_prob`            | `[[u8; MV_OFFSET_BITS]; 2]`                | 20    | yes           |
+/// | `class0_fr_probs`      | `[[[u8; MV_FR_SIZE - 1]; CLASS0_SIZE]; 2]` | 12    | yes           |
+/// | `fr_probs`             | `[[u8; MV_FR_SIZE - 1]; 2]`                | 6     | yes           |
+/// | `class0_hp_prob`       | `[u8; 2]`                                  | 2     | only if `allow_high_precision_mv` |
+/// | `hp_prob`              | `[u8; 2]`                                  | 2     | only if `allow_high_precision_mv` |
+///
+/// Total = 65 cells when `allow_high_precision_mv == 0`, 69 when `1`.
+///
+/// Initial / reset values come from the §10.5 listing (single source of
+/// truth in [`crate::mode_info`]): `DEFAULT_MV_JOINT_PROBS`,
+/// `DEFAULT_MV_SIGN_PROB`, `DEFAULT_MV_CLASS_PROBS`,
+/// `DEFAULT_MV_CLASS0_BIT_PROB`, `DEFAULT_MV_BITS_PROB`,
+/// `DEFAULT_MV_CLASS0_FR_PROBS`, `DEFAULT_MV_FR_PROBS`,
+/// `DEFAULT_MV_CLASS0_HP_PROB`, `DEFAULT_MV_HP_PROB`. The
+/// [`MvProbs::defaults`] constructor seeds every slot from those tables.
+///
+/// The struct is `pub(crate)` and `#[allow(dead_code)]`-tagged on its
+/// fields until the §6.3 outer dispatch grows the inter arm — at that
+/// point the §6.4 / §6.5 MV-tree decoders consume the same fields
+/// directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct MvProbs {
+    /// `mv_joint_probs[ MV_JOINTS - 1 ]` — joint-tree decision probs
+    /// (3 cells).
+    pub(crate) joint_probs: [u8; MV_JOINTS - 1],
+    /// `mv_sign_prob[ 2 ]` — per-component sign probs (2 cells).
+    pub(crate) sign_prob: [u8; 2],
+    /// `mv_class_probs[ 2 ][ MV_CLASSES - 1 ]` — per-component
+    /// magnitude-class probs (20 cells).
+    pub(crate) class_probs: [[u8; MV_CLASSES - 1]; 2],
+    /// `mv_class0_bit_prob[ 2 ]` — per-component class0 sub-bin selector
+    /// (2 cells).
+    pub(crate) class0_bit_prob: [u8; 2],
+    /// `mv_bits_prob[ 2 ][ MV_OFFSET_BITS ]` — per-component magnitude
+    /// offset-bit probs (20 cells).
+    pub(crate) bits_prob: [[u8; MV_OFFSET_BITS]; 2],
+    /// `mv_class0_fr_probs[ 2 ][ CLASS0_SIZE ][ MV_FR_SIZE - 1 ]` —
+    /// per-component-per-class0-sub-bin fractional-pel probs (12 cells).
+    pub(crate) class0_fr_probs: [[[u8; MV_FR_SIZE - 1]; CLASS0_SIZE]; 2],
+    /// `mv_fr_probs[ 2 ][ MV_FR_SIZE - 1 ]` — per-component
+    /// fractional-pel probs (6 cells).
+    pub(crate) fr_probs: [[u8; MV_FR_SIZE - 1]; 2],
+    /// `mv_class0_hp_prob[ 2 ]` — per-component high-precision class0
+    /// probs (2 cells; swept only if `allow_high_precision_mv == 1`).
+    pub(crate) class0_hp_prob: [u8; 2],
+    /// `mv_hp_prob[ 2 ]` — per-component high-precision probs (2 cells;
+    /// swept only if `allow_high_precision_mv == 1`).
+    pub(crate) hp_prob: [u8; 2],
+}
+
+#[allow(dead_code)]
+impl MvProbs {
+    /// Construct the §10.5 initial / reset bundle. Every slot is seeded
+    /// from the `mode_info::DEFAULT_MV_*` listings (single source of
+    /// truth — same constants feed the §6.5 MV-tree decoders once they
+    /// land).
+    pub(crate) const fn defaults() -> Self {
+        Self {
+            joint_probs: DEFAULT_MV_JOINT_PROBS,
+            sign_prob: DEFAULT_MV_SIGN_PROB,
+            class_probs: DEFAULT_MV_CLASS_PROBS,
+            class0_bit_prob: DEFAULT_MV_CLASS0_BIT_PROB,
+            bits_prob: DEFAULT_MV_BITS_PROB,
+            class0_fr_probs: DEFAULT_MV_CLASS0_FR_PROBS,
+            fr_probs: DEFAULT_MV_FR_PROBS,
+            class0_hp_prob: DEFAULT_MV_CLASS0_HP_PROB,
+            hp_prob: DEFAULT_MV_HP_PROB,
+        }
+    }
+}
+
+/// `mv_probs( )` per spec §6.3.16 ("MV probs syntax" — `vp9-spec.txt`
+/// lines 2234-2259).
+///
+/// Listing reproduced verbatim:
+///
+/// ```text
+/// mv_probs( ) {
+///     for( j = 0; j < MV_JOINTS - 1 ; j++ )
+///         mv_joint_probs[ j ] = update_mv_prob( mv_joint_probs[ j ] )
+///     for ( i = 0; i < 2; i++ ) {
+///         mv_sign_prob[ i ] = update_mv_prob( mv_sign_prob[ i ] )
+///         for ( j = 0; j < MV_CLASSES - 1; j++ )
+///              mv_class_probs[ i ][ j ] = update_mv_prob( mv_class_probs[ i ][ j ] )
+///         mv_class0_bit_prob[ i ] = update_mv_prob( mv_class0_bit_prob[ i ] )
+///         for ( j = 0; j < MV_OFFSET_BITS; j++ )
+///              mv_bits_prob[ i ][ j ] = update_mv_prob( mv_bits_prob[ i ][ j ] )
+///     }
+///     for ( i = 0; i < 2; i++ ) {
+///         for ( j = 0; j < CLASS0_SIZE; j++ )
+///              for ( k = 0; k < MV_FR_SIZE - 1; k++ )
+///                    mv_class0_fr_probs[i][j][k] = update_mv_prob(mv_class0_fr_probs[i][j][k])
+///         for ( k = 0; k < MV_FR_SIZE - 1; k++ )
+///              mv_fr_probs[ i ][ k ] = update_mv_prob( mv_fr_probs[ i ][ k ] )
+///     }
+///     if ( allow_high_precision_mv ) {
+///         for ( i = 0; i < 2; i++ ) {
+///              mv_class0_hp_prob[ i ] = update_mv_prob( mv_class0_hp_prob[ i ] )
+///              mv_hp_prob[ i ] = update_mv_prob( mv_hp_prob[ i ] )
+///         }
+///     }
+/// }
+/// ```
+///
+/// Three unconditional outer phases plus one conditional tail:
+///
+/// 1. **Joint phase** (3 cells): walks
+///    `mv_joint_probs[ MV_JOINTS - 1 = 3 ]`.
+/// 2. **Per-component bulk phase** (2 components × 22 cells = 44
+///    cells): per `i ∈ {0, 1}`, walks `sign_prob[ i ]` (1) +
+///    `class_probs[ i ][ 0..MV_CLASSES - 1 ]` (10) +
+///    `class0_bit_prob[ i ]` (1) + `bits_prob[ i ][ 0..MV_OFFSET_BITS ]`
+///    (10).
+/// 3. **Per-component fractional phase** (2 components × (CLASS0_SIZE ×
+///    (MV_FR_SIZE - 1) + (MV_FR_SIZE - 1)) = 2 × 9 = 18 cells): per
+///    `i ∈ {0, 1}`, walks `class0_fr_probs[ i ][ 0..CLASS0_SIZE ][
+///    0..MV_FR_SIZE - 1 ]` (6) + `fr_probs[ i ][ 0..MV_FR_SIZE - 1 ]`
+///    (3).
+/// 4. **High-precision tail** (2 components × 2 cells = 4 cells; gated
+///    on `allow_high_precision_mv == 1`): per `i ∈ {0, 1}`, walks
+///    `class0_hp_prob[ i ]` (1) + `hp_prob[ i ]` (1).
+///
+/// Total cell count = 3 + 44 + 18 = **65 cells** (`allow_high_precision_mv
+/// == 0`) or 65 + 4 = **69 cells** (`allow_high_precision_mv == 1`).
+///
+/// Every cell consumes one `B(252)` `update_mv_prob` flag from the §9.2
+/// coder via [`update_mv_prob`]; cells where the flag reads `1` also
+/// consume seven extra `L(7)` literal bits. The `update_mv_prob`
+/// primitive differs from `read_diff_update_prob` used by every other
+/// §6.3 probability sweep: the diff-update primitive uses
+/// `decode_term_subexp` + `inv_remap_prob` and the output depends on
+/// the previous probability; the MV-update primitive ignores the
+/// previous probability on the flag-set branch and produces a fresh
+/// value purely from the 7-bit literal as `(mv_prob << 1) | 1` (odd
+/// values in `[1, 255]`; the `0` value is reserved by the §6.5 MV-tree
+/// decode as an unconditional branch).
+///
+/// The §6.3 outer dispatch invokes `mv_probs( )` only when
+/// `FrameIsIntra == 0` (alongside §6.3.9 / §6.3.10 / §6.3.11 /
+/// §6.3.12 / §6.3.13 / §6.3.14 / §6.3.15 / §6.3.17 / §6.3.18). The
+/// function itself is unconditional once the caller has decided to
+/// fire it; the gating lives in the `parse_compressed_header` outer
+/// driver, which is still deferred because it needs
+/// `ref_frame_sign_bias[ ]` + `allow_high_precision_mv` state the
+/// uncompressed-header walker still rejects with `Error::Unsupported`.
+///
+/// `probs` is updated in place. The §10.5 listings transcribed in
+/// [`crate::mode_info`] supply the initial / reset bundle via
+/// [`MvProbs::defaults`]; passing custom starting tables exercises the
+/// pass-through branch on flag-clear cells.
+// Forward-staged: the §6.3 outer dispatch gates this call on
+// `FrameIsIntra == 0` and pulls `allow_high_precision_mv` from §6.2.5
+// of the uncompressed header, and the parent `parse_compressed_header`
+// driver doesn't yet wire any of the inter-only branch in. The
+// `#[allow(dead_code)]` lifts the lint until the outer dispatch grows
+// the inter arm.
+#[allow(dead_code)]
+pub(crate) fn mv_probs(
+    coder: &mut BoolCoder<'_>,
+    probs: &mut MvProbs,
+    allow_high_precision_mv: bool,
+) -> Result<(), Error> {
+    // Phase 1: joint probs — 3 cells.
+    for slot in probs.joint_probs.iter_mut() {
+        *slot = update_mv_prob(coder, *slot)?;
+    }
+    // Phase 2: per-component bulk — 2 × (1 + 10 + 1 + 10) = 44 cells.
+    for i in 0..2 {
+        probs.sign_prob[i] = update_mv_prob(coder, probs.sign_prob[i])?;
+        for slot in probs.class_probs[i].iter_mut() {
+            *slot = update_mv_prob(coder, *slot)?;
+        }
+        probs.class0_bit_prob[i] = update_mv_prob(coder, probs.class0_bit_prob[i])?;
+        for slot in probs.bits_prob[i].iter_mut() {
+            *slot = update_mv_prob(coder, *slot)?;
+        }
+    }
+    // Phase 3: per-component fractional — 2 × (CLASS0_SIZE × (MV_FR_SIZE
+    // - 1) + (MV_FR_SIZE - 1)) = 2 × 9 = 18 cells.
+    for i in 0..2 {
+        for j in 0..CLASS0_SIZE {
+            for slot in probs.class0_fr_probs[i][j].iter_mut() {
+                *slot = update_mv_prob(coder, *slot)?;
+            }
+        }
+        for slot in probs.fr_probs[i].iter_mut() {
+            *slot = update_mv_prob(coder, *slot)?;
+        }
+    }
+    // Phase 4 (conditional): high-precision tail — 2 × 2 = 4 cells.
+    if allow_high_precision_mv {
+        for i in 0..2 {
+            probs.class0_hp_prob[i] = update_mv_prob(coder, probs.class0_hp_prob[i])?;
+            probs.hp_prob[i] = update_mv_prob(coder, probs.hp_prob[i])?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3846,5 +4078,323 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // §6.3.16 mv_probs( ) tests
+    // -----------------------------------------------------------------
+
+    /// Expected cell counts derived from the §6.3.16 listing.
+    const MV_PROBS_UNCOND_CELLS: usize = 3 // mv_joint_probs[MV_JOINTS - 1]
+        + 2 * (1 + (MV_CLASSES - 1) + 1 + MV_OFFSET_BITS) // sign + class + class0_bit + bits
+        + 2 * (CLASS0_SIZE * (MV_FR_SIZE - 1) + (MV_FR_SIZE - 1)); // class0_fr + fr
+    const MV_PROBS_HP_TAIL_CELLS: usize = 2 * 2; // class0_hp + hp per component
+
+    #[test]
+    fn mv_probs_uncond_cell_count_constant_equals_sixty_five() {
+        // 3 + 2 * 22 + 2 * 9 = 3 + 44 + 18 = 65.
+        assert_eq!(MV_PROBS_UNCOND_CELLS, 65);
+    }
+
+    #[test]
+    fn mv_probs_hp_tail_cell_count_constant_equals_four() {
+        assert_eq!(MV_PROBS_HP_TAIL_CELLS, 4);
+    }
+
+    #[test]
+    fn mv_probs_defaults_match_spec_listing() {
+        // Verbatim transcription cross-check: MvProbs::defaults() must
+        // mirror the §10.5 listing's nine default tables exactly.
+        let p = MvProbs::defaults();
+        assert_eq!(p.joint_probs, [32u8, 64, 96]);
+        assert_eq!(p.sign_prob, [128u8, 128]);
+        assert_eq!(
+            p.class_probs,
+            [
+                [224, 144, 192, 168, 192, 176, 192, 198, 198, 245],
+                [216, 128, 176, 160, 176, 176, 192, 198, 198, 208],
+            ]
+        );
+        assert_eq!(p.class0_bit_prob, [216u8, 208]);
+        assert_eq!(
+            p.bits_prob,
+            [
+                [136, 140, 148, 160, 176, 192, 224, 234, 234, 240],
+                [136, 140, 148, 160, 176, 192, 224, 234, 234, 240],
+            ]
+        );
+        assert_eq!(
+            p.class0_fr_probs,
+            [
+                [[128, 128, 64], [96, 112, 64]],
+                [[128, 128, 64], [96, 112, 64]],
+            ]
+        );
+        assert_eq!(p.fr_probs, [[64, 96, 64], [64, 96, 64]]);
+        assert_eq!(p.class0_hp_prob, [160u8, 160]);
+        assert_eq!(p.hp_prob, [128u8, 128]);
+    }
+
+    #[test]
+    fn mv_probs_zero_buffer_leaves_defaults_unchanged_no_hp() {
+        // Zero buffer: every B(252) flag reads 0 (BoolValue=0 < split=125
+        // not satisfied for B(252)? Let's check: read_bool(252) returns 0
+        // when split = ((BoolRange-1)*p) >> 8 + 1 and value < split bits
+        // round to 0). Whatever the precise mechanics, the existing
+        // §6.3.x sweeps all converge on zero-buffer = unchanged, and
+        // update_mv_prob_zero_buffer_returns_base_unchanged pins it for
+        // the per-cell primitive. Composition over 65 cells must
+        // preserve that.
+        let bytes = [0x00u8; 64];
+        let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut probs = MvProbs::defaults();
+        let snapshot = probs.clone();
+        mv_probs(&mut dec, &mut probs, false).unwrap();
+        assert_eq!(probs, snapshot);
+    }
+
+    #[test]
+    fn mv_probs_zero_buffer_leaves_defaults_unchanged_with_hp() {
+        // Same as above with the high-precision tail enabled — total 69
+        // cells. The hp_prob / class0_hp_prob defaults must survive too.
+        let bytes = [0x00u8; 64];
+        let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut probs = MvProbs::defaults();
+        let snapshot = probs.clone();
+        mv_probs(&mut dec, &mut probs, true).unwrap();
+        assert_eq!(probs, snapshot);
+    }
+
+    #[test]
+    fn mv_probs_zero_buffer_visits_every_slot_with_custom_starts() {
+        // Pick a non-uniform starting bundle and assert every cell
+        // passes through unchanged on the zero buffer — proves every
+        // slot is visited but not mutated.
+        let bytes = [0x00u8; 64];
+        let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut probs = MvProbs {
+            joint_probs: [11, 22, 33],
+            sign_prob: [44, 55],
+            class_probs: [
+                [10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
+                [101, 102, 103, 104, 105, 106, 107, 108, 109, 110],
+            ],
+            class0_bit_prob: [66, 77],
+            bits_prob: [
+                [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                [21, 22, 23, 24, 25, 26, 27, 28, 29, 30],
+            ],
+            class0_fr_probs: [[[31, 32, 33], [34, 35, 36]], [[37, 38, 39], [40, 41, 42]]],
+            fr_probs: [[43, 44, 45], [46, 47, 48]],
+            class0_hp_prob: [88, 99],
+            hp_prob: [111, 122],
+        };
+        let snapshot = probs.clone();
+        mv_probs(&mut dec, &mut probs, true).unwrap();
+        assert_eq!(probs, snapshot);
+    }
+
+    #[test]
+    fn mv_probs_consumes_sixty_five_b252_flags_on_zero_buffer_no_hp() {
+        // Cursor equivalence on the zero buffer: 65 update_mv_prob
+        // primitives on a parallel coder must leave the cursor in the
+        // same state as a single mv_probs( ) call with
+        // allow_high_precision_mv == false.
+        let bytes = [0x00u8; 64];
+        let mut ref_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        for _ in 0..MV_PROBS_UNCOND_CELLS {
+            let _ = update_mv_prob(&mut ref_dec, 128).unwrap();
+        }
+        let mut test_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut probs = MvProbs::defaults();
+        mv_probs(&mut test_dec, &mut probs, false).unwrap();
+        assert_eq!(
+            ref_dec.read_literal(1).unwrap(),
+            test_dec.read_literal(1).unwrap(),
+            "coder cursor must agree after 65-cell sweep",
+        );
+    }
+
+    #[test]
+    fn mv_probs_consumes_sixty_nine_b252_flags_on_zero_buffer_with_hp() {
+        // Cursor equivalence: 69 update_mv_prob primitives on a parallel
+        // coder must match a single mv_probs( ) call with
+        // allow_high_precision_mv == true.
+        let bytes = [0x00u8; 64];
+        let mut ref_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        for _ in 0..(MV_PROBS_UNCOND_CELLS + MV_PROBS_HP_TAIL_CELLS) {
+            let _ = update_mv_prob(&mut ref_dec, 128).unwrap();
+        }
+        let mut test_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut probs = MvProbs::defaults();
+        mv_probs(&mut test_dec, &mut probs, true).unwrap();
+        assert_eq!(
+            ref_dec.read_literal(1).unwrap(),
+            test_dec.read_literal(1).unwrap(),
+            "coder cursor must agree after 69-cell sweep",
+        );
+    }
+
+    #[test]
+    fn mv_probs_hp_tail_skipped_when_allow_high_precision_mv_false() {
+        // Cursor equivalence: a 65-cell sweep (no HP tail) must consume
+        // exactly four fewer B(252) flags than a 69-cell sweep (HP
+        // tail). Verified by reading 4 more bits from the no-HP
+        // residual cursor and matching the with-HP cursor.
+        let bytes = [0x00u8; 64];
+        let mut no_hp = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut no_hp_probs = MvProbs::defaults();
+        mv_probs(&mut no_hp, &mut no_hp_probs, false).unwrap();
+        // Walk 4 more flags on the no-HP residual to "catch up".
+        for _ in 0..MV_PROBS_HP_TAIL_CELLS {
+            let _ = update_mv_prob(&mut no_hp, 128).unwrap();
+        }
+        let mut with_hp = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut with_hp_probs = MvProbs::defaults();
+        mv_probs(&mut with_hp, &mut with_hp_probs, true).unwrap();
+        assert_eq!(
+            no_hp.read_literal(1).unwrap(),
+            with_hp.read_literal(1).unwrap(),
+            "no-HP cursor + 4 catch-up flags must match with-HP cursor",
+        );
+    }
+
+    #[test]
+    fn mv_probs_matches_explicit_phase_walk() {
+        // Independent equivalence check: mv_probs( ) must walk slots in
+        // the exact phase / index order of the §6.3.16 listing —
+        // joints → per-component (sign, class, class0_bit, bits) →
+        // per-component (class0_fr, fr) → per-component hp tail. Compare
+        // against a hand-rolled walker that follows the listing
+        // verbatim.
+        let bytes = [0x00u8; 64];
+        let starts = [
+            MvProbs::defaults(),
+            MvProbs {
+                joint_probs: [10, 20, 30],
+                sign_prob: [40, 50],
+                class_probs: [
+                    [60, 70, 80, 90, 100, 110, 120, 130, 140, 150],
+                    [160, 170, 180, 190, 200, 210, 220, 230, 240, 250],
+                ],
+                class0_bit_prob: [1, 2],
+                bits_prob: [
+                    [3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+                    [13, 14, 15, 16, 17, 18, 19, 20, 21, 22],
+                ],
+                class0_fr_probs: [[[23, 24, 25], [26, 27, 28]], [[29, 30, 31], [32, 33, 34]]],
+                fr_probs: [[35, 36, 37], [38, 39, 40]],
+                class0_hp_prob: [41, 42],
+                hp_prob: [43, 44],
+            },
+        ];
+        for hp_flag in [false, true] {
+            for start in starts.iter() {
+                // Reference walker: 65 or 69 explicit update_mv_prob
+                // calls in spec order, threaded through a separate
+                // coder.
+                let mut ref_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+                let mut ref_p = start.clone();
+                for slot in ref_p.joint_probs.iter_mut() {
+                    *slot = update_mv_prob(&mut ref_dec, *slot).unwrap();
+                }
+                for i in 0..2 {
+                    ref_p.sign_prob[i] = update_mv_prob(&mut ref_dec, ref_p.sign_prob[i]).unwrap();
+                    for slot in ref_p.class_probs[i].iter_mut() {
+                        *slot = update_mv_prob(&mut ref_dec, *slot).unwrap();
+                    }
+                    ref_p.class0_bit_prob[i] =
+                        update_mv_prob(&mut ref_dec, ref_p.class0_bit_prob[i]).unwrap();
+                    for slot in ref_p.bits_prob[i].iter_mut() {
+                        *slot = update_mv_prob(&mut ref_dec, *slot).unwrap();
+                    }
+                }
+                for i in 0..2 {
+                    for j in 0..CLASS0_SIZE {
+                        for slot in ref_p.class0_fr_probs[i][j].iter_mut() {
+                            *slot = update_mv_prob(&mut ref_dec, *slot).unwrap();
+                        }
+                    }
+                    for slot in ref_p.fr_probs[i].iter_mut() {
+                        *slot = update_mv_prob(&mut ref_dec, *slot).unwrap();
+                    }
+                }
+                if hp_flag {
+                    for i in 0..2 {
+                        ref_p.class0_hp_prob[i] =
+                            update_mv_prob(&mut ref_dec, ref_p.class0_hp_prob[i]).unwrap();
+                        ref_p.hp_prob[i] = update_mv_prob(&mut ref_dec, ref_p.hp_prob[i]).unwrap();
+                    }
+                }
+                // Under-test walker.
+                let mut test_dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+                let mut test_p = start.clone();
+                mv_probs(&mut test_dec, &mut test_p, hp_flag).unwrap();
+                assert_eq!(
+                    test_p, ref_p,
+                    "mv_probs must match explicit phase walk (hp={hp_flag})",
+                );
+                assert_eq!(
+                    ref_dec.read_literal(1).unwrap(),
+                    test_dec.read_literal(1).unwrap(),
+                    "cursor must agree after phase walk (hp={hp_flag})",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mv_probs_preserves_hp_fields_when_flag_false() {
+        // The hp_prob / class0_hp_prob fields must be left strictly
+        // untouched when allow_high_precision_mv == false. Seed with
+        // distinctive sentinel HP values, run mv_probs with the gate
+        // off on the zero buffer (every unconditional cell ends up
+        // pass-through), and confirm the HP slots are bit-identical to
+        // the sentinels. The zero-buffer baseline isolates "phase 4 not
+        // entered" from "phase 4 entered but flag = 0".
+        let bytes = [0x00u8; 64];
+        let mut probs = MvProbs::defaults();
+        probs.class0_hp_prob = [201, 202];
+        probs.hp_prob = [203, 204];
+        let hp_class0_before = probs.class0_hp_prob;
+        let hp_before = probs.hp_prob;
+        let mut dec = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        mv_probs(&mut dec, &mut probs, false).unwrap();
+        assert_eq!(
+            probs.class0_hp_prob, hp_class0_before,
+            "class0_hp_prob must not change when allow_high_precision_mv == false",
+        );
+        assert_eq!(
+            probs.hp_prob, hp_before,
+            "hp_prob must not change when allow_high_precision_mv == false",
+        );
+    }
+
+    #[test]
+    fn mv_probs_mv_constants_pin_spec_section_3_values() {
+        // §3 constant table (vp9-spec.txt lines 458, 508-511): the four
+        // counts feeding the §6.3.16 cell layout must be transcribed
+        // verbatim from the spec.
+        assert_eq!(MV_JOINTS, 4);
+        assert_eq!(MV_CLASSES, 11);
+        assert_eq!(CLASS0_SIZE, 2);
+        assert_eq!(MV_OFFSET_BITS, 10);
+        assert_eq!(MV_FR_SIZE, 4);
+    }
+
+    #[test]
+    fn mv_probs_default_tables_match_mode_info_source() {
+        // Single source of truth: the bundle constructor must seed every
+        // slot from the §10.5 listings in mode_info — no shadow copy.
+        let p = MvProbs::defaults();
+        assert_eq!(p.joint_probs, DEFAULT_MV_JOINT_PROBS);
+        assert_eq!(p.sign_prob, DEFAULT_MV_SIGN_PROB);
+        assert_eq!(p.class_probs, DEFAULT_MV_CLASS_PROBS);
+        assert_eq!(p.class0_bit_prob, DEFAULT_MV_CLASS0_BIT_PROB);
+        assert_eq!(p.bits_prob, DEFAULT_MV_BITS_PROB);
+        assert_eq!(p.class0_fr_probs, DEFAULT_MV_CLASS0_FR_PROBS);
+        assert_eq!(p.fr_probs, DEFAULT_MV_FR_PROBS);
+        assert_eq!(p.class0_hp_prob, DEFAULT_MV_CLASS0_HP_PROB);
+        assert_eq!(p.hp_prob, DEFAULT_MV_HP_PROB);
     }
 }

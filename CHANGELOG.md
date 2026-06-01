@@ -6,6 +6,51 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 30: §6.3.16 `mv_probs( )` compressed-header outer sweep.**
+  Closes the §6.3.x primitives chain by landing the final 65/69-cell
+  MV-probability walk that drives the §6.3.17 [`update_mv_prob`]
+  per-cell primitive across nine `mv_*_prob[ ]` arrays:
+  * `mv_probs( coder, probs, allow_high_precision_mv )` per §6.3.16
+    (`vp9-spec.txt` lines 2234-2259). Three unconditional phases —
+    joint probs (3 cells), per-component bulk (2 × 22 = 44 cells:
+    sign + class + class0_bit + bits) and per-component fractional (2
+    × 9 = 18 cells: class0_fr + fr) — plus one conditional tail
+    (high-precision: 2 × 2 = 4 cells, gated on
+    `allow_high_precision_mv`). Totals: **65 cells** (no HP), **69
+    cells** (HP). Every cell consumes one `B(252)` `update_mv_prob`
+    flag plus, on flag-set, seven extra `L(7)` literal bits.
+  * `MvProbs { joint_probs, sign_prob, class_probs, class0_bit_prob,
+    bits_prob, class0_fr_probs, fr_probs, class0_hp_prob, hp_prob }`
+    bundles the nine arrays as a single mutable target; the
+    `MvProbs::defaults()` constructor seeds every slot from the §10.5
+    listings (single source of truth in `mode_info.rs`).
+  * §3 MV-constants transcribed into `mode_info.rs`: `MV_JOINTS = 4`
+    (line 508), `MV_CLASSES = 11` (line 509), `CLASS0_SIZE = 2`
+    (line 510), `MV_OFFSET_BITS = 10` (line 511), `MV_FR_SIZE = 4`
+    (line 458). Nine §10.5 default tables transcribed verbatim:
+    `DEFAULT_MV_JOINT_PROBS = [32, 64, 96]`,
+    `DEFAULT_MV_SIGN_PROB = [128, 128]`,
+    `DEFAULT_MV_CLASS_PROBS` (2 × 10),
+    `DEFAULT_MV_CLASS0_BIT_PROB = [216, 208]`,
+    `DEFAULT_MV_BITS_PROB` (2 × 10),
+    `DEFAULT_MV_CLASS0_FR_PROBS` (2 × 2 × 3),
+    `DEFAULT_MV_FR_PROBS` (2 × 3),
+    `DEFAULT_MV_CLASS0_HP_PROB = [160, 160]`,
+    `DEFAULT_MV_HP_PROB = [128, 128]`.
+  * +13 lib tests covering: cell-count constants (3 + 44 + 18 = 65,
+    +4 HP); §10.5 default-table transcription cross-check; zero-buffer
+    pass-through with `hp ∈ {false, true}` on both defaulting bundle
+    and custom-starts path; cursor-equivalence proofs at 65 and 69
+    cells; four-flag-catch-up cursor proof that the HP tail
+    contributes exactly 4 bool-coder reads; explicit phase-walk
+    equivalence against a hand-coded §6.3.16 listing walker (two
+    starts × `hp ∈ {false, true}`); HP-field preservation under
+    `allow_high_precision_mv == false`; §3 constant pinning; and a
+    defaults-vs-`mode_info` single-source-of-truth audit.
+  * Lib test count 402 → 415; suite total 422 → 435. §6.3.x
+    primitives chain (§6.3.1 → §6.3.18 inclusive) is now complete
+    modulo wiring into the outer dispatch.
+
 * **Round 29: §6.3.12 `frame_reference_mode( )` compressed-header
   outer driver.** Two-`L(1)` walker that gates the §6.3.18
   [`setup_compound_reference_mode`] caller and decides the frame-

@@ -4,6 +4,14 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.11...v0.0.12) - 2026-06-01
+
+### Other
+
+- Round 30: §6.3.16 mv_probs() compressed-header outer sweep
+- Round 29: §6.3.12 frame_reference_mode() compressed-header outer driver
+- Round 28: §6.3.18 setup_compound_reference_mode() pure-compute leaf
+
 ### Added
 
 * **Round 30: §6.3.16 `mv_probs( )` compressed-header outer sweep.**

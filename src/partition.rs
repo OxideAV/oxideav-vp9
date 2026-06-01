@@ -92,7 +92,7 @@
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7
 //! (`docs/video/vp9/vp9-spec.txt` §3 / §6.4.3 / §9.3.1 / §9.3.2 / §10.2 /
-//! §10.4 / §10.5). No external library source consulted.
+//! §10.4 / §10.5).
 
 #![allow(dead_code)] // surfaces land in the next round's §6.4.3 driver
 

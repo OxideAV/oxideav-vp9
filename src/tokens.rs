@@ -37,9 +37,8 @@
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7
 //! (`docs/video/vp9/vp9-spec.txt` §6.4.24, §6.4.26, §7.4.16, §9.3,
-//! §10.2, §10.3). No external library source was consulted. Black-box
-//! validators (`vpxdec`, `ffmpeg`) remain available for whole-stream
-//! cross-checks once the residual driver lands.
+//! §10.2, §10.3). Black-box validator binaries remain available for
+//! whole-stream cross-checks once the residual driver lands.
 
 // The §6.4.21 `residual( )` driver — which will consume these
 // helpers — lands in a subsequent round. Until then the entire
@@ -791,8 +790,7 @@ mod tests {
 
     // The hand-traced golden buffers below were derived by stepping
     // the §9.2 Boolean decoder by hand against the documented
-    // `init_bool` semantics; no external library / source was
-    // consulted at any point. The `0x00` prefix produces the
+    // `init_bool` semantics. The `0x00` prefix produces the
     // post-marker state `(BoolValue=0, BoolRange=128)` from which the
     // first `read_bool(p)` decodes 0 for any `p` with split > 0
     // (i.e. any p > 0).

@@ -28,9 +28,9 @@
 //! round; this module is the pure transform layer it will call.
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7
-//! (`docs/video/vp9/vp9-spec.txt` §8.7). No external library source was
-//! consulted; the `cos64_lookup` table and the `SINPI_*_9` constants
-//! are transcribed directly from the spec §8.7.1 listings.
+//! (`docs/video/vp9/vp9-spec.txt` §8.7). The `cos64_lookup` table and
+//! the `SINPI_*_9` constants are transcribed directly from the spec
+//! §8.7.1 listings.
 
 // The §8.6.2 reconstruct process that drives these transforms lands in
 // a subsequent round; until then the module is exercised exclusively

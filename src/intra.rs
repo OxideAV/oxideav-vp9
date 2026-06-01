@@ -30,9 +30,8 @@
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7
 //! (`docs/video/vp9/vp9-spec.txt` §8.5.1, plus §3 `Round2` / `Clip1`
-//! and §7.4.5 mode numbering). No external library source was
-//! consulted; every formula is transcribed directly from the §8.5.1
-//! listing.
+//! and §7.4.5 mode numbering). Every formula is transcribed directly
+//! from the §8.5.1 listing.
 
 // The §8.6.2 reconstruct process that drives this with real
 // availability flags lands in a subsequent round; until then the

@@ -43,9 +43,8 @@
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7
 //! (`docs/video/vp9/vp9-spec.txt` §8.6.2, plus §6.4.25 `mode2txfm_map`,
-//! §6.2.9 `Lossless`, and §3 `Clip1`). No external library source was
-//! consulted; every formula is transcribed directly from the §8.6.2
-//! listing.
+//! §6.2.9 `Lossless`, and §3 `Clip1`). Every formula is transcribed
+//! directly from the §8.6.2 listing.
 
 // The §6.4.21 residual driver that calls this with real per-block state
 // lands in a subsequent round; until then the module is exercised

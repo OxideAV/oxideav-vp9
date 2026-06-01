@@ -52,8 +52,8 @@
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7
 //! (`docs/video/vp9/vp9-spec.txt` §6.4.21 / §6.4.22 / §6.4.23 / §10.2
-//! / §3 `BLOCK_SIZES`). No external library source was consulted;
-//! every formula is transcribed directly from the spec listings.
+//! / §3 `BLOCK_SIZES`). Every formula is transcribed directly from
+//! the spec listings.
 
 // Several helpers in this module are exercised exclusively from
 // `#[cfg(test)]` until the per-frame public decode path lands (the

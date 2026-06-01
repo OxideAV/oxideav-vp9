@@ -24,8 +24,7 @@
 //! shape.
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7
-//! (`docs/video/vp9/vp9-spec.txt` §10). No external library source
-//! consulted.
+//! (`docs/video/vp9/vp9-spec.txt` §10).
 
 /// Shape alias for the §10 `default_coef_probs` table.
 ///

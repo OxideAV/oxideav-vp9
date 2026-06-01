@@ -6,6 +6,51 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 30: §6.3.16 `mv_probs( )` compressed-header outer sweep.**
+  Closes the §6.3.x primitives chain by landing the final 65/69-cell
+  MV-probability walk that drives the §6.3.17 [`update_mv_prob`]
+  per-cell primitive across nine `mv_*_prob[ ]` arrays:
+  * `mv_probs( coder, probs, allow_high_precision_mv )` per §6.3.16
+    (`vp9-spec.txt` lines 2234-2259). Three unconditional phases —
+    joint probs (3 cells), per-component bulk (2 × 22 = 44 cells:
+    sign + class + class0_bit + bits) and per-component fractional (2
+    × 9 = 18 cells: class0_fr + fr) — plus one conditional tail
+    (high-precision: 2 × 2 = 4 cells, gated on
+    `allow_high_precision_mv`). Totals: **65 cells** (no HP), **69
+    cells** (HP). Every cell consumes one `B(252)` `update_mv_prob`
+    flag plus, on flag-set, seven extra `L(7)` literal bits.
+  * `MvProbs { joint_probs, sign_prob, class_probs, class0_bit_prob,
+    bits_prob, class0_fr_probs, fr_probs, class0_hp_prob, hp_prob }`
+    bundles the nine arrays as a single mutable target; the
+    `MvProbs::defaults()` constructor seeds every slot from the §10.5
+    listings (single source of truth in `mode_info.rs`).
+  * §3 MV-constants transcribed into `mode_info.rs`: `MV_JOINTS = 4`
+    (line 508), `MV_CLASSES = 11` (line 509), `CLASS0_SIZE = 2`
+    (line 510), `MV_OFFSET_BITS = 10` (line 511), `MV_FR_SIZE = 4`
+    (line 458). Nine §10.5 default tables transcribed verbatim:
+    `DEFAULT_MV_JOINT_PROBS = [32, 64, 96]`,
+    `DEFAULT_MV_SIGN_PROB = [128, 128]`,
+    `DEFAULT_MV_CLASS_PROBS` (2 × 10),
+    `DEFAULT_MV_CLASS0_BIT_PROB = [216, 208]`,
+    `DEFAULT_MV_BITS_PROB` (2 × 10),
+    `DEFAULT_MV_CLASS0_FR_PROBS` (2 × 2 × 3),
+    `DEFAULT_MV_FR_PROBS` (2 × 3),
+    `DEFAULT_MV_CLASS0_HP_PROB = [160, 160]`,
+    `DEFAULT_MV_HP_PROB = [128, 128]`.
+  * +13 lib tests covering: cell-count constants (3 + 44 + 18 = 65,
+    +4 HP); §10.5 default-table transcription cross-check; zero-buffer
+    pass-through with `hp ∈ {false, true}` on both defaulting bundle
+    and custom-starts path; cursor-equivalence proofs at 65 and 69
+    cells; four-flag-catch-up cursor proof that the HP tail
+    contributes exactly 4 bool-coder reads; explicit phase-walk
+    equivalence against a hand-coded §6.3.16 listing walker (two
+    starts × `hp ∈ {false, true}`); HP-field preservation under
+    `allow_high_precision_mv == false`; §3 constant pinning; and a
+    defaults-vs-`mode_info` single-source-of-truth audit.
+  * Lib test count 402 → 415; suite total 422 → 435. §6.3.x
+    primitives chain (§6.3.1 → §6.3.18 inclusive) is now complete
+    modulo wiring into the outer dispatch.
+
 * **Round 29: §6.3.12 `frame_reference_mode( )` compressed-header
   outer driver.** Two-`L(1)` walker that gates the §6.3.18
   [`setup_compound_reference_mode`] caller and decides the frame-
@@ -388,7 +433,7 @@ All notable changes to `oxideav-vp9` are recorded here.
     (`docs/video/vp9/vp9-spec.txt` §6.4.4 lines 2395-2437, §6.4.7 lines
     2480-2494, §6.4.12 lines 2562-2586, §6.4.14 lines 2607-2620, §7.4.1
     lines 3824-3830, §7.4.2 lines 3831-3838, §9.3.2 lines 6313-6314,
-    §10.2 line 7117). No external library source consulted.
+    §10.2 line 7117).
 
 * **Round 19: §6.4.3 recursive `decode_partition( )` driver (extending
   the crate-local `partition` module).** Composes the round-18
@@ -441,8 +486,7 @@ All notable changes to `oxideav-vp9` are recorded here.
     target `(bit, p)` sequence; the first candidate that produces
     every target bit wins. The trailing tail is zero-padded so any
     further renorm reads past the strictly-required bits resolve to
-    0. No external library / source consulted; the search loop
-    walks the §9.2.2 listing verbatim.
+    0. The search loop walks the §9.2.2 listing verbatim.
   * 8 new unit tests covering the recursive driver: a `RangeEncoder`
     roundtrip across an arbitrary 8-element `(bit, p)` sequence; a
     roundtrip with extreme probabilities (`p ∈ { 1, 128, 255 }`); a
@@ -701,7 +745,7 @@ All notable changes to `oxideav-vp9` are recorded here.
     (both ctx=0 and ctx=1 evaluated against `tx_size_context`).
     Every test consumes the §9.2 BoolCoder through valid byte
     buffers (marker-bit conformant) hand-derived by walking the
-    §9.2 listing — no external library or source was consulted.
+    §9.2 listing.
   * Out of scope this round: the §6.4.6 `intra_frame_mode_info()`
     orchestrator (which wires `read_skip` + `read_tx_size` + the
     deferred §6.4.7 `intra_segment_id` + §6.4.15
@@ -761,9 +805,9 @@ All notable changes to `oxideav-vp9` are recorded here.
     out-of-bounds block skip with intact zero context, a DC-only luma
     block at MI (1,1) lockstep against an independent `predict_intra` +
     `reconstruct_block` probe, and the `bsize = max(MiSize, BLOCK_8X8)`
-    widening for a `BLOCK_4X4` MI block. No external library / source
-    was consulted; every formula and table is transcribed directly from
-    the §6.4.21 / §6.4.22 / §6.4.23 / §10.2 listings.
+    widening for a `BLOCK_4X4` MI block. Every formula and table is
+    transcribed directly from the §6.4.21 / §6.4.22 / §6.4.23 / §10.2
+    listings.
   * The `is_inter` branch of §6.4.21 (which calls `predict_inter( )`
     before the per-block loop) is deferred until the §8.5.2 inter
     prediction process and reference-buffer state land; the per-block
@@ -811,9 +855,8 @@ All notable changes to `oxideav-vp9` are recorded here.
     `ZERO_TOKEN`-clears-`checkEob` block fill, a lockstep match against
     an independent `read_coef_token` walk, the DC non-zero-context cell
     routing, the trailing zero-fill, and the `NonzeroContext::new`
-    all-zero invariant). No external library source was consulted; the
-    band tables and every formula are transcribed directly from the
-    §6.4.24 / §9.3.2 / §10 listings. The §6.4.21 residual loop that
+    all-zero invariant). The band tables and every formula are
+    transcribed directly from the §6.4.24 / §9.3.2 / §10 listings. The §6.4.21 residual loop that
     threads `NonzeroContext` across the frame and feeds the round-11
     reconstruct driver lands in a later round; the round-13 surface is
     internal-only.
@@ -842,9 +885,8 @@ All notable changes to `oxideav-vp9` are recorded here.
     entry of each table), the §6.4.25 `txType` → table selection for
     4x4 / 8x8 / 16x16, the `TX_32X32`-always-default and
     chroma-forces-default first-half overrides, and the
-    `16 << (txSz << 1)` `segEob` length match. No external library
-    source was consulted; the tables are transcribed directly from the
-    §10.1 listing.
+    `16 << (txSz << 1)` `segEob` length match. The tables are
+    transcribed directly from the §10.1 listing.
 
 * **Round 11: §8.6.2 reconstruct driver (crate-local `reconstruct`
   module).** Ties the rounds 7-10 pieces together at the conceptual
@@ -916,9 +958,8 @@ All notable changes to `oxideav-vp9` are recorded here.
     transform sizes, the `D207_PRED` bottom-row / step-2 formulas, the
     `notOnRight`-gated upper-right `aboveRow` extension (via
     `D45_PRED`, enabled only for `txSz == 0`), and the `Min(maxX, .)`
-    plane-edge clamping of neighbour reads. No external library /
-    source was consulted; every formula is transcribed directly from
-    the spec §8.5.1 listing. The §8.6.2 reconstruct driver that
+    plane-edge clamping of neighbour reads. Every formula is
+    transcribed directly from the spec §8.5.1 listing. The §8.6.2 reconstruct driver that
     supplies the real availability flags and adds the round-9
     inverse-transformed residual to this prediction remains deferred
     to a future round; the round-10 surface is internal-only.
@@ -956,9 +997,8 @@ All notable changes to `oxideav-vp9` are recorded here.
     DCT, zero-in/zero-out for all ADST sizes, the §8.7.1.5 output
     permutation indices, and the 2D driver's zero-in/zero-out (all
     four `TxType`s, `n = 2..5`) + DC-only flat-block property (lossy
-    and lossless paths). No external library / source was consulted;
-    the `cos64_lookup` table and `SINPI_*_9` constants are
-    transcribed directly from the spec §8.7.1 listings. The §8.6.2
+    and lossless paths). The `cos64_lookup` table and `SINPI_*_9`
+    constants are transcribed directly from the spec §8.7.1 listings. The §8.6.2
     reconstruct driver that builds the `Dequant` input (round-7 token
     magnitudes scaled by the round-8 quantizers) and adds the
     residual to the prediction remains deferred to a future round.
@@ -1257,8 +1297,7 @@ All notable changes to `oxideav-vp9` are recorded here.
 * **Orphan rebuild (2026-05-20).** The crate was reset to a clean-room
   scaffold. The prior implementation contained module-level docstrings
   and inline comments whose provenance could not be defended against
-  the workspace clean-room rule (no external library source as
-  reference, not even as a sanity check). Per the workspace's
+  the workspace clean-room rule. Per the workspace's
   Implementer-Round procedure, such audit failures are unrecoverable
   via incremental cleanup and require an orphan rebuild.
 

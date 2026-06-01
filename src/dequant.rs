@@ -26,9 +26,8 @@
 //! the pure quantizer-value layer it will call.
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7
-//! (`docs/video/vp9/vp9-spec.txt` §6.4.9, §8.6.1). No external library
-//! source was consulted; the lookup tables are transcribed directly
-//! from the spec §8.6.1 listing.
+//! (`docs/video/vp9/vp9-spec.txt` §6.4.9, §8.6.1). The lookup tables
+//! are transcribed directly from the spec §8.6.1 listing.
 
 // The §8.6.2 reconstruct process that consumes these helpers lands in
 // a subsequent round; until then the module is exercised exclusively

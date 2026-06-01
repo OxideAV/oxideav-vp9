@@ -31,9 +31,9 @@
 //! `0..=1023` range of the 32x32 table.
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7
-//! (`docs/video/vp9/vp9-spec.txt` §6.4.25, §10.1). No external library
-//! source was consulted; every table is transcribed directly from the
-//! §10.1 listing and the selection logic from the §6.4.25 syntax.
+//! (`docs/video/vp9/vp9-spec.txt` §6.4.25, §10.1). Every table is
+//! transcribed directly from the §10.1 listing and the selection logic
+//! from the §6.4.25 syntax.
 
 // The §6.4.24 `tokens( )` driver that calls `get_scan` — and the
 // §6.4.21 residual loop above it — land in a subsequent round. Until

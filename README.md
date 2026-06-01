@@ -3,6 +3,77 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-06-01 (round 30)
+
+**Round 30: §6.3.16 `mv_probs( )` compressed-header outer sweep.** Round
+30 closes the §6.3.x primitives chain by landing the final outer driver
+— the 65/69-cell MV-probability walk that consumes the §6.3.17
+[`update_mv_prob`] primitive across nine `mv_*_prob[ ]` arrays:
+
+* `mv_probs( coder, probs, allow_high_precision_mv )` per §6.3.16
+  (`vp9-spec.txt` lines 2234-2259). Three unconditional phases plus
+  one conditional tail:
+  * **Phase 1 — joint probs** (3 cells): walks
+    `mv_joint_probs[ MV_JOINTS - 1 = 3 ]`.
+  * **Phase 2 — per-component bulk** (44 cells = 2 × 22): per
+    `i ∈ {0, 1}`, walks `sign_prob[ i ]` (1) +
+    `class_probs[ i ][ MV_CLASSES - 1 = 10 ]` (10) +
+    `class0_bit_prob[ i ]` (1) +
+    `bits_prob[ i ][ MV_OFFSET_BITS = 10 ]` (10).
+  * **Phase 3 — per-component fractional** (18 cells = 2 × 9): per
+    `i ∈ {0, 1}`, walks
+    `class0_fr_probs[ i ][ CLASS0_SIZE = 2 ][ MV_FR_SIZE - 1 = 3 ]`
+    (6) + `fr_probs[ i ][ MV_FR_SIZE - 1 = 3 ]` (3).
+  * **Phase 4 (conditional) — high-precision tail** (4 cells, gated on
+    `allow_high_precision_mv == 1`): per `i ∈ {0, 1}`, walks
+    `class0_hp_prob[ i ]` (1) + `hp_prob[ i ]` (1).
+
+  Total cell count = **65 cells** when `allow_high_precision_mv == 0`,
+  **69 cells** when `1`. Every cell consumes one `B(252)`
+  `update_mv_prob` flag (and seven extra `L(7)` bits on flag-set).
+
+* `MvProbs { joint_probs, sign_prob, class_probs, class0_bit_prob,
+  bits_prob, class0_fr_probs, fr_probs, class0_hp_prob, hp_prob }`
+  bundles the nine arrays as a single mutable target for the sweep;
+  `MvProbs::defaults()` seeds every slot from the §10.5 listings (the
+  newly-transcribed `DEFAULT_MV_JOINT_PROBS` /
+  `DEFAULT_MV_SIGN_PROB` / `DEFAULT_MV_CLASS_PROBS` /
+  `DEFAULT_MV_CLASS0_BIT_PROB` / `DEFAULT_MV_BITS_PROB` /
+  `DEFAULT_MV_CLASS0_FR_PROBS` / `DEFAULT_MV_FR_PROBS` /
+  `DEFAULT_MV_CLASS0_HP_PROB` / `DEFAULT_MV_HP_PROB` constants in
+  `mode_info.rs`).
+
+* §3 MV-constants transcribed verbatim into `mode_info.rs`:
+  `MV_JOINTS = 4` (line 508), `MV_CLASSES = 11` (line 509),
+  `CLASS0_SIZE = 2` (line 510), `MV_OFFSET_BITS = 10` (line 511),
+  `MV_FR_SIZE = 4` (line 458). These size the §6.5 MV-tree decoders
+  as well as the §6.3.16 sweep.
+
+Validation (+13 lib tests, lib total 402 → 415; suite total 422 →
+435) covers: cell-count constants (3 + 44 + 18 = 65 unconditional,
++4 HP tail); verbatim transcription of the nine §10.5 default
+tables against the spec listing; zero-buffer pass-through on both
+`allow_high_precision_mv ∈ {false, true}` defaulting-bundle and
+custom-starts paths; cursor-equivalence proofs that the no-HP sweep
+consumes exactly 65 `B(252)` flags and the with-HP sweep consumes
+exactly 69; a four-flag-catch-up cursor proof that the HP tail
+contributes exactly 4 cells of bool-coder delta; explicit phase-walk
+equivalence against a hand-coded §6.3.16 listing walker (two starting
+bundles × `hp ∈ {false, true}`); HP-field preservation under
+`allow_high_precision_mv == false`; §3 constant pinning; and a
+defaults-vs-`mode_info` single-source-of-truth audit.
+
+Out of scope for round 30: wiring `mv_probs( )` into the
+`parse_compressed_header` outer dispatch — the call site is gated on
+`FrameIsIntra == 0` and needs the `allow_high_precision_mv` flag from
+§6.2.5, which the uncompressed-header walker still rejects with
+`Error::Unsupported`. The round-30 surface stays internal-only
+(`pub(crate)` with `#[allow(dead_code)]` on the function + struct);
+the public API still exposes `parse_uncompressed_header`,
+`parse_compressed_header` and their result types exclusively. The
+§6.3.x primitives chain is now complete (§6.3.1 → §6.3.18 inclusive)
+modulo wiring into the outer dispatch.
+
 ## Status — 2026-06-01 (round 29)
 
 **Round 29: §6.3.12 `frame_reference_mode( )` compressed-header outer
@@ -1557,12 +1628,11 @@ remainder of the frame.
 ## Provenance
 
 Single source of truth: VP9 Bitstream & Decoding Process Specification
-v0.7 (`docs/video/vp9/vp9-spec.txt`). No external library source —
-`libvpx`, `libaom`, FFmpeg's `libavcodec/vp9*`, `dav1d`, `libgav1`,
-prior 0.0.x releases of this crate — has been consulted, quoted, or
-cross-checked. Black-box `ffmpeg` binary invocations remain
-permissible as opaque validators but are not yet wired into the test
-harness.
+v0.7 (`docs/video/vp9/vp9-spec.txt`) plus any clean-room trace material
+staged under `docs/video/vp9/`. The workspace clean-room rule applies
+in full: only material in this project's `docs/` tree informs the
+code. Black-box `ffmpeg` binary invocations remain permissible as
+opaque validators but are not yet wired into the test harness.
 
 ## Roadmap
 

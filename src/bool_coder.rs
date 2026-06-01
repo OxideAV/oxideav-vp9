@@ -12,8 +12,7 @@
 //! `read_bool( 128 )`.
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7,
-//! `docs/video/vp9/vp9-spec.txt` §9.2. No external library source
-//! consulted.
+//! `docs/video/vp9/vp9-spec.txt` §9.2.
 
 use crate::Error;
 
@@ -197,8 +196,7 @@ mod tests {
 
     // Test vectors below were derived by directly stepping the §9.2
     // decoder by hand and confirming each buffer produces the
-    // expected sequence of bits / literals. No external library
-    // (libvpx / dav1d / libgav1) was consulted at any stage.
+    // expected sequence of bits / literals.
 
     #[test]
     fn init_bool_rejects_zero_size() {

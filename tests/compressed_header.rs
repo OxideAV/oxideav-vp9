@@ -10,8 +10,7 @@
 //!     `parse_compressed_header` against the next
 //!     `header_size_in_bytes` of the buffer.
 //!
-//! No external library was consulted — the §9.2 byte vectors here
-//! are the same golden buffers verified in
+//! The §9.2 byte vectors here are the same golden buffers verified in
 //! `src/compressed.rs`'s unit tests.
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7

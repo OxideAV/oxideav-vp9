@@ -324,8 +324,7 @@
 //! ## Provenance
 //!
 //! Clean-room, single source of truth: `docs/video/vp9/vp9-spec.txt`
-//! (the v0.7 specification snapshot). No external library source was
-//! consulted.
+//! (the v0.7 specification snapshot).
 
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]

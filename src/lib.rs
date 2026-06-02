@@ -335,6 +335,7 @@ mod bitreader;
 mod bool_coder;
 mod coef_probs;
 mod compressed;
+mod decode_block;
 mod dequant;
 mod header;
 mod idct;

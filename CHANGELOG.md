@@ -6,6 +6,52 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 31: §6.4.4 `decode_block( r, c, subsize )` driver — pure-state
+  fan-out primitive.** Lands the §6.4.4 per-leaf driver as a standalone
+  book-keeping primitive that consumes the per-MI outputs of
+  `mode_info( )` and `residual( )` (decoded by the §6.4.5 / §6.4.6 /
+  §6.4.15 / §6.4.21 primitives landed in earlier rounds) and fans them
+  into the frame-wide §6.4.4 arrays at every `(r + y, c + x)` cell for
+  `y ∈ 0..num_8x8_blocks_high_lookup[ subsize ]`,
+  `x ∈ 0..num_8x8_blocks_wide_lookup[ subsize ]`.
+  * `decode_block_apply( state, r, c, subsize, result )` per §6.4.4
+    (`vp9-spec.txt` lines 2395-2437): two phases — the `skip = 1`
+    rewrite under `is_inter ∧ subsize ≥ BLOCK_8X8 ∧ EobTotal = 0`
+    (lines 2405-2407), then the `num_8x8_blocks_*_lookup[ subsize ]`
+    fan-out (lines 2408-2436) writing ten cells per `(y, x)` step
+    (`Skips` / `TxSizes` / `MiSizes` / `YModes` / `SegmentIds` /
+    `RefFrames[ 0..2 ]` + `InterpFilters` / `Mvs[ 0..2 ]` /
+    `SubMvs[ 0..2 ][ 0..4 ]` on `is_inter`, `SubModes[ 0..4 ]` on
+    `!is_inter`). Returns the rewritten `skip` value.
+  * `DecodedBlockResult { skip, tx_size, y_mode, segment_id,
+    ref_frame[ 2 ], is_inter, eob_total, interp_filter,
+    block_mvs[ 2 ][ 4 ], sub_modes[ 4 ] }` bundles the per-MI values
+    upstream §6.4.5 / §6.4.6 / §6.4.15 / §6.4.21 produce. `Default`
+    seeds `ref_frame = [INTRA_FRAME = 0, NONE = -1]` per §6.4.6
+    lines 2469-2470 (intra-block init).
+  * `Vp9FrameState { mi_cols, mi_rows, skips, tx_sizes, mi_sizes,
+    y_modes, segment_ids, ref_frames, interp_filters, mvs, sub_mvs,
+    sub_modes }` owns the `MiRows × MiCols` (× 2 / × 4 for the
+    per-`refList` / per-sub-block strides) §6.4.4 write-back arrays
+    in row-major order. Accessors return `Option<T>` for out-of-frame
+    coordinates per §7.4.3 defensive bounds.
+  * +13 lib tests covering: §6.4.4 intra-default top-left write;
+    BLOCK_8X8 single-cell write with `sub_modes` propagation;
+    BLOCK_16X16 2×2 fan-out; BLOCK_64X64 full-8×8-MI-frame fan-out;
+    the §6.4.4 `skip = 1` rewrite firing under all three preconditions
+    and the three non-firing cases (sub-8×8, `EobTotal > 0`,
+    intra block); inter-branch `Mvs` / `SubMvs` / `InterpFilters`
+    write-back; `ref_frame[ 0..2 ]` writes on both branches; §7.4.3
+    out-of-frame clip on a 32×32 block at the edge of an 8×8 MI frame;
+    `skip = 1` propagating into every cell of the fan-out; and §10.2
+    `num_8x8_blocks_*_lookup[ ]` table pinning.
+  * Lib total 415 → 428; suite total 435 → 448.
+  * Out of scope: wiring `decode_block_apply` into the §6.4.3
+    [`partition::decode_partition`] driver — the swap is mechanical
+    (the existing leaf log carries `(r, c, subsize)`) but requires a
+    frame-state allocator + per-leaf §6.4.5 `mode_info( )` invocation
+    which sits outside the §6.4.4 scope.
+
 * **Round 30: §6.3.16 `mv_probs( )` compressed-header outer sweep.**
   Closes the §6.3.x primitives chain by landing the final 65/69-cell
   MV-probability walk that drives the §6.3.17 [`update_mv_prob`]

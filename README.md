@@ -3,6 +3,74 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-06-02 (round 31)
+
+**Round 31: §6.4.4 `decode_block( r, c, subsize )` driver — pure-state
+fan-out primitive.** Round 31 lands the §6.4.4 per-leaf driver as a
+standalone book-keeping primitive that consumes the per-MI outputs of
+`mode_info( )` and `residual( )` (decoded by the §6.4.5 / §6.4.6 /
+§6.4.15 / §6.4.21 primitives landed in earlier rounds) and fans them
+into the frame-wide §6.4.4 arrays at every `(r + y, c + x)` cell for
+`y ∈ 0..num_8x8_blocks_high_lookup[ subsize ]`,
+`x ∈ 0..num_8x8_blocks_wide_lookup[ subsize ]`:
+
+* `decode_block_apply( state, r, c, subsize, result )` per §6.4.4
+  (`vp9-spec.txt` lines 2395-2437). Two phases:
+  * **Phase 1 — `skip` rewrite** (lines 2405-2407): if
+    `is_inter && subsize >= BLOCK_8X8 && EobTotal == 0` set
+    `skip = 1`. Returns the rewritten `skip` value so a §8.4
+    probability-adaption sink can consume it.
+  * **Phase 2 — fan-out** (lines 2408-2436): for each `(y, x)` step
+    of the `num_8x8_blocks_*_lookup[ subsize ]` grid, write the ten
+    cells `Skips`, `TxSizes`, `MiSizes`, `YModes`, `SegmentIds`,
+    `RefFrames[ 0..2 ]`, `InterpFilters` (inter only),
+    `Mvs[ 0..2 ]` = `BlockMvs[ refList ][ 3 ]` (inter only),
+    `SubMvs[ 0..2 ][ 0..4 ]` (inter only), and
+    `SubModes[ 0..4 ] = sub_modes[ ]` (intra only).
+* `DecodedBlockResult { skip, tx_size, y_mode, segment_id,
+  ref_frame[ 2 ], is_inter, eob_total, interp_filter,
+  block_mvs[ 2 ][ 4 ], sub_modes[ 4 ] }` bundles the per-MI values
+  the §6.4.5 / §6.4.6 / §6.4.15 / §6.4.21 primitives produce. The
+  `Default` impl seeds `ref_frame = [INTRA_FRAME = 0, NONE = -1]` per
+  §6.4.6 lines 2469-2470 (intra-block init).
+* `Vp9FrameState { mi_cols, mi_rows, skips, tx_sizes, mi_sizes,
+  y_modes, segment_ids, ref_frames, interp_filters, mvs, sub_mvs,
+  sub_modes }` owns the `MiRows × MiCols` (and `× 2` / `× 4` for the
+  per-`refList` / per-sub-block strides) §6.4.4 write-back arrays in
+  row-major order, with `get_skip` / `get_tx_size` / `get_mi_size`
+  / `get_y_mode` / `get_segment_id` / `get_ref_frame` /
+  `get_interp_filter` / `get_mv` / `get_sub_mv` / `get_sub_mode`
+  accessors returning `Option<T>` for out-of-frame coordinates.
+
+Validation (+13 lib tests, lib total 415 → 428; suite total 435 →
+448) covers: §6.4.4 intra-default top-left-cell write (skip = 0,
+`ref_frame = [INTRA, NONE]`); §6.4.4 BLOCK_8X8 single-cell write
+with `sub_modes[ 4 ]` propagation and untouched neighbours; §6.4.4
+BLOCK_16X16 2×2 fan-out propagating `MiSize` / `y_mode` / `segment_id`
+/ `tx_size` into all four cells; §6.4.4 BLOCK_64X64 full-8×8-MI-frame
+fan-out (64 cells); §6.4.4 lines 2405-2407 `skip = 1` rewrite under
+`is_inter ∧ subsize ≥ BLOCK_8X8 ∧ EobTotal = 0`, plus all three
+non-firing cases (sub-8×8 / `EobTotal > 0` / `is_inter = 0`); inter
+branch writing `InterpFilters` + `Mvs[ refList ] = BlockMvs[ refList
+][ 3 ]` + `SubMvs[ refList ][ b ] = BlockMvs[ refList ][ b ]` (all
+16 cells of a 16x16 fan-out × 2 refLists × 4 sub-blocks); §6.4.4
+line 2416 `ref_frame[ 0..2 ]` write on both branches; §7.4.3
+out-of-frame clip on a 32×32 block straddling the edge of an 8×8
+MI frame; `skip = 1` rewrite propagating into every cell of the
+fan-out; and §10.2 `num_8x8_blocks_*_lookup[ ]` table pinning so the
+fan-out cell-counts stay anchored to the spec values.
+
+Out of scope for round 31: wiring `decode_block_apply` into the
+§6.4.3 [`partition::decode_partition`] driver — i.e. invoking it at
+every `LeafBlock` log site rather than only logging the leaf. The
+swap is mechanical (the leaf log already carries `(r, c, subsize)`)
+but requires a frame-state allocator + per-leaf §6.4.5 `mode_info( )`
+invocation which sits outside the §6.4.4 scope. The round-31 surface
+stays internal-only (`pub(crate)` with `#[allow(dead_code)]` on
+`DecodedBlockResult` / `Vp9FrameState` / `decode_block_apply`); the
+public API still exposes `parse_uncompressed_header`,
+`parse_compressed_header` and their result types exclusively.
+
 ## Status — 2026-06-01 (round 30)
 
 **Round 30: §6.3.16 `mv_probs( )` compressed-header outer sweep.** Round

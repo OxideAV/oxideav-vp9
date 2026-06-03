@@ -3,6 +3,85 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-06-03 (round 33)
+
+**Round 33: §6.4 `decode_tiles( )` outer driver — frame-level tile
+walk.** Round 33 composes the round-32 §6.4.1 / §6.4.2 primitives
+into the full `(1 << tile_rows_log2) × (1 << tile_cols_log2)` frame
+walk per `vp9-spec.txt` lines 2300-2331:
+
+* `decode_tiles( data, sz, tile_rows_log2, tile_cols_log2, mi_rows,
+  mi_cols, ctx_state, probs_kind )` per §6.4. Phases:
+  * **Phase 1 — frame reset** (line 2303): fires
+    `PartitionContextState::clear_above( )` (the §7.4.1
+    `clear_above_context( )` reset) once before any tile walks.
+  * **Phase 2 — tile-grid walk** (lines 2304-2330): iterates
+    `(tileRow, tileCol)` in row-major order across `tileRows × tileCols
+    = (1 << tile_rows_log2) × (1 << tile_cols_log2)` cells. For
+    every tile except `lastTile = (tileRow == tileRows - 1) &&
+    (tileCol == tileCols - 1)` it reads `tile_size  f(32)`
+    (big-endian) from the byte stream and runs `sz -= tile_size + 4`
+    per spec line 2311; the last tile assigns `tile_size = sz`. Per
+    tile it derives `MiRowStart` / `MiRowEnd` / `MiColStart` /
+    `MiColEnd` via the §6.4.1 helper, brackets a fresh `BoolCoder`
+    with `init_bool( tile_size ) / exit_bool( )` per §9.2.1 /
+    §9.2.3, and invokes the §6.4.2 `decode_tile( )` primitive.
+* `DecodedTile { tile_row, tile_col, mi_row_start, mi_row_end,
+  mi_col_start, mi_col_end, tile_size, leaves }` bundles the §6.4
+  listing's four `get_tile_offset( )` outputs, the per-tile byte
+  budget, and the §6.4.2 leaf log (in §6.4.3 traversal order). The
+  `Vec<DecodedTile>` output is sized exactly `tileRows * tileCols`.
+* `PartitionContextState::clear_above( )` per §7.4.1: the dual of
+  the round-32 `clear_left( )` reset, zeroes
+  `AbovePartitionContext[ ]` once per `decode_tiles( )` call. The
+  §7.4.1 note observes the canonical span is `0..Sb64Cols * 8 - 1`
+  (the array can be read past `MiCols`); callers wanting that span
+  size the strip rounded up to the next multiple of 8 at
+  `PartitionContextState::new( )`.
+
+Bitstream-error surface (with explicit test coverage): §6.4 line
+2310 underflow on the `f(32)` read raises `Error::UnexpectedEof`; a
+declared `tile_size` whose `(+ 4)` would exceed the remaining `sz`
+raises `Error::InvalidBitstream` (the spec's `sz -= tile_size + 4`
+must not underflow); a declared `tile_size` larger than the
+available byte stream raises `Error::UnexpectedEof`; per-tile
+`init_bool( )` marker-rejection or `exit_bool( )` non-zero-padding
+raises `Error::InvalidBitstream`.
+
+Validation (+13 lib tests, lib total 440 → 453; suite total 460 →
+473) covers: single-tile (`tile_rows_log2 == 0`, `tile_cols_log2 ==
+0`) frame consuming the full payload via `lastTile = true` (no
+`f(32)` prefix); §6.4 line 2303 `clear_above_context( )` zeroing a
+pre-poisoned `above[ ]` strip BEFORE any `decode_tile( )` runs;
+two-tile horizontal split reading exactly one `f(32)` prefix and
+deriving `MiColStart` / `MiColEnd` matching the §6.4.1 split at
+`(0, 8, 16)`; full 2×2 grid iterating `(0,0) → (0,1) → (1,0) →
+(1,1)` with three `f(32)` prefixes and one `lastTile`; last-tile
+explicitly skipping the `f(32)` prefix (back-to-back bodies with one
+prefix only); output `Vec<DecodedTile>` length matching `tileRows *
+tileCols` for a 1×4 strip plus contiguous `MiColEnd`/`MiColStart`
+pairs; truncated 3-byte stream raising `UnexpectedEof` at the
+`f(32)` fetch; oversized declared `tile_size = u32::MAX` raising
+`InvalidBitstream` (the spec's `sz -= tile_size + 4` arithmetic);
+truncated tile body (declared 8, supplied 6) raising
+`UnexpectedEof`; a non-zero-marker first byte (`0x80`) raising
+`InvalidBitstream` via the per-tile `init_bool( )`; 1×2 vertical
+split partitioning MI rows at `(0, 8, 16)`; the cross-axis 2×2
+invariant that consecutive tiles are contiguous within rows AND
+within columns (each row's last `MiColEnd == MiCols`, each column's
+last `MiRowEnd == MiRows`); and
+`PartitionContextState::clear_above( )` zero-strip dual to the
+round-32 `clear_left` invariant.
+
+Out of scope for round 33: wiring `decode_tiles( )` into the
+public `decode_vp9( )` entry point — the per-tile leaf log
+(`DecodedTile::leaves`) still feeds the §6.4.4 `decode_block_apply`
+driver from round 31 rather than the full §6.4.5 `mode_info( )` +
+§6.4.6 `residual( )` pipeline; the public API still exposes
+`parse_uncompressed_header`, `parse_compressed_header` and their
+result types exclusively. The round-33 surface stays internal-only
+(`pub(crate)` on `decode_tiles` / `DecodedTile`).
+
 ## Status — 2026-06-03 (round 32)
 
 **Round 32: §6.4.1 `get_tile_offset( )` + §6.4.2 `decode_tile( )` —

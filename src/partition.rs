@@ -612,6 +612,23 @@ impl PartitionContextState {
             *cell = 0;
         }
     }
+
+    /// `clear_above_context( )` per §6.4 / §7.4.1 — zeroes
+    /// `AbovePartitionContext[ ]` once per `decode_tiles( )` invocation
+    /// (i.e. once per frame, before the first tile's `decode_tile( )`).
+    ///
+    /// Per §7.4.1 the canonical span is `i = 0..Sb64Cols * 8 - 1`
+    /// because the array can be read for locations beyond `MiCols`.
+    /// The strip allocated by [`PartitionContextState::new`] is sized to
+    /// `mi_cols` cells — callers that want the full `Sb64Cols * 8`
+    /// span should round `mi_cols` up to the next multiple of 8 when
+    /// constructing the state. The reset itself is a per-cell zero so
+    /// it is correct regardless of the chosen strip width.
+    pub(crate) fn clear_above(&mut self) {
+        for cell in self.above.iter_mut() {
+            *cell = 0;
+        }
+    }
 }
 
 /// Per-leaf log record emitted in §6.4.3 traversal order by
@@ -982,6 +999,234 @@ pub(crate) fn decode_tile(
     }
 
     Ok(())
+}
+
+// ----- §6.4 decode_tiles outer driver -----
+
+/// Per-tile record emitted by [`decode_tiles`] for each
+/// `(tileRow, tileCol)` cell of the tile grid.
+///
+/// Each entry captures the four `get_tile_offset( )` outputs and the
+/// flat list of `(r, c, subsize)` leaves the per-tile [`decode_tile`]
+/// call emitted, so the caller can replay the §6.4.2 traversal order
+/// per tile without reaching back through a single global leaf log.
+#[derive(Debug, Clone)]
+pub(crate) struct DecodedTile {
+    /// `tileRow` per §6.4 line 2304.
+    pub tile_row: u32,
+    /// `tileCol` per §6.4 line 2305.
+    pub tile_col: u32,
+    /// `MiRowStart` per §6.4 line 2313.
+    pub mi_row_start: u32,
+    /// `MiRowEnd` per §6.4 line 2314.
+    pub mi_row_end: u32,
+    /// `MiColStart` per §6.4 line 2315.
+    pub mi_col_start: u32,
+    /// `MiColEnd` per §6.4 line 2316.
+    pub mi_col_end: u32,
+    /// `tile_size` per §6.4 lines 2308 / 2310 — the per-tile byte budget
+    /// handed to `init_bool( )` for this tile.
+    pub tile_size: u32,
+    /// The §6.4.2 per-tile leaf log: every `(r, c, subsize)` cell
+    /// `decode_tile( )` visited inside this tile, in §6.4.3 traversal
+    /// order.
+    pub leaves: Vec<LeafBlock>,
+}
+
+/// `decode_tiles( sz )` per spec §6.4 (`vp9-spec.txt` lines 2300-2331).
+///
+/// ```text
+/// decode_tiles( sz ) {
+///     tileCols = 1 << tile_cols_log2
+///     tileRows = 1 << tile_rows_log2
+///     clear_above_context()
+///     for ( tileRow = 0; tileRow < tileRows; tileRow++ ) {
+///         for ( tileCol = 0; tileCol < tileCols; tileCol++ ) {
+///             lastTile = (tileRow == tileRows - 1) && (tileCol == tileCols - 1)
+///             if ( lastTile ) {
+///                 tile_size = sz
+///             } else {
+///                 tile_size                                                  f(32)
+///                 sz -= tile_size + 4
+///             }
+///             MiRowStart = get_tile_offset( tileRow, MiRows, tile_rows_log2 )
+///             MiRowEnd   = get_tile_offset( tileRow + 1, MiRows, tile_rows_log2 )
+///             MiColStart = get_tile_offset( tileCol, MiCols, tile_cols_log2 )
+///             MiColEnd   = get_tile_offset( tileCol + 1, MiCols, tile_cols_log2 )
+///             init_bool( tile_size )
+///             decode_tile( )
+///             exit_bool( )
+///         }
+///     }
+/// }
+/// ```
+///
+/// Frame-level driver: walks the `(1 << tile_rows_log2) × (1 <<
+/// tile_cols_log2)` tile grid in row-major order, composing the four
+/// pieces this round and earlier rounds have already lifted into
+/// primitives:
+///
+/// * `clear_above_context( )` per §7.4.1 — fires once before the tile
+///   walk, via [`PartitionContextState::clear_above`]. The §7.4.2
+///   `clear_left_context( )` reset that fires per superblock row is
+///   the responsibility of the inner [`decode_tile`] driver.
+/// * `tile_size` per §6.4 line 2310 — read as `f(32)` (32-bit
+///   big-endian) from the byte stream for every tile EXCEPT the last,
+///   where the spec sets `tile_size = sz`. The 4-byte header is not
+///   counted toward `tile_size` itself (the line 2311
+///   `sz -= tile_size + 4` accounts for both the tile body AND the
+///   4-byte length prefix).
+/// * `init_bool( tile_size )` / `exit_bool( )` per §9.2.1 / §9.2.3 —
+///   bracket the per-tile bool-coder lifetime; the byte slice handed
+///   to `init_bool( )` is the `tile_size`-length sub-slice starting at
+///   the current byte position.
+/// * `decode_tile( )` per §6.4.2 — the [`decode_tile`] primitive
+///   landed in round 32 fires `clear_left_context( )` per superblock
+///   row and walks `decode_partition( r, c, BLOCK_64X64 )` over the
+///   tile's MI window.
+///
+/// Inputs:
+///
+/// * `data` — the tile-stream slice starting at the first tile's
+///   `tile_size` (i.e. immediately past `parse_compressed_header`'s
+///   exit). The caller is responsible for stripping the
+///   uncompressed-header bytes + the compressed-header bytes from the
+///   frame buffer first.
+/// * `sz` — the total tile-stream budget in bytes (the running `sz`
+///   the §6.4 listing updates with `sz -= tile_size + 4`). On entry
+///   this is the frame's tile payload size; on exit it must equal the
+///   last tile's `tile_size` (the §6.4 line 2308 assignment for
+///   `lastTile`).
+/// * `tile_rows_log2`, `tile_cols_log2` — from the
+///   [`crate::header::TileInfo`] of the uncompressed header.
+/// * `mi_rows`, `mi_cols` — frame extents per §7.2.4.
+/// * `ctx_state` — the `Above` / `Left` partition-context strips
+///   (zeroed `clear_above_context( )` is fired internally for the
+///   above strip; the inner [`decode_tile`] resets the left strip per
+///   superblock row).
+/// * `probs_kind` — the §9.3.2 `partition` probability source.
+///
+/// Returns one [`DecodedTile`] per `(tileRow, tileCol)` cell, in
+/// row-major order. The output `Vec` length is exactly `tileRows *
+/// tileCols`.
+///
+/// # Errors
+///
+/// * [`Error::UnexpectedEof`] — the byte stream is shorter than the
+///   running tile_size demands (either the 4-byte length prefix or
+///   the tile body), or `sz` underflows when the spec computes `sz -=
+///   tile_size + 4`.
+/// * [`Error::InvalidBitstream`] — the inner `init_bool( ) /
+///   exit_bool( )` rejects (`sz < 1`, nonzero marker, nonzero
+///   exit-padding) or [`decode_partition`] / [`decode_tile`] surfaces
+///   an inner bitstream violation.
+#[allow(clippy::too_many_arguments)] // mirrors the §6.4 spec
+                                     // composition (data + running sz
+                                     // + two tile-grid sizes + two
+                                     // frame extents + ctx state +
+                                     // probs).
+pub(crate) fn decode_tiles(
+    data: &[u8],
+    mut sz: u32,
+    tile_rows_log2: u8,
+    tile_cols_log2: u8,
+    mi_rows: u32,
+    mi_cols: u32,
+    ctx_state: &mut PartitionContextState,
+    probs_kind: PartitionProbsKind<'_>,
+) -> Result<Vec<DecodedTile>, Error> {
+    let tile_cols: u32 = 1u32 << tile_cols_log2;
+    let tile_rows: u32 = 1u32 << tile_rows_log2;
+
+    // §6.4 line 2303: clear_above_context() — once per frame, before
+    // the first tile.
+    ctx_state.clear_above();
+
+    let mut out: Vec<DecodedTile> = Vec::with_capacity((tile_rows * tile_cols) as usize);
+    let mut byte_cursor: usize = 0;
+
+    for tile_row in 0..tile_rows {
+        for tile_col in 0..tile_cols {
+            let last_tile = tile_row == tile_rows - 1 && tile_col == tile_cols - 1;
+            let tile_size: u32 = if last_tile {
+                sz
+            } else {
+                // §6.4 line 2310: tile_size  f(32).
+                if data.len() < byte_cursor + 4 {
+                    return Err(Error::UnexpectedEof);
+                }
+                let raw = u32::from_be_bytes([
+                    data[byte_cursor],
+                    data[byte_cursor + 1],
+                    data[byte_cursor + 2],
+                    data[byte_cursor + 3],
+                ]);
+                byte_cursor += 4;
+                // §6.4 line 2311: sz -= tile_size + 4. Use checked
+                // arithmetic so an oversized declared tile_size that
+                // would underflow the running budget surfaces as a
+                // bitstream error rather than wrapping.
+                let delta = raw.checked_add(4).ok_or(Error::InvalidBitstream)?;
+                sz = sz.checked_sub(delta).ok_or(Error::InvalidBitstream)?;
+                raw
+            };
+
+            // §6.4 lines 2313-2316: derive the four MI extents via
+            // the §6.4.1 primitive.
+            let mi_row_start = get_tile_offset(tile_row, mi_rows, tile_rows_log2 as u32);
+            let mi_row_end = get_tile_offset(tile_row + 1, mi_rows, tile_rows_log2 as u32);
+            let mi_col_start = get_tile_offset(tile_col, mi_cols, tile_cols_log2 as u32);
+            let mi_col_end = get_tile_offset(tile_col + 1, mi_cols, tile_cols_log2 as u32);
+
+            // §6.4 line 2326: init_bool( tile_size ). The §9.2 bool
+            // coder is bracketed inside the tile; its byte cursor is
+            // independent of `byte_cursor` (which counts whole bytes
+            // through the frame's tile payload). The §7.4.1 note
+            // permits `tile_size = 0` only when the tile has zero
+            // superblocks — `init_bool( )` itself still requires
+            // `sz >= 1` per §9.2.1, so a zero-superblock tile is
+            // still required to carry an init/exit pair with at
+            // least one byte of body.
+            if data.len() < byte_cursor + tile_size as usize {
+                return Err(Error::UnexpectedEof);
+            }
+            let tile_slice = &data[byte_cursor..byte_cursor + tile_size as usize];
+            let mut coder = BoolCoder::init_bool(tile_slice, tile_size as usize)?;
+
+            // §6.4 line 2327: decode_tile( ).
+            let mut leaves: Vec<LeafBlock> = Vec::new();
+            decode_tile(
+                &mut coder,
+                mi_row_start,
+                mi_row_end,
+                mi_col_start,
+                mi_col_end,
+                mi_rows,
+                mi_cols,
+                ctx_state,
+                probs_kind,
+                &mut leaves,
+            )?;
+
+            // §6.4 line 2328: exit_bool( ).
+            coder.exit_bool()?;
+
+            byte_cursor += tile_size as usize;
+
+            out.push(DecodedTile {
+                tile_row,
+                tile_col,
+                mi_row_start,
+                mi_row_end,
+                mi_col_start,
+                mi_col_end,
+                tile_size,
+                leaves,
+            });
+        }
+    }
+
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -2659,5 +2904,515 @@ mod tests {
         .unwrap();
         assert_eq!(leaves.last().unwrap().c, 8);
         assert_eq!(leaves.len(), 2);
+    }
+
+    // ----- §6.4 decode_tiles outer-driver tests -----
+
+    /// Build a single-tile byte stream: one §9.2.1 `init_bool` payload
+    /// encoding the given partition-decode sequence. The output is a
+    /// `(bytes, sz)` pair ready to hand to [`decode_tiles`] with
+    /// `tile_rows_log2 == tile_cols_log2 == 0` (i.e. one tile total,
+    /// no `f(32)` prefix per §6.4 lines 2306-2308).
+    fn single_tile_payload(decodes: &[(u8, bool, bool)]) -> (Vec<u8>, u32) {
+        let mut enc = RangeEncoder::new();
+        for &(partition, has_rows, has_cols) in decodes {
+            push_partition_decode(&mut enc, partition, has_rows, has_cols, 12);
+        }
+        let body = enc.finish();
+        let sz = body.len() as u32;
+        (body, sz)
+    }
+
+    /// `PartitionContextState::clear_above( )` zeroes the above strip
+    /// without touching the left strip — the dual of the round-32
+    /// `clear_left` invariant.
+    #[test]
+    fn partition_context_state_clear_above_zeroes_above_only() {
+        let mut s = PartitionContextState::new(8, 8);
+        s.above[3] = 7;
+        s.left[2] = 11;
+        s.clear_above();
+        assert_eq!(s.left[2], 11);
+        for &cell in s.above.iter() {
+            assert_eq!(cell, 0);
+        }
+    }
+
+    /// Single-tile frame (`tile_rows_log2 = 0`, `tile_cols_log2 = 0`):
+    /// §6.4 lines 2306-2308 set `lastTile = true` on the first
+    /// iteration so no `f(32)` prefix is read; `tile_size = sz` is the
+    /// whole payload; the inner `decode_tile( )` walks one
+    /// `(0, 0, BLOCK_64X64)` superblock.
+    #[test]
+    fn decode_tiles_single_tile_consumes_full_payload() {
+        let mi_cols = 8u32;
+        let mi_rows = 8u32;
+        let (body, sz) = single_tile_payload(&[(PARTITION_NONE, true, true)]);
+
+        let mut state = PartitionContextState::new(mi_cols as usize, mi_rows as usize);
+        let tiles = decode_tiles(
+            &body,
+            sz,
+            0,
+            0,
+            mi_rows,
+            mi_cols,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+        )
+        .unwrap();
+
+        assert_eq!(tiles.len(), 1);
+        let t = &tiles[0];
+        assert_eq!(t.tile_row, 0);
+        assert_eq!(t.tile_col, 0);
+        assert_eq!(t.mi_row_start, 0);
+        assert_eq!(t.mi_row_end, mi_rows);
+        assert_eq!(t.mi_col_start, 0);
+        assert_eq!(t.mi_col_end, mi_cols);
+        assert_eq!(t.tile_size, sz);
+        assert_eq!(
+            t.leaves,
+            vec![LeafBlock {
+                r: 0,
+                c: 0,
+                subsize: BLOCK_64X64,
+            }]
+        );
+    }
+
+    /// §6.4 line 2303 `clear_above_context( )` fires once at the
+    /// start of `decode_tiles( )`: a pre-poisoned `above[ ]` strip is
+    /// observed zeroed BEFORE the first tile's `decode_tile( )` walks.
+    #[test]
+    fn decode_tiles_clears_above_context_at_start_of_frame() {
+        let mi_cols = 8u32;
+        let mi_rows = 8u32;
+        let (body, sz) = single_tile_payload(&[(PARTITION_NONE, true, true)]);
+
+        let mut state = PartitionContextState::new(mi_cols as usize, mi_rows as usize);
+        // Pre-poison every above cell with a sentinel value.
+        for cell in state.above.iter_mut() {
+            *cell = 0xAA;
+        }
+        decode_tiles(
+            &body,
+            sz,
+            0,
+            0,
+            mi_rows,
+            mi_cols,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+        )
+        .unwrap();
+        // The §6.4 line 2303 reset wipes the strip. The §6.4.3
+        // write-back may then have written `15 >> b_width_log2_lookup`
+        // = `15 >> 4 = 0` cells for BLOCK_64X64 — so every cell is 0
+        // post-decode, with no surviving 0xAA.
+        for &cell in state.above.iter() {
+            assert_eq!(cell, 0, "clear_above_context did not zero strip pre-decode");
+        }
+    }
+
+    /// Two-tile horizontal split (`tile_cols_log2 = 1`,
+    /// `tile_rows_log2 = 0`): §6.4 reads `f(32) = tile_size` for the
+    /// first tile, then `sz -= tile_size + 4`; the second tile is
+    /// `lastTile` and consumes the remaining `sz`. Each tile's
+    /// `MiColStart` / `MiColEnd` matches the §6.4.1 split at MI=8.
+    #[test]
+    fn decode_tiles_two_horizontal_tiles_reads_f32_prefix() {
+        let mi_cols = 16u32;
+        let mi_rows = 8u32;
+
+        let (body_a, sz_a) = single_tile_payload(&[(PARTITION_NONE, true, true)]);
+        let (body_b, sz_b) = single_tile_payload(&[(PARTITION_NONE, true, true)]);
+
+        // Build the full stream: [f(32) sz_a][body_a][body_b].
+        let mut stream: Vec<u8> = Vec::new();
+        stream.extend_from_slice(&sz_a.to_be_bytes());
+        stream.extend_from_slice(&body_a);
+        stream.extend_from_slice(&body_b);
+        let total = 4u32 + sz_a + sz_b;
+
+        let mut state = PartitionContextState::new(mi_cols as usize, mi_rows as usize);
+        let tiles = decode_tiles(
+            &stream,
+            total,
+            0,
+            1,
+            mi_rows,
+            mi_cols,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+        )
+        .unwrap();
+
+        assert_eq!(tiles.len(), 2);
+        let (t0, t1) = (&tiles[0], &tiles[1]);
+        // Tile 0: f(32) declared size matches body_a.
+        assert_eq!(t0.tile_col, 0);
+        assert_eq!(t0.mi_col_start, 0);
+        assert_eq!(t0.mi_col_end, 8);
+        assert_eq!(t0.tile_size, sz_a);
+        // Tile 1 (last): tile_size = remaining sz = sz_b (after
+        // sz -= sz_a + 4 brings total down to sz_b).
+        assert_eq!(t1.tile_col, 1);
+        assert_eq!(t1.mi_col_start, 8);
+        assert_eq!(t1.mi_col_end, 16);
+        assert_eq!(t1.tile_size, sz_b);
+        // Each tile contributed one leaf at its respective `c`
+        // origin.
+        assert_eq!(t0.leaves.len(), 1);
+        assert_eq!(t0.leaves[0].c, 0);
+        assert_eq!(t1.leaves.len(), 1);
+        assert_eq!(t1.leaves[0].c, 8);
+    }
+
+    /// 2x2 tile grid (`tile_rows_log2 = 1`, `tile_cols_log2 = 1`):
+    /// row-major iteration order produces `(0,0) → (0,1) → (1,0) →
+    /// (1,1)`; all but the last read an `f(32)` prefix; the last
+    /// consumes the residual `sz`.
+    #[test]
+    fn decode_tiles_2x2_grid_iterates_row_major() {
+        let mi_cols = 16u32;
+        let mi_rows = 16u32;
+
+        let bodies: Vec<(Vec<u8>, u32)> = (0..4)
+            .map(|_| single_tile_payload(&[(PARTITION_NONE, true, true)]))
+            .collect();
+        let sizes: Vec<u32> = bodies.iter().map(|(_, s)| *s).collect();
+
+        // Stream: f(32) sz_0 || body_0 || f(32) sz_1 || body_1 ||
+        //         f(32) sz_2 || body_2 || body_3.
+        let mut stream: Vec<u8> = Vec::new();
+        for (i, (body, sz)) in bodies.iter().enumerate() {
+            if i < 3 {
+                stream.extend_from_slice(&sz.to_be_bytes());
+            }
+            stream.extend_from_slice(body);
+        }
+        let total: u32 = sizes.iter().sum::<u32>() + 4 * 3;
+
+        let mut state = PartitionContextState::new(mi_cols as usize, mi_rows as usize);
+        let tiles = decode_tiles(
+            &stream,
+            total,
+            1,
+            1,
+            mi_rows,
+            mi_cols,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+        )
+        .unwrap();
+
+        assert_eq!(tiles.len(), 4);
+        // Row-major order:
+        assert_eq!((tiles[0].tile_row, tiles[0].tile_col), (0, 0));
+        assert_eq!((tiles[1].tile_row, tiles[1].tile_col), (0, 1));
+        assert_eq!((tiles[2].tile_row, tiles[2].tile_col), (1, 0));
+        assert_eq!((tiles[3].tile_row, tiles[3].tile_col), (1, 1));
+        // Per-tile MI extents: each tile is 8 MI on each axis.
+        for t in &tiles {
+            assert_eq!(t.mi_row_end - t.mi_row_start, 8);
+            assert_eq!(t.mi_col_end - t.mi_col_start, 8);
+            assert_eq!(t.leaves.len(), 1);
+        }
+        // Leaves' (r, c) origins match the per-tile MI starts.
+        for t in &tiles {
+            assert_eq!(t.leaves[0].r, t.mi_row_start);
+            assert_eq!(t.leaves[0].c, t.mi_col_start);
+        }
+        // Sizes: tiles 0..=2 took their declared `f(32)` size;
+        // tile 3 is `lastTile` and took the residual.
+        assert_eq!(tiles[0].tile_size, sizes[0]);
+        assert_eq!(tiles[1].tile_size, sizes[1]);
+        assert_eq!(tiles[2].tile_size, sizes[2]);
+        assert_eq!(tiles[3].tile_size, sizes[3]);
+    }
+
+    /// §6.4 lines 2308 vs 2310: the LAST tile reads NO `f(32)`
+    /// prefix. A second tile placed back-to-back with no length
+    /// prefix between body_a and body_b decodes successfully because
+    /// the `lastTile` branch uses `tile_size = sz`.
+    #[test]
+    fn decode_tiles_last_tile_skips_f32_prefix() {
+        let mi_cols = 16u32;
+        let mi_rows = 8u32;
+
+        let (body_a, sz_a) = single_tile_payload(&[(PARTITION_NONE, true, true)]);
+        let (body_b, sz_b) = single_tile_payload(&[(PARTITION_NONE, true, true)]);
+
+        // Build [f(32) sz_a][body_a][body_b] — note no length prefix
+        // between body_a and body_b.
+        let mut stream: Vec<u8> = Vec::new();
+        stream.extend_from_slice(&sz_a.to_be_bytes());
+        stream.extend_from_slice(&body_a);
+        let body_b_start = stream.len();
+        stream.extend_from_slice(&body_b);
+
+        let total = 4u32 + sz_a + sz_b;
+        let mut state = PartitionContextState::new(mi_cols as usize, mi_rows as usize);
+        let tiles = decode_tiles(
+            &stream,
+            total,
+            0,
+            1,
+            mi_rows,
+            mi_cols,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+        )
+        .unwrap();
+
+        // Last tile's tile_size equals the remaining byte budget after
+        // tile 0 consumed `4 + sz_a` bytes.
+        assert_eq!(tiles[1].tile_size, sz_b);
+        // Byte cursor sanity: stream[body_b_start..] is exactly
+        // `sz_b` long.
+        assert_eq!(stream.len() - body_b_start, sz_b as usize);
+    }
+
+    /// `Vec<DecodedTile>` length matches the grid `tileRows * tileCols`
+    /// across the §7.2.11 conformance space (4 cells = `(0,0)`,
+    /// `(0,1)`, `(1,0)`, `(1,1)`).
+    #[test]
+    fn decode_tiles_output_length_matches_grid() {
+        // 4x1 strip: tile_cols_log2 = 2, tile_rows_log2 = 0 → 4 tiles.
+        let mi_cols = 32u32;
+        let mi_rows = 8u32;
+
+        let bodies: Vec<(Vec<u8>, u32)> = (0..4)
+            .map(|_| single_tile_payload(&[(PARTITION_NONE, true, true)]))
+            .collect();
+        let sizes: Vec<u32> = bodies.iter().map(|(_, s)| *s).collect();
+        let mut stream: Vec<u8> = Vec::new();
+        for (i, (body, sz)) in bodies.iter().enumerate() {
+            if i < 3 {
+                stream.extend_from_slice(&sz.to_be_bytes());
+            }
+            stream.extend_from_slice(body);
+        }
+        let total: u32 = sizes.iter().sum::<u32>() + 4 * 3;
+        let mut state = PartitionContextState::new(mi_cols as usize, mi_rows as usize);
+        let tiles = decode_tiles(
+            &stream,
+            total,
+            0,
+            2,
+            mi_rows,
+            mi_cols,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+        )
+        .unwrap();
+        assert_eq!(tiles.len(), 4);
+        // Each tile's MiColEnd matches the next tile's MiColStart.
+        for w in tiles.windows(2) {
+            assert_eq!(w[0].mi_col_end, w[1].mi_col_start);
+        }
+        // Last tile's MiColEnd equals MiCols.
+        assert_eq!(tiles.last().unwrap().mi_col_end, mi_cols);
+    }
+
+    /// §6.4 line 2310 `f(32)` truncation: a stream shorter than the
+    /// 4-byte prefix yields `Error::UnexpectedEof`.
+    #[test]
+    fn decode_tiles_short_f32_prefix_is_eof() {
+        let mi_cols = 16u32;
+        let mi_rows = 8u32;
+        // Only 3 bytes available — can't even read the f(32).
+        let stream = [0u8, 0, 0];
+        let mut state = PartitionContextState::new(mi_cols as usize, mi_rows as usize);
+        let err = decode_tiles(
+            &stream,
+            3,
+            0,
+            1,
+            mi_rows,
+            mi_cols,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+        )
+        .unwrap_err();
+        assert_eq!(err, Error::UnexpectedEof);
+    }
+
+    /// §6.4 line 2311 underflow: a declared `tile_size` larger than
+    /// the remaining `sz` would underflow `sz -= tile_size + 4`. The
+    /// driver surfaces this as `Error::InvalidBitstream` rather than
+    /// wrapping.
+    #[test]
+    fn decode_tiles_oversized_declared_tile_size_is_invalid_bitstream() {
+        let mi_cols = 16u32;
+        let mi_rows = 8u32;
+        // Declared tile_size = u32::MAX → sz - (u32::MAX + 4) wraps.
+        let mut stream: Vec<u8> = Vec::new();
+        stream.extend_from_slice(&u32::MAX.to_be_bytes());
+        stream.extend_from_slice(&[0u8; 16]);
+        let mut state = PartitionContextState::new(mi_cols as usize, mi_rows as usize);
+        let err = decode_tiles(
+            &stream,
+            16,
+            0,
+            1,
+            mi_rows,
+            mi_cols,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+        )
+        .unwrap_err();
+        assert_eq!(err, Error::InvalidBitstream);
+    }
+
+    /// §6.4 line 2310: a non-last tile whose declared `tile_size`
+    /// extends past the byte stream raises `UnexpectedEof` from the
+    /// per-tile slice fetch (the slice bound check fails before
+    /// `init_bool( )` runs).
+    #[test]
+    fn decode_tiles_truncated_tile_body_is_eof() {
+        let mi_cols = 16u32;
+        let mi_rows = 8u32;
+        // Build the f(32) prefix for "tile_size = 8" but supply only
+        // 6 body bytes (cursor exhausts before the 8-byte body fetch).
+        let mut stream: Vec<u8> = Vec::new();
+        stream.extend_from_slice(&8u32.to_be_bytes());
+        stream.extend_from_slice(&[0u8; 6]); // 6 bytes < declared 8
+        let mut state = PartitionContextState::new(mi_cols as usize, mi_rows as usize);
+        let err = decode_tiles(
+            &stream,
+            4 + 8 + 4, // sz allows the subtraction, but bytes don't
+            0,
+            1,
+            mi_rows,
+            mi_cols,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+        )
+        .unwrap_err();
+        assert_eq!(err, Error::UnexpectedEof);
+    }
+
+    /// §9.2.1 marker rejection at `init_bool( )` propagates as
+    /// `Error::InvalidBitstream` through `decode_tiles`. A
+    /// non-zero-marker first byte fails the per-tile `init_bool( )`.
+    #[test]
+    fn decode_tiles_per_tile_marker_failure_is_invalid_bitstream() {
+        let mi_cols = 8u32;
+        let mi_rows = 8u32;
+        // Single-tile mode, no f(32) prefix. First byte 0x80 has the
+        // top bit set so the §9.2.1 marker `read_bool(128)` decodes
+        // to 1 and init_bool rejects.
+        let stream = vec![0x80u8, 0x00, 0x00, 0x00];
+        let mut state = PartitionContextState::new(mi_cols as usize, mi_rows as usize);
+        let err = decode_tiles(
+            &stream,
+            4,
+            0,
+            0,
+            mi_rows,
+            mi_cols,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+        )
+        .unwrap_err();
+        assert_eq!(err, Error::InvalidBitstream);
+    }
+
+    /// 1x2 vertical split (`tile_rows_log2 = 1`, `tile_cols_log2 =
+    /// 0`): MI rows split at 8; the two tiles' `MiRowStart` /
+    /// `MiRowEnd` cover `[0, 8)` and `[8, 16)` per §6.4.1.
+    #[test]
+    fn decode_tiles_two_vertical_tiles_partition_mi_rows() {
+        let mi_cols = 8u32;
+        let mi_rows = 16u32;
+
+        let (body_a, sz_a) = single_tile_payload(&[(PARTITION_NONE, true, true)]);
+        let (body_b, sz_b) = single_tile_payload(&[(PARTITION_NONE, true, true)]);
+
+        let mut stream: Vec<u8> = Vec::new();
+        stream.extend_from_slice(&sz_a.to_be_bytes());
+        stream.extend_from_slice(&body_a);
+        stream.extend_from_slice(&body_b);
+        let total = 4u32 + sz_a + sz_b;
+
+        let mut state = PartitionContextState::new(mi_cols as usize, mi_rows as usize);
+        let tiles = decode_tiles(
+            &stream,
+            total,
+            1,
+            0,
+            mi_rows,
+            mi_cols,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+        )
+        .unwrap();
+
+        assert_eq!(tiles.len(), 2);
+        assert_eq!((tiles[0].mi_row_start, tiles[0].mi_row_end), (0, 8));
+        assert_eq!((tiles[1].mi_row_start, tiles[1].mi_row_end), (8, 16));
+        // Both tiles' MI col span is the full frame width.
+        for t in &tiles {
+            assert_eq!(t.mi_col_start, 0);
+            assert_eq!(t.mi_col_end, mi_cols);
+        }
+        // The two leaves are at (0, 0) and (8, 0).
+        assert_eq!(tiles[0].leaves[0].r, 0);
+        assert_eq!(tiles[1].leaves[0].r, 8);
+    }
+
+    /// §6.4 + §6.4.1 invariant: across the full `tileRows * tileCols`
+    /// grid every consecutive `(MiColEnd_prev, MiColStart_next)` pair
+    /// matches within a row, and `MiColEnd` of the last column equals
+    /// `MiCols` (mirror invariant on rows).
+    #[test]
+    fn decode_tiles_mi_extents_are_contiguous_within_rows() {
+        let mi_cols = 32u32;
+        let mi_rows = 16u32;
+        // 2x2 grid.
+        let bodies: Vec<(Vec<u8>, u32)> = (0..4)
+            .map(|_| single_tile_payload(&[(PARTITION_NONE, true, true)]))
+            .collect();
+        let sizes: Vec<u32> = bodies.iter().map(|(_, s)| *s).collect();
+        let mut stream: Vec<u8> = Vec::new();
+        for (i, (body, sz)) in bodies.iter().enumerate() {
+            if i < 3 {
+                stream.extend_from_slice(&sz.to_be_bytes());
+            }
+            stream.extend_from_slice(body);
+        }
+        let total: u32 = sizes.iter().sum::<u32>() + 4 * 3;
+
+        let mut state = PartitionContextState::new(mi_cols as usize, mi_rows as usize);
+        let tiles = decode_tiles(
+            &stream,
+            total,
+            1,
+            1,
+            mi_rows,
+            mi_cols,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+        )
+        .unwrap();
+
+        // Within each row, consecutive cols are contiguous.
+        for row in 0..2u32 {
+            let row_tiles: Vec<&DecodedTile> = tiles.iter().filter(|t| t.tile_row == row).collect();
+            for w in row_tiles.windows(2) {
+                assert_eq!(w[0].mi_col_end, w[1].mi_col_start);
+            }
+            assert_eq!(row_tiles.last().unwrap().mi_col_end, mi_cols);
+        }
+        // Within each col, consecutive rows are contiguous.
+        for col in 0..2u32 {
+            let col_tiles: Vec<&DecodedTile> = tiles.iter().filter(|t| t.tile_col == col).collect();
+            for w in col_tiles.windows(2) {
+                assert_eq!(w[0].mi_row_end, w[1].mi_row_start);
+            }
+            assert_eq!(col_tiles.last().unwrap().mi_row_end, mi_rows);
+        }
     }
 }

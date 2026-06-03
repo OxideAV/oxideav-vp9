@@ -6,6 +6,57 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 33: §6.4 `decode_tiles( )` outer driver — frame-level tile
+  walk.** Composes the round-32 §6.4.1 / §6.4.2 primitives into the
+  full `(1 << tile_rows_log2) × (1 << tile_cols_log2)` frame walk per
+  `vp9-spec.txt` lines 2300-2331.
+  * `decode_tiles( data, sz, tile_rows_log2, tile_cols_log2, mi_rows,
+    mi_cols, ctx_state, probs_kind )` per §6.4: derives `tileCols` /
+    `tileRows` from the §7.2.11 log2 fields, fires
+    `PartitionContextState::clear_above( )` (the §7.4.1
+    `clear_above_context( )` reset) once before the tile walk, then
+    iterates `(tileRow, tileCol)` in row-major order. For every tile
+    except the last it reads `tile_size  f(32)` (big-endian) from the
+    byte stream and runs `sz -= tile_size + 4`; on the last tile
+    `tile_size = sz`. Per tile it derives the four MI extents via the
+    §6.4.1 helper, brackets a fresh `BoolCoder` with `init_bool(
+    tile_size ) / exit_bool( )` per §9.2.1 / §9.2.3, and invokes the
+    §6.4.2 `decode_tile( )` primitive. Returns `Vec<DecodedTile>`
+    where each entry carries `(tile_row, tile_col, mi_row_start,
+    mi_row_end, mi_col_start, mi_col_end, tile_size, leaves)` for
+    downstream replay.
+  * `PartitionContextState::clear_above( )` per §7.4.1: the dual of
+    the round-32 `clear_left( )` reset, zeroes
+    `AbovePartitionContext[ ]` once per `decode_tiles( )` invocation.
+  * `DecodedTile { tile_row, tile_col, mi_row_start, mi_row_end,
+    mi_col_start, mi_col_end, tile_size, leaves }`: per-tile record
+    bundling the §6.4 listing's four `get_tile_offset( )` outputs,
+    the `tile_size` byte budget, and the per-tile §6.4.2 leaf log.
+  * Bitstream-error surface: §6.4 line 2310 underflow on the f(32)
+    read → `Error::UnexpectedEof`; declared `tile_size` whose `(+ 4)`
+    addend would exceed remaining `sz` → `Error::InvalidBitstream`;
+    declared `tile_size` larger than the available byte stream →
+    `Error::UnexpectedEof`; per-tile `init_bool( )` marker rejection
+    or `exit_bool( )` non-zero-padding → `Error::InvalidBitstream`.
+  * +13 lib tests (lib 440 → 453; suite 460 → 473): single-tile
+    `lastTile = true` consuming the full payload; §6.4 line 2303
+    `clear_above_context( )` zeroing a pre-poisoned strip before the
+    first tile; two-tile horizontal split reading one `f(32)` prefix
+    and `MiColStart` / `MiColEnd` matching the §6.4.1 split at
+    `(0, 8, 16)`; 2×2 grid iterating `(0,0) → (0,1) → (1,0) →
+    (1,1)`; last-tile skipping `f(32)` prefix (back-to-back bodies
+    with one prefix only); output `Vec<DecodedTile>` length matching
+    `tileRows * tileCols`; truncated 3-byte stream raising
+    `UnexpectedEof` at the `f(32)` fetch; oversized declared
+    `tile_size = u32::MAX` raising `InvalidBitstream`; truncated tile
+    body (declared 8, supplied 6) raising `UnexpectedEof`;
+    nonzero-marker first byte (`0x80`) raising `InvalidBitstream`
+    from `init_bool( )`; 1×2 vertical split partitioning MI rows at
+    `(0, 8, 16)`; full 2×2 grid invariant that consecutive tiles are
+    contiguous within rows AND within columns; and
+    `PartitionContextState::clear_above( )` zero-strip dual to the
+    round-32 `clear_left` invariant.
+
 * **Round 32: §6.4.1 `get_tile_offset( )` + §6.4.2 `decode_tile( )` —
   tile-driver primitive layer.** Lifts the §6.4.3 recursive partition
   driver landed in round 19 into the §6.4.2 superblock-row driver and

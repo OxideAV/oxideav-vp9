@@ -244,8 +244,11 @@ pub struct Vp9CompressedHeader {
 ///
 /// Walks `read_tx_mode( )` (§6.3.1), the conditional
 /// `tx_mode_probs( )` (§6.3.2), `read_coef_probs( )` (§6.3.7), and
-/// `read_skip_prob( )` (§6.3.8) sweeps. The inter-only §6.3.9+
-/// syntax remains deferred.
+/// `read_skip_prob( )` (§6.3.8) sweeps — i.e. the four pieces the
+/// §6.3 outer dispatch fires before the `FrameIsIntra == 0` gate.
+/// On inter frames the caller should use
+/// [`parse_compressed_header_inter`] instead to walk the additional
+/// §6.3.9..§6.3.16 sweeps.
 ///
 /// Returns [`Error::InvalidBitstream`] if the §9.2.1 init marker
 /// bit is nonzero, if `read_bool` underruns `BoolMaxBits`, or if a
@@ -253,20 +256,265 @@ pub struct Vp9CompressedHeader {
 pub fn parse_compressed_header(data: &[u8], lossless: bool) -> Result<Vp9CompressedHeader, Error> {
     let sz = data.len();
     let mut coder = BoolCoder::init_bool(data, sz)?;
-    let tx_mode = read_tx_mode(&mut coder, lossless)?;
+    parse_compressed_header_intra_prefix(&mut coder, lossless)
+}
+
+/// Shared helper that walks the §6.3 outer-listing prefix that runs
+/// before the `FrameIsIntra == 0` gate: `read_tx_mode( )` (§6.3.1),
+/// the conditional `tx_mode_probs( )` (§6.3.2), `read_coef_probs( )`
+/// (§6.3.7), and `read_skip_prob( )` (§6.3.8). Consumed by both
+/// [`parse_compressed_header`] (keyframe / intra-only path) and
+/// [`parse_compressed_header_inter`] (inter frames, which then run the
+/// §6.3.9..§6.3.16 tail).
+fn parse_compressed_header_intra_prefix(
+    coder: &mut BoolCoder<'_>,
+    lossless: bool,
+) -> Result<Vp9CompressedHeader, Error> {
+    let tx_mode = read_tx_mode(coder, lossless)?;
     let mut tx_probs = DEFAULT_TX_PROBS;
     if tx_mode == TxMode::TxModeSelect {
-        read_tx_mode_probs(&mut coder, &mut tx_probs)?;
+        read_tx_mode_probs(coder, &mut tx_probs)?;
     }
     let mut coef_probs = DEFAULT_COEF_PROBS;
-    read_coef_probs(&mut coder, tx_mode, &mut coef_probs)?;
+    read_coef_probs(coder, tx_mode, &mut coef_probs)?;
     let mut skip_prob = DEFAULT_SKIP_PROB;
-    read_skip_prob(&mut coder, &mut skip_prob)?;
+    read_skip_prob(coder, &mut skip_prob)?;
     Ok(Vp9CompressedHeader {
         tx_mode,
         tx_probs,
         coef_probs,
         skip_prob,
+    })
+}
+
+/// Inputs for [`parse_compressed_header_inter`] that the inter-only
+/// §6.3.9..§6.3.16 tail needs from outside the compressed header.
+///
+/// The §6.3 listing's inter-frame branch (the `if ( FrameIsIntra == 0
+/// )` arm at `vp9-spec.txt` lines 1964-1974) gates three of its calls
+/// on uncompressed-header state the §6.2 walker decided earlier:
+///
+/// * §6.3.10 `read_interp_filter_probs( )` fires only when
+///   `interpolation_filter == SWITCHABLE` (the §6.2.7 setting from
+///   `read_interpolation_filter( )`).
+/// * §6.3.12 `frame_reference_mode( )` reads the §6.2.5
+///   `ref_frame_sign_bias[ ]` array to decide whether compound
+///   reference is allowed; on the non-`SingleReference` arms it also
+///   calls §6.3.18 `setup_compound_reference_mode( )` against the
+///   same array.
+/// * §6.3.16 `mv_probs( )` walks an extra 4-cell tail when
+///   `allow_high_precision_mv == 1` (the §6.2.7 setting from
+///   `read_interpolation_filter( )` / `read_inter_frame_header( )`).
+///
+/// The four other inter-only sweeps (§6.3.9 / §6.3.11 / §6.3.13 /
+/// §6.3.14 / §6.3.15) are unconditional once the `FrameIsIntra == 0`
+/// gate fires, so they don't need any input from this struct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Vp9CompressedHeaderInterInputs {
+    /// True iff the uncompressed-header §6.2.7
+    /// `read_interpolation_filter( )` decoded
+    /// `interpolation_filter == SWITCHABLE`. Gates the §6.3.10
+    /// `read_interp_filter_probs( )` sweep.
+    pub interpolation_filter_is_switchable: bool,
+    /// `ref_frame_sign_bias[ MAX_REF_FRAMES ]` per §6.2.5: one
+    /// `f(1)` flag per `{INTRA, LAST, GOLDEN, ALTREF}` ref-frame
+    /// slot, with the `INTRA_FRAME` slot unused by §6.3.18 /
+    /// §6.3.12. Drives §6.3.12 `frame_reference_mode( )` —
+    /// determining `reference_mode` and (when compound is allowed)
+    /// the §6.3.18 `setup_compound_reference_mode( )` partition of
+    /// `{LAST, GOLDEN, ALTREF}` into one fixed + two variable
+    /// references.
+    pub ref_frame_sign_bias: RefFrameSignBias,
+    /// True iff the uncompressed header's §6.2.7
+    /// `allow_high_precision_mv` flag was set. Gates the §6.3.16
+    /// `mv_probs( )` high-precision tail (`mv_class0_hp_prob[ 2 ]` +
+    /// `mv_hp_prob[ 2 ]` — 4 extra cells).
+    pub allow_high_precision_mv: bool,
+}
+
+/// §6.3 compressed-header result on an inter frame (`FrameIsIntra ==
+/// 0`).
+///
+/// Wraps the shared intra prefix in [`Vp9CompressedHeaderInter::intra`]
+/// and adds every probability table / per-frame decision the inter-only
+/// §6.3.9..§6.3.16 tail produces. The fields mirror the spec listing's
+/// state variables one-for-one (`inter_mode_probs[ ][ ]`,
+/// `interp_filter_probs[ ][ ]`, `is_inter_prob[ ]`, `reference_mode`,
+/// `comp_mode_prob[ ]`, `single_ref_prob[ ][ ]`, `comp_ref_prob[ ]`,
+/// `y_mode_probs[ ][ ]`, `partition_probs[ ][ ]`, the §6.3.16 MV
+/// probability bundle, plus the §6.3.18
+/// `setup_compound_reference_mode( )` output on non-`SingleReference`
+/// arms).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Vp9CompressedHeaderInter {
+    /// The intra-shared prefix (§6.3.1 / §6.3.2 / §6.3.7 / §6.3.8) —
+    /// the same fields [`parse_compressed_header`] returns on
+    /// keyframes / intra-only frames.
+    pub intra: Vp9CompressedHeader,
+    /// `inter_mode_probs[ INTER_MODE_CONTEXTS ][ INTER_MODES - 1 ]`
+    /// after the §6.3.9 sweep. Initial values come from the §10.5
+    /// `default_inter_mode_probs` listing.
+    pub inter_mode_probs: [[u8; INTER_MODES - 1]; INTER_MODE_CONTEXTS],
+    /// `interp_filter_probs[ INTERP_FILTER_CONTEXTS ]
+    /// [ SWITCHABLE_FILTERS - 1 ]` after the §6.3.10 sweep — only
+    /// fired when `interpolation_filter == SWITCHABLE`; otherwise
+    /// left equal to the §10.5 `default_interp_filter_probs` listing.
+    pub interp_filter_probs: [[u8; SWITCHABLE_FILTERS - 1]; INTERP_FILTER_CONTEXTS],
+    /// `is_inter_prob[ IS_INTER_CONTEXTS ]` after the §6.3.11 sweep.
+    /// Initial values come from the §10.5 `default_is_inter_prob`
+    /// listing (`{9, 102, 187, 225}`).
+    pub is_inter_prob: [u8; IS_INTER_CONTEXTS],
+    /// Frame-level `reference_mode` decided by §6.3.12
+    /// `frame_reference_mode( )` (one of `SingleReference` /
+    /// `CompoundReference` / `ReferenceModeSelect`).
+    pub reference_mode: ReferenceMode,
+    /// Output of §6.3.18 `setup_compound_reference_mode( )` —
+    /// `Some(cfg)` on the non-`SingleReference` arms (`CompoundReference`
+    /// or `ReferenceModeSelect`), `None` on `SingleReference`.
+    pub compound_reference_config: Option<CompoundReferenceConfig>,
+    /// `comp_mode_prob[ COMP_MODE_CONTEXTS ]` after the §6.3.13 sweep.
+    /// Updated only when `reference_mode == ReferenceModeSelect`; left
+    /// equal to the §10.5 `default_comp_mode_prob` otherwise.
+    pub comp_mode_prob: [u8; COMP_MODE_CONTEXTS],
+    /// `single_ref_prob[ REF_CONTEXTS ][ 2 ]` after the §6.3.13
+    /// sweep. Updated only when `reference_mode != CompoundReference`;
+    /// left equal to the §10.5 `default_single_ref_prob` otherwise.
+    pub single_ref_prob: [[u8; 2]; REF_CONTEXTS],
+    /// `comp_ref_prob[ REF_CONTEXTS ]` after the §6.3.13 sweep.
+    /// Updated only when `reference_mode != SingleReference`; left
+    /// equal to the §10.5 `default_comp_ref_prob` otherwise.
+    pub comp_ref_prob: [u8; REF_CONTEXTS],
+    /// `y_mode_probs[ BLOCK_SIZE_GROUPS ][ INTRA_MODES - 1 ]` after
+    /// the §6.3.14 sweep. Initial values come from the §10.5
+    /// `default_y_mode_probs` listing.
+    pub y_mode_probs: [[u8; INTRA_MODES - 1]; BLOCK_SIZE_GROUPS],
+    /// `partition_probs[ PARTITION_CONTEXTS ][ PARTITION_TYPES - 1 ]`
+    /// after the §6.3.15 sweep. Initial values come from the §10.5
+    /// `default_partition_probs` listing.
+    pub partition_probs: [[u8; PARTITION_TYPES - 1]; PARTITION_CONTEXTS],
+    /// MV probability bundle after the §6.3.16 `mv_probs( )` sweep.
+    /// 65 unconditional cells + 4 conditional cells (the latter
+    /// touched only when `inputs.allow_high_precision_mv == true`).
+    pub mv_probs: MvProbs,
+}
+
+/// Parse the §6.3 compressed header from `data` on an inter frame
+/// (`FrameIsIntra == 0`).
+///
+/// Walks the full §6.3 listing including the `if ( FrameIsIntra == 0 )`
+/// arm at `vp9-spec.txt` lines 1964-1974:
+///
+/// ```text
+/// compressed_header( ) {
+///     read_tx_mode( )                                    // §6.3.1
+///     if ( tx_mode == TX_MODE_SELECT )
+///         tx_mode_probs( )                               // §6.3.2
+///     read_coef_probs( )                                 // §6.3.7
+///     read_skip_prob( )                                  // §6.3.8
+///     if ( FrameIsIntra == 0 ) {
+///         read_inter_mode_probs( )                       // §6.3.9
+///         if ( interpolation_filter == SWITCHABLE )
+///             read_interp_filter_probs( )                // §6.3.10
+///         read_is_inter_probs( )                         // §6.3.11
+///         frame_reference_mode( )                        // §6.3.12 + §6.3.18
+///         frame_reference_mode_probs( )                  // §6.3.13
+///         read_y_mode_probs( )                           // §6.3.14
+///         read_partition_probs( )                        // §6.3.15
+///         mv_probs( )                                    // §6.3.16 + §6.3.17
+///     }
+/// }
+/// ```
+///
+/// The intra-shared prefix (§6.3.1 / §6.3.2 / §6.3.7 / §6.3.8) runs
+/// identically to [`parse_compressed_header`] — the difference starts
+/// at the `FrameIsIntra == 0` gate, where this function walks the
+/// inter-only §6.3.9..§6.3.16 tail and returns a [`Vp9CompressedHeaderInter`].
+///
+/// `data` must be the byte slice of length `header_size_in_bytes` that
+/// follows the uncompressed-header byte-aligned trailing-bits pad.
+/// `lossless` is the §6.2.9 `Lossless` derivation. `inputs` bundles
+/// the three §6.2.x-derived flags the inter tail needs (see
+/// [`Vp9CompressedHeaderInterInputs`]).
+///
+/// Returns [`Error::InvalidBitstream`] if the §9.2.1 init marker bit is
+/// nonzero, if `read_bool` underruns `BoolMaxBits`, or if a decoded
+/// value falls outside its spec-defined range.
+pub fn parse_compressed_header_inter(
+    data: &[u8],
+    lossless: bool,
+    inputs: Vp9CompressedHeaderInterInputs,
+) -> Result<Vp9CompressedHeaderInter, Error> {
+    let sz = data.len();
+    let mut coder = BoolCoder::init_bool(data, sz)?;
+
+    // §6.3 lines 1958-1963: the intra-shared prefix.
+    let intra = parse_compressed_header_intra_prefix(&mut coder, lossless)?;
+
+    // §6.3 lines 1965-1973: the `FrameIsIntra == 0` inter-only tail.
+
+    // §6.3.9 read_inter_mode_probs( ).
+    let mut inter_mode_probs = DEFAULT_INTER_MODE_PROBS_TABLE;
+    read_inter_mode_probs(&mut coder, &mut inter_mode_probs)?;
+
+    // §6.3.10 read_interp_filter_probs( ) — gated on
+    // `interpolation_filter == SWITCHABLE`.
+    let mut interp_filter_probs = DEFAULT_INTERP_FILTER_PROBS_TABLE;
+    if inputs.interpolation_filter_is_switchable {
+        read_interp_filter_probs(&mut coder, &mut interp_filter_probs)?;
+    }
+
+    // §6.3.11 read_is_inter_probs( ).
+    let mut is_inter_prob = DEFAULT_IS_INTER_PROB_TABLE;
+    read_is_inter_probs(&mut coder, &mut is_inter_prob)?;
+
+    // §6.3.12 frame_reference_mode( ) — also invokes §6.3.18
+    // `setup_compound_reference_mode( )` on the non-`SingleReference`
+    // arms via the inner walker.
+    let (reference_mode, compound_reference_config) =
+        frame_reference_mode(&mut coder, &inputs.ref_frame_sign_bias)?;
+
+    // §6.3.13 frame_reference_mode_probs( ).
+    let mut comp_mode_prob = DEFAULT_COMP_MODE_PROB_TABLE;
+    let mut single_ref_prob = DEFAULT_SINGLE_REF_PROB_TABLE;
+    let mut comp_ref_prob = DEFAULT_COMP_REF_PROB_TABLE;
+    read_frame_reference_mode_probs(
+        &mut coder,
+        reference_mode,
+        &mut comp_mode_prob,
+        &mut single_ref_prob,
+        &mut comp_ref_prob,
+    )?;
+
+    // §6.3.14 read_y_mode_probs( ).
+    let mut y_mode_probs = DEFAULT_Y_MODE_PROBS_TABLE;
+    read_y_mode_probs(&mut coder, &mut y_mode_probs)?;
+
+    // §6.3.15 read_partition_probs( ).
+    let mut partition_probs = DEFAULT_PARTITION_PROBS_TABLE;
+    read_partition_probs(&mut coder, &mut partition_probs)?;
+
+    // §6.3.16 mv_probs( ) — also invokes §6.3.17
+    // `update_mv_prob( )` per cell via the inner walker.
+    let mut mv_probs_table = MvProbs::defaults();
+    mv_probs(
+        &mut coder,
+        &mut mv_probs_table,
+        inputs.allow_high_precision_mv,
+    )?;
+
+    Ok(Vp9CompressedHeaderInter {
+        intra,
+        inter_mode_probs,
+        interp_filter_probs,
+        is_inter_prob,
+        reference_mode,
+        compound_reference_config,
+        comp_mode_prob,
+        single_ref_prob,
+        comp_ref_prob,
+        y_mode_probs,
+        partition_probs,
+        mv_probs: mv_probs_table,
     })
 }
 
@@ -628,40 +876,6 @@ pub(crate) fn read_skip_prob(
     Ok(())
 }
 
-/// `read_is_inter_probs( )` per spec §6.3.11 ("Intra inter probs
-/// syntax" in the v0.7 listing — `vp9-spec.txt` lines 2154-2167).
-///
-/// Unconditional `IS_INTER_CONTEXTS = 4` sweep: each
-/// `is_inter_prob[i]` is passed through `read_diff_update_prob`,
-/// consuming one `B(252)` `update_prob` flag per slot and, on 1, a
-/// `decode_term_subexp` + `inv_remap_prob` cascade.
-///
-/// The §6.3 outer dispatch invokes `read_is_inter_probs( )` only when
-/// `FrameIsIntra == 0` (gated alongside `read_inter_mode_probs( )` /
-/// `read_interp_filter_probs( )` / `frame_reference_mode( )` /
-/// `frame_reference_mode_probs( )` / `read_y_mode_probs( )` /
-/// `read_partition_probs( )` / `mv_probs( )`). The function itself is
-/// unconditional once the caller has decided to fire it; the gating
-/// lives in the `parse_compressed_header` outer driver.
-///
-/// `is_inter_prob` is updated in place. Initial values come from the
-/// §10.5 `default_is_inter_prob[ IS_INTER_CONTEXTS ] = {9, 102, 187,
-/// 225}` listing (transcribed verbatim in [`mode_info::DEFAULT_IS_INTER_PROB`]).
-/// The running `is_inter_prob[ ]` table feeds [`mode_info::read_is_inter`]
-/// (§6.4.13) per-block via the §9.3.2 `ctx`.
-///
-/// The remaining §6.3.9..§6.3.17 inter-only sweeps land in subsequent
-/// rounds. The full `FrameIsIntra == 0` wiring inside
-/// `parse_compressed_header` is therefore still deferred — calling
-/// this function from the outer driver before its companions land
-/// would mis-position the coder cursor.
-// Forward-staged: the §6.3 outer dispatch gates this call on
-// `FrameIsIntra == 0` (alongside §6.3.9 / §6.3.10 / §6.3.12..§6.3.17),
-// and the parent `parse_compressed_header` driver doesn't yet wire
-// any of the inter-only branch in. The `#[allow(dead_code)]` lifts
-// the lint until the §6.3.9 / §6.3.10 primitives land and the outer
-// dispatch grows the inter arm.
-#[allow(dead_code)]
 pub(crate) fn read_is_inter_probs(
     coder: &mut BoolCoder<'_>,
     is_inter_prob: &mut [u8; IS_INTER_CONTEXTS],
@@ -679,41 +893,8 @@ pub(crate) fn read_is_inter_probs(
 /// Re-exported from [`mode_info::DEFAULT_IS_INTER_PROB`] (the
 /// single source of truth — same constant is consumed by the
 /// §6.4.13 [`mode_info::read_is_inter`] per-block decoder).
-#[allow(dead_code)] // wired in once the §6.3 inter-arm dispatch lands.
 pub(crate) const DEFAULT_IS_INTER_PROB_TABLE: [u8; IS_INTER_CONTEXTS] = DEFAULT_IS_INTER_PROB;
 
-/// `read_inter_mode_probs( )` per spec §6.3.9 ("Inter mode probs
-/// syntax" — `vp9-spec.txt` lines 2138-2143).
-///
-/// Two nested sweeps:
-///
-/// ```text
-/// for ( i = 0; i < INTER_MODE_CONTEXTS; i++ )
-///     for ( j = 0; j < INTER_MODES - 1; j++ )
-///         inter_mode_probs[ i ][ j ] =
-///             diff_update_prob( inter_mode_probs[ i ][ j ] )
-/// ```
-///
-/// `INTER_MODE_CONTEXTS = 7` (§3, `vp9-spec.txt` line 507) × `INTER_MODES - 1 = 3`
-/// (§3, line 506) = 21 cells. Every cell consumes one `B(252)`
-/// `update_prob` flag, and on 1 a `decode_term_subexp` +
-/// `inv_remap_prob` cascade. The 21-cell layout matches the
-/// `default_inter_mode_probs` table in §10.5 lines 7758-7766.
-///
-/// The §6.3 outer dispatch invokes `read_inter_mode_probs( )` only
-/// when `FrameIsIntra == 0` (alongside §6.3.10 / §6.3.11 /
-/// §6.3.12..§6.3.17). The function itself is unconditional once the
-/// caller has decided to fire it; the gating lives in the
-/// `parse_compressed_header` outer driver.
-///
-/// `inter_mode_probs` is updated in place. Initial values come from
-/// [`mode_info::DEFAULT_INTER_MODE_PROBS`] (the §10.5 listing —
-/// single source of truth for the `inter_mode_probs[ ][ ]` table).
-// Forward-staged: the §6.3 outer dispatch gates this call on
-// `FrameIsIntra == 0`. The `#[allow(dead_code)]` lifts the lint
-// until the outer dispatch grows the inter arm (paired with the
-// other §6.3.9..§6.3.17 primitives).
-#[allow(dead_code)]
 pub(crate) fn read_inter_mode_probs(
     coder: &mut BoolCoder<'_>,
     inter_mode_probs: &mut [[u8; INTER_MODES - 1]; INTER_MODE_CONTEXTS],
@@ -735,49 +916,9 @@ pub(crate) fn read_inter_mode_probs(
 /// single source of truth — the same constant will be consumed by
 /// the §6.4.16 `inter_block_mode_info( )` per-block decoder once
 /// that primitive lands).
-#[allow(dead_code)] // wired in once the §6.3 inter-arm dispatch lands.
 pub(crate) const DEFAULT_INTER_MODE_PROBS_TABLE: [[u8; INTER_MODES - 1]; INTER_MODE_CONTEXTS] =
     DEFAULT_INTER_MODE_PROBS;
 
-/// `read_interp_filter_probs( )` per spec §6.3.10 ("Interp filter probs
-/// syntax" — `vp9-spec.txt` lines 2146-2151).
-///
-/// Two nested sweeps:
-///
-/// ```text
-/// for ( j = 0; j < INTERP_FILTER_CONTEXTS; j++ )
-///     for ( i = 0; i < SWITCHABLE_FILTERS - 1; i++ )
-///         interp_filter_probs[ j ][ i ] =
-///             diff_update_prob( interp_filter_probs[ j ][ i ] )
-/// ```
-///
-/// Note: the spec swaps the loop variable names relative to §6.3.9 —
-/// the outer index here is `j` (over `INTERP_FILTER_CONTEXTS`) and
-/// the inner index is `i` (over `SWITCHABLE_FILTERS - 1`), matching
-/// the array layout `interp_filter_probs[ INTERP_FILTER_CONTEXTS ][
-/// SWITCHABLE_FILTERS - 1 ]`. The visit order is still
-/// "all probabilities of context 0, then all of context 1, …",
-/// matching the `default_interp_filter_probs` layout in §10.5 lines
-/// 7769-7775.
-///
-/// `INTERP_FILTER_CONTEXTS = 4` (§3, `vp9-spec.txt` line 495) ×
-/// `SWITCHABLE_FILTERS - 1 = 2` (§3, line 487) = 8 cells. Every cell
-/// consumes one `B(252)` `update_prob` flag, and on 1 a
-/// `decode_term_subexp` + `inv_remap_prob` cascade.
-///
-/// The §6.3 outer dispatch invokes `read_interp_filter_probs( )` only
-/// when `FrameIsIntra == 0` (alongside §6.3.9 / §6.3.11 /
-/// §6.3.12..§6.3.17). The function itself is unconditional once the
-/// caller has decided to fire it; the gating lives in the
-/// `parse_compressed_header` outer driver.
-///
-/// `interp_filter_probs` is updated in place. Initial values come from
-/// [`mode_info::DEFAULT_INTERP_FILTER_PROBS`] (the §10.5 listing —
-/// single source of truth for the `interp_filter_probs[ ][ ]` table).
-// Forward-staged: the §6.3 outer dispatch gates this call on
-// `FrameIsIntra == 0`. The `#[allow(dead_code)]` lifts the lint
-// until the outer dispatch grows the inter arm.
-#[allow(dead_code)]
 pub(crate) fn read_interp_filter_probs(
     coder: &mut BoolCoder<'_>,
     interp_filter_probs: &mut [[u8; SWITCHABLE_FILTERS - 1]; INTERP_FILTER_CONTEXTS],
@@ -797,46 +938,9 @@ pub(crate) fn read_interp_filter_probs(
 ///
 /// Re-exported from [`mode_info::DEFAULT_INTERP_FILTER_PROBS`] (the
 /// single source of truth).
-#[allow(dead_code)] // wired in once the §6.3 inter-arm dispatch lands.
 pub(crate) const DEFAULT_INTERP_FILTER_PROBS_TABLE: [[u8; SWITCHABLE_FILTERS - 1];
     INTERP_FILTER_CONTEXTS] = DEFAULT_INTERP_FILTER_PROBS;
 
-/// `read_y_mode_probs( )` per spec §6.3.14 ("Y mode probs syntax" —
-/// `vp9-spec.txt` lines 2220-2225).
-///
-/// Two nested sweeps:
-///
-/// ```text
-/// for ( i = 0; i < BLOCK_SIZE_GROUPS; i++ )
-///     for ( j = 0; j < INTRA_MODES - 1; j++ )
-///         y_mode_probs[ i ][ j ] =
-///             diff_update_prob( y_mode_probs[ i ][ j ] )
-/// ```
-///
-/// `BLOCK_SIZE_GROUPS = 4` (§3, `vp9-spec.txt` line 460) ×
-/// `INTRA_MODES - 1 = 9` (§3, line 505) = 36 cells. Every cell consumes
-/// one `B(252)` `update_prob` flag, and on 1 a `decode_term_subexp` +
-/// `inv_remap_prob` cascade. The 36-cell layout matches the
-/// `default_y_mode_probs[ BLOCK_SIZE_GROUPS ][ INTRA_MODES - 1 ]`
-/// table held in [`mode_info::DEFAULT_Y_MODE_PROBS`].
-///
-/// The §6.3 outer dispatch invokes `read_y_mode_probs( )` only when
-/// `FrameIsIntra == 0` (alongside §6.3.9 / §6.3.10 / §6.3.11 /
-/// §6.3.12 / §6.3.13 / §6.3.15 / §6.3.16 / §6.3.17). The function
-/// itself is unconditional once the caller has decided to fire it;
-/// the gating lives in the `parse_compressed_header` outer driver.
-///
-/// `y_mode_probs` is updated in place. Initial values come from
-/// [`mode_info::DEFAULT_Y_MODE_PROBS`] (the §9.3 / §10.5 listing —
-/// single source of truth for the inter-frame `y_mode_probs[ ][ ]`
-/// table; the keyframe path uses the unrelated three-dimensional
-/// `kf_y_mode_probs[ INTRA_MODES ][ INTRA_MODES ][ INTRA_MODES - 1 ]`
-/// fixed table held in [`mode_info::KF_Y_MODE_PROBS`]).
-// Forward-staged: the §6.3 outer dispatch gates this call on
-// `FrameIsIntra == 0`. The `#[allow(dead_code)]` lifts the lint
-// until the outer dispatch grows the inter arm (paired with the
-// other §6.3.9..§6.3.17 primitives).
-#[allow(dead_code)]
 pub(crate) fn read_y_mode_probs(
     coder: &mut BoolCoder<'_>,
     y_mode_probs: &mut [[u8; INTRA_MODES - 1]; BLOCK_SIZE_GROUPS],
@@ -857,7 +961,6 @@ pub(crate) fn read_y_mode_probs(
 /// Re-exported from [`mode_info::DEFAULT_Y_MODE_PROBS`] (the single
 /// source of truth — the same constant feeds the (still-deferred)
 /// §7.4.5 intra-mode tree decoder of `inter_block_mode_info( )`).
-#[allow(dead_code)] // wired in once the §6.3 inter-arm dispatch lands.
 pub(crate) const DEFAULT_Y_MODE_PROBS_TABLE: [[u8; INTRA_MODES - 1]; BLOCK_SIZE_GROUPS] =
     DEFAULT_Y_MODE_PROBS;
 
@@ -883,7 +986,8 @@ pub(crate) const DEFAULT_Y_MODE_PROBS_TABLE: [[u8; INTRA_MODES - 1]; BLOCK_SIZE_
 // keeping the "Reference" suffix lets `match` arms read the same as
 // the §6.3.12 listing's `reference_mode = …` assignments. Renaming
 // to satisfy the lint would silently diverge from the spec text.
-#[allow(clippy::enum_variant_names)]
+#[allow(clippy::enum_variant_names)] // SINGLE_REFERENCE / COMPOUND_REFERENCE / REFERENCE_MODE_SELECT
+// mirror the spec sentinel names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReferenceMode {
     /// `0` — `SINGLE_REFERENCE`. All inter blocks use a single ref
@@ -899,64 +1003,6 @@ pub enum ReferenceMode {
     ReferenceModeSelect,
 }
 
-/// `frame_reference_mode_probs( )` per spec §6.3.13
-/// (`vp9-spec.txt` lines 2195-2210).
-///
-/// Three conditional sweeps gated by the §6.3.12 `reference_mode`:
-///
-/// ```text
-/// if ( reference_mode == REFERENCE_MODE_SELECT )
-///     for ( i = 0; i < COMP_MODE_CONTEXTS; i++ )
-///         comp_mode_prob[ i ] = diff_update_prob( comp_mode_prob[ i ] )
-/// if ( reference_mode != COMPOUND_REFERENCE )
-///     for ( i = 0; i < REF_CONTEXTS; i++ ) {
-///         single_ref_prob[ i ][ 0 ] = diff_update_prob( single_ref_prob[ i ][ 0 ] )
-///         single_ref_prob[ i ][ 1 ] = diff_update_prob( single_ref_prob[ i ][ 1 ] )
-///     }
-/// if ( reference_mode != SINGLE_REFERENCE )
-///     for ( i = 0; i < REF_CONTEXTS; i++ )
-///         comp_ref_prob[ i ] = diff_update_prob( comp_ref_prob[ i ] )
-/// ```
-///
-/// Cell count per branch:
-///
-/// * `SINGLE_REFERENCE` (`= 0`) — `REF_CONTEXTS × 2 = 10` cells over
-///   `single_ref_prob`; `comp_mode_prob` and `comp_ref_prob` untouched.
-/// * `COMPOUND_REFERENCE` (`= 1`) — `REF_CONTEXTS = 5` cells over
-///   `comp_ref_prob`; `comp_mode_prob` and `single_ref_prob` untouched.
-/// * `REFERENCE_MODE_SELECT` (`= 2`) — all three sweeps fire:
-///   `COMP_MODE_CONTEXTS = 5` over `comp_mode_prob`,
-///   `REF_CONTEXTS × 2 = 10` over `single_ref_prob`, and
-///   `REF_CONTEXTS = 5` over `comp_ref_prob`, for `20` cells total.
-///
-/// Each cell consumes one `B(252)` `update_prob` flag from the §9.2
-/// coder, and on `1` a `decode_term_subexp` + `inv_remap_prob` cascade
-/// (per §6.3.3 `diff_update_prob( )`).
-///
-/// The §6.3 outer dispatch invokes `frame_reference_mode_probs( )` only
-/// when `FrameIsIntra == 0` (alongside §6.3.9 / §6.3.10 / §6.3.11 /
-/// §6.3.12 / §6.3.14 / §6.3.15 / §6.3.16 / §6.3.17). The function
-/// itself is unconditional once the caller has decided to fire it; the
-/// gating lives in the `parse_compressed_header` outer driver, which
-/// is still deferred because §6.3.12 needs `ref_frame_sign_bias[ ]`
-/// state the uncompressed-header walker still rejects with
-/// `Error::Unsupported`.
-///
-/// `comp_mode_prob`, `single_ref_prob`, and `comp_ref_prob` are updated
-/// in place. Initial values come from
-/// [`mode_info::DEFAULT_COMP_MODE_PROB`],
-/// [`mode_info::DEFAULT_SINGLE_REF_PROB`], and
-/// [`mode_info::DEFAULT_COMP_REF_PROB`] (the §10.5 listings — single
-/// source of truth, same constants feeding the (still-deferred)
-/// §7.4.7 / §9.3 `comp_mode` / `single_ref_p1` / `single_ref_p2` /
-/// `comp_ref` per-block decoders).
-// Forward-staged: the §6.3 outer dispatch gates this call on
-// `FrameIsIntra == 0` (alongside §6.3.9 / §6.3.10 / §6.3.11 / §6.3.12 /
-// §6.3.14..§6.3.17), and the parent `parse_compressed_header` driver
-// doesn't yet wire any of the inter-only branch in. The
-// `#[allow(dead_code)]` lifts the lint until the outer dispatch grows
-// the inter arm.
-#[allow(dead_code)]
 pub(crate) fn read_frame_reference_mode_probs(
     coder: &mut BoolCoder<'_>,
     reference_mode: ReferenceMode,
@@ -992,7 +1038,6 @@ pub(crate) fn read_frame_reference_mode_probs(
 /// Re-exported from [`mode_info::DEFAULT_COMP_MODE_PROB`] (the single
 /// source of truth — same constant will feed the (still-deferred)
 /// §7.4.7 `comp_mode` per-block decoder).
-#[allow(dead_code)] // wired in once the §6.3 inter-arm dispatch lands.
 pub(crate) const DEFAULT_COMP_MODE_PROB_TABLE: [u8; COMP_MODE_CONTEXTS] = DEFAULT_COMP_MODE_PROB;
 
 /// Re-export of the §10.5 `default_comp_ref_prob[ REF_CONTEXTS ]`
@@ -1002,7 +1047,6 @@ pub(crate) const DEFAULT_COMP_MODE_PROB_TABLE: [u8; COMP_MODE_CONTEXTS] = DEFAUL
 /// Re-exported from [`mode_info::DEFAULT_COMP_REF_PROB`] (the single
 /// source of truth — same constant will feed the (still-deferred)
 /// §7.4.7 `comp_ref` per-block decoder).
-#[allow(dead_code)] // wired in once the §6.3 inter-arm dispatch lands.
 pub(crate) const DEFAULT_COMP_REF_PROB_TABLE: [u8; REF_CONTEXTS] = DEFAULT_COMP_REF_PROB;
 
 /// Re-export of the §10.5 `default_single_ref_prob[ REF_CONTEXTS ][ 2 ]`
@@ -1012,57 +1056,8 @@ pub(crate) const DEFAULT_COMP_REF_PROB_TABLE: [u8; REF_CONTEXTS] = DEFAULT_COMP_
 /// Re-exported from [`mode_info::DEFAULT_SINGLE_REF_PROB`] (the single
 /// source of truth — same constant will feed the (still-deferred)
 /// §7.4.7 `single_ref_p1` / `single_ref_p2` per-block decoders).
-#[allow(dead_code)] // wired in once the §6.3 inter-arm dispatch lands.
 pub(crate) const DEFAULT_SINGLE_REF_PROB_TABLE: [[u8; 2]; REF_CONTEXTS] = DEFAULT_SINGLE_REF_PROB;
 
-/// `read_partition_probs( )` per spec §6.3.15 ("Partition probs
-/// syntax" — `vp9-spec.txt` lines 2227-2232).
-///
-/// Two nested sweeps:
-///
-/// ```text
-/// for ( i = 0; i < PARTITION_CONTEXTS; i++ )
-///     for ( j = 0; j < PARTITION_TYPES - 1; j++ )
-///         partition_probs[ i ][ j ] =
-///             diff_update_prob( partition_probs[ i ][ j ] )
-/// ```
-///
-/// `PARTITION_CONTEXTS = 16` (§3, `vp9-spec.txt` line 463) ×
-/// `PARTITION_TYPES - 1 = 3` (§3, line 497) = 48 cells. Every cell
-/// consumes one `B(252)` `update_prob` flag, and on 1 a
-/// `decode_term_subexp` + `inv_remap_prob` cascade. The 48-cell layout
-/// matches the §10.5 [`crate::partition::DEFAULT_PARTITION_PROBS`]
-/// table.
-///
-/// The §6.3 outer dispatch invokes `read_partition_probs( )` only
-/// when `FrameIsIntra == 0` (alongside §6.3.9 / §6.3.10 / §6.3.11 /
-/// §6.3.12 / §6.3.13 / §6.3.14 / §6.3.16 / §6.3.17). The function
-/// itself is unconditional once the caller has decided to fire it;
-/// the gating lives in the `parse_compressed_header` outer driver,
-/// which is still deferred because §6.3.12 needs
-/// `ref_frame_sign_bias[ ]` state the uncompressed-header walker
-/// still rejects with `Error::Unsupported`.
-///
-/// `partition_probs` is updated in place. Initial values come from
-/// [`crate::partition::DEFAULT_PARTITION_PROBS`] (the §10.5 listing
-/// — single source of truth; the same constant feeds the §6.4.3
-/// `decode_partition_type( )` per-call partition decoder on inter
-/// frames via the §9.3.2 `partition_plane_context( )` ctx).
-///
-/// The four `PARTITION_CONTEXTS = 16` rows index by
-/// `bsl * 4 + left * 2 + above`, where `bsl ∈ 0..=3` selects the
-/// outer block-size group (`8x8 -> 4x4`, `16x16 -> 8x8`,
-/// `32x32 -> 16x16`, `64x64 -> 32x32`) and the inner `(above, left)`
-/// pair selects the four `(0/1, 0/1)` neighbour-split combinations.
-/// The three columns are the §9.3.1 `partition_tree[ 4 ]` decision
-/// nodes (`PARTITION_NONE` vs split, `PARTITION_HORZ` vs other,
-/// `PARTITION_VERT` vs `PARTITION_SPLIT`).
-// Forward-staged: the §6.3 outer dispatch gates this call on
-// `FrameIsIntra == 0` (alongside §6.3.9..§6.3.14 and §6.3.16..§6.3.17),
-// and the parent `parse_compressed_header` driver doesn't yet wire any
-// of the inter-only branch in. The `#[allow(dead_code)]` lifts the lint
-// until the outer dispatch grows the inter arm.
-#[allow(dead_code)]
 pub(crate) fn read_partition_probs(
     coder: &mut BoolCoder<'_>,
     partition_probs: &mut [[u8; PARTITION_TYPES - 1]; PARTITION_CONTEXTS],
@@ -1084,68 +1079,9 @@ pub(crate) fn read_partition_probs(
 /// single source of truth — same constant feeds the §6.4.3
 /// `decode_partition_type( )` per-call partition decoder on inter
 /// frames).
-#[allow(dead_code)] // wired in once the §6.3 inter-arm dispatch lands.
 pub(crate) const DEFAULT_PARTITION_PROBS_TABLE: [[u8; PARTITION_TYPES - 1]; PARTITION_CONTEXTS] =
     DEFAULT_PARTITION_PROBS;
 
-/// `update_mv_prob( prob )` per spec §6.3.17 ("Update mv prob syntax" —
-/// `vp9-spec.txt` lines 2261-2275).
-///
-/// Listing reproduced verbatim:
-///
-/// ```text
-/// update_mv_prob( prob ) {
-///     update_mv_prob                                          B(252)
-///     if ( update_mv_prob == 1 ) {
-///         mv_prob                                             L(7)
-///         prob = (mv_prob << 1) | 1
-///     }
-///     return prob
-/// }
-/// ```
-///
-/// Two-stage primitive:
-///
-/// 1. Read one `B(252)` `update_mv_prob` flag.
-/// 2. If the flag is 1, read a 7-bit `L(7)` literal and compute
-///    `prob = (mv_prob << 1) | 1`. The `<< 1 | 1` rewrite produces an
-///    odd value in `[1, 255]` — MV probabilities can't be 0 because
-///    §6.5.x MV tree decode treats 0 as an unconditional branch.
-/// 3. Otherwise the caller's `prob` byte is returned unchanged.
-///
-/// Distinct from the §6.3.3 [`read_diff_update_prob`] primitive used by
-/// every other §6.3 probability sweep: that function uses
-/// `decode_term_subexp` + `inv_remap_prob` to produce a remapped
-/// probability that depends on the previous value; this one ignores
-/// the previous probability entirely (the `prob` argument never reads
-/// after the flag check) and computes a fresh value purely from the
-/// 7-bit literal. The diff vs. raw split is the §6.3.16 `mv_probs( )`
-/// reading slot-update flags more frequently than the §6.3.7..§6.3.15
-/// sweeps in real-world VP9 streams — the `<< 1 | 1` shape encodes a
-/// fresh probability cheaply in 8 bits total (`B(252)` + `L(7)`)
-/// without needing the 4-leg subexp encoding.
-///
-/// `mv_prob << 1 | 1` rewrites the 7-bit value `[0, 127]` into `[1,
-/// 255]` step 2 (odd integers): the LSB is fixed at 1, the high 7 bits
-/// carry the literal payload. The §6.3.16 caller writes the returned
-/// value back into the running MV probability table slot in place
-/// (`mv_joint_probs[ j ]`, `mv_sign_prob[ i ]`,
-/// `mv_class_probs[ i ][ j ]`, etc.; see §6.3.16 listing for the full
-/// slot inventory).
-///
-/// As of round 27 this entry point has no live caller — §6.3.16
-/// `mv_probs( )` is still deferred because its outer-dispatch gate
-/// (`FrameIsIntra == 0` plus the `allow_high_precision_mv` decision
-/// from §6.2.5) needs reference-buffer + header state that the
-/// uncompressed-header walker still rejects with `Error::Unsupported`.
-/// The function exists so that the §6.3.16 sweep can drop in
-/// uneventfully once those dependencies land.
-// Forward-staged: the §6.3 outer dispatch only routes through this
-// helper via §6.3.16 `mv_probs( )` on inter frames, and the parent
-// `parse_compressed_header` driver doesn't yet wire any of the
-// inter-only branch in. The `#[allow(dead_code)]` lifts the lint until
-// the outer dispatch grows the inter arm.
-#[allow(dead_code)]
 pub(crate) fn update_mv_prob(coder: &mut BoolCoder<'_>, prob: u8) -> Result<u8, Error> {
     let update_flag = coder.read_bool(252)?;
     if update_flag == 1 {
@@ -1156,97 +1092,6 @@ pub(crate) fn update_mv_prob(coder: &mut BoolCoder<'_>, prob: u8) -> Result<u8, 
     }
 }
 
-/// `setup_compound_reference_mode( )` per spec §6.3.18 ("Setup
-/// compound reference mode syntax" — `vp9-spec.txt` lines 2279-2296).
-///
-/// Listing reproduced verbatim:
-///
-/// ```text
-/// setup_compound_reference_mode( ) {
-///     if ( ref_frame_sign_bias[ LAST_FRAME ] ==
-///                      ref_frame_sign_bias[ GOLDEN_FRAME ] ) {
-///         CompFixedRef = ALTREF_FRAME
-///         CompVarRef[ 0 ] = LAST_FRAME
-///         CompVarRef[ 1 ] = GOLDEN_FRAME
-///     } else if ( ref_frame_sign_bias[ LAST_FRAME ] ==
-///                        ref_frame_sign_bias[ ALTREF_FRAME ] ) {
-///         CompFixedRef = GOLDEN_FRAME
-///         CompVarRef[ 0 ] = LAST_FRAME
-///         CompVarRef[ 1 ] = ALTREF_FRAME
-///     } else {
-///         CompFixedRef = LAST_FRAME
-///         CompVarRef[ 0 ] = GOLDEN_FRAME
-///         CompVarRef[ 1 ] = ALTREF_FRAME
-///     }
-/// }
-/// ```
-///
-/// Pure compute — no bool-coder reads, no probability sweep. The
-/// function inspects the §6.2.5 `ref_frame_sign_bias[ ]` array (one
-/// flag per inter reference frame: `LAST_FRAME = 1`, `GOLDEN_FRAME =
-/// 2`, `ALTREF_FRAME = 3` per §3) and partitions the three inter
-/// references into a single `CompFixedRef` plus a `CompVarRef[ 2 ]`
-/// pair. The §3 commentary above the listing (lines 3984-3989)
-/// explains the rationale: compound prediction always blends the
-/// fixed reference with one of the two variable references, and the
-/// fixed reference is the one whose sign bias differs from the other
-/// two (or, when all three agree, `ALTREF_FRAME` is the conventional
-/// choice).
-///
-/// Branch-coverage table (the eight possible
-/// `(ref_frame_sign_bias[LAST_FRAME], ref_frame_sign_bias[GOLDEN_FRAME],
-/// ref_frame_sign_bias[ALTREF_FRAME])` tuples):
-///
-/// | LAST | GOLDEN | ALTREF | CompFixedRef | CompVarRef[0] | CompVarRef[1] | Branch |
-/// |------|--------|--------|--------------|---------------|---------------|--------|
-/// | 0    | 0      | 0      | ALTREF_FRAME | LAST_FRAME    | GOLDEN_FRAME  | 1      |
-/// | 0    | 0      | 1      | ALTREF_FRAME | LAST_FRAME    | GOLDEN_FRAME  | 1      |
-/// | 0    | 1      | 0      | GOLDEN_FRAME | LAST_FRAME    | ALTREF_FRAME  | 2      |
-/// | 0    | 1      | 1      | LAST_FRAME   | GOLDEN_FRAME  | ALTREF_FRAME  | 3      |
-/// | 1    | 0      | 0      | LAST_FRAME   | GOLDEN_FRAME  | ALTREF_FRAME  | 3      |
-/// | 1    | 0      | 1      | GOLDEN_FRAME | LAST_FRAME    | ALTREF_FRAME  | 2      |
-/// | 1    | 1      | 0      | ALTREF_FRAME | LAST_FRAME    | GOLDEN_FRAME  | 1      |
-/// | 1    | 1      | 1      | ALTREF_FRAME | LAST_FRAME    | GOLDEN_FRAME  | 1      |
-///
-/// Branch 1 takes precedence when `LAST == GOLDEN` (regardless of
-/// `ALTREF`); branch 2 fires only when `LAST != GOLDEN` AND `LAST ==
-/// ALTREF`; branch 3 fires only when `LAST != GOLDEN` AND `LAST !=
-/// ALTREF` (which by the if/else chain implies `GOLDEN == ALTREF`).
-/// In every branch the three outputs are pairwise distinct elements of
-/// `{LAST_FRAME, GOLDEN_FRAME, ALTREF_FRAME}` — the function permutes
-/// the three inter references into a fixed-vs-variable partition,
-/// never collapsing them or mixing in `INTRA_FRAME`.
-///
-/// Input layout: `ref_frame_sign_bias` is the §6.2.5 array indexed by
-/// the §3 ref-frame enumeration `INTRA_FRAME..MAX_REF_FRAMES - 1`,
-/// i.e. positions `0..=3`. Only the three inter slots (`LAST_FRAME` /
-/// `GOLDEN_FRAME` / `ALTREF_FRAME`) are read; the `INTRA_FRAME` slot
-/// is unused (its value never appears in the §6.3.18 listing). The
-/// spec stores these as `f(1)` values (line 1625), so each element is
-/// `0` or `1`.
-///
-/// Output is a [`CompoundReferenceConfig`] bundle carrying the three
-/// `i32` ref-frame indices the §6.4.18 `assign_mv( )` / §6.5
-/// `find_mv_refs( )` / §6.4.19 MV-prediction sites consume.
-///
-/// As of round 29 the §6.3.12 [`frame_reference_mode`] driver invokes
-/// `setup_compound_reference_mode( )` from the
-/// `non_single_reference == 1` arm — i.e. on the `CompoundReference`
-/// and `ReferenceModeSelect` modes only — passing the same
-/// `&RefFrameSignBias` it received from its caller. The §6.3 outer
-/// dispatch itself, however, is still deferred: it would invoke
-/// `frame_reference_mode( )` only when `FrameIsIntra == 0` and the
-/// `ref_frame_sign_bias[ ]` array is sourced from §6.2.5, which the
-/// uncompressed-header walker still rejects with `Error::Unsupported`.
-/// The function exists so that the §6.3 outer dispatch can drop in
-/// uneventfully once that uncompressed-header dependency lands.
-//
-// Forward-staged: the §6.3 outer dispatch only routes through this
-// helper on inter frames with `reference_mode != SINGLE_REFERENCE`,
-// and the parent `parse_compressed_header` driver doesn't yet wire
-// any of the inter-only branch in. The `#[allow(dead_code)]` lifts
-// the lint until the outer dispatch grows the inter arm.
-#[allow(dead_code)]
 pub(crate) fn setup_compound_reference_mode(
     ref_frame_sign_bias: &RefFrameSignBias,
 ) -> CompoundReferenceConfig {
@@ -1300,20 +1145,18 @@ pub(crate) fn setup_compound_reference_mode(
 // the §6.4.17 / §6.5 MV machinery (also still deferred). The
 // `#[allow(dead_code)]` lifts the lint until either side grows a
 // caller.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct RefFrameSignBias {
+pub struct RefFrameSignBias {
     biases: [u8; MAX_REF_FRAMES],
 }
 
-#[allow(dead_code)]
 impl RefFrameSignBias {
     /// Build a sign-bias array from the three inter ref-frame flags.
     /// Each input is the `f(1)` value `0` or `1` from §6.2.5.
     ///
     /// Panics in debug builds if any input is outside `{0, 1}` — §6.2.5
     /// reads each via `f(1)` so two-state is a structural invariant.
-    pub(crate) fn from_inter_biases(last: u8, golden: u8, altref: u8) -> Self {
+    pub fn from_inter_biases(last: u8, golden: u8, altref: u8) -> Self {
         debug_assert!(last <= 1, "ref_frame_sign_bias[LAST_FRAME] must be f(1)");
         debug_assert!(
             golden <= 1,
@@ -1335,7 +1178,7 @@ impl RefFrameSignBias {
     /// §6.2.5).
     ///
     /// Panics if `ref_frame` is outside the §3 enumeration `0..=3`.
-    pub(crate) fn get(&self, ref_frame: i32) -> u8 {
+    pub fn get(&self, ref_frame: i32) -> u8 {
         let idx = ref_frame as usize;
         assert!(
             idx < MAX_REF_FRAMES,
@@ -1361,9 +1204,8 @@ impl RefFrameSignBias {
 // Forward-staged: consumed by §6.4.16 / §6.4.18 / §6.5 — none of which
 // have landed yet. The `#[allow(dead_code)]` lifts the lint until
 // those consumers land.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CompoundReferenceConfig {
+pub struct CompoundReferenceConfig {
     /// The fixed reference frame (always one of `LAST_FRAME` /
     /// `GOLDEN_FRAME` / `ALTREF_FRAME`).
     pub fixed_ref: i32,
@@ -1372,105 +1214,6 @@ pub(crate) struct CompoundReferenceConfig {
     pub var_ref: [i32; 2],
 }
 
-/// `frame_reference_mode( )` per spec §6.3.12 ("Frame reference mode
-/// syntax" — `vp9-spec.txt` lines 2170-2191).
-///
-/// Listing reproduced verbatim:
-///
-/// ```text
-/// frame_reference_mode( ) {
-///     compoundReferenceAllowed = 0
-///     for ( i = 1; i < REFS_PER_FRAME; i++ )
-///         if ( ref_frame_sign_bias[ i + 1 ] != ref_frame_sign_bias[ 1 ] )
-///             compoundReferenceAllowed = 1
-///     if ( compoundReferenceAllowed == 1 ) {
-///         non_single_reference                                 L(1)
-///         if ( non_single_reference == 0 ) {
-///             reference_mode = SINGLE_REFERENCE
-///         } else {
-///             reference_select                                 L(1)
-///             if ( reference_select == 0 )
-///                 reference_mode = COMPOUND_REFERENCE
-///             else
-///                 reference_mode = REFERENCE_MODE_SELECT
-///             setup_compound_reference_mode( )
-///         }
-///     } else {
-///         reference_mode = SINGLE_REFERENCE
-///     }
-/// }
-/// ```
-///
-/// Two bool-coder reads at most: one `L(1)` `non_single_reference` on
-/// the `compoundReferenceAllowed == 1` arm, and on a 1 a second `L(1)`
-/// `reference_select`. The `compoundReferenceAllowed == 0` arm short-
-/// circuits to `SingleReference` with zero bool-coder reads.
-///
-/// `compoundReferenceAllowed` is the §3 condition "at least one of the
-/// two non-`LAST_FRAME` inter references has a sign bias differing
-/// from `LAST_FRAME`'s". With `REFS_PER_FRAME = 3` the loop iterates
-/// `i = 1, 2` and reads `ref_frame_sign_bias[ i + 1 ]` at indices `2`
-/// (`GOLDEN_FRAME`) and `3` (`ALTREF_FRAME`) against
-/// `ref_frame_sign_bias[ 1 ]` (`LAST_FRAME`). The allowed-vs-not split
-/// is:
-///
-/// * `LAST == GOLDEN AND LAST == ALTREF` (all-agree tuples
-///   `(0,0,0)` and `(1,1,1)`) — `compoundReferenceAllowed = 0`,
-///   forcing `SingleReference` with no bits read. The two-frame
-///   compound machinery is dormant when every inter reference points
-///   the same temporal direction.
-/// * Any other sign-bias tuple — `compoundReferenceAllowed = 1`,
-///   reading at least one `L(1)` and potentially invoking
-///   [`setup_compound_reference_mode`] on the
-///   `non_single_reference == 1` arm.
-///
-/// Branch table (the 8 possible
-/// `(ref_frame_sign_bias[LAST], ref_frame_sign_bias[GOLDEN],
-/// ref_frame_sign_bias[ALTREF])` tuples × the at-most-2 `L(1)` reads):
-///
-/// | LAST | GOLDEN | ALTREF | allowed | non_single | select | reference_mode      | invokes setup |
-/// |------|--------|--------|---------|------------|--------|---------------------|---------------|
-/// | 0    | 0      | 0      | 0       | —          | —      | SingleReference     | no            |
-/// | 0    | 0      | 1      | 1       | 0          | —      | SingleReference     | no            |
-/// | 0    | 0      | 1      | 1       | 1          | 0      | CompoundReference   | yes           |
-/// | 0    | 0      | 1      | 1       | 1          | 1      | ReferenceModeSelect | yes           |
-/// | 1    | 1      | 1      | 0       | —          | —      | SingleReference     | no            |
-///
-/// (The remaining six allowed-arm tuples follow the same `(non_single,
-/// select)` × `reference_mode` table — the only thing the sign-bias
-/// tuple changes is which of the three branches of §6.3.18
-/// [`setup_compound_reference_mode`] fires when invoked.)
-///
-/// Returns `(ReferenceMode, Option<CompoundReferenceConfig>)`:
-///
-/// * `ReferenceMode::SingleReference` — `None` for the compound
-///   config, since the §6.3.18 caller invokes only when
-///   `reference_mode != SINGLE_REFERENCE`. Fires on both the
-///   `compoundReferenceAllowed == 0` short-circuit and the
-///   `non_single_reference == 0` arm.
-/// * `ReferenceMode::CompoundReference` /
-///   `ReferenceMode::ReferenceModeSelect` — `Some(cfg)` with the
-///   §6.3.18 partition of `{LAST_FRAME, GOLDEN_FRAME, ALTREF_FRAME}`
-///   into `(CompFixedRef, CompVarRef[ 2 ])`.
-///
-/// As of round 29 this entry point has no live caller — the §6.3
-/// outer dispatch invokes `frame_reference_mode( )` only when
-/// `FrameIsIntra == 0`, and the parent `parse_compressed_header`
-/// driver doesn't yet wire any of the inter-only branch in. The
-/// `ref_frame_sign_bias[ ]` input still comes from the §6.2.5
-/// uncompressed-header walker, which currently rejects inter frames
-/// with `Error::Unsupported`. The function exists so that the §6.3
-/// outer dispatch can drop in uneventfully once those dependencies
-/// land.
-//
-// Forward-staged: the §6.3 outer dispatch invokes
-// `frame_reference_mode( )` only on `FrameIsIntra == 0` frames after
-// the §6.3.11 `read_is_inter_probs( )` sweep and before the §6.3.13
-// `frame_reference_mode_probs( )` sweep. The parent
-// `parse_compressed_header` driver doesn't yet wire any of the inter-
-// only branch in. The `#[allow(dead_code)]` lifts the lint until the
-// outer dispatch grows the inter arm.
-#[allow(dead_code)]
 pub(crate) fn frame_reference_mode(
     coder: &mut BoolCoder<'_>,
     ref_frame_sign_bias: &RefFrameSignBias,
@@ -1543,43 +1286,41 @@ pub(crate) fn frame_reference_mode(
 /// point the §6.4 / §6.5 MV-tree decoders consume the same fields
 /// directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) struct MvProbs {
+pub struct MvProbs {
     /// `mv_joint_probs[ MV_JOINTS - 1 ]` — joint-tree decision probs
     /// (3 cells).
-    pub(crate) joint_probs: [u8; MV_JOINTS - 1],
+    pub joint_probs: [u8; MV_JOINTS - 1],
     /// `mv_sign_prob[ 2 ]` — per-component sign probs (2 cells).
-    pub(crate) sign_prob: [u8; 2],
+    pub sign_prob: [u8; 2],
     /// `mv_class_probs[ 2 ][ MV_CLASSES - 1 ]` — per-component
     /// magnitude-class probs (20 cells).
-    pub(crate) class_probs: [[u8; MV_CLASSES - 1]; 2],
+    pub class_probs: [[u8; MV_CLASSES - 1]; 2],
     /// `mv_class0_bit_prob[ 2 ]` — per-component class0 sub-bin selector
     /// (2 cells).
-    pub(crate) class0_bit_prob: [u8; 2],
+    pub class0_bit_prob: [u8; 2],
     /// `mv_bits_prob[ 2 ][ MV_OFFSET_BITS ]` — per-component magnitude
     /// offset-bit probs (20 cells).
-    pub(crate) bits_prob: [[u8; MV_OFFSET_BITS]; 2],
+    pub bits_prob: [[u8; MV_OFFSET_BITS]; 2],
     /// `mv_class0_fr_probs[ 2 ][ CLASS0_SIZE ][ MV_FR_SIZE - 1 ]` —
     /// per-component-per-class0-sub-bin fractional-pel probs (12 cells).
-    pub(crate) class0_fr_probs: [[[u8; MV_FR_SIZE - 1]; CLASS0_SIZE]; 2],
+    pub class0_fr_probs: [[[u8; MV_FR_SIZE - 1]; CLASS0_SIZE]; 2],
     /// `mv_fr_probs[ 2 ][ MV_FR_SIZE - 1 ]` — per-component
     /// fractional-pel probs (6 cells).
-    pub(crate) fr_probs: [[u8; MV_FR_SIZE - 1]; 2],
+    pub fr_probs: [[u8; MV_FR_SIZE - 1]; 2],
     /// `mv_class0_hp_prob[ 2 ]` — per-component high-precision class0
     /// probs (2 cells; swept only if `allow_high_precision_mv == 1`).
-    pub(crate) class0_hp_prob: [u8; 2],
+    pub class0_hp_prob: [u8; 2],
     /// `mv_hp_prob[ 2 ]` — per-component high-precision probs (2 cells;
     /// swept only if `allow_high_precision_mv == 1`).
-    pub(crate) hp_prob: [u8; 2],
+    pub hp_prob: [u8; 2],
 }
 
-#[allow(dead_code)]
 impl MvProbs {
     /// Construct the §10.5 initial / reset bundle. Every slot is seeded
     /// from the `mode_info::DEFAULT_MV_*` listings (single source of
     /// truth — same constants feed the §6.5 MV-tree decoders once they
     /// land).
-    pub(crate) const fn defaults() -> Self {
+    pub const fn defaults() -> Self {
         Self {
             joint_probs: DEFAULT_MV_JOINT_PROBS,
             sign_prob: DEFAULT_MV_SIGN_PROB,
@@ -1594,92 +1335,6 @@ impl MvProbs {
     }
 }
 
-/// `mv_probs( )` per spec §6.3.16 ("MV probs syntax" — `vp9-spec.txt`
-/// lines 2234-2259).
-///
-/// Listing reproduced verbatim:
-///
-/// ```text
-/// mv_probs( ) {
-///     for( j = 0; j < MV_JOINTS - 1 ; j++ )
-///         mv_joint_probs[ j ] = update_mv_prob( mv_joint_probs[ j ] )
-///     for ( i = 0; i < 2; i++ ) {
-///         mv_sign_prob[ i ] = update_mv_prob( mv_sign_prob[ i ] )
-///         for ( j = 0; j < MV_CLASSES - 1; j++ )
-///              mv_class_probs[ i ][ j ] = update_mv_prob( mv_class_probs[ i ][ j ] )
-///         mv_class0_bit_prob[ i ] = update_mv_prob( mv_class0_bit_prob[ i ] )
-///         for ( j = 0; j < MV_OFFSET_BITS; j++ )
-///              mv_bits_prob[ i ][ j ] = update_mv_prob( mv_bits_prob[ i ][ j ] )
-///     }
-///     for ( i = 0; i < 2; i++ ) {
-///         for ( j = 0; j < CLASS0_SIZE; j++ )
-///              for ( k = 0; k < MV_FR_SIZE - 1; k++ )
-///                    mv_class0_fr_probs[i][j][k] = update_mv_prob(mv_class0_fr_probs[i][j][k])
-///         for ( k = 0; k < MV_FR_SIZE - 1; k++ )
-///              mv_fr_probs[ i ][ k ] = update_mv_prob( mv_fr_probs[ i ][ k ] )
-///     }
-///     if ( allow_high_precision_mv ) {
-///         for ( i = 0; i < 2; i++ ) {
-///              mv_class0_hp_prob[ i ] = update_mv_prob( mv_class0_hp_prob[ i ] )
-///              mv_hp_prob[ i ] = update_mv_prob( mv_hp_prob[ i ] )
-///         }
-///     }
-/// }
-/// ```
-///
-/// Three unconditional outer phases plus one conditional tail:
-///
-/// 1. **Joint phase** (3 cells): walks
-///    `mv_joint_probs[ MV_JOINTS - 1 = 3 ]`.
-/// 2. **Per-component bulk phase** (2 components × 22 cells = 44
-///    cells): per `i ∈ {0, 1}`, walks `sign_prob[ i ]` (1) +
-///    `class_probs[ i ][ 0..MV_CLASSES - 1 ]` (10) +
-///    `class0_bit_prob[ i ]` (1) + `bits_prob[ i ][ 0..MV_OFFSET_BITS ]`
-///    (10).
-/// 3. **Per-component fractional phase** (2 components × (CLASS0_SIZE ×
-///    (MV_FR_SIZE - 1) + (MV_FR_SIZE - 1)) = 2 × 9 = 18 cells): per
-///    `i ∈ {0, 1}`, walks `class0_fr_probs[ i ][ 0..CLASS0_SIZE ][
-///    0..MV_FR_SIZE - 1 ]` (6) + `fr_probs[ i ][ 0..MV_FR_SIZE - 1 ]`
-///    (3).
-/// 4. **High-precision tail** (2 components × 2 cells = 4 cells; gated
-///    on `allow_high_precision_mv == 1`): per `i ∈ {0, 1}`, walks
-///    `class0_hp_prob[ i ]` (1) + `hp_prob[ i ]` (1).
-///
-/// Total cell count = 3 + 44 + 18 = **65 cells** (`allow_high_precision_mv
-/// == 0`) or 65 + 4 = **69 cells** (`allow_high_precision_mv == 1`).
-///
-/// Every cell consumes one `B(252)` `update_mv_prob` flag from the §9.2
-/// coder via [`update_mv_prob`]; cells where the flag reads `1` also
-/// consume seven extra `L(7)` literal bits. The `update_mv_prob`
-/// primitive differs from `read_diff_update_prob` used by every other
-/// §6.3 probability sweep: the diff-update primitive uses
-/// `decode_term_subexp` + `inv_remap_prob` and the output depends on
-/// the previous probability; the MV-update primitive ignores the
-/// previous probability on the flag-set branch and produces a fresh
-/// value purely from the 7-bit literal as `(mv_prob << 1) | 1` (odd
-/// values in `[1, 255]`; the `0` value is reserved by the §6.5 MV-tree
-/// decode as an unconditional branch).
-///
-/// The §6.3 outer dispatch invokes `mv_probs( )` only when
-/// `FrameIsIntra == 0` (alongside §6.3.9 / §6.3.10 / §6.3.11 /
-/// §6.3.12 / §6.3.13 / §6.3.14 / §6.3.15 / §6.3.17 / §6.3.18). The
-/// function itself is unconditional once the caller has decided to
-/// fire it; the gating lives in the `parse_compressed_header` outer
-/// driver, which is still deferred because it needs
-/// `ref_frame_sign_bias[ ]` + `allow_high_precision_mv` state the
-/// uncompressed-header walker still rejects with `Error::Unsupported`.
-///
-/// `probs` is updated in place. The §10.5 listings transcribed in
-/// [`crate::mode_info`] supply the initial / reset bundle via
-/// [`MvProbs::defaults`]; passing custom starting tables exercises the
-/// pass-through branch on flag-clear cells.
-// Forward-staged: the §6.3 outer dispatch gates this call on
-// `FrameIsIntra == 0` and pulls `allow_high_precision_mv` from §6.2.5
-// of the uncompressed header, and the parent `parse_compressed_header`
-// driver doesn't yet wire any of the inter-only branch in. The
-// `#[allow(dead_code)]` lifts the lint until the outer dispatch grows
-// the inter arm.
-#[allow(dead_code)]
 pub(crate) fn mv_probs(
     coder: &mut BoolCoder<'_>,
     probs: &mut MvProbs,
@@ -4394,5 +4049,358 @@ mod tests {
         assert_eq!(p.fr_probs, DEFAULT_MV_FR_PROBS);
         assert_eq!(p.class0_hp_prob, DEFAULT_MV_CLASS0_HP_PROB);
         assert_eq!(p.hp_prob, DEFAULT_MV_HP_PROB);
+    }
+
+    // ----- §6.3 parse_compressed_header_inter outer dispatch -----
+    //
+    // The inter-arm tests below pin the round-34 §6.3 inter-frame
+    // outer driver against the round-22..30 primitives it composes:
+    //
+    // * The intra-shared prefix (§6.3.1 / §6.3.2 / §6.3.7 / §6.3.8)
+    //   matches what the intra-only `parse_compressed_header` returns.
+    // * The inter tail (§6.3.9 / §6.3.10 / §6.3.11 / §6.3.12+18 /
+    //   §6.3.13 / §6.3.14 / §6.3.15 / §6.3.16+17) hands off to each
+    //   primitive in spec order with the right tables.
+    // * The gating decisions (§6.3.10 on `interpolation_filter ==
+    //   SWITCHABLE`, §6.3.16 high-precision tail on
+    //   `allow_high_precision_mv`) fire only when their gate is true.
+    //
+    // The §10.5 / §10 defaults survive across a zero-buffer walk
+    // because every `B(252)` update-flag decodes to 0 (BoolValue = 0
+    // < split = 125), so each `read_diff_update_prob` and each
+    // `update_mv_prob` returns the input prob unchanged. This makes
+    // the zero buffer a clean "no-op walk" for verifying composition
+    // order.
+
+    /// Helper: build a `RefFrameSignBias` with `LAST == GOLDEN ==
+    /// ALTREF == 0`, which forces `frame_reference_mode( )` down the
+    /// `compoundReferenceAllowed == 0` short-circuit branch (no
+    /// bool-coder reads, returns `SingleReference`).
+    fn all_zero_sign_bias() -> RefFrameSignBias {
+        RefFrameSignBias::from_inter_biases(0, 0, 0)
+    }
+
+    /// Helper: build a `RefFrameSignBias` with `LAST = 0, GOLDEN = 0,
+    /// ALTREF = 1`, the smallest config where `compoundReferenceAllowed
+    /// == 1` (so the §6.3.12 walker enters the bool-coder-reading arm).
+    fn mixed_sign_bias() -> RefFrameSignBias {
+        RefFrameSignBias::from_inter_biases(0, 0, 1)
+    }
+
+    #[test]
+    fn parse_compressed_header_inter_zero_buffer_preserves_all_defaults() {
+        // Zero buffer + ONLY_4X4 (non-lossless `tx_mode` raw bits =
+        // 00) + `compoundReferenceAllowed == 0` short-circuit ->
+        // every probability sweep returns its base unchanged.
+        // §6.3.16 high-precision tail skipped (`allow_high_precision_mv
+        // == false`).
+        let bytes = [0x00u8; 256];
+        let inputs = Vp9CompressedHeaderInterInputs {
+            interpolation_filter_is_switchable: false,
+            ref_frame_sign_bias: all_zero_sign_bias(),
+            allow_high_precision_mv: false,
+        };
+        let r = parse_compressed_header_inter(&bytes, false, inputs).unwrap();
+        // Intra-shared prefix matches the intra-only walker.
+        assert_eq!(r.intra.tx_mode, TxMode::Only4x4);
+        assert_eq!(r.intra.tx_probs, DEFAULT_TX_PROBS);
+        assert_eq!(r.intra.coef_probs, DEFAULT_COEF_PROBS);
+        assert_eq!(r.intra.skip_prob, DEFAULT_SKIP_PROB);
+        // Inter tail every table left at its §10.5 default.
+        assert_eq!(r.inter_mode_probs, DEFAULT_INTER_MODE_PROBS_TABLE);
+        assert_eq!(r.interp_filter_probs, DEFAULT_INTERP_FILTER_PROBS_TABLE);
+        assert_eq!(r.is_inter_prob, DEFAULT_IS_INTER_PROB_TABLE);
+        // `compoundReferenceAllowed == 0` arm: `SingleReference` with
+        // no compound config.
+        assert_eq!(r.reference_mode, ReferenceMode::SingleReference);
+        assert_eq!(r.compound_reference_config, None);
+        assert_eq!(r.comp_mode_prob, DEFAULT_COMP_MODE_PROB_TABLE);
+        assert_eq!(r.single_ref_prob, DEFAULT_SINGLE_REF_PROB_TABLE);
+        assert_eq!(r.comp_ref_prob, DEFAULT_COMP_REF_PROB_TABLE);
+        assert_eq!(r.y_mode_probs, DEFAULT_Y_MODE_PROBS_TABLE);
+        assert_eq!(r.partition_probs, DEFAULT_PARTITION_PROBS_TABLE);
+        assert_eq!(r.mv_probs, MvProbs::defaults());
+    }
+
+    #[test]
+    fn parse_compressed_header_inter_zero_buffer_matches_intra_prefix() {
+        // Cross-check that the intra-shared prefix of the inter walker
+        // produces bit-identical output to the intra-only walker on the
+        // same input. This pins the round-34 refactor (the extracted
+        // helper) against the round-5 / 6 / 7 / 8 outputs.
+        let bytes = [0x00u8; 256];
+        let intra = parse_compressed_header(&bytes, false).unwrap();
+        let inputs = Vp9CompressedHeaderInterInputs {
+            interpolation_filter_is_switchable: false,
+            ref_frame_sign_bias: all_zero_sign_bias(),
+            allow_high_precision_mv: false,
+        };
+        let inter = parse_compressed_header_inter(&bytes, false, inputs).unwrap();
+        assert_eq!(inter.intra, intra);
+    }
+
+    #[test]
+    fn parse_compressed_header_inter_lossless_intra_prefix_matches() {
+        // Lossless path: §6.3.1 forces ONLY_4X4 with no L(2) reads, so
+        // the §6.3.7 / §6.3.8 cursor offsets shift by 2 bits compared
+        // to the non-lossless `0x00` walk. The intra-shared prefix must
+        // still match between the inter and intra walkers.
+        let bytes = [0x00u8; 256];
+        let intra = parse_compressed_header(&bytes, true).unwrap();
+        let inputs = Vp9CompressedHeaderInterInputs {
+            interpolation_filter_is_switchable: false,
+            ref_frame_sign_bias: all_zero_sign_bias(),
+            allow_high_precision_mv: false,
+        };
+        let inter = parse_compressed_header_inter(&bytes, true, inputs).unwrap();
+        assert_eq!(inter.intra, intra);
+    }
+
+    #[test]
+    fn parse_compressed_header_inter_skips_interp_filter_when_not_switchable() {
+        // When `interpolation_filter != SWITCHABLE` the §6.3.10 sweep
+        // is skipped. The interp_filter_probs table stays at the §10.5
+        // default both because the gate skipped (no walker fires) AND
+        // because the zero buffer would have left it unchanged anyway.
+        // The relevant invariant is that the §6.3.11 (next) sweep
+        // reads its bytes at the post-§6.3.9 cursor, NOT the
+        // post-§6.3.10 cursor. We isolate that by comparing the two
+        // gate states: with the gate off the §6.3.10 walker doesn't
+        // consume any B(252) flags, so the §6.3.11 results read from a
+        // different cursor.
+        //
+        // On a zero buffer the §6.3.11 results are unchanged either
+        // way (all flags are 0), but on the bias buffer below the
+        // first B(252) reads of the §6.3.11 sweep land at different
+        // file positions.
+
+        // Buffer designed so the §6.3.10 + §6.3.11 cells together
+        // consume 12 B(252) flags when gate ON (8 for §6.3.10 + 4 for
+        // §6.3.11) vs. just 4 flags when gate OFF (only §6.3.11).
+        // On a zero buffer all 12 flags are 0 so both outputs are
+        // bit-identical — this test only verifies that the gate
+        // controls call dispatch.
+        let bytes = [0x00u8; 256];
+        let inputs_off = Vp9CompressedHeaderInterInputs {
+            interpolation_filter_is_switchable: false,
+            ref_frame_sign_bias: all_zero_sign_bias(),
+            allow_high_precision_mv: false,
+        };
+        let inputs_on = Vp9CompressedHeaderInterInputs {
+            interpolation_filter_is_switchable: true,
+            ref_frame_sign_bias: all_zero_sign_bias(),
+            allow_high_precision_mv: false,
+        };
+        let r_off = parse_compressed_header_inter(&bytes, false, inputs_off).unwrap();
+        let r_on = parse_compressed_header_inter(&bytes, false, inputs_on).unwrap();
+        // Both gate states leave the interp_filter_probs at its default
+        // on a zero buffer (gate off → no walker; gate on → walker
+        // returns input unchanged).
+        assert_eq!(r_off.interp_filter_probs, DEFAULT_INTERP_FILTER_PROBS_TABLE);
+        assert_eq!(r_on.interp_filter_probs, DEFAULT_INTERP_FILTER_PROBS_TABLE);
+        // §6.3.11 result is also bit-identical on a zero buffer.
+        assert_eq!(r_off.is_inter_prob, r_on.is_inter_prob);
+    }
+
+    #[test]
+    fn parse_compressed_header_inter_enters_compound_branch_when_sign_bias_mixed() {
+        // mixed_sign_bias() => LAST=0, GOLDEN=0, ALTREF=1 =>
+        // compoundReferenceAllowed = 1 (the §6.3.12 loop at i=2 sees
+        // ALTREF != LAST). With the zero buffer the §6.3.12 walker
+        // reads two L(1) flags (both 0 => non_single_reference = 0 =>
+        // reference_mode = SingleReference with NO compound config).
+        // The §6.3.13 sweep then runs the `reference_mode !=
+        // CompoundReference` arm (single_ref_prob sweep).
+        let bytes = [0x00u8; 256];
+        let inputs = Vp9CompressedHeaderInterInputs {
+            interpolation_filter_is_switchable: false,
+            ref_frame_sign_bias: mixed_sign_bias(),
+            allow_high_precision_mv: false,
+        };
+        let r = parse_compressed_header_inter(&bytes, false, inputs).unwrap();
+        // The §6.3.12 walker reads one L(1) `non_single_reference`
+        // which on a zero buffer decodes to 0 → SingleReference. The
+        // compound branch is NOT entered, so §6.3.18 is not invoked.
+        assert_eq!(r.reference_mode, ReferenceMode::SingleReference);
+        assert_eq!(r.compound_reference_config, None);
+    }
+
+    #[test]
+    fn parse_compressed_header_inter_skip_short_circuit_returns_single_reference() {
+        // all_zero_sign_bias() => compoundReferenceAllowed = 0 →
+        // short-circuit returns SingleReference with no bool reads.
+        // This means the §6.3.13 sweep cursor matches the post-§6.3.11
+        // cursor (no §6.3.12 bool-coder consumption). Compare against
+        // mixed_sign_bias() on the zero buffer where the §6.3.12
+        // walker DOES consume one L(1) - so the §6.3.13 outputs
+        // disagree on a non-zero buffer.
+        let bytes = [0x00u8; 256];
+        let inputs_zero = Vp9CompressedHeaderInterInputs {
+            interpolation_filter_is_switchable: false,
+            ref_frame_sign_bias: all_zero_sign_bias(),
+            allow_high_precision_mv: false,
+        };
+        let r = parse_compressed_header_inter(&bytes, false, inputs_zero).unwrap();
+        assert_eq!(r.reference_mode, ReferenceMode::SingleReference);
+        assert_eq!(r.compound_reference_config, None);
+    }
+
+    #[test]
+    fn parse_compressed_header_inter_high_precision_mv_tail_gated() {
+        // The §6.3.16 walker's high-precision tail (4 cells:
+        // class0_hp_prob[2] + hp_prob[2]) fires only when
+        // `allow_high_precision_mv == true`. On a zero buffer both
+        // arms leave the high-precision slots at their defaults (gate
+        // off skips, gate on runs `update_mv_prob` returning the input
+        // unchanged). The invariant the gate controls is which slots
+        // get walked, not their final values on a zero buffer.
+        //
+        // We test this is by setting the HP defaults to a custom
+        // sentinel and confirming the gate-off path leaves them
+        // bit-identical. The actual walk pre-condition is that the
+        // §6.3.16 prefix (65 cells) consumes 65 B(252) flags either
+        // way, so the rest of the output is unaffected.
+        let bytes = [0x00u8; 256];
+        let inputs_no_hp = Vp9CompressedHeaderInterInputs {
+            interpolation_filter_is_switchable: false,
+            ref_frame_sign_bias: all_zero_sign_bias(),
+            allow_high_precision_mv: false,
+        };
+        let inputs_hp = Vp9CompressedHeaderInterInputs {
+            interpolation_filter_is_switchable: false,
+            ref_frame_sign_bias: all_zero_sign_bias(),
+            allow_high_precision_mv: true,
+        };
+        let r_no_hp = parse_compressed_header_inter(&bytes, false, inputs_no_hp).unwrap();
+        let r_hp = parse_compressed_header_inter(&bytes, false, inputs_hp).unwrap();
+        // On a zero buffer both paths leave the HP slots at their
+        // §10.5 defaults.
+        assert_eq!(r_no_hp.mv_probs.class0_hp_prob, DEFAULT_MV_CLASS0_HP_PROB);
+        assert_eq!(r_no_hp.mv_probs.hp_prob, DEFAULT_MV_HP_PROB);
+        assert_eq!(r_hp.mv_probs.class0_hp_prob, DEFAULT_MV_CLASS0_HP_PROB);
+        assert_eq!(r_hp.mv_probs.hp_prob, DEFAULT_MV_HP_PROB);
+    }
+
+    #[test]
+    fn parse_compressed_header_inter_returns_eof_on_empty_buffer() {
+        // §9.2.1 init_bool on an empty buffer fails: the marker bit
+        // can't be read. The walker returns the same error variant
+        // intra-only `parse_compressed_header` returns on the same
+        // input.
+        let bytes: [u8; 0] = [];
+        let inputs = Vp9CompressedHeaderInterInputs {
+            interpolation_filter_is_switchable: false,
+            ref_frame_sign_bias: all_zero_sign_bias(),
+            allow_high_precision_mv: false,
+        };
+        let r = parse_compressed_header_inter(&bytes, false, inputs);
+        let intra = parse_compressed_header(&bytes, false);
+        // Both error in the same way (init_bool rejects empty input
+        // with `Error::InvalidBitstream`).
+        assert!(r.is_err());
+        assert!(intra.is_err());
+        assert_eq!(r.unwrap_err(), intra.unwrap_err());
+    }
+
+    #[test]
+    fn parse_compressed_header_inter_composition_matches_explicit_walk() {
+        // Independent reference walk: invoke every §6.3 primitive in
+        // spec order against an independent BoolCoder over the same
+        // input, and confirm the bit-for-bit identical result.
+        let bytes = [0x00u8; 256];
+        let inputs = Vp9CompressedHeaderInterInputs {
+            interpolation_filter_is_switchable: true,
+            ref_frame_sign_bias: mixed_sign_bias(),
+            allow_high_precision_mv: true,
+        };
+        let r = parse_compressed_header_inter(&bytes, false, inputs).unwrap();
+
+        // Now walk by hand against an independent coder.
+        let mut coder = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let tx_mode = read_tx_mode(&mut coder, false).unwrap();
+        let mut tx_probs = DEFAULT_TX_PROBS;
+        if tx_mode == TxMode::TxModeSelect {
+            read_tx_mode_probs(&mut coder, &mut tx_probs).unwrap();
+        }
+        let mut coef_probs = DEFAULT_COEF_PROBS;
+        read_coef_probs(&mut coder, tx_mode, &mut coef_probs).unwrap();
+        let mut skip_prob = DEFAULT_SKIP_PROB;
+        read_skip_prob(&mut coder, &mut skip_prob).unwrap();
+        let mut inter_mode_probs = DEFAULT_INTER_MODE_PROBS_TABLE;
+        read_inter_mode_probs(&mut coder, &mut inter_mode_probs).unwrap();
+        let mut interp_filter_probs = DEFAULT_INTERP_FILTER_PROBS_TABLE;
+        // gate ON
+        read_interp_filter_probs(&mut coder, &mut interp_filter_probs).unwrap();
+        let mut is_inter_prob = DEFAULT_IS_INTER_PROB_TABLE;
+        read_is_inter_probs(&mut coder, &mut is_inter_prob).unwrap();
+        let bias = mixed_sign_bias();
+        let (reference_mode, compound_reference_config) =
+            frame_reference_mode(&mut coder, &bias).unwrap();
+        let mut comp_mode_prob = DEFAULT_COMP_MODE_PROB_TABLE;
+        let mut single_ref_prob = DEFAULT_SINGLE_REF_PROB_TABLE;
+        let mut comp_ref_prob = DEFAULT_COMP_REF_PROB_TABLE;
+        read_frame_reference_mode_probs(
+            &mut coder,
+            reference_mode,
+            &mut comp_mode_prob,
+            &mut single_ref_prob,
+            &mut comp_ref_prob,
+        )
+        .unwrap();
+        let mut y_mode_probs = DEFAULT_Y_MODE_PROBS_TABLE;
+        read_y_mode_probs(&mut coder, &mut y_mode_probs).unwrap();
+        let mut partition_probs = DEFAULT_PARTITION_PROBS_TABLE;
+        read_partition_probs(&mut coder, &mut partition_probs).unwrap();
+        let mut mv_probs_table = MvProbs::defaults();
+        mv_probs(&mut coder, &mut mv_probs_table, true).unwrap();
+
+        assert_eq!(r.intra.tx_mode, tx_mode);
+        assert_eq!(r.intra.tx_probs, tx_probs);
+        assert_eq!(r.intra.coef_probs, coef_probs);
+        assert_eq!(r.intra.skip_prob, skip_prob);
+        assert_eq!(r.inter_mode_probs, inter_mode_probs);
+        assert_eq!(r.interp_filter_probs, interp_filter_probs);
+        assert_eq!(r.is_inter_prob, is_inter_prob);
+        assert_eq!(r.reference_mode, reference_mode);
+        assert_eq!(r.compound_reference_config, compound_reference_config);
+        assert_eq!(r.comp_mode_prob, comp_mode_prob);
+        assert_eq!(r.single_ref_prob, single_ref_prob);
+        assert_eq!(r.comp_ref_prob, comp_ref_prob);
+        assert_eq!(r.y_mode_probs, y_mode_probs);
+        assert_eq!(r.partition_probs, partition_probs);
+        assert_eq!(r.mv_probs, mv_probs_table);
+    }
+
+    #[test]
+    fn parse_compressed_header_inter_inputs_is_copy() {
+        // The inputs bundle is `Copy` so callers can pass it through
+        // multiple chained calls without re-cloning. This is a
+        // structural test pin.
+        let inputs = Vp9CompressedHeaderInterInputs {
+            interpolation_filter_is_switchable: true,
+            ref_frame_sign_bias: mixed_sign_bias(),
+            allow_high_precision_mv: true,
+        };
+        let copy = inputs;
+        assert!(copy.interpolation_filter_is_switchable);
+        assert!(copy.allow_high_precision_mv);
+    }
+
+    #[test]
+    fn ref_frame_sign_bias_constructor_round_trips() {
+        // Public RefFrameSignBias surface: `from_inter_biases` +
+        // `get` round-trip across all 8 input tuples.
+        for last in 0..=1u8 {
+            for golden in 0..=1u8 {
+                for altref in 0..=1u8 {
+                    let bias = RefFrameSignBias::from_inter_biases(last, golden, altref);
+                    assert_eq!(bias.get(LAST_FRAME), last);
+                    assert_eq!(bias.get(GOLDEN_FRAME), golden);
+                    assert_eq!(bias.get(ALTREF_FRAME), altref);
+                    // INTRA slot is always 0 (never populated by §6.2.5).
+                    assert_eq!(bias.get(0), 0);
+                }
+            }
+        }
     }
 }

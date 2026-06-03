@@ -6,6 +6,56 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 34: §6.3 `if ( FrameIsIntra == 0 )` outer dispatch —
+  [`parse_compressed_header_inter`] entry point.** Wires the
+  inter-frame arm of the §6.3 compressed-header listing
+  (`vp9-spec.txt` lines 1964-1974) into a new public entry point
+  composing the round-22..30 inter-only primitives in spec order.
+  * `parse_compressed_header_inter(data, lossless, inputs) ->
+    Vp9CompressedHeaderInter` per §6.3. Runs the intra-shared prefix
+    (§6.3.1 / §6.3.2 / §6.3.7 / §6.3.8) via an extracted crate-local
+    helper, then walks the inter-only tail: §6.3.9
+    `read_inter_mode_probs( )` → §6.3.10 `read_interp_filter_probs( )`
+    (gated on `interpolation_filter == SWITCHABLE`) → §6.3.11
+    `read_is_inter_probs( )` → §6.3.12 `frame_reference_mode( )`
+    (which also fires §6.3.18 `setup_compound_reference_mode( )` on
+    non-`SingleReference` arms) → §6.3.13
+    `frame_reference_mode_probs( )` → §6.3.14 `read_y_mode_probs( )` →
+    §6.3.15 `read_partition_probs( )` → §6.3.16 `mv_probs( )` (with
+    §6.3.17 `update_mv_prob( )` per cell, plus the conditional
+    high-precision tail).
+  * `Vp9CompressedHeaderInterInputs { interpolation_filter_is_switchable,
+    ref_frame_sign_bias, allow_high_precision_mv }`: bundles the
+    three §6.2-derived flags the inter tail needs from the
+    uncompressed-header walker (§6.2.7 `read_interpolation_filter( )`
+    + §6.2.5 `ref_frame_sign_bias[ ]` + §6.2.7
+    `allow_high_precision_mv`).
+  * `Vp9CompressedHeaderInter { intra, inter_mode_probs[7][3],
+    interp_filter_probs[4][2], is_inter_prob[4], reference_mode,
+    compound_reference_config, comp_mode_prob[5],
+    single_ref_prob[5][2], comp_ref_prob[5], y_mode_probs[4][9],
+    partition_probs[16][3], mv_probs }`: post-§6.3.16 state of every
+    inter-only probability table plus the §6.3.12 frame-level
+    `reference_mode` decision and (when compound is active) the
+    §6.3.18 fixed-vs-variable ref-frame partition. `intra` is a
+    `Vp9CompressedHeader` matching what [`parse_compressed_header`]
+    returns on the same intra-shared prefix bit-for-bit.
+  * `RefFrameSignBias`, `ReferenceMode`, `CompoundReferenceConfig`,
+    `MvProbs` promoted from `pub(crate)` to `pub` (they surface in
+    `Vp9CompressedHeaderInter` / `Vp9CompressedHeaderInterInputs`).
+  * +11 lib tests (lib 453 → 464; suite 473 → 484): zero-buffer
+    preserves all §10 / §10.5 defaults; intra-shared prefix matches
+    intra-only walker (non-lossless + lossless); §6.3.10 gate skips
+    walker on `interpolation_filter != SWITCHABLE`; §6.3.12
+    `compoundReferenceAllowed == 0` short-circuit (sign-bias
+    `(0,0,0)`) vs. mixed-bias path; §6.3.16 high-precision tail
+    gating on `allow_high_precision_mv`; empty buffer surfaces same
+    `InvalidBitstream` error as intra walker; full composed walk
+    bit-identical to explicit independent hand-walk against every
+    §6.3.x primitive in spec order; `RefFrameSignBias::from_inter_biases`
+    / `get` round-trip across all eight sign-bias tuples; inputs
+    bundle is `Copy`.
+
 * **Round 33: §6.4 `decode_tiles( )` outer driver — frame-level tile
   walk.** Composes the round-32 §6.4.1 / §6.4.2 primitives into the
   full `(1 << tile_rows_log2) × (1 << tile_cols_log2)` frame walk per

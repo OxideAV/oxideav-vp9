@@ -3,6 +3,79 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-06-04 (round 34)
+
+**Round 34: §6.3 `if ( FrameIsIntra == 0 )` outer dispatch —
+[`parse_compressed_header_inter`] entry point composing the
+round-22..30 inter-only primitives.** Round 34 wires the inter-frame
+arm of the §6.3 compressed-header listing (`vp9-spec.txt` lines
+1964-1974) into a new public entry point that walks the full §6.3
+listing on inter frames:
+
+* New public function `parse_compressed_header_inter(data, lossless,
+  inputs)` per §6.3 (`vp9-spec.txt` lines 1957-1975). Runs the
+  intra-shared prefix (§6.3.1 / §6.3.2 / §6.3.7 / §6.3.8) bit-for-bit
+  identically to [`parse_compressed_header`] via a newly-extracted
+  crate-local helper, then walks the inter-only tail in spec order:
+  §6.3.9 `read_inter_mode_probs( )` →
+  §6.3.10 `read_interp_filter_probs( )` gated on
+  `interpolation_filter == SWITCHABLE` →
+  §6.3.11 `read_is_inter_probs( )` →
+  §6.3.12 `frame_reference_mode( )` (which fires
+  §6.3.18 `setup_compound_reference_mode( )` on the non-`SingleReference`
+  arms) →
+  §6.3.13 `frame_reference_mode_probs( )` (the conditional 5 / 10 / 20
+  cell sweep keyed by `reference_mode`) →
+  §6.3.14 `read_y_mode_probs( )` →
+  §6.3.15 `read_partition_probs( )` →
+  §6.3.16 `mv_probs( )` (which fires
+  §6.3.17 `update_mv_prob( )` per cell and walks the high-precision
+  tail when `allow_high_precision_mv == 1`).
+* New public type `Vp9CompressedHeaderInterInputs { interpolation_filter_is_switchable,
+  ref_frame_sign_bias, allow_high_precision_mv }` bundling the three
+  §6.2-derived flags the inter tail needs from the uncompressed-header
+  walker.
+* New public result `Vp9CompressedHeaderInter { intra,
+  inter_mode_probs[ 7 ][ 3 ], interp_filter_probs[ 4 ][ 2 ],
+  is_inter_prob[ 4 ], reference_mode, compound_reference_config,
+  comp_mode_prob[ 5 ], single_ref_prob[ 5 ][ 2 ], comp_ref_prob[ 5 ],
+  y_mode_probs[ 4 ][ 9 ], partition_probs[ 16 ][ 3 ], mv_probs }`
+  bundling the post-§6.3.16 state of every inter-only probability
+  table plus the §6.3.12 frame-level decision and (when compound is
+  active) the §6.3.18 fixed-vs-variable ref-frame partition.
+* `RefFrameSignBias`, `ReferenceMode`, `CompoundReferenceConfig`,
+  `MvProbs` promoted from `pub(crate)` to `pub` since they surface
+  in `Vp9CompressedHeaderInter` / `Vp9CompressedHeaderInterInputs`.
+
+Validation (+11 lib tests, lib total 453 → 464; suite total 473 →
+484): every §10 / §10.5 default table survives a zero-buffer walk
+(every `B(252)` flag decodes to 0 → all primitives pass-through);
+the inter-walker's intra-shared prefix is bit-identical to
+[`parse_compressed_header`] on the same buffer for both lossless and
+non-lossless paths; the §6.3.10 gate skips the walker when
+`interpolation_filter != SWITCHABLE`; the §6.3.12
+`compoundReferenceAllowed == 0` short-circuit (sign-bias tuple
+`(0,0,0)`) returns `SingleReference` with no compound config and no
+bool-coder reads, vs. the mixed-bias path that consumes the
+non_single_reference flag; the §6.3.16 high-precision tail is gated
+on `allow_high_precision_mv` (a zero-buffer walk leaves the four HP
+slots at their §10.5 defaults in both states, isolating gate
+behaviour from value-update); empty input surfaces the same
+`InvalidBitstream` error as the intra walker (`init_bool` rejects);
+the full composed walk is bit-identical to an explicit independent
+hand-walk against every §6.3.x primitive in spec order; and
+`RefFrameSignBias::from_inter_biases` / `get` round-trips across all
+eight sign-bias tuples.
+
+Out of scope for round 34: wiring `parse_compressed_header_inter`
+into [`decode_vp9`] — the uncompressed-header walker still rejects
+inter frames with `Error::Unsupported` (`frame_size_with_refs` +
+reference-buffer state are required first). The round-34 entry
+point is callable directly by integrators that have the §6.2-derived
+flags from another source. The §6.3.18 `setup_compound_reference_mode( )`
+output is surfaced on the non-`SingleReference` arms but the
+downstream §6.4.16 / §6.4.18 / §6.5 consumers still need to land.
+
 ## Status — 2026-06-03 (round 33)
 
 **Round 33: §6.4 `decode_tiles( )` outer driver — frame-level tile

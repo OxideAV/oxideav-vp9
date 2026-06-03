@@ -311,6 +311,38 @@
 //!   [`mode_info::DEFAULT_IS_INTER_PROB`] (round 21) into
 //!   `compressed::DEFAULT_IS_INTER_PROB_TABLE`. The round-22 surface
 //!   is internal-only.
+//! * Round 34 wires the §6.3 `if ( FrameIsIntra == 0 )` outer
+//!   dispatch into a new public [`parse_compressed_header_inter`]
+//!   entry point that composes the round-22..30 primitives in spec
+//!   order:
+//!   §6.3.9 [`compressed::read_inter_mode_probs`] →
+//!   §6.3.10 [`compressed::read_interp_filter_probs`] gated on
+//!   `interpolation_filter == SWITCHABLE` →
+//!   §6.3.11 [`compressed::read_is_inter_probs`] →
+//!   §6.3.12 [`compressed::frame_reference_mode`] (which also fires
+//!   §6.3.18 [`compressed::setup_compound_reference_mode`] on the
+//!   non-`SingleReference` arms) →
+//!   §6.3.13 [`compressed::read_frame_reference_mode_probs`] →
+//!   §6.3.14 [`compressed::read_y_mode_probs`] →
+//!   §6.3.15 [`compressed::read_partition_probs`] →
+//!   §6.3.16 [`compressed::mv_probs`] (which fires
+//!   §6.3.17 [`compressed::update_mv_prob`] per cell and walks the
+//!   high-precision tail when `allow_high_precision_mv == 1`).
+//!   The intra prefix (§6.3.1 / §6.3.2 / §6.3.7 / §6.3.8) is
+//!   factored out into a shared crate-local helper so both
+//!   [`parse_compressed_header`] (intra-only / keyframe) and the new
+//!   inter entry point reuse it bit-identically. New public types:
+//!   [`Vp9CompressedHeaderInterInputs`] (the three §6.2-derived flags
+//!   the inter tail needs), [`Vp9CompressedHeaderInter`] (the
+//!   intra-shared prefix plus 9 inter-only probability tables +
+//!   `reference_mode` decision + optional
+//!   [`CompoundReferenceConfig`]), [`RefFrameSignBias`],
+//!   [`ReferenceMode`], [`CompoundReferenceConfig`], [`MvProbs`]
+//!   (all promoted from `pub(crate)` to `pub` since they surface in
+//!   the result). Wiring the new entry point into the public
+//!   [`decode_vp9`] still depends on the uncompressed-header walker
+//!   accepting inter frames (currently still
+//!   [`Error::Unsupported`]).
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return
@@ -348,7 +380,11 @@ mod scan;
 mod tokens;
 
 pub use coef_probs::CoefProbs;
-pub use compressed::{parse_compressed_header, TxMode, Vp9CompressedHeader};
+pub use compressed::{
+    parse_compressed_header, parse_compressed_header_inter, CompoundReferenceConfig, MvProbs,
+    RefFrameSignBias, ReferenceMode, TxMode, Vp9CompressedHeader, Vp9CompressedHeaderInter,
+    Vp9CompressedHeaderInterInputs,
+};
 pub use header::{
     parse_uncompressed_header, ColorConfig, ColorSpace, FrameType, LoopFilterParams,
     QuantizationParams, SegmentationParams, TileInfo, Vp9FrameHeader, MAX_SEGMENTS,

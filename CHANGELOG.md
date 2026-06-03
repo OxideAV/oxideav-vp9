@@ -6,6 +6,43 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 32: §6.4.1 `get_tile_offset( )` + §6.4.2 `decode_tile( )` —
+  tile-driver primitive layer.** Lifts the §6.4.3 recursive partition
+  driver landed in round 19 into the §6.4.2 superblock-row driver and
+  the §6.4.1 per-tile-axis offset arithmetic that §6.4
+  `decode_tiles( )` composes them with.
+  * `get_tile_offset( tile_num, mis, tile_sz_log2 )` per §6.4.1
+    (`vp9-spec.txt` lines 2335-2338): three-line pure-u32 helper —
+    `sbs = (mis + 7) >> 3`, `offset = ((tile_num * sbs) >>
+    tile_sz_log2) << 3`, `Min( offset, mis )`. Used by the §6.4
+    outer driver four times per tile to derive `MiRowStart` /
+    `MiRowEnd` / `MiColStart` / `MiColEnd`.
+  * `decode_tile( coder, mi_row_start, mi_row_end, mi_col_start,
+    mi_col_end, mi_rows, mi_cols, ctx_state, probs_kind, leaves )` per
+    §6.4.2 (`vp9-spec.txt` lines 2343-2349): outer `r ∈ [Start, End)`
+    step-8 loop firing `PartitionContextState::clear_left( )` (the
+    §7.4.2 `clear_left_context( )` reset) once per superblock-row
+    start, inner `c ∈ [Start, End)` step-8 loop calling
+    `decode_partition( r, c, BLOCK_64X64, ... )` once per superblock
+    origin.
+  * +12 lib tests covering: §6.4.1 single-tile (`tile_sz_log2 == 0`)
+    cases for sb64-aligned and non-aligned `mis`, the past-end clamp;
+    two-tile case (`tile_sz_log2 == 1`, `mis = 16`) producing
+    `(0, 8, 16)`; the `Min` clamp on `tile_sz_log2 == 2`,
+    `mis = 8`; consecutive-pair cover proof; an 8-alignment sweep
+    across `mis ∈ {8, 16, 32, 64, 256}` and `tile_sz_log2 ∈
+    {0, 1, 2, 3}`; §6.4.2 empty-window early-return; single-sb64
+    tile producing one leaf; two-sb-wide row producing leaves in
+    `c` order; two-sb-tall column producing leaves in `r` order plus
+    sentinel-proof that `clear_left_context( )` fires at the START
+    of the second row; 2×2 sb64 row-major traversal order; sub-tile
+    MI window starting at `(8, 8)`; §6.4.1 + §6.4.2 composition
+    splitting a 16-MI-wide frame into two tiles.
+  * Surface stays internal-only (`pub(crate)` with
+    `#[allow(dead_code)]` on `get_tile_offset` / `decode_tile`).
+    Public API still exposes `parse_uncompressed_header`,
+    `parse_compressed_header` and their result types exclusively.
+
 * **Round 31: §6.4.4 `decode_block( r, c, subsize )` driver — pure-state
   fan-out primitive.** Lands the §6.4.4 per-leaf driver as a standalone
   book-keeping primitive that consumes the per-MI outputs of

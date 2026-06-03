@@ -3,6 +3,76 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-06-03 (round 32)
+
+**Round 32: §6.4.1 `get_tile_offset( )` + §6.4.2 `decode_tile( )` —
+tile-driver primitive layer.** Round 32 lifts the §6.4.3
+[`partition::decode_partition`] driver landed in round 19 into the
+§6.4.2 tile-row driver and the §6.4.1 per-tile-offset arithmetic that
+§6.4 `decode_tiles( )` will compose them with:
+
+* `get_tile_offset( tile_num, mis, tile_sz_log2 )` per §6.4.1
+  (`vp9-spec.txt` lines 2335-2338). Three lines:
+  `sbs = (mis + 7) >> 3` (round-up to sb64-cell count),
+  `offset = ((tile_num * sbs) >> tile_sz_log2) << 3` (per-tile-axis
+  MI-cell offset, 8-aligned to the sb64 boundary),
+  `return Min( offset, mis )` (clamp the past-the-end fetch the §6.4
+  caller fires for `tileNum = tilesPerAxis` against the frame extent).
+  Pure u32 arithmetic — the §6.4 outer driver invokes it four times
+  per tile to derive `MiRowStart` / `MiRowEnd` / `MiColStart` /
+  `MiColEnd` from `MiRows` + `tile_rows_log2` and `MiCols` +
+  `tile_cols_log2`.
+
+* `decode_tile( coder, mi_row_start, mi_row_end, mi_col_start,
+  mi_col_end, mi_rows, mi_cols, ctx_state, probs_kind, leaves )` per
+  §6.4.2 (`vp9-spec.txt` lines 2343-2349). Two-deep loop:
+  * outer `r ∈ [ mi_row_start, mi_row_end )` step 8, firing
+    `PartitionContextState::clear_left( )` (the §7.4.2
+    `clear_left_context( )` reset) once per superblock-row start;
+  * inner `c ∈ [ mi_col_start, mi_col_end )` step 8, firing
+    [`decode_partition`]`( r, c, BLOCK_64X64, mi_rows, mi_cols, ... )`
+    once per superblock origin.
+  The §6.4.3 driver's own `r >= mi_rows || c >= mi_cols`
+  short-circuit absorbs tiles whose `End` offsets fall past the frame
+  edge with no extra bookkeeping.
+
+Validation (+12 lib tests, lib total 428 → 440; suite total 448 →
+460) covers: §6.4.1 single-tile (`tile_sz_log2 == 0`) cases for both
+sb64-aligned (`mis = 8`) and non-aligned (`mis = 11`) frame extents,
+including the past-end clamp; the §6.4.1 two-tile case
+(`tile_sz_log2 == 1`, `mis = 16`) producing `(0, 8, 16)`; the
+`Min( offset, mis )` clamp on `tile_sz_log2 == 2` with
+`mis = 8`; a consecutive-pair `(i, i+1)` cover proof that
+`get_tile_offset( i+1, mis, log2 ) >= get_tile_offset( i, mis, log2 )`
+and the last `End` equals `mis` (the §6.4 outer-driver invariant);
+an 8-alignment sweep across `mis ∈ {8, 16, 32, 64, 256}` and
+`tile_sz_log2 ∈ {0, 1, 2, 3}`; the §6.4.2 empty-window
+(`mi_row_start == mi_row_end`) early-return preserving the above
+strip; the §6.4.2 single-sb64 tile producing one `(0, 0, BLOCK_64X64)`
+leaf; the §6.4.2 two-sb-wide row producing leaves at `(0, 0)` then
+`(0, 8)` in order; the §6.4.2 two-sb-tall column producing leaves at
+`(0, 0)` then `(8, 0)` and proof that `clear_left_context( )` fires
+at the START of the second row (pre-poisoned `left[ ]` sentinel does
+NOT leak into the second-row partition_decode ctx); the §6.4.2 2×2
+sb64 row-major traversal order `(0,0) → (0,8) → (8,0) → (8,8)`; the
+§6.4.2 sub-tile MI window starting at `(mi_row_start = 8,
+mi_col_start = 8)` producing one `(8, 8)` leaf; and the §6.4.1 +
+§6.4.2 composition splitting a 16-MI-wide frame into two tiles and
+decoding each tile's single superblock with the matching `c` offset.
+
+Out of scope for round 32: the §6.4 `decode_tiles( )` outer driver
+(reads `tile_size` as `f(32)` between tiles, fires `init_bool( ) /
+exit_bool( )` per tile, calls `clear_above_context( )` once per
+frame, walks all `(1 << tile_rows_log2) × (1 << tile_cols_log2)`
+tiles), and wiring the §6.4.4 [`decode_block::decode_block_apply`]
+fan-out into the per-leaf log site inside [`decode_partition`] — the
+leaf log already carries `(r, c, subsize)` but the swap needs a
+frame-state allocator plus per-leaf §6.4.5 `mode_info( )`
+invocation. The round-32 surface stays internal-only (`pub(crate)`
+with `#[allow(dead_code)]` on `get_tile_offset` / `decode_tile`);
+the public API still exposes `parse_uncompressed_header`,
+`parse_compressed_header` and their result types exclusively.
+
 ## Status — 2026-06-02 (round 31)
 
 **Round 31: §6.4.4 `decode_block( r, c, subsize )` driver — pure-state

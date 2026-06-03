@@ -851,6 +851,139 @@ pub(crate) fn decode_partition(
     Ok(())
 }
 
+// ----- §6.4.1 get_tile_offset + §6.4.2 decode_tile -----
+
+/// `get_tile_offset( tileNum, mis, tileSzLog2 )` per spec §6.4.1
+/// (`vp9-spec.txt` lines 2335-2338).
+///
+/// ```text
+/// get_tile_offset( tileNum, mis, tileSzLog2 ) {
+///     sbs = (mis + 7) >> 3
+///     offset = ( (tileNum * sbs) >> tileSzLog2 ) << 3
+///     return Min( offset, mis )
+/// }
+/// ```
+///
+/// Pure arithmetic helper invoked by §6.4 `decode_tiles( )` four times per
+/// tile to derive `MiRowStart` / `MiRowEnd` / `MiColStart` / `MiColEnd`.
+/// `mis` is the relevant frame extent in MI cells (`MiRows` for row
+/// offsets, `MiCols` for column offsets); `tileSzLog2` is the matching
+/// `tile_rows_log2` / `tile_cols_log2` field from the uncompressed
+/// header. The §6.4 caller invokes this with `tileNum ∈ 0..=tilesPerAxis`
+/// (one extra past the last tile, to fetch the `End` extent), so the
+/// `Min( offset, mis )` clamp guards the past-the-end call.
+///
+/// The intermediate product `tileNum * sbs` cannot overflow `u32`: the
+/// largest level (Level 6) caps `MiRows * MiCols` at well under `2^28`,
+/// so `sbs <= 2^25`; the max `tileNum` is the per-axis tile count plus
+/// one, bounded by `MAX_TILE_WIDTH_SB64 + 1 = 65` per §7.2 — comfortably
+/// inside `u32`.
+pub(crate) fn get_tile_offset(tile_num: u32, mis: u32, tile_sz_log2: u32) -> u32 {
+    let sbs = (mis + 7) >> 3;
+    let offset = ((tile_num * sbs) >> tile_sz_log2) << 3;
+    offset.min(mis)
+}
+
+/// `decode_tile( )` per spec §6.4.2 (`vp9-spec.txt` lines 2343-2349).
+///
+/// ```text
+/// decode_tile( ) {
+///     for ( r = MiRowStart; r < MiRowEnd; r += 8 ) {
+///         clear_left_context( )
+///         for ( c = MiColStart; c < MiColEnd; c += 8 )
+///             decode_partition( r, c, BLOCK_64X64 )
+///     }
+/// }
+/// ```
+///
+/// Superblock-row driver: walks the tile's MI window in 64x64 superblock
+/// strides, fires `clear_left_context( )` once at the start of each row
+/// per §7.4.2, then invokes [`decode_partition`] at each
+/// `(r, c, BLOCK_64X64)` superblock origin. The §6.4.3 driver
+/// short-circuits when `r >= mi_rows || c >= mi_cols`, so a tile whose
+/// `End` offsets fall past the frame edge naturally skips the
+/// out-of-frame superblocks without extra bookkeeping.
+///
+/// Inputs follow the §6.4 `decode_tiles( )` listing one-to-one:
+///
+/// * `mi_row_start`, `mi_row_end`, `mi_col_start`, `mi_col_end` —
+///   the four `get_tile_offset( )` outputs for the current tile.
+/// * `mi_rows`, `mi_cols` — frame extents (`MiRows` / `MiCols` per
+///   §7.2.4), passed verbatim into [`decode_partition`]'s edge clamp.
+/// * `ctx_state` — the `AbovePartitionContext` / `LeftPartitionContext`
+///   strips. The §7.4.1 `clear_above_context( )` reset that fires once
+///   per `decode_tiles( )` is the caller's responsibility (the tile
+///   driver only fires the §7.4.2 `clear_left_context( )` reset per
+///   superblock row, matching the spec listing).
+/// * `probs_kind` — the §9.3.2 `partition` probability source
+///   (`Keyframe` for `FrameIsIntra == 1`, `Inter(...)` otherwise).
+/// * `leaves` — per-leaf log sink threaded through every
+///   [`decode_partition`] call so the tile's full traversal order is
+///   recoverable by the caller.
+///
+/// Returns [`Error::InvalidBitstream`] if any inner [`decode_partition`]
+/// underflows the §9.2 bool coder.
+///
+/// # Panics
+///
+/// Panics if `mi_row_end < mi_row_start` or `mi_col_end < mi_col_start`
+/// (the §6.4.1 `get_tile_offset( )` clamp guarantees the spec-defined
+/// caller never produces a backwards range — this assertion documents
+/// the precondition).
+#[allow(clippy::too_many_arguments)] // mirrors the §6.4 + §6.4.2 spec
+                                     // composition (four tile-offset
+                                     // inputs + two frame extents + ctx
+                                     // state + probs + leaf sink); each
+                                     // is independent and bundling them
+                                     // would obscure the spec mapping.
+pub(crate) fn decode_tile(
+    coder: &mut BoolCoder<'_>,
+    mi_row_start: u32,
+    mi_row_end: u32,
+    mi_col_start: u32,
+    mi_col_end: u32,
+    mi_rows: u32,
+    mi_cols: u32,
+    ctx_state: &mut PartitionContextState,
+    probs_kind: PartitionProbsKind<'_>,
+    leaves: &mut Vec<LeafBlock>,
+) -> Result<(), Error> {
+    assert!(
+        mi_row_end >= mi_row_start,
+        "decode_tile: mi_row_end={mi_row_end} < mi_row_start={mi_row_start}"
+    );
+    assert!(
+        mi_col_end >= mi_col_start,
+        "decode_tile: mi_col_end={mi_col_end} < mi_col_start={mi_col_start}"
+    );
+
+    let mut r = mi_row_start;
+    while r < mi_row_end {
+        // §7.4.2 clear_left_context( ) — fires once per superblock row
+        // per the §6.4.2 listing line 2345.
+        ctx_state.clear_left();
+        let mut c = mi_col_start;
+        while c < mi_col_end {
+            // §6.4.2 line 2347: decode_partition( r, c, BLOCK_64X64 ).
+            decode_partition(
+                coder,
+                r,
+                c,
+                crate::residual::BLOCK_64X64,
+                mi_rows,
+                mi_cols,
+                ctx_state,
+                probs_kind,
+                leaves,
+            )?;
+            c += 8;
+        }
+        r += 8;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2073,5 +2206,458 @@ mod tests {
         let kf = PartitionProbsKind::Keyframe;
         assert_eq!(kf.row(0), KF_PARTITION_PROBS[0]);
         assert_eq!(kf.row(15), KF_PARTITION_PROBS[15]);
+    }
+
+    // ----- §6.4.1 get_tile_offset tests -----
+
+    /// The §6.4.1 single-tile (`tile_sz_log2 == 0`) case: `tileNum = 0`
+    /// returns `0`; `tileNum = 1` returns the clamped frame extent.
+    #[test]
+    fn get_tile_offset_single_tile_spans_full_frame() {
+        // 64x64 frame = 8 MI rows. sbs = (8 + 7) >> 3 = 1.
+        // tileNum = 0: offset = (0 * 1) >> 0 << 3 = 0.
+        // tileNum = 1: offset = (1 * 1) >> 0 << 3 = 8. Min(8, 8) = 8.
+        assert_eq!(get_tile_offset(0, 8, 0), 0);
+        assert_eq!(get_tile_offset(1, 8, 0), 8);
+        // Non-multiple-of-8 frame: MiRows = 11 → sbs = (11+7)>>3 = 2.
+        // tileNum = 0: 0; tileNum = 1: (1*2)>>0<<3 = 16, Min(16,11) = 11.
+        assert_eq!(get_tile_offset(0, 11, 0), 0);
+        assert_eq!(get_tile_offset(1, 11, 0), 11);
+    }
+
+    /// The §6.4.1 two-tile (`tile_sz_log2 == 1`) case: the frame splits
+    /// at the half-sb64 boundary, rounded up.
+    #[test]
+    fn get_tile_offset_two_tiles_split_at_half() {
+        // MiCols = 16 (128x128 frame). sbs = (16+7)>>3 = 2.
+        // tileNum 0: ((0*2)>>1)<<3 = 0.
+        // tileNum 1: ((1*2)>>1)<<3 = 8.
+        // tileNum 2: ((2*2)>>1)<<3 = 16. Min(16, 16) = 16.
+        assert_eq!(get_tile_offset(0, 16, 1), 0);
+        assert_eq!(get_tile_offset(1, 16, 1), 8);
+        assert_eq!(get_tile_offset(2, 16, 1), 16);
+    }
+
+    /// `Min( offset, mis )` clamps the past-the-end `tileNum` against
+    /// the frame extent.
+    #[test]
+    fn get_tile_offset_clamps_past_end_against_mis() {
+        // MiCols = 8, tile_sz_log2 = 2 (four tiles configured but only
+        // one sb64 wide — every tileNum >= 1 collapses to mis).
+        // sbs = 1; tile_sz_log2 = 2 → offset = ((tileNum * 1) >> 2) << 3.
+        // tileNum 0: 0. tileNum 1: ((1>>2)<<3) = 0.  tileNum 4: ((4>>2)<<3) = 8.
+        assert_eq!(get_tile_offset(0, 8, 2), 0);
+        assert_eq!(get_tile_offset(1, 8, 2), 0);
+        assert_eq!(get_tile_offset(4, 8, 2), 8);
+        // tileNum 5: ((5>>2)<<3) = 8. Still clamped at mis = 8.
+        assert_eq!(get_tile_offset(5, 8, 2), 8);
+    }
+
+    /// Consecutive `tileNum` pairs `(i, i+1)` produce a contiguous
+    /// `[Start, End)` cover of `[0, mis)` for the spec-defined caller
+    /// (the §6.4 loop fires `tileRows = 1 << tile_rows_log2` tiles plus
+    /// one past-the-end fetch).
+    #[test]
+    fn get_tile_offset_consecutive_pairs_cover_full_extent() {
+        // MiRows = 16, tile_rows_log2 = 2 (four tiles).
+        let mis = 16u32;
+        let log2 = 2u32;
+        let tiles = 1u32 << log2;
+        let mut prev_end = 0u32;
+        for tile in 0..tiles {
+            let start = get_tile_offset(tile, mis, log2);
+            let end = get_tile_offset(tile + 1, mis, log2);
+            assert_eq!(start, prev_end, "tile {tile} Start != previous End");
+            assert!(end >= start, "tile {tile}: end < start ({end} < {start})");
+            prev_end = end;
+        }
+        assert_eq!(prev_end, mis, "last tile End != mis");
+    }
+
+    /// The §6.4.1 offsets are always 8-aligned (the `<<3` tail).
+    #[test]
+    fn get_tile_offset_returns_8_aligned_offsets_below_mis() {
+        for tile_num in 0..32u32 {
+            for &mis in &[8u32, 16, 32, 64, 256] {
+                for &log2 in &[0u32, 1, 2, 3] {
+                    let off = get_tile_offset(tile_num, mis, log2);
+                    if off < mis {
+                        assert_eq!(off & 7, 0, "non-aligned offset {off}");
+                    }
+                }
+            }
+        }
+    }
+
+    // ----- §6.4.2 decode_tile tests -----
+
+    /// `decode_tile( )` over an empty MI window (`mi_row_start ==
+    /// mi_row_end`) returns Ok with no leaves and leaves the above
+    /// strip + bool-coder untouched (the loop body never runs).
+    #[test]
+    fn decode_tile_empty_window_consumes_nothing() {
+        let bytes: &'static [u8] = Box::leak(vec![0u8; 4].into_boxed_slice());
+        let mut coder = BoolCoder::init_bool(bytes, 4).unwrap();
+        let mut state = PartitionContextState::new(8, 8);
+        state.above[0] = 7; // sentinel, must survive (clear_left does
+                            // NOT touch above)
+        let mut leaves: Vec<LeafBlock> = Vec::new();
+        decode_tile(
+            &mut coder,
+            0,
+            0, // empty row span
+            0,
+            8,
+            8,
+            8,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+            &mut leaves,
+        )
+        .unwrap();
+        assert!(leaves.is_empty());
+        assert_eq!(state.above[0], 7);
+    }
+
+    /// Single-superblock tile (8x8 MI = 64x64 px frame, one sb64): the
+    /// §6.4.2 driver fires `clear_left_context( )` once, then exactly
+    /// one [`decode_partition`] call at `(0, 0, BLOCK_64X64)`. With a
+    /// `PARTITION_NONE` decode the result matches the single-leaf
+    /// fixture used by `decode_partition_single_64x64_none`.
+    #[test]
+    fn decode_tile_single_superblock_yields_one_leaf() {
+        let mi_cols = 8u32;
+        let mi_rows = 8u32;
+
+        let mut enc = RangeEncoder::new();
+        push_partition_decode(&mut enc, PARTITION_NONE, true, true, 12);
+        let bytes = enc.finish();
+        let sz = bytes.len();
+        let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        let mut coder = BoolCoder::init_bool(leaked, sz).unwrap();
+
+        let mut state = PartitionContextState::new(mi_cols as usize, mi_rows as usize);
+        let mut leaves: Vec<LeafBlock> = Vec::new();
+        decode_tile(
+            &mut coder,
+            0,
+            mi_rows,
+            0,
+            mi_cols,
+            mi_rows,
+            mi_cols,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+            &mut leaves,
+        )
+        .unwrap();
+
+        assert_eq!(
+            leaves,
+            vec![LeafBlock {
+                r: 0,
+                c: 0,
+                subsize: BLOCK_64X64,
+            }]
+        );
+    }
+
+    /// Two-superblock-wide tile (16 MI cols × 8 MI rows = 128x64 px):
+    /// the §6.4.2 driver fires two [`decode_partition`] calls in
+    /// `c = 0`, `c = 8` order. With each decoded as `PARTITION_NONE`,
+    /// the resulting `leaves` log is two entries at `(0, 0)` and
+    /// `(0, 8)`.
+    #[test]
+    fn decode_tile_two_superblock_row_visits_each_sb_in_order() {
+        let mi_cols = 16u32;
+        let mi_rows = 8u32;
+
+        let mut enc = RangeEncoder::new();
+        // SB at (0, 0): ctx = 12 (all strips zero).
+        push_partition_decode(&mut enc, PARTITION_NONE, true, true, 12);
+        // SB at (0, 8): partition write-back at BLOCK_64X64 NONE writes
+        // `15 >> 4 = 0` to above[0..8] and left[0..8], so strips are
+        // still all zero. ctx = 12 again.
+        push_partition_decode(&mut enc, PARTITION_NONE, true, true, 12);
+        let bytes = enc.finish();
+        let sz = bytes.len();
+        let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        let mut coder = BoolCoder::init_bool(leaked, sz).unwrap();
+
+        let mut state = PartitionContextState::new(mi_cols as usize, mi_rows as usize);
+        let mut leaves: Vec<LeafBlock> = Vec::new();
+        decode_tile(
+            &mut coder,
+            0,
+            mi_rows,
+            0,
+            mi_cols,
+            mi_rows,
+            mi_cols,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+            &mut leaves,
+        )
+        .unwrap();
+
+        assert_eq!(
+            leaves,
+            vec![
+                LeafBlock {
+                    r: 0,
+                    c: 0,
+                    subsize: BLOCK_64X64,
+                },
+                LeafBlock {
+                    r: 0,
+                    c: 8,
+                    subsize: BLOCK_64X64,
+                },
+            ]
+        );
+    }
+
+    /// Two-superblock-tall tile (8 MI cols × 16 MI rows = 64x128 px):
+    /// the §6.4.2 driver fires two superblock-row iterations
+    /// `(r = 0, r = 8)`. Verifies that `clear_left_context( )` fires at
+    /// the START of each row by pre-poisoning `state.left[ ]` with a
+    /// sentinel and confirming the second-row partition_decode sees a
+    /// zero left strip (its ctx derivation would shift otherwise).
+    #[test]
+    fn decode_tile_clears_left_context_per_superblock_row() {
+        let mi_cols = 8u32;
+        let mi_rows = 16u32;
+
+        let mut enc = RangeEncoder::new();
+        // Row 1 SB at (0, 0): ctx = 12 (zero strips).
+        push_partition_decode(&mut enc, PARTITION_NONE, true, true, 12);
+        // Row 2 SB at (8, 0): even though BLOCK_64X64 NONE wrote
+        // 15 >> 4 = 0 to above[0..8], and clear_left_context fired,
+        // the left strip is zero again → ctx = 12.
+        push_partition_decode(&mut enc, PARTITION_NONE, true, true, 12);
+        let bytes = enc.finish();
+        let sz = bytes.len();
+        let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        let mut coder = BoolCoder::init_bool(leaked, sz).unwrap();
+
+        let mut state = PartitionContextState::new(mi_cols as usize, mi_rows as usize);
+        // Pre-poison the left strip with a non-zero sentinel; if
+        // clear_left_context did NOT fire before row 2 the cells at
+        // left[8..16] would carry the sentinel into the ctx derivation
+        // and the encoded ctx = 12 would mismatch.
+        for cell in state.left.iter_mut() {
+            *cell = 5;
+        }
+        let mut leaves: Vec<LeafBlock> = Vec::new();
+        decode_tile(
+            &mut coder,
+            0,
+            mi_rows,
+            0,
+            mi_cols,
+            mi_rows,
+            mi_cols,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+            &mut leaves,
+        )
+        .unwrap();
+
+        assert_eq!(
+            leaves,
+            vec![
+                LeafBlock {
+                    r: 0,
+                    c: 0,
+                    subsize: BLOCK_64X64,
+                },
+                LeafBlock {
+                    r: 8,
+                    c: 0,
+                    subsize: BLOCK_64X64,
+                },
+            ]
+        );
+        // After the two row-starting clear_left_context calls + two
+        // NONE write-backs of 15>>4 = 0, the left strip is uniformly
+        // zero (the sentinel is gone).
+        for &cell in state.left.iter() {
+            assert_eq!(cell, 0);
+        }
+    }
+
+    /// 2x2 superblock tile (16 MI cols × 16 MI rows = 128x128 px):
+    /// four [`decode_partition`] calls fire in
+    /// `(r, c) = (0,0), (0,8), (8,0), (8,8)` order — row-major with
+    /// the inner column loop sweeping each superblock row before
+    /// advancing.
+    #[test]
+    fn decode_tile_2x2_superblocks_row_major_order() {
+        let mi_cols = 16u32;
+        let mi_rows = 16u32;
+
+        let mut enc = RangeEncoder::new();
+        push_partition_decode(&mut enc, PARTITION_NONE, true, true, 12);
+        push_partition_decode(&mut enc, PARTITION_NONE, true, true, 12);
+        push_partition_decode(&mut enc, PARTITION_NONE, true, true, 12);
+        push_partition_decode(&mut enc, PARTITION_NONE, true, true, 12);
+        let bytes = enc.finish();
+        let sz = bytes.len();
+        let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        let mut coder = BoolCoder::init_bool(leaked, sz).unwrap();
+
+        let mut state = PartitionContextState::new(mi_cols as usize, mi_rows as usize);
+        let mut leaves: Vec<LeafBlock> = Vec::new();
+        decode_tile(
+            &mut coder,
+            0,
+            mi_rows,
+            0,
+            mi_cols,
+            mi_rows,
+            mi_cols,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+            &mut leaves,
+        )
+        .unwrap();
+
+        assert_eq!(
+            leaves,
+            vec![
+                LeafBlock {
+                    r: 0,
+                    c: 0,
+                    subsize: BLOCK_64X64,
+                },
+                LeafBlock {
+                    r: 0,
+                    c: 8,
+                    subsize: BLOCK_64X64,
+                },
+                LeafBlock {
+                    r: 8,
+                    c: 0,
+                    subsize: BLOCK_64X64,
+                },
+                LeafBlock {
+                    r: 8,
+                    c: 8,
+                    subsize: BLOCK_64X64,
+                },
+            ]
+        );
+    }
+
+    /// Sub-tile MI window: `decode_tile( )` invoked over
+    /// `[mi_row_start = 8, mi_row_end = 16) × [mi_col_start = 8,
+    /// mi_col_end = 16)` (the bottom-right tile of a 2x2 split)
+    /// produces a single `(r = 8, c = 8)` leaf — the §6.4.2 loop
+    /// honours both `Start` and `End` boundaries.
+    #[test]
+    fn decode_tile_sub_tile_window_honours_start_and_end_offsets() {
+        let mi_cols = 16u32;
+        let mi_rows = 16u32;
+
+        let mut enc = RangeEncoder::new();
+        push_partition_decode(&mut enc, PARTITION_NONE, true, true, 12);
+        let bytes = enc.finish();
+        let sz = bytes.len();
+        let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        let mut coder = BoolCoder::init_bool(leaked, sz).unwrap();
+
+        let mut state = PartitionContextState::new(mi_cols as usize, mi_rows as usize);
+        let mut leaves: Vec<LeafBlock> = Vec::new();
+        decode_tile(
+            &mut coder,
+            8,
+            16,
+            8,
+            16,
+            mi_rows,
+            mi_cols,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+            &mut leaves,
+        )
+        .unwrap();
+
+        assert_eq!(
+            leaves,
+            vec![LeafBlock {
+                r: 8,
+                c: 8,
+                subsize: BLOCK_64X64,
+            }]
+        );
+    }
+
+    /// `decode_tile( )` chained with §6.4.1 `get_tile_offset( )`: the
+    /// composition of the two primitives reproduces the §6.4
+    /// `decode_tiles( )` per-tile boundary derivation. Smoke-tests the
+    /// integration pattern the §6.4 outer driver will adopt — splits a
+    /// 16-MI-wide frame into two tiles, then decodes each tile's
+    /// single superblock and confirms the `c` offsets are 0 and 8.
+    #[test]
+    fn decode_tile_composes_with_get_tile_offset() {
+        let mi_cols = 16u32;
+        let mi_rows = 8u32;
+        let tile_cols_log2 = 1u32;
+        let tile_rows_log2 = 0u32;
+
+        let mut enc = RangeEncoder::new();
+        push_partition_decode(&mut enc, PARTITION_NONE, true, true, 12);
+        push_partition_decode(&mut enc, PARTITION_NONE, true, true, 12);
+        let bytes = enc.finish();
+        let sz = bytes.len();
+        let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        let mut coder = BoolCoder::init_bool(leaked, sz).unwrap();
+
+        // Tile (0, 0): rows [0, mi_rows), cols [0, 8).
+        let mr_start = get_tile_offset(0, mi_rows, tile_rows_log2);
+        let mr_end = get_tile_offset(1, mi_rows, tile_rows_log2);
+        let mc0_start = get_tile_offset(0, mi_cols, tile_cols_log2);
+        let mc0_end = get_tile_offset(1, mi_cols, tile_cols_log2);
+        assert_eq!((mr_start, mr_end, mc0_start, mc0_end), (0, 8, 0, 8));
+
+        // Tile (0, 1): rows [0, mi_rows), cols [8, 16).
+        let mc1_start = get_tile_offset(1, mi_cols, tile_cols_log2);
+        let mc1_end = get_tile_offset(2, mi_cols, tile_cols_log2);
+        assert_eq!((mc1_start, mc1_end), (8, 16));
+
+        let mut state = PartitionContextState::new(mi_cols as usize, mi_rows as usize);
+        let mut leaves: Vec<LeafBlock> = Vec::new();
+        // Decode tile (0, 0).
+        decode_tile(
+            &mut coder,
+            mr_start,
+            mr_end,
+            mc0_start,
+            mc0_end,
+            mi_rows,
+            mi_cols,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+            &mut leaves,
+        )
+        .unwrap();
+        assert_eq!(leaves.last().unwrap().c, 0);
+
+        // Decode tile (0, 1).
+        decode_tile(
+            &mut coder,
+            mr_start,
+            mr_end,
+            mc1_start,
+            mc1_end,
+            mi_rows,
+            mi_cols,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+            &mut leaves,
+        )
+        .unwrap();
+        assert_eq!(leaves.last().unwrap().c, 8);
+        assert_eq!(leaves.len(), 2);
     }
 }

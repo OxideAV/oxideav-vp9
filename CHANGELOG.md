@@ -6,6 +6,27 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 35: §6.3 `parse_compressed_header_inter` integration-test
+  coverage.** Pins the round-34 inter outer-dispatch entry point at
+  the public-API boundary in `tests/compressed_header.rs`. Ten new
+  integration tests cover the zero-buffer default-table pass-through
+  across the full §6.3.1..§6.3.16 chain, the §6.3.10
+  `interpolation_filter == SWITCHABLE` gate, the §6.3.12
+  `compoundReferenceAllowed` short-circuit vs. bool-coder-reading
+  arm, the §6.3.16 `allow_high_precision_mv` tail gate, lossless and
+  non-lossless intra-prefix parity with `parse_compressed_header`,
+  shared `init_bool` error surface (empty buffer + non-zero marker)
+  against the intra walker, and the
+  `RefFrameSignBias::from_inter_biases` / `get` public-surface
+  round-trip across all eight §6.2.5 sign-bias tuples (the §3
+  `INTRA_FRAME` slot stays 0). Anchors §10.5 default values
+  transcribed verbatim from the spec listing: `default_is_inter_prob
+  = {9, 102, 187, 225}`, `default_inter_mode_probs[ 0 ] = {2, 173,
+  34}`, `default_mv_class0_hp_prob = {160, 160}`, `default_mv_hp_prob
+  = {128, 128}`, plus the §6.3.2 / §6.3.7 / §6.3.8 anchors reused
+  from the existing intra tests. Suite total 484 → 494 (+10
+  integration tests).
+
 * **Round 34: §6.3 `if ( FrameIsIntra == 0 )` outer dispatch —
   [`parse_compressed_header_inter`] entry point.** Wires the
   inter-frame arm of the §6.3 compressed-header listing

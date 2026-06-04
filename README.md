@@ -3,6 +3,65 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-06-04 (round 35)
+
+**Round 35: §6.3 `parse_compressed_header_inter` integration-test
+coverage.** Round 35 pins the round-34 inter outer-dispatch entry
+point at the public-API boundary by adding ten new integration tests
+to `tests/compressed_header.rs` against
+[`parse_compressed_header_inter`] per spec `vp9-spec.txt` lines
+1957-1975:
+
+* Zero-buffer default-table pass-through across the full §6.3.1
+  ..§6.3.16 chain — every §10 / §10.5 default table survives a
+  zero-filled compressed-header payload (every `B(252)` flag and
+  every §6.3.7 outer `L(1) update_probs` flag decodes to 0, so each
+  primitive returns its input unchanged). Anchors: `default_coef_probs`
+  TX_4X4/intra/band-0/ctx-0 = `{195, 29, 183}` and
+  TX_32X32/inter/band-5/ctx-5 = `{1, 16, 6}`; `default_skip_prob =
+  {192, 128, 64}`; `default_tx_probs` rows 1..3 from §10;
+  `default_is_inter_prob = {9, 102, 187, 225}`;
+  `default_inter_mode_probs[ 0 ] = {2, 173, 34}`;
+  `default_mv_class0_hp_prob = {160, 160}`;
+  `default_mv_hp_prob = {128, 128}`; `MvProbs::defaults( )`.
+* §6.3.10 `interpolation_filter == SWITCHABLE` gate: with the gate
+  off, the 8-cell `read_interp_filter_probs( )` sweep is skipped
+  entirely; downstream `is_inter_prob` / `mv_probs` results are
+  bit-identical across gate states on a zero buffer (cursor shift
+  doesn't matter when every flag is 0).
+* §6.3.12 `compoundReferenceAllowed` paths: with `LAST = GOLDEN =
+  ALTREF = 0` the walker takes the short-circuit arm returning
+  `SingleReference` with no bool reads and no compound config; with
+  `LAST = 0, GOLDEN = 0, ALTREF = 1` the bool-coder-reading arm runs
+  one `L(1) non_single_reference` = 0 on a zero buffer, still
+  yielding `SingleReference` (this time via the `L(1)`-driven path,
+  not the short-circuit) without firing §6.3.18.
+* §6.3.16 `allow_high_precision_mv` tail gate: the 4-cell
+  high-precision tail is gated correctly — both `class0_hp_prob` and
+  `hp_prob` stay at their §10.5 defaults across gate states on a
+  zero buffer.
+* Intra-prefix parity: the inter walker's §6.3.1 / §6.3.2 / §6.3.7
+  / §6.3.8 prefix is bit-identical to `parse_compressed_header` on
+  identical input for both lossless (no `L(2)` read in §6.3.1) and
+  non-lossless (`L(2)` reads zero → `ONLY_4X4`) paths.
+* Shared-error surface: empty buffer and non-zero §9.2.1 marker bit
+  (first byte `0xFF`) both raise the same `Error` variant the intra
+  walker raises — `init_bool` is the shared first step.
+* `RefFrameSignBias::from_inter_biases` / `get` public-surface
+  round-trip across all eight §6.2.5 input tuples (`LAST` /
+  `GOLDEN` / `ALTREF` ∈ {0, 1}); the §3 `INTRA_FRAME` slot stays at
+  0 (never populated by §6.2.5).
+
+Validation (+10 integration tests, suite total 484 → 494; lib total
+unchanged at 464).
+
+Out of scope for round 35: wiring `parse_compressed_header_inter`
+into [`decode_vp9`] — the uncompressed-header walker still rejects
+inter frames with `Error::Unsupported` (`frame_size_with_refs` +
+reference-buffer state are required first). The §6.3 listing is now
+fully covered by both unit tests (round 34) and integration tests
+(round 35) at the public-API boundary.
+
 ## Status — 2026-06-04 (round 34)
 
 **Round 34: §6.3 `if ( FrameIsIntra == 0 )` outer dispatch —

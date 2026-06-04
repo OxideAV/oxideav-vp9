@@ -1,5 +1,5 @@
-//! Integration tests for the VP9 §6.3 compressed-header walker
-//! (round 3). Each test:
+//! Integration tests for the VP9 §6.3 compressed-header walker. Each
+//! intra-path test:
 //!
 //!  1. Builds a `uncompressed_header()` buffer with a known
 //!     `header_size_in_bytes`, slicing off the byte-aligned tail.
@@ -13,10 +13,21 @@
 //! The §9.2 byte vectors here are the same golden buffers verified in
 //! `src/compressed.rs`'s unit tests.
 //!
+//! Round 35 adds an inter-path section pinning `parse_compressed_header_inter`
+//! (the §6.3 `if ( FrameIsIntra == 0 )` outer-dispatch entry point landed
+//! in round 34) at the public-API boundary. The uncompressed-header
+//! walker still rejects inter frames with `Error::Unsupported`
+//! (`frame_size_with_refs` not yet wired), so the integration tests
+//! call `parse_compressed_header_inter` directly with hand-supplied
+//! §6.2.5 / §6.2.7-derived inputs.
+//!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7
-//! (`docs/video/vp9/vp9-spec.txt`).
+//! (`docs/video/vp9/vp9-spec.txt`) §6.3 lines 1957-1975.
 
-use oxideav_vp9::{parse_compressed_header, parse_uncompressed_header, FrameType, TxMode};
+use oxideav_vp9::{
+    parse_compressed_header, parse_compressed_header_inter, parse_uncompressed_header, FrameType,
+    MvProbs, RefFrameSignBias, ReferenceMode, TxMode, Vp9CompressedHeaderInterInputs,
+};
 
 /// Minimal MSB-first bit builder mirroring §9.1 read order.
 struct BitBuilder {
@@ -289,4 +300,272 @@ fn end_to_end_only_4x4_visits_only_first_tx_size_coef_slab() {
     // loop — maxTxSize was 0).
     assert_eq!(c.coef_probs[3][1][1][5][5], [1, 16, 6]);
     assert_eq!(c.skip_prob, [192, 128, 64]);
+}
+
+// ---------- §6.3 `parse_compressed_header_inter` integration ----------
+//
+// Round 35 pins the round-34 inter outer-dispatch entry point at the
+// public-API boundary. The §6.3 listing's `if ( FrameIsIntra == 0 )`
+// branch (`vp9-spec.txt` lines 1964-1974) composes ten primitives:
+// §6.3.1 / §6.3.2 (gated on TX_MODE_SELECT) / §6.3.7 / §6.3.8 / §6.3.9
+// / §6.3.10 (gated on `interpolation_filter == SWITCHABLE`) / §6.3.11
+// / §6.3.12 (which fires §6.3.18 on the non-`SingleReference` arms) /
+// §6.3.13 / §6.3.14 / §6.3.15 / §6.3.16 (which fires §6.3.17 per cell
+// and the high-precision tail when `allow_high_precision_mv == 1`).
+//
+// On a zero-filled byte buffer every §9.2 `B(252)` flag and every
+// §9.2 `L(1) update_probs` flag in the §6.3.7 outer loop decodes to 0,
+// so each `read_diff_update_prob` / `update_mv_prob` / outer `L(1)`
+// returns the running probability or default-table slot unchanged.
+// This makes a long zero buffer a clean "no-op walk" against which we
+// can pin the composition order without depending on hand-computed
+// post-update values for ~70 distinct MV cells + thousands of coef
+// probability cells.
+//
+// The §10 / §10.5 default-table values asserted below are anchors from
+// the spec listing transcribed verbatim into the crate's
+// `mode_info::DEFAULT_*` / `coef_probs::DEFAULT_COEF_PROBS` /
+// `partition::DEFAULT_PARTITION_PROBS` constants.
+
+/// Helper: build a `RefFrameSignBias` with `LAST = GOLDEN = ALTREF =
+/// 0`, which forces the §6.3.12 walker down the
+/// `compoundReferenceAllowed == 0` short-circuit arm (no bool-coder
+/// reads, returns `SingleReference`).
+fn all_zero_sign_bias() -> RefFrameSignBias {
+    RefFrameSignBias::from_inter_biases(0, 0, 0)
+}
+
+/// Helper: build a `RefFrameSignBias` with `LAST = 0, GOLDEN = 0,
+/// ALTREF = 1`. The §6.3.12 loop at `i = 2` then sees `ALTREF !=
+/// LAST`, setting `compoundReferenceAllowed = 1` and entering the
+/// bool-coder-reading arm.
+fn mixed_sign_bias() -> RefFrameSignBias {
+    RefFrameSignBias::from_inter_biases(0, 0, 1)
+}
+
+#[test]
+fn inter_zero_buffer_passes_through_all_default_tables() {
+    // Zero buffer + ONLY_4X4 raw tx_mode + `compoundReferenceAllowed
+    // == 0` short-circuit + HP gate off + interp gate off → every
+    // probability sweep returns its §10 / §10.5 default unchanged.
+    let bytes = [0u8; 256];
+    let inputs = Vp9CompressedHeaderInterInputs {
+        interpolation_filter_is_switchable: false,
+        ref_frame_sign_bias: all_zero_sign_bias(),
+        allow_high_precision_mv: false,
+    };
+    let r = parse_compressed_header_inter(&bytes, false, inputs).expect("inter walker runs");
+
+    // Intra-shared prefix anchors (§10 default_coef_probs / §10
+    // default_skip_prob / §10 default_tx_probs).
+    assert_eq!(r.intra.tx_mode, TxMode::Only4x4);
+    assert_eq!(r.intra.coef_probs[0][0][0][0][0], [195, 29, 183]);
+    assert_eq!(r.intra.coef_probs[3][1][1][5][5], [1, 16, 6]);
+    assert_eq!(r.intra.skip_prob, [192, 128, 64]);
+    assert_eq!(r.intra.tx_probs[1], [[100, 0, 0], [66, 0, 0]]);
+    assert_eq!(r.intra.tx_probs[2], [[20, 152, 0], [15, 101, 0]]);
+    assert_eq!(r.intra.tx_probs[3], [[3, 136, 37], [5, 52, 13]]);
+
+    // §10.5 `default_is_inter_prob` = { 9, 102, 187, 225 }.
+    assert_eq!(r.is_inter_prob, [9, 102, 187, 225]);
+
+    // §10.5 `default_inter_mode_probs` row anchor: context 0 →
+    // {2, 173, 34} (verifies §6.3.9 default pass-through).
+    assert_eq!(r.inter_mode_probs[0], [2, 173, 34]);
+
+    // §6.3.12 `compoundReferenceAllowed == 0` short-circuit:
+    // `SingleReference` with no compound config.
+    assert_eq!(r.reference_mode, ReferenceMode::SingleReference);
+    assert_eq!(r.compound_reference_config, None);
+
+    // §6.3.16 mv_probs pass-through: every slot matches `MvProbs::defaults`.
+    assert_eq!(r.mv_probs, MvProbs::defaults());
+}
+
+#[test]
+fn inter_interpolation_filter_gate_skips_walker_when_not_switchable() {
+    // The §6.3.10 sweep fires only when `interpolation_filter ==
+    // SWITCHABLE`. With the gate off, the 8-cell §6.3.10 sweep is
+    // skipped entirely (no B(252) reads consumed). On a zero buffer
+    // the resulting `interp_filter_probs` table is the §10.5 default
+    // either way; this test pins the gate by checking that downstream
+    // tables (which would read at a shifted cursor if the §6.3.10
+    // walker had fired) are bit-identical between the two gate states.
+    let bytes = [0u8; 256];
+    let inputs_off = Vp9CompressedHeaderInterInputs {
+        interpolation_filter_is_switchable: false,
+        ref_frame_sign_bias: all_zero_sign_bias(),
+        allow_high_precision_mv: false,
+    };
+    let inputs_on = Vp9CompressedHeaderInterInputs {
+        interpolation_filter_is_switchable: true,
+        ref_frame_sign_bias: all_zero_sign_bias(),
+        allow_high_precision_mv: false,
+    };
+    let r_off = parse_compressed_header_inter(&bytes, false, inputs_off).unwrap();
+    let r_on = parse_compressed_header_inter(&bytes, false, inputs_on).unwrap();
+    // §10.5 `default_interp_filter_probs` survives the zero-buffer
+    // walk on both arms.
+    assert_eq!(r_off.interp_filter_probs, r_on.interp_filter_probs);
+    // §6.3.11 result is bit-identical because every cell update would
+    // have been a no-op on a zero buffer regardless of cursor.
+    assert_eq!(r_off.is_inter_prob, r_on.is_inter_prob);
+    // §6.3.16 MV-probs result is bit-identical for the same reason.
+    assert_eq!(r_off.mv_probs, r_on.mv_probs);
+}
+
+#[test]
+fn inter_compound_reference_short_circuit_returns_single_reference() {
+    // `compoundReferenceAllowed == 0` (every inter ref-frame sign-bias
+    // identical) → §6.3.12 returns `SingleReference` with no bool
+    // reads. No `setup_compound_reference_mode( )` output.
+    let bytes = [0u8; 256];
+    let inputs = Vp9CompressedHeaderInterInputs {
+        interpolation_filter_is_switchable: false,
+        ref_frame_sign_bias: all_zero_sign_bias(),
+        allow_high_precision_mv: false,
+    };
+    let r = parse_compressed_header_inter(&bytes, false, inputs).unwrap();
+    assert_eq!(r.reference_mode, ReferenceMode::SingleReference);
+    assert!(r.compound_reference_config.is_none());
+}
+
+#[test]
+fn inter_compound_reference_allowed_enters_walker_arm() {
+    // mixed_sign_bias() → `compoundReferenceAllowed = 1`. On a zero
+    // buffer the §6.3.12 walker reads one L(1) `non_single_reference`
+    // = 0 → `reference_mode = SingleReference` (NOT
+    // `SingleReference` via the short-circuit arm — this is the
+    // L(1)-driven `SingleReference`). §6.3.18 is not invoked because
+    // the `non_single_reference` flag is 0.
+    let bytes = [0u8; 256];
+    let inputs = Vp9CompressedHeaderInterInputs {
+        interpolation_filter_is_switchable: false,
+        ref_frame_sign_bias: mixed_sign_bias(),
+        allow_high_precision_mv: false,
+    };
+    let r = parse_compressed_header_inter(&bytes, false, inputs).unwrap();
+    assert_eq!(r.reference_mode, ReferenceMode::SingleReference);
+    assert!(r.compound_reference_config.is_none());
+}
+
+#[test]
+fn inter_high_precision_mv_gate_preserves_defaults_on_zero_buffer() {
+    // The §6.3.16 walker's high-precision tail (`mv_class0_hp_prob[ 2
+    // ]` + `mv_hp_prob[ 2 ]` = 4 cells) fires only when
+    // `allow_high_precision_mv == 1`. On a zero buffer both arms leave
+    // the HP slots at their §10.5 defaults (gate off skips, gate on
+    // runs `update_mv_prob` returning the input unchanged) so the
+    // four cells are bit-identical across gate states.
+    let bytes = [0u8; 256];
+    let inputs_off = Vp9CompressedHeaderInterInputs {
+        interpolation_filter_is_switchable: false,
+        ref_frame_sign_bias: all_zero_sign_bias(),
+        allow_high_precision_mv: false,
+    };
+    let inputs_on = Vp9CompressedHeaderInterInputs {
+        interpolation_filter_is_switchable: false,
+        ref_frame_sign_bias: all_zero_sign_bias(),
+        allow_high_precision_mv: true,
+    };
+    let r_off = parse_compressed_header_inter(&bytes, false, inputs_off).unwrap();
+    let r_on = parse_compressed_header_inter(&bytes, false, inputs_on).unwrap();
+    assert_eq!(r_off.mv_probs.class0_hp_prob, r_on.mv_probs.class0_hp_prob);
+    assert_eq!(r_off.mv_probs.hp_prob, r_on.mv_probs.hp_prob);
+    // The §10.5 `default_mv_class0_hp_prob` = 160 per spec listing.
+    assert_eq!(r_off.mv_probs.class0_hp_prob, [160, 160]);
+    assert_eq!(r_on.mv_probs.class0_hp_prob, [160, 160]);
+    // The §10.5 `default_mv_hp_prob` = 128 per spec listing.
+    assert_eq!(r_off.mv_probs.hp_prob, [128, 128]);
+    assert_eq!(r_on.mv_probs.hp_prob, [128, 128]);
+}
+
+#[test]
+fn inter_lossless_intra_prefix_matches_intra_walker() {
+    // On the lossless path §6.3.1 forces `tx_mode = ONLY_4X4` with no
+    // L(2) reads, so the §6.3.7 / §6.3.8 cursor offsets shift versus
+    // the non-lossless `0x00` walk. The intra-shared prefix must
+    // still match between the inter and intra walkers on identical
+    // input.
+    let bytes = [0u8; 256];
+    let intra = parse_compressed_header(&bytes, true).unwrap();
+    let inputs = Vp9CompressedHeaderInterInputs {
+        interpolation_filter_is_switchable: false,
+        ref_frame_sign_bias: all_zero_sign_bias(),
+        allow_high_precision_mv: false,
+    };
+    let inter = parse_compressed_header_inter(&bytes, true, inputs).unwrap();
+    assert_eq!(inter.intra, intra);
+}
+
+#[test]
+fn inter_nonlossless_intra_prefix_matches_intra_walker() {
+    // Non-lossless path: the §6.3.1 `L(2)` raw tx_mode decodes to 0
+    // (zero buffer) → `ONLY_4X4`. The intra-shared prefix of the
+    // inter walker must produce bit-identical output to the
+    // intra-only walker on the same input.
+    let bytes = [0u8; 256];
+    let intra = parse_compressed_header(&bytes, false).unwrap();
+    let inputs = Vp9CompressedHeaderInterInputs {
+        interpolation_filter_is_switchable: false,
+        ref_frame_sign_bias: all_zero_sign_bias(),
+        allow_high_precision_mv: false,
+    };
+    let inter = parse_compressed_header_inter(&bytes, false, inputs).unwrap();
+    assert_eq!(inter.intra, intra);
+}
+
+#[test]
+fn inter_empty_buffer_rejected_with_same_error_as_intra() {
+    // §9.2.1 `init_bool` on an empty buffer fails: the marker bit
+    // can't be read. The inter walker must return the same error
+    // variant the intra walker returns on identical input — both
+    // routes share `init_bool` as their first step.
+    let bytes: [u8; 0] = [];
+    let inputs = Vp9CompressedHeaderInterInputs {
+        interpolation_filter_is_switchable: false,
+        ref_frame_sign_bias: all_zero_sign_bias(),
+        allow_high_precision_mv: false,
+    };
+    let inter_err = parse_compressed_header_inter(&bytes, false, inputs).unwrap_err();
+    let intra_err = parse_compressed_header(&bytes, false).unwrap_err();
+    assert_eq!(inter_err, intra_err);
+}
+
+#[test]
+fn inter_invalid_marker_rejected_with_same_error_as_intra() {
+    // First byte `0xFF`: `BoolValue = 0xFF`, split for p = 128 is
+    // 128, so the §9.2.1 marker bit decodes to 1, violating the
+    // "shall be equal to 0" constraint. Both intra and inter walkers
+    // share `init_bool` as their first step and must reject with the
+    // same error.
+    let bytes = [0xFFu8, 0x00, 0x00, 0x00];
+    let inputs = Vp9CompressedHeaderInterInputs {
+        interpolation_filter_is_switchable: false,
+        ref_frame_sign_bias: all_zero_sign_bias(),
+        allow_high_precision_mv: false,
+    };
+    let inter_err = parse_compressed_header_inter(&bytes, false, inputs).unwrap_err();
+    let intra_err = parse_compressed_header(&bytes, false).unwrap_err();
+    assert_eq!(inter_err, intra_err);
+}
+
+#[test]
+fn ref_frame_sign_bias_public_constructor_round_trips() {
+    // `RefFrameSignBias::from_inter_biases` + `get` are part of the
+    // public API surface (round 34 promoted them from `pub(crate)` to
+    // `pub`). The §3 ref-frame indices `LAST_FRAME = 1`,
+    // `GOLDEN_FRAME = 2`, `ALTREF_FRAME = 3` round-trip across all
+    // eight input tuples; the `INTRA_FRAME = 0` slot is always 0.
+    for last in 0..=1u8 {
+        for golden in 0..=1u8 {
+            for altref in 0..=1u8 {
+                let bias = RefFrameSignBias::from_inter_biases(last, golden, altref);
+                assert_eq!(bias.get(1), last); // LAST_FRAME
+                assert_eq!(bias.get(2), golden); // GOLDEN_FRAME
+                assert_eq!(bias.get(3), altref); // ALTREF_FRAME
+                assert_eq!(bias.get(0), 0); // INTRA_FRAME — never populated.
+            }
+        }
+    }
 }

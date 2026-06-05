@@ -390,6 +390,7 @@ pub use header::{
     QuantizationParams, SegmentationParams, TileInfo, Vp9FrameHeader, MAX_SEGMENTS,
     SEGMENTATION_FEATURE_BITS, SEGMENTATION_FEATURE_SIGNED, SEG_LVL_MAX,
 };
+pub use partition::tile_payload_sizes;
 
 /// Crate-local error type.
 ///

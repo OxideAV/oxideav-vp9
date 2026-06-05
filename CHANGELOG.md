@@ -6,6 +6,43 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 36: §6.4 lines 2306-2311 byte-walk lifted to a public
+  primitive — [`tile_payload_sizes`].** Factors the pure
+  byte-arithmetic prefix walk out of the round-33 `decode_tiles`
+  outer driver into a new public function:
+  `tile_payload_sizes(data, sz, tile_rows_log2, tile_cols_log2) ->
+  Result<Vec<u32>, Error>`. The helper walks the `(1 <<
+  tile_rows_log2) x (1 << tile_cols_log2)` grid in row-major order
+  per §6.4 lines 2304-2305, reads the `f(32)` length prefix per line
+  2310 for every tile except the last, applies the
+  `sz -= tile_size + 4` running subtraction per line 2311 with
+  checked arithmetic, assigns `tile_size = sz` per line 2308 to the
+  last tile, and range-checks every declared body against `data`.
+  The §9.2 bool coder and the §6.4.2 `decode_tile( )` body are not
+  invoked — this is the demuxer slice a caller needs to split a
+  frame's tile payload into per-tile bool-coder sub-streams without
+  decoding any block content.
+  * `decode_tiles` is refactored to call `tile_payload_sizes` for
+    the prefix walk; the per-tile slice fetch can then trust that
+    every tile body is in-bounds, removing the duplicate
+    range-check from the per-tile loop.
+  * `Error::UnexpectedEof` — non-last tile's 4-byte prefix runs
+    past the end of `data`, or a declared `tile_size` extends past
+    the available byte slice.
+  * `Error::InvalidBitstream` — declared `tile_size + 4` would
+    underflow the running `sz` budget per §6.4 line 2311.
+  * 5 new partition::tests cases (lib total 464 -> 469): single-tile
+    pass-through returning `[sz]`; two-tile horizontal layout
+    matching the `docs/video/vp9/fixtures/tile-cols-2` per-frame
+    trace (`tile_size` 662 + 635 totalling 1301 bytes with one
+    4-byte prefix); 2x2 grid emitting four distinguishable sizes in
+    row-major order (would catch a transpose); 3-byte input
+    rejected with `UnexpectedEof` at the first `f(32)` prefix;
+    declared `tile_size = u32::MAX` rejected with
+    `InvalidBitstream` at the §6.4 line 2311 underflow.
+  * `pub use partition::tile_payload_sizes;` exposes the helper on
+    the crate root.
+
 * **Round 35: §6.3 `parse_compressed_header_inter` integration-test
   coverage.** Pins the round-34 inter outer-dispatch entry point at
   the public-API boundary in `tests/compressed_header.rs`. Ten new

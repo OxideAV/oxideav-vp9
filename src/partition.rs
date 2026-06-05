@@ -1003,6 +1003,119 @@ pub(crate) fn decode_tile(
 
 // ----- §6.4 decode_tiles outer driver -----
 
+/// `tile_payload_sizes( sz, tile_rows_log2, tile_cols_log2 )` per spec
+/// §6.4 lines 2306-2311 — the byte-stream prefix walk that derives the
+/// per-tile size budget WITHOUT invoking the §9.2 bool coder or the
+/// §6.4.2 [`decode_tile`] body.
+///
+/// ```text
+/// for ( tileRow = 0; tileRow < tileRows; tileRow++ ) {
+///     for ( tileCol = 0; tileCol < tileCols; tileCol++ ) {
+///         lastTile = (tileRow == tileRows - 1) && (tileCol == tileCols - 1)
+///         if ( lastTile ) {
+///             tile_size = sz
+///         } else {
+///             tile_size                                                  f(32)
+///             sz -= tile_size + 4
+///         }
+///         ...
+///     }
+/// }
+/// ```
+///
+/// Inputs:
+///
+/// * `data` — the tile-stream slice starting at the first tile's
+///   `tile_size` (i.e. immediately past `parse_compressed_header`'s
+///   exit). Only the `f(32)` length prefixes are read; the tile
+///   bodies themselves are skipped over by byte count, never decoded.
+/// * `sz` — the total tile-stream budget in bytes (the running `sz`
+///   the §6.4 listing updates with `sz -= tile_size + 4`). On exit
+///   the budget that would remain for the last tile is reflected in
+///   the last entry of the returned vector.
+/// * `tile_rows_log2`, `tile_cols_log2` — from the
+///   [`crate::header::TileInfo`] of the uncompressed header.
+///
+/// Returns one `u32` per `(tileRow, tileCol)` cell, in row-major
+/// order. The output `Vec` length is exactly `tileRows * tileCols`.
+/// Every entry except the last is the `f(32)` value read at that
+/// tile's slot; the last entry is the spec's `tile_size = sz`
+/// assignment for the `lastTile` case (line 2308).
+///
+/// This is the pure byte-arithmetic subset of [`decode_tiles`] — it
+/// is what a §6.4 demuxer needs to slice a frame's tile payload into
+/// per-tile bool-coder sub-streams, and what the round-32 §6.4.2
+/// [`decode_tile`] caller can pre-compute before allocating per-tile
+/// state.
+///
+/// # Errors
+///
+/// * [`Error::UnexpectedEof`] — the byte stream is shorter than the
+///   running `tile_size + 4` reads demand (a non-last tile's 4-byte
+///   length prefix runs past the end of `data`, or a declared
+///   `tile_size` value extends past the available byte slice).
+/// * [`Error::InvalidBitstream`] — a non-last tile's declared
+///   `tile_size + 4` would underflow the running `sz` budget per
+///   §6.4 line 2311 (the spec's running subtraction would wrap).
+pub fn tile_payload_sizes(
+    data: &[u8],
+    mut sz: u32,
+    tile_rows_log2: u8,
+    tile_cols_log2: u8,
+) -> Result<Vec<u32>, Error> {
+    let tile_cols: u32 = 1u32 << tile_cols_log2;
+    let tile_rows: u32 = 1u32 << tile_rows_log2;
+
+    let mut out: Vec<u32> = Vec::with_capacity((tile_rows * tile_cols) as usize);
+    let mut byte_cursor: usize = 0;
+
+    for tile_row in 0..tile_rows {
+        for tile_col in 0..tile_cols {
+            let last_tile = tile_row == tile_rows - 1 && tile_col == tile_cols - 1;
+            let tile_size: u32 = if last_tile {
+                // §6.4 line 2308: tile_size = sz.
+                sz
+            } else {
+                // §6.4 line 2310: tile_size  f(32) — big-endian per
+                // the spec's f(n) convention.
+                if data.len() < byte_cursor + 4 {
+                    return Err(Error::UnexpectedEof);
+                }
+                let raw = u32::from_be_bytes([
+                    data[byte_cursor],
+                    data[byte_cursor + 1],
+                    data[byte_cursor + 2],
+                    data[byte_cursor + 3],
+                ]);
+                byte_cursor += 4;
+                // §6.4 line 2311: sz -= tile_size + 4. Checked
+                // arithmetic so an oversized declared tile_size that
+                // would underflow the running budget surfaces as a
+                // bitstream error rather than wrapping.
+                let delta = raw.checked_add(4).ok_or(Error::InvalidBitstream)?;
+                sz = sz.checked_sub(delta).ok_or(Error::InvalidBitstream)?;
+                raw
+            };
+
+            // Range check on the tile body itself (mirrors the
+            // §9.2.1 `init_bool( tile_size )` slice fetch in
+            // [`decode_tiles`]): a declared size that overshoots
+            // `data` is `UnexpectedEof`. The last tile's `tile_size =
+            // sz` is constrained by the caller's `sz` argument; for
+            // non-last tiles the running `byte_cursor` has already
+            // advanced past the `f(32)` prefix.
+            if data.len() < byte_cursor + tile_size as usize {
+                return Err(Error::UnexpectedEof);
+            }
+            byte_cursor += tile_size as usize;
+
+            out.push(tile_size);
+        }
+    }
+
+    Ok(out)
+}
+
 /// Per-tile record emitted by [`decode_tiles`] for each
 /// `(tileRow, tileCol)` cell of the tile grid.
 ///
@@ -1127,7 +1240,7 @@ pub(crate) struct DecodedTile {
                                      // probs).
 pub(crate) fn decode_tiles(
     data: &[u8],
-    mut sz: u32,
+    sz: u32,
     tile_rows_log2: u8,
     tile_cols_log2: u8,
     mi_rows: u32,
@@ -1138,38 +1251,32 @@ pub(crate) fn decode_tiles(
     let tile_cols: u32 = 1u32 << tile_cols_log2;
     let tile_rows: u32 = 1u32 << tile_rows_log2;
 
+    // §6.4 lines 2306-2311: walk the per-tile `f(32)` length prefixes
+    // up-front via the [`tile_payload_sizes`] helper. The helper also
+    // range-checks every declared tile body against `data`, so the
+    // per-tile slice fetch below is guaranteed in-bounds for every
+    // `tile_size` returned.
+    let sizes = tile_payload_sizes(data, sz, tile_rows_log2, tile_cols_log2)?;
+
     // §6.4 line 2303: clear_above_context() — once per frame, before
     // the first tile.
     ctx_state.clear_above();
 
     let mut out: Vec<DecodedTile> = Vec::with_capacity((tile_rows * tile_cols) as usize);
     let mut byte_cursor: usize = 0;
+    let mut size_idx: usize = 0;
 
     for tile_row in 0..tile_rows {
         for tile_col in 0..tile_cols {
             let last_tile = tile_row == tile_rows - 1 && tile_col == tile_cols - 1;
-            let tile_size: u32 = if last_tile {
-                sz
-            } else {
-                // §6.4 line 2310: tile_size  f(32).
-                if data.len() < byte_cursor + 4 {
-                    return Err(Error::UnexpectedEof);
-                }
-                let raw = u32::from_be_bytes([
-                    data[byte_cursor],
-                    data[byte_cursor + 1],
-                    data[byte_cursor + 2],
-                    data[byte_cursor + 3],
-                ]);
+            // Every non-last tile carries a 4-byte length prefix per
+            // §6.4 line 2310; the last tile uses §6.4 line 2308
+            // `tile_size = sz` with no prefix.
+            if !last_tile {
                 byte_cursor += 4;
-                // §6.4 line 2311: sz -= tile_size + 4. Use checked
-                // arithmetic so an oversized declared tile_size that
-                // would underflow the running budget surfaces as a
-                // bitstream error rather than wrapping.
-                let delta = raw.checked_add(4).ok_or(Error::InvalidBitstream)?;
-                sz = sz.checked_sub(delta).ok_or(Error::InvalidBitstream)?;
-                raw
-            };
+            }
+            let tile_size: u32 = sizes[size_idx];
+            size_idx += 1;
 
             // §6.4 lines 2313-2316: derive the four MI extents via
             // the §6.4.1 primitive.
@@ -1186,10 +1293,8 @@ pub(crate) fn decode_tiles(
             // superblocks — `init_bool( )` itself still requires
             // `sz >= 1` per §9.2.1, so a zero-superblock tile is
             // still required to carry an init/exit pair with at
-            // least one byte of body.
-            if data.len() < byte_cursor + tile_size as usize {
-                return Err(Error::UnexpectedEof);
-            }
+            // least one byte of body. The [`tile_payload_sizes`]
+            // helper already proved this slice is in-bounds.
             let tile_slice = &data[byte_cursor..byte_cursor + tile_size as usize];
             let mut coder = BoolCoder::init_bool(tile_slice, tile_size as usize)?;
 
@@ -2904,6 +3009,106 @@ mod tests {
         .unwrap();
         assert_eq!(leaves.last().unwrap().c, 8);
         assert_eq!(leaves.len(), 2);
+    }
+
+    // ----- §6.4 tile_payload_sizes byte-walk tests -----
+
+    /// Worked example for the single-tile case (`tile_rows_log2 = 0`,
+    /// `tile_cols_log2 = 0`): §6.4 line 2306 picks `lastTile = true`
+    /// on the first iteration so no `f(32)` prefix is read; the §6.4
+    /// line 2308 assignment `tile_size = sz` is the only value
+    /// emitted.
+    #[test]
+    fn tile_payload_sizes_single_tile_returns_sz() {
+        // No prefix is read; `data` need not even contain bytes for
+        // the prefix slot — but it must contain `sz` bytes for the
+        // per-tile body range check below to pass.
+        let body = [0u8; 19];
+        let sizes = tile_payload_sizes(&body, 19, 0, 0).unwrap();
+        assert_eq!(sizes, vec![19]);
+    }
+
+    /// Two-tile horizontal split (`tile_cols_log2 = 1`,
+    /// `tile_rows_log2 = 0`): §6.4 reads `tile_size  f(32)` for the
+    /// first tile only; the second tile takes whatever `sz` remains
+    /// after `sz -= first_tile_size + 4`.
+    ///
+    /// This worked example mirrors the docs/video/vp9/fixtures/tile-cols-2
+    /// per-frame trace exactly: a 512x64 keyframe (1 SB row x 2 tile
+    /// columns) where the §6.4 trace reports `tile_size = 662` for
+    /// `tile_col = 0` and `tile_size = 635` for `tile_col = 1`. The
+    /// total tile-payload budget is therefore 4 (prefix) + 662 +
+    /// 635 = 1301 bytes.
+    #[test]
+    fn tile_payload_sizes_two_horizontal_tiles_matches_fixture_layout() {
+        let total: u32 = 4 + 662 + 635;
+
+        // The §6.4 byte-walk only reads the f(32) prefix and steps
+        // over the bodies — the body bytes themselves are not
+        // inspected. Build a minimal `data` of `total` bytes whose
+        // first four bytes encode the big-endian f(32) value 662.
+        let mut data: Vec<u8> = Vec::with_capacity(total as usize);
+        data.extend_from_slice(&662u32.to_be_bytes());
+        data.resize(total as usize, 0);
+
+        let sizes = tile_payload_sizes(&data, total, 0, 1).unwrap();
+        assert_eq!(sizes, vec![662, 635]);
+        // Sum invariant: every non-last entry plus the (last entry)
+        // and the (tileCount - 1) four-byte prefixes account for the
+        // full byte budget.
+        let tile_count: u32 = sizes.len() as u32;
+        let prefix_bytes: u32 = (tile_count - 1) * 4;
+        let body_bytes: u32 = sizes.iter().sum();
+        assert_eq!(prefix_bytes + body_bytes, total);
+    }
+
+    /// 2x2 grid (`tile_rows_log2 = 1`, `tile_cols_log2 = 1`): three
+    /// `f(32)` prefixes are read for the first three tiles, then the
+    /// last tile takes the running `sz`. The output order is
+    /// row-major per §6.4 lines 2304-2305.
+    #[test]
+    fn tile_payload_sizes_2x2_grid_emits_row_major_order() {
+        // Pick four distinguishable sizes so a transpose would be
+        // visible.
+        let s: [u32; 4] = [11, 22, 33, 44];
+        let total: u32 = s.iter().sum::<u32>() + 4 * 3;
+
+        // Build the byte stream: f(32) prefixes for the first three
+        // tiles in row-major order, then enough body bytes to satisfy
+        // the per-tile range checks. The body bytes are not inspected.
+        let mut data: Vec<u8> = Vec::new();
+        data.extend_from_slice(&s[0].to_be_bytes());
+        data.resize(data.len() + s[0] as usize, 0);
+        data.extend_from_slice(&s[1].to_be_bytes());
+        data.resize(data.len() + s[1] as usize, 0);
+        data.extend_from_slice(&s[2].to_be_bytes());
+        data.resize(data.len() + s[2] as usize, 0);
+        data.resize(data.len() + s[3] as usize, 0);
+
+        let sizes = tile_payload_sizes(&data, total, 1, 1).unwrap();
+        assert_eq!(sizes, vec![s[0], s[1], s[2], s[3]]);
+    }
+
+    /// §6.4 line 2310 underflow: a 3-byte input can't even hold the
+    /// first `f(32)` prefix, so `tile_payload_sizes` reports
+    /// `UnexpectedEof` before touching the body.
+    #[test]
+    fn tile_payload_sizes_short_f32_prefix_is_eof() {
+        let data = [0u8; 3];
+        let err = tile_payload_sizes(&data, 3, 0, 1).unwrap_err();
+        assert_eq!(err, Error::UnexpectedEof);
+    }
+
+    /// §6.4 line 2311 underflow: a declared `tile_size = u32::MAX`
+    /// would make `sz - (u32::MAX + 4)` wrap. The helper rejects with
+    /// `InvalidBitstream` rather than wrapping.
+    #[test]
+    fn tile_payload_sizes_oversized_declared_size_is_invalid_bitstream() {
+        let mut data: Vec<u8> = Vec::new();
+        data.extend_from_slice(&u32::MAX.to_be_bytes());
+        data.resize(16, 0);
+        let err = tile_payload_sizes(&data, 16, 0, 1).unwrap_err();
+        assert_eq!(err, Error::InvalidBitstream);
     }
 
     // ----- §6.4 decode_tiles outer-driver tests -----

@@ -3,6 +3,64 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-06-05 (round 36)
+
+**Round 36: §6.4 lines 2306-2311 byte-walk lifted to a public
+primitive — [`tile_payload_sizes`].** Round 36 factors the pure
+byte-arithmetic prefix walk out of the round-33 `decode_tiles`
+outer driver into a new standalone public function that a caller can
+invoke without instantiating any per-tile bool-coder state:
+
+* `pub fn tile_payload_sizes(data, sz, tile_rows_log2,
+  tile_cols_log2) -> Result<Vec<u32>, Error>` per spec `vp9-spec.txt`
+  §6.4 lines 2306-2311. Walks the `(1 << tile_rows_log2) x (1 <<
+  tile_cols_log2)` grid in row-major order per §6.4 lines 2304-2305;
+  reads the `f(32)` length prefix per line 2310 for every tile
+  except the last; applies the `sz -= tile_size + 4` running
+  subtraction per line 2311 with checked arithmetic; assigns
+  `tile_size = sz` per line 2308 to the last tile; range-checks
+  every declared body against `data`.
+* `decode_tiles` is refactored to invoke `tile_payload_sizes` for
+  the prefix walk, so the two §6.4 entry points share a single
+  byte-walk implementation. The per-tile slice fetch in
+  `decode_tiles` can now trust that every tile body is in-bounds,
+  eliminating the duplicate range-check from the per-tile loop.
+* Error surface mirrors the §6.4 conformance constraints:
+  `Error::UnexpectedEof` when a non-last tile's 4-byte prefix runs
+  past the end of `data` or when a declared `tile_size` extends past
+  the available byte slice; `Error::InvalidBitstream` when a
+  declared `tile_size + 4` would underflow the running `sz` budget
+  per §6.4 line 2311.
+
+Validation (+5 lib tests, lib total 464 -> 469; suite total 494 ->
+499):
+
+* Single-tile pass-through: `tile_rows_log2 = tile_cols_log2 = 0`
+  returns `vec![sz]` with no `f(32)` read per §6.4 lines 2306-2308.
+* Two-tile horizontal layout matching the
+  `docs/video/vp9/fixtures/tile-cols-2` per-frame trace (`tile_size
+  = 662` for the first tile, `tile_size = 635` for the last; total
+  budget 4 + 662 + 635 = 1301 bytes).
+* 2x2 grid (`tile_rows_log2 = tile_cols_log2 = 1`) emits four
+  distinguishable sizes in row-major order — a transpose would
+  surface here.
+* 3-byte input rejected with `UnexpectedEof` at the first `f(32)`
+  prefix per §6.4 line 2310.
+* Declared `tile_size = u32::MAX` rejected with `InvalidBitstream`
+  at the §6.4 line 2311 underflow rather than wrapping.
+
+`pub use partition::tile_payload_sizes;` exposes the helper on the
+crate root alongside `parse_uncompressed_header` /
+`parse_compressed_header` / `parse_compressed_header_inter`.
+
+Out of scope for round 36: a public `decode_tiles` wrapper that
+runs the inner §6.4.2 / §6.4.3 walk against a real
+fixture — `decode_partition` currently only emits the partition
+tree, so against a real keyframe payload it would consume the
+partition bits but leave the mode / tx / coefficient bits
+unconsumed; that needs §6.4.4 `decode_block( )` wired into the
+recursive driver first.
+
 ## Status — 2026-06-04 (round 35)
 
 **Round 35: §6.3 `parse_compressed_header_inter` integration-test

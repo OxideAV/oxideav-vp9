@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19 + 20 + 21 + 22)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19 + 20 + 21 + 22 + 37)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -343,6 +343,29 @@
 //!   [`decode_vp9`] still depends on the uncompressed-header walker
 //!   accepting inter frames (currently still
 //!   [`Error::Unsupported`]).
+//! * Round 37 lands the §8.8.1 `loop_filter_frame_init( )` book-keeping
+//!   primitive that builds the `LvlLookup[ MAX_SEGMENTS ][
+//!   MAX_REF_FRAMES ][ MAX_MODE_LF_DELTAS ]` filter-strength table the
+//!   §8.8.4 adaptive-strength consumer reads at every superblock
+//!   raster step. Covers the four §8.8.1 steps verbatim: step 1
+//!   `lvlSeg = loop_filter_level`, step 2 `seg_feature_active(
+//!   SEG_LVL_ALT_L )` segment override (abs vs delta + step-2.c
+//!   `Clip3` saturation), step 3 `delta_update == 0` per-segment
+//!   broadcast, step 4 `delta_enabled == 1` per-(ref, mode) delta
+//!   walk (with the line 5481 `INTRA / mode 0` write + lines 5482-5487
+//!   `LAST..ALTREF / 0..MAX_MODE_LF_DELTAS - 1` cover). The
+//!   `nShift = loop_filter_level >> 5` scaling (line 5468) and the
+//!   final `Clip3( 0, MAX_LOOP_FILTER, … )` saturations (line 5481 /
+//!   5486) are applied verbatim. The caller supplies resolved
+//!   `loop_filter_ref_deltas[ 4 ]` / `loop_filter_mode_deltas[ 2 ]`
+//!   arrays per §7.2's "previous value" rule (the §7.2
+//!   `setup_past_independence` defaults are `[1, 0, -1, -1]` for
+//!   refs and `[0, 0]` for modes). Public types:
+//!   [`loop_filter_frame_init`] + [`LvlLookup`] +
+//!   [`MAX_MODE_LF_DELTAS`] + [`MAX_LOOP_FILTER`]. The §8.8.2
+//!   superblock raster walk, §8.8.3 `filter_size`, §8.8.4
+//!   `adaptive_filter_strength`, and §8.8.5 sample-filtering
+//!   primitives are deferred.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return
@@ -372,6 +395,7 @@ mod dequant;
 mod header;
 mod idct;
 mod intra;
+mod loop_filter;
 mod mode_info;
 mod partition;
 mod reconstruct;
@@ -390,6 +414,7 @@ pub use header::{
     QuantizationParams, SegmentationParams, TileInfo, Vp9FrameHeader, MAX_SEGMENTS,
     SEGMENTATION_FEATURE_BITS, SEGMENTATION_FEATURE_SIGNED, SEG_LVL_MAX,
 };
+pub use loop_filter::{loop_filter_frame_init, LvlLookup, MAX_LOOP_FILTER, MAX_MODE_LF_DELTAS};
 pub use partition::tile_payload_sizes;
 
 /// Crate-local error type.

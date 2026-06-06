@@ -3,6 +3,113 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-06-06 (round 37)
+
+**Round 37: §8.8.1 `loop_filter_frame_init( )` lifted to a public
+primitive — [`loop_filter_frame_init`].** Round 37 lands the
+per-frame §8.8 loop-filter init step as a standalone public function
+that converts the §6.2.8 [`LoopFilterParams`] and §6.2.11
+[`SegmentationParams`] walker outputs (already produced by earlier
+rounds) into the `LvlLookup[ MAX_SEGMENTS ][ MAX_REF_FRAMES ][
+MAX_MODE_LF_DELTAS ]` filter-strength table the §8.8.4
+adaptive-strength consumer reads at every superblock raster step:
+
+* `pub fn loop_filter_frame_init(lf: &LoopFilterParams, seg:
+  &SegmentationParams, ref_deltas: [i8; 4], mode_deltas: [i8; 2]) ->
+  LvlLookup` per spec `vp9-spec.txt` §8.8.1 lines 5465-5488. Computes
+  `nShift = loop_filter_level >> 5` per line 5468; iterates the
+  `segment_id = 0..MAX_SEGMENTS - 1` outer loop per line 5469;
+  applies the §8.8.1 step 1 `lvlSeg = loop_filter_level` init, the
+  step 2 `seg_feature_active( SEG_LVL_ALT_L )` override (§6.4.9 gate
+  + §6.2.11 abs/delta mode + `Clip3( 0, MAX_LOOP_FILTER, … )`
+  saturation), the step 3 `delta_update == 0` per-segment broadcast,
+  and the step 4 `delta_enabled == 1` per-(ref, mode) delta-apply
+  walk (with the spec listing's `INTRA_FRAME / 0` line 5481 +
+  `LAST..ALTREF / 0..MAX_MODE_LF_DELTAS - 1` lines 5482-5487 split,
+  and the final `Clip3( 0, MAX_LOOP_FILTER, … )` saturations on every
+  output cell).
+* `pub struct LvlLookup { pub levels: [[[u8; 2]; 4]; 8] }` carries
+  the §8.8.1 output indexed by `(segment_id, ref_frame, mode)` with
+  a `LvlLookup::zeros()` no-filter identity constructor and a
+  bounds-checked `get(segment_id, ref_frame, mode) -> Option<u8>`
+  read-back surface. Cells fit `u8` because §8.8.1's `Clip3( 0,
+  MAX_LOOP_FILTER, … )` (line 5476 / 5481 / 5486) saturates every
+  output into `0..=63`.
+* Constants exposed: `pub const MAX_MODE_LF_DELTAS: usize = 2` (§3
+  `vp9-spec.txt` line 513 — the per-mode delta slot count), `pub
+  const MAX_LOOP_FILTER: i32 = 63` (§3 line 515 — the §8.8.1 `Clip3`
+  upper bound). The §3 `SEG_LVL_ALT_L = 1` segmentation-feature
+  index is the crate-local `pub(crate) const` carrying the §8.8.1
+  step 2 gate's feature slot.
+
+Caller-supplied `ref_deltas[ 4 ]` and `mode_deltas[ 2 ]` arrays carry
+the resolved (post-`Option::unwrap_or(prev)`) values per §7.2's
+"previous value" rule — the §7.2 `setup_past_independence` defaults
+are `loop_filter_ref_deltas = [1, 0, -1, -1]` (indexed `INTRA / LAST
+/ GOLDEN / ALTREF`) and `loop_filter_mode_deltas = [0, 0]`. Keeping
+the resolved arrays as inputs lets §8.8.1 stand alone without a
+`Vp9DecoderState` carrying the running deltas across frames — that
+state is the §7.2 inter-frame orchestrator's responsibility.
+
+Validation (+13 lib tests, lib total 469 -> 482; +5 integration
+tests in `tests/loop_filter.rs`; suite total 499 -> 517):
+
+* §8.8.1 base case: zero `loop_filter_level` with everything disabled
+  yields an all-zero `LvlLookup` (line 5468 makes `nShift = 0`, step
+  3 broadcasts `lvlSeg = 0` into every cell, step 4 is gated off).
+* §8.8.1 step 3 broadcast: `delta_update == 0 && delta_enabled == 0`
+  broadcasts `lvlSeg = loop_filter_level` into every `(segment_id,
+  ref, mode)` cell.
+* §8.8.1 step 4 alone: `delta_update == 1 && delta_enabled == 1`
+  skips the step-3 broadcast and step 4 covers every cell except
+  `(INTRA_FRAME, 1)` (line 5481 is mode-0-only; lines 5482-5487 skip
+  `INTRA_FRAME`); the `INTRA / 1` cell stays at the zero default.
+* §8.8.1 line 5468 `nShift = level >> 5` threshold: at level 32 a
+  `±1` ref-delta moves the cell by ±2 from `lvlSeg`; at level 31
+  the shift is 0 (1:1).
+* §8.8.1 line 5481 / 5486 `Clip3( 0, MAX_LOOP_FILTER, … )`
+  saturation on both bounds: positive overflow clamps to 63;
+  negative underflow clamps to 0 (no `u8` underflow).
+* §8.8.1 step 2 segment override: a segment with `SEG_LVL_ALT_L`
+  enabled has its `lvlSeg` REPLACED in abs mode (`feature_data` is
+  the new level) or ADDED to in delta mode (`feature_data +
+  loop_filter_level`).
+* §8.8.1 step 2.c `Clip3( 0, MAX_LOOP_FILTER, lvlSeg )` saturation:
+  a `feature_data = -100` in delta mode clamps to 0; a `feature_data
+  = 200` in abs mode clamps to 63.
+* §6.4.9 `seg_feature_active( )` gate: when `segmentation_enabled ==
+  0` step 2 is OFF even if `feature_enabled[ ][ SEG_LVL_ALT_L ] ==
+  1` (both flags are required per §6.4.9).
+* §8.8.1 step 3 + step 4 composition: with `delta_update = 0 &&
+  delta_enabled = 1` step 3 broadcasts then step 4 partially
+  overwrites, leaving `(INTRA_FRAME, 1)` at the step-3 broadcast
+  value (line 5481 + 5482-5487 don't cover that cell).
+* `LvlLookup::get` returns `Some(_)` for every in-range
+  `(segment_id < 8, ref_frame ∈ [0, 4), mode < 2)` triple and `None`
+  for every out-of-range axis (including `ref_frame < 0`).
+
+`pub use loop_filter::{loop_filter_frame_init, LvlLookup,
+MAX_LOOP_FILTER, MAX_MODE_LF_DELTAS};` exposes the §8.8.1 surface on
+the crate root alongside `parse_uncompressed_header` /
+`parse_compressed_header` / `parse_compressed_header_inter` /
+`tile_payload_sizes`.
+
+Out of scope for round 37 (each lands in a separate later round):
+
+* §8.8.2 `superblock_loop_filter` — the per-superblock raster walk
+  driving §8.8.3 / §8.8.4 / §8.8.5, which needs `MiSizes` / `TxSizes`
+  / `Skips` / `RefFrames` arrays the §6.4.4 `decode_block` fan-out
+  produces. The round-31 `decode_block_apply` primitive plus the
+  round-19 `decode_partition` driver already build that frame
+  state; wiring them into §8.8.2 is the natural follow-up.
+* §8.8.3 `filter_size` — the `txSz` / `is32Edge` derivation per
+  lines 5587-5625.
+* §8.8.4 `adaptive_filter_strength` — reads `LvlLookup` produced by
+  this round and emits `(lvl, limit, blimit, thresh)` per lines
+  5626 onwards.
+* §8.8.5 `sample_filtering` — the actual MB-edge deblocking filter
+  primitives (`filter4` / `filter6` / `filter8` / `filter16`).
+
 ## Status — 2026-06-05 (round 36)
 
 **Round 36: §6.4 lines 2306-2311 byte-walk lifted to a public

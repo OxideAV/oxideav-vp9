@@ -6,6 +6,57 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 37: §8.8.1 `loop_filter_frame_init( )` lifted to a public
+  primitive — [`loop_filter_frame_init`].** New per-frame book-keeping
+  function building the `LvlLookup[ MAX_SEGMENTS ][ MAX_REF_FRAMES ][
+  MAX_MODE_LF_DELTAS ]` filter-strength lookup table per spec
+  `vp9-spec.txt` §8.8.1 lines 5465-5488. Signature:
+  `loop_filter_frame_init(lf: &LoopFilterParams, seg:
+  &SegmentationParams, ref_deltas: [i8; 4], mode_deltas: [i8; 2]) ->
+  LvlLookup`.
+  * Covers all four §8.8.1 steps: step 1 `lvlSeg = loop_filter_level`,
+    step 2 `seg_feature_active( SEG_LVL_ALT_L )` segment override
+    (with §6.2.11 abs/delta mode handling + §8.8.1 step 2.c
+    `Clip3( 0, MAX_LOOP_FILTER, lvlSeg )` saturation), step 3
+    `delta_update == 0` per-segment broadcast, and step 4
+    `delta_enabled == 1` per-(ref, mode) delta-apply walk (with the
+    §8.8.1 line 5481 / 5482-5487 split: `INTRA_FRAME / mode 0` writes
+    line 5481, `LAST_FRAME..ALTREF_FRAME / 0..MAX_MODE_LF_DELTAS - 1`
+    writes lines 5482-5487; the `INTRA_FRAME / mode 1` cell is never
+    touched by step 4).
+  * `nShift = loop_filter_level >> 5` line 5468: the deltas scale by
+    `<< nShift` so a `level >= 32` doubles every `±1` delta into
+    `±2` (and `level >= 64` would 4x, but `MAX_LOOP_FILTER = 63`
+    caps the input).
+  * Caller supplies resolved `ref_deltas[ 4 ]` / `mode_deltas[ 2 ]`
+    (post-`Option::unwrap_or(prev)`) per §7.2's "previous value"
+    rule. The §7.2 `setup_past_independence` defaults are
+    `loop_filter_ref_deltas = [1, 0, -1, -1]` and
+    `loop_filter_mode_deltas = [0, 0]`.
+  * New `pub struct LvlLookup { pub levels: [[[u8; 2]; 4]; 8] }` with
+    `LvlLookup::zeros()` no-filter identity constructor and a
+    bounds-checked `get(segment_id: usize, ref_frame: i32, mode:
+    usize) -> Option<u8>` read-back.
+  * New public constants: `MAX_MODE_LF_DELTAS: usize = 2` (§3
+    `vp9-spec.txt` line 513), `MAX_LOOP_FILTER: i32 = 63` (§3 line
+    515). Crate-local `SEG_LVL_ALT_L: usize = 1` (§3 line 476).
+  * 13 new lib-side `loop_filter::tests` (lib total 469 -> 482): the
+    all-disabled zero base case, the step-3 broadcast, the
+    `delta_update + delta_enabled` step-4 cover excluding `INTRA / 1`,
+    the `nShift = 1` threshold at level 32, both `Clip3` saturations
+    (0 and 63), step 2.a abs-mode replacement, step 2.b delta-mode
+    addition, step 2.c underflow + overflow clips, the §6.4.9
+    `segmentation_enabled == 0` gate that makes step 2 a no-op even
+    when `feature_enabled[ ][ SEG_LVL_ALT_L ] == 1`, the
+    `INTRA_FRAME / 1` cell retention when step 3 broadcasts then step
+    4 partial-overwrites, and the `LvlLookup::get` bounds-check.
+  * 5 new integration tests in `tests/loop_filter.rs` (suite total
+    499 -> 517): step-3 broadcast via public API, `nShift` threshold
+    sweep at levels 31 / 32 / 63 with `Clip3` saturation, step 3 +
+    step 4 composition leaving `INTRA_FRAME / 1` at broadcast value,
+    step 2 segment-specific override (only the configured segment
+    sees the alt level), and `LvlLookup::zeros()` identity.
+
 * **Round 36: §6.4 lines 2306-2311 byte-walk lifted to a public
   primitive — [`tile_payload_sizes`].** Factors the pure
   byte-arithmetic prefix walk out of the round-33 `decode_tiles`

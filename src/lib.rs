@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19 + 20 + 21 + 22 + 37)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19 + 20 + 21 + 22 + 37 + 244)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -366,6 +366,18 @@
 //!   superblock raster walk, §8.8.3 `filter_size`, §8.8.4
 //!   `adaptive_filter_strength`, and §8.8.5 sample-filtering
 //!   primitives are deferred.
+//! * Round 244 lifts §8.8.3 `filter_size( )` to a public leaf
+//!   primitive — [`filter_size`] — covering the `baseSize` derivation
+//!   (`txSz == TX_4X4 && is32Edge == 1 → TX_8X8`; otherwise
+//!   `Min(TX_16X16, txSz)`) plus the vertical chroma-right-edge clip
+//!   (`pass == 0 && sub_x == 1 && baseSize == TX_16X16 && (x >> 3)
+//!   == MiCols - 1 → TX_8X8`) and horizontal chroma-bottom-edge clip
+//!   (`pass == 1 && sub_y == 1 && baseSize == TX_16X16 && (y >> 3)
+//!   == MiRows - 1 → TX_8X8`) per `vp9-spec.txt` §8.8.3 lines
+//!   5587-5625. Public surface: [`filter_size`] + the four §7.4.8
+//!   transform-size constants [`TX_4X4`], [`TX_8X8`], [`TX_16X16`],
+//!   [`TX_32X32`] (verbatim from §7.4.8 lines 3937-3940) + the two
+//!   pass-direction constants [`PASS_VERTICAL`] and [`PASS_HORIZONTAL`].
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return
@@ -392,6 +404,7 @@ mod coef_probs;
 mod compressed;
 mod decode_block;
 mod dequant;
+mod filter_size;
 mod header;
 mod idct;
 mod intra;
@@ -408,6 +421,9 @@ pub use compressed::{
     parse_compressed_header, parse_compressed_header_inter, CompoundReferenceConfig, MvProbs,
     RefFrameSignBias, ReferenceMode, TxMode, Vp9CompressedHeader, Vp9CompressedHeaderInter,
     Vp9CompressedHeaderInterInputs,
+};
+pub use filter_size::{
+    filter_size, PASS_HORIZONTAL, PASS_VERTICAL, TX_16X16, TX_32X32, TX_4X4, TX_8X8,
 };
 pub use header::{
     parse_uncompressed_header, ColorConfig, ColorSpace, FrameType, LoopFilterParams,

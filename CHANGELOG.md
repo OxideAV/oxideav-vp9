@@ -6,6 +6,52 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 244: §8.8.3 `filter_size( )` lifted to a public leaf
+  primitive — [`filter_size`].** New per-edge filter-size derivation
+  built from the `(tx_sz, is_32_edge, pass, x, y, sub_x, sub_y,
+  mi_cols, mi_rows)` inputs the §8.8.2 superblock raster walk will
+  supply per spec `vp9-spec.txt` §8.8.3 lines 5587-5625. Signature:
+  `filter_size(tx_sz: u8, is_32_edge: bool, pass: u8, x: u32, y:
+  u32, sub_x: u8, sub_y: u8, mi_cols: u32, mi_rows: u32) -> u8`.
+  * Step 1 `baseSize` derivation per lines 5609-5611: the `txSz ==
+    TX_4X4 && is32Edge == 1 → baseSize = TX_8X8` promotion (the
+    §8.8.3 lead paragraph "minimum size of TX_8X8 for boundaries
+    on a multiple of 32 samples" rule) and the otherwise-branch
+    `baseSize = Min(TX_16X16, txSz)` clip (cap below `TX_32X32`).
+  * Step 2 vertical chroma right-edge clip per lines 5615-5619:
+    `pass == 0 && sub_x == 1 && baseSize == TX_16X16 && (x >> 3)
+    == MiCols - 1 → TX_8X8`. Realises the §8.8.3 lead paragraph
+    "reduce the width of chroma filters" rule.
+  * Step 2 horizontal chroma bottom-edge clip per lines 5620-5624:
+    mirror gate on `pass == 1 && sub_y == 1 && baseSize ==
+    TX_16X16 && (y >> 3) == MiRows - 1 → TX_8X8`.
+  * Otherwise `filterSize = baseSize` per line 5625.
+  * New public constants verbatim from §7.4.8 (`vp9-spec.txt`
+    lines 3937-3940): `TX_4X4: u8 = 0`, `TX_8X8: u8 = 1`,
+    `TX_16X16: u8 = 2`, `TX_32X32: u8 = 3`. Two §8.8.3 pass-
+    direction integers: `PASS_VERTICAL: u8 = 0` and
+    `PASS_HORIZONTAL: u8 = 1`.
+  * 14 new lib-side `filter_size::tests` (lib total 482 -> 496):
+    `Min` clip on `TX_8X8` interior, `Min` cap of `TX_32X32` at
+    `TX_16X16`, `TX_4X4` interior keeps `TX_4X4`, `TX_4X4 +
+    is_32_edge` promotion to `TX_8X8`, vertical chroma right-edge
+    clip fires, vertical clip skipped on horizontal pass, vertical
+    clip skipped when `sub_x = 0`, vertical clip skipped when
+    `baseSize < TX_16X16`, vertical clip skipped on interior edge,
+    horizontal chroma bottom-edge clip fires, horizontal clip
+    skipped on vertical pass, horizontal clip skipped when `sub_y
+    = 0`, `is32Edge` promotion doesn't fire the chroma clip
+    (`baseSize != TX_16X16` after promotion), and the
+    `mi_cols == 0` / `mi_rows == 0` no-clip edge case.
+  * 8 new integration tests in `tests/filter_size.rs`: `Min` clip
+    via public API, `is_32_edge` promotion via public API,
+    vertical chroma-clip sweep over `mi_cols ∈ [1, 8]`, horizontal
+    chroma-clip sweep over `mi_rows ∈ [1, 8]`, luma 8x8 grid
+    stays unclipped on both passes, `TX_*` constants match §7.4.8
+    values, pass-direction constants verified, and the `TX_32X32`
+    right-edge chroma clip via the intermediate `TX_16X16`
+    `baseSize`.
+
 * **Round 37: §8.8.1 `loop_filter_frame_init( )` lifted to a public
   primitive — [`loop_filter_frame_init`].** New per-frame book-keeping
   function building the `LvlLookup[ MAX_SEGMENTS ][ MAX_REF_FRAMES ][

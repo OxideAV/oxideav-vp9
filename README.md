@@ -3,6 +3,81 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-06-07 (round 244)
+
+**Round 244: §8.8.3 `filter_size( )` lifted to a public leaf
+primitive — [`filter_size`].** Round 244 lands the per-edge filter-
+size derivation as a pure-state function the §8.8.2 superblock
+raster walk will call at every loop-filter edge to pick the maximum
+filter size between the §8.8.4 strength derivation and the §8.8.5
+sample-filter pass:
+
+* `pub fn filter_size(tx_sz: u8, is_32_edge: bool, pass: u8, x: u32,
+  y: u32, sub_x: u8, sub_y: u8, mi_cols: u32, mi_rows: u32) -> u8`
+  per spec `vp9-spec.txt` §8.8.3 lines 5587-5625. Returns one of
+  `TX_4X4` / `TX_8X8` / `TX_16X16` (the §8.8.3 `Min(TX_16X16, txSz)`
+  step caps the output below `TX_32X32`).
+* Step 1 (`baseSize` derivation, lines 5609-5611): the `txSz ==
+  TX_4X4 && is32Edge == 1 → baseSize = TX_8X8` promotion realises
+  the §8.8.3 lead paragraph's "minimum size of TX_8X8 for boundaries
+  on a multiple of 32 samples" rule; otherwise
+  `baseSize = Min(TX_16X16, txSz)`.
+* Step 2 (chroma frame-edge clip, lines 5615-5624): the vertical
+  pass clip `pass == 0 && sub_x == 1 && baseSize == TX_16X16 && (x
+  >> 3) == MiCols - 1 → TX_8X8` realises the §8.8.3 lead paragraph's
+  "reduce the width of chroma filters" rule; the mirror horizontal
+  pass clip `pass == 1 && sub_y == 1 && baseSize == TX_16X16 && (y
+  >> 3) == MiRows - 1 → TX_8X8` handles the bottom edge.
+* Constants exposed verbatim per §7.4.8 (`vp9-spec.txt` lines
+  3937-3940): `pub const TX_4X4: u8 = 0`, `pub const TX_8X8: u8 =
+  1`, `pub const TX_16X16: u8 = 2`, `pub const TX_32X32: u8 = 3`.
+  The §8.8.3 pass-direction integers are surfaced as `pub const
+  PASS_VERTICAL: u8 = 0` and `pub const PASS_HORIZONTAL: u8 = 1`.
+
+`pub use filter_size::{filter_size, PASS_HORIZONTAL, PASS_VERTICAL,
+TX_16X16, TX_32X32, TX_4X4, TX_8X8};` exposes the §8.8.3 surface on
+the crate root alongside the round-37 §8.8.1 surface
+(`loop_filter_frame_init` / `LvlLookup` / `MAX_LOOP_FILTER` /
+`MAX_MODE_LF_DELTAS`).
+
+Validation (+14 lib tests, lib total 482 -> 496; +8 integration
+tests in `tests/filter_size.rs`; suite total 517 -> 539):
+
+* §8.8.3 line 5611 `Min(TX_16X16, txSz)` clip: `TX_8X8` stays
+  `TX_8X8`; `TX_32X32` caps at `TX_16X16`; `TX_4X4` (without the
+  `is32Edge` promotion) stays `TX_4X4`.
+* §8.8.3 line 5610 `is32Edge` promotion: `tx_sz = TX_4X4 &&
+  is_32_edge = true` lifts `baseSize` to `TX_8X8`.
+* §8.8.3 lines 5615-5619 vertical chroma right-edge clip: fires
+  only on `pass == 0 && sub_x == 1 && baseSize == TX_16X16 && (x
+  >> 3) == MiCols - 1`. Verified by a `mi_cols ∈ [1, 8]` sweep
+  comparing the `sub_x = 1` clip with the `sub_x = 0` no-clip path.
+* §8.8.3 lines 5620-5624 horizontal chroma bottom-edge clip: mirror
+  gate on `pass == 1 && sub_y == 1 && baseSize == TX_16X16 && (y >>
+  3) == MiRows - 1`. Verified by the same `mi_rows ∈ [1, 8]` sweep.
+* §8.8.3 step 1 + step 2 composition: a `TX_32X32` input on the
+  sub-sampled chroma right-edge clips to `TX_8X8` via the
+  intermediate `baseSize = TX_16X16`; a `TX_4X4 + is32Edge` input
+  on the same edge stays at `TX_8X8` (the step-1 promotion's
+  output skips the step-2 gate because `baseSize != TX_16X16`).
+* §8.8.3 lead paragraph (lines 5597-5599) purpose check: an 8x8
+  grid of edges with `sub_x = sub_y = 0` (luma plane) never sees a
+  clip on either pass; both chroma-clip gates require sub-sampling.
+* `mi_cols == 0` / `mi_rows == 0` edge case: the on-edge gates
+  evaluate to `false` (no integer wrap-around into a spurious clip).
+
+Out of scope for round 244 (each lands in a separate later round):
+
+* §8.8.2 `superblock_loop_filter` — the per-superblock raster walk
+  that calls [`filter_size`] at every `(plane, pass, row, col)`
+  step. Needs the `MiSizes` / `TxSizes` / `Skips` / `RefFrames`
+  arrays the §6.4.4 [`decode_block_apply`] fan-out produces.
+* §8.8.4 `adaptive_filter_strength` — reads the round-37
+  [`LvlLookup`] and emits `(lvl, limit, blimit, thresh)` per lines
+  5626-5661.
+* §8.8.5 `sample_filtering` — the actual MB-edge deblocking filter
+  primitives (`filter4` / `filter6` / `filter8` / `filter16`).
+
 ## Status — 2026-06-06 (round 37)
 
 **Round 37: §8.8.1 `loop_filter_frame_init( )` lifted to a public

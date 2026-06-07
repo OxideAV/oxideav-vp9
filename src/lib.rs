@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19 + 20 + 21 + 22 + 37 + 244)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19 + 20 + 21 + 22 + 37 + 244 + 250)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -378,6 +378,25 @@
 //!   transform-size constants [`TX_4X4`], [`TX_8X8`], [`TX_16X16`],
 //!   [`TX_32X32`] (verbatim from §7.4.8 lines 3937-3940) + the two
 //!   pass-direction constants [`PASS_VERTICAL`] and [`PASS_HORIZONTAL`].
+//! * Round 250 lifts §8.8.4 `adaptive_filter_strength( )` to a public
+//!   leaf primitive — [`adaptive_filter_strength`] — covering the
+//!   four §8.8.4 steps verbatim. Step 1 reads `LvlLookup[ segment ][
+//!   ref ][ modeType ]` from the round-37 §8.8.1
+//!   [`loop_filter_frame_init`] output, deriving `modeType = 1` for
+//!   `NEARESTMV` / `NEARMV` / `NEWMV` per `vp9-spec.txt` lines
+//!   5637-5638 and `modeType = 0` for intra modes and `ZEROMV`. Step
+//!   2 picks `shift ∈ {0, 1, 2}` from `loop_filter_sharpness`. Step
+//!   3 yields `limit` via the sharpness-gated `Clip3( 1, 9 -
+//!   loop_filter_sharpness, lvl >> shift )` (sharpness > 0) or
+//!   `Max( 1, lvl >> shift )` (sharpness = 0). Step 4 sets `blimit =
+//!   2 * (lvl + 2) + limit`. Step 5 sets `thresh = lvl >> 4`. Public
+//!   surface: [`adaptive_filter_strength`] + [`FilterStrength`] +
+//!   [`mode_to_mode_type`] + the four §7.4.11 inter-mode constants
+//!   [`NEARESTMV`], [`NEARMV`], [`ZEROMV`], [`NEWMV`] (verbatim
+//!   from `vp9-spec.txt` §7.4.11 lines 3957-3961). The §8.8.2
+//!   superblock raster walk that calls this primitive at every
+//!   `(loopRow, loopCol)` step and the §8.8.5 sample-filter pass
+//!   that consumes its output both remain deferred.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return
@@ -398,6 +417,7 @@
 
 use oxideav_core::RuntimeContext;
 
+mod adaptive_filter_strength;
 mod bitreader;
 mod bool_coder;
 mod coef_probs;
@@ -416,6 +436,9 @@ mod residual;
 mod scan;
 mod tokens;
 
+pub use adaptive_filter_strength::{
+    adaptive_filter_strength, mode_to_mode_type, FilterStrength, NEARESTMV, NEARMV, NEWMV, ZEROMV,
+};
 pub use coef_probs::CoefProbs;
 pub use compressed::{
     parse_compressed_header, parse_compressed_header_inter, CompoundReferenceConfig, MvProbs,

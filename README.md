@@ -3,6 +3,107 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-06-07 (round 250)
+
+**Round 250: §8.8.4 `adaptive_filter_strength( )` lifted to a public
+leaf primitive — [`adaptive_filter_strength`].** Round 250 lands
+the per-(loopRow, loopCol) filter-strength derivation as a pure-
+state function the §8.8.2 superblock raster walk will call at every
+luma 8x8 position to produce the `(lvl, limit, blimit, thresh)`
+tuple the §8.8.5 sample-filter pass consumes:
+
+* `pub fn adaptive_filter_strength(lvl_lookup: &LvlLookup,
+  segment_id: usize, ref_frame: i32, y_mode: u8,
+  loop_filter_sharpness: u8) -> Option<FilterStrength>` per spec
+  `vp9-spec.txt` §8.8.4 lines 5626-5661. Returns `None` for an
+  out-of-range axis (`segment_id >= MAX_SEGMENTS`, `ref_frame`
+  outside `0..=3`).
+* Step 1 (`lvl` derivation, lines 5632-5639): the §8.8.1
+  [`LvlLookup`] from round 37 is indexed by `(segment_id, ref_frame,
+  modeType)`, where `modeType = 1` when `y_mode` is one of the
+  three §7.4.11 MV-predicting inter modes (`NEARESTMV` = 10,
+  `NEARMV` = 11, `NEWMV` = 13) and `modeType = 0` for intra modes
+  (0..=9) or `ZEROMV` = 12, per the §8.8.4 step-1 partition (lines
+  5637-5638).
+* Step 2 (`shift` derivation, lines 5642-5645): `shift = 2` when
+  `loop_filter_sharpness > 4`, `shift = 1` when
+  `loop_filter_sharpness > 0`, and `shift = 0` otherwise.
+* Step 3 (`limit` derivation, lines 5648-5651): sharpness > 0 →
+  `limit = Clip3( 1, 9 - loop_filter_sharpness, lvl >> shift )`;
+  sharpness = 0 → `limit = Max( 1, lvl >> shift )`. Both branches
+  guarantee `limit >= 1` even when `lvl >> shift = 0`.
+* Step 4 (`blimit` line 5660): `blimit = 2 * (lvl + 2) + limit`.
+  The §8.8.1 `Clip3( 0, MAX_LOOP_FILTER, … )` ceiling bounds `lvl`
+  at 63, so the maximum `blimit` is `2 * 65 + 63 = 193` — under
+  `u8::MAX`.
+* Step 5 (`thresh` line 5661): `thresh = lvl >> 4` — the §8.8.5.1
+  high-edge-variance threshold. Bounded by `lvl <= 63 → thresh <=
+  3`.
+* §7.4.11 inter-mode constants surfaced verbatim (`vp9-spec.txt`
+  lines 3957-3961): `pub const NEARESTMV: u8 = 10`, `pub const
+  NEARMV: u8 = 11`, `pub const ZEROMV: u8 = 12`, `pub const NEWMV:
+  u8 = 13`.
+* Helper `pub fn mode_to_mode_type(mode: u8) -> usize` exposes the
+  §8.8.4 step-1 classification at module scope so a future §8.8.2
+  raster walker can derive `modeType` directly from `YModes[ ][ ]`
+  without re-reading the lookup.
+
+`pub use adaptive_filter_strength::{adaptive_filter_strength,
+mode_to_mode_type, FilterStrength, NEARESTMV, NEARMV, NEWMV,
+ZEROMV};` exposes the §8.8.4 surface on the crate root alongside the
+round-37 §8.8.1 surface (`loop_filter_frame_init` / `LvlLookup` /
+`MAX_LOOP_FILTER` / `MAX_MODE_LF_DELTAS`) and the round-244 §8.8.3
+surface (`filter_size` / `TX_4X4` / `TX_8X8` / `TX_16X16` /
+`TX_32X32` / `PASS_VERTICAL` / `PASS_HORIZONTAL`).
+
+Validation (+11 lib tests, lib total 496 -> 507; +7 integration
+tests in `tests/adaptive_filter_strength.rs`; suite total 539 ->
+557):
+
+* §8.8.4 step 1 modeType classification: every intra mode 0..=9 and
+  `ZEROMV` (= 12) maps to `modeType = 0`; `NEARESTMV` / `NEARMV` /
+  `NEWMV` map to `modeType = 1`.
+* §8.8.4 step 1 lookup dispatch: with non-zero mode-delta = `[0,
+  4]`, the mode-0 / mode-1 columns of `LvlLookup[s][LAST][m]` differ
+  by 4 and the four inter MV modes route to the mode-1 column while
+  `ZEROMV` and the ten intra modes route to the mode-0 column.
+* §8.8.4 step 2 `shift` boundaries verified at `sharpness = 0` (=
+  0), `sharpness = 1` (= 1), `sharpness = 5` (= 2) per the strict-
+  `>` comparisons in the spec.
+* §8.8.4 step 3 envelope: full `0..=7` sharpness sweep computes the
+  expected `(shift, limit, blimit, thresh)` independently and
+  matches the primitive at `lvl = 40`.
+* §8.8.4 step 3 lower clip at `lvl = 0`: both sharpness = 0
+  (`Max(1, 0) = 1`) and sharpness > 0 (`Clip3(1, 9-sharp, 0) = 1`)
+  enforce `limit >= 1`.
+* §8.8.4 step 3 upper clip at sharpness = 7: `Clip3(1, 2, ...) <=
+  2` even when `lvl >> shift = 15`.
+* §8.8.4 steps 1 + 2 + 3 + 4 + 5 end-to-end at `level = 25` with
+  §7.2 setup_past_independence defaults: returns
+  `FilterStrength { lvl: 25, limit: 25, blimit: 79, thresh: 1 }`.
+* §8.8.1 segment override propagates into §8.8.4 step 1 lookup:
+  segment 2's `feature_data` override of 50 surfaces as
+  `out.lvl = 50` / `blimit = 154` / `thresh = 3`.
+* §8.8.4 step 5 `thresh` partition: a sweep at level ∈ {15, 16, 31,
+  32, 47, 48, 63} confirms the four `lvl >> 4` bands.
+* Out-of-range axes return `None` without panic: `segment_id =
+  MAX_SEGMENTS`, `ref_frame = -1` (the `NONE` sentinel from
+  §6.4.16), `ref_frame = 4`.
+
+Out of scope for round 250 and queued for later rounds:
+
+* §8.8.2 `superblock_loop_filter( )` — the per-superblock raster
+  walk that invokes this primitive at every `(loopRow, loopCol)`
+  step. Needs `MiSizes` / `TxSizes` / `Skips` / `RefFrames` /
+  `YModes` / `SegmentIds` arrays the §6.4.4 [`decode_block`] fan-
+  out produces.
+* §8.8.5 `sample_filtering( )` — the actual edge-filter primitives
+  (`filter4` / `filter6` / `filter8` / `filter16`) that consume the
+  `FilterStrength` tuple this round returns.
+* §6.2.5 `frame_size_with_refs` — needed before the inter-frame
+  uncompressed-header path returns anything other than
+  `Error::Unsupported`.
+
 ## Status — 2026-06-07 (round 244)
 
 **Round 244: §8.8.3 `filter_size( )` lifted to a public leaf

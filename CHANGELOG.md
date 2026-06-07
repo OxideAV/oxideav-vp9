@@ -6,6 +6,62 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 250: §8.8.4 `adaptive_filter_strength( )` lifted to a
+  public leaf primitive — [`adaptive_filter_strength`].** New per-
+  `(loopRow, loopCol)` filter-strength derivation built from the
+  `(lvl_lookup, segment_id, ref_frame, y_mode, loop_filter_sharpness)`
+  inputs the §8.8.2 superblock raster walk will supply per spec
+  `vp9-spec.txt` §8.8.4 lines 5626-5661. Signature:
+  `adaptive_filter_strength(lvl_lookup: &LvlLookup, segment_id:
+  usize, ref_frame: i32, y_mode: u8, loop_filter_sharpness: u8) ->
+  Option<FilterStrength>`. Returns `None` for an out-of-range axis
+  (`segment_id >= MAX_SEGMENTS` or `ref_frame` outside `0..=3`).
+  * Step 1 `lvl` derivation per lines 5632-5639: reads the §8.8.1
+    [`LvlLookup`] at `(segment_id, ref_frame, modeType)`, where
+    `modeType = 1` for `NEARESTMV` / `NEARMV` / `NEWMV` and
+    `modeType = 0` for intra modes (0..=9) or `ZEROMV` per lines
+    5637-5638.
+  * Step 2 `shift` derivation per lines 5642-5645: `shift = 2` when
+    `loop_filter_sharpness > 4`, `shift = 1` when
+    `loop_filter_sharpness > 0`, and `shift = 0` otherwise.
+  * Step 3 `limit` derivation per lines 5648-5651: sharpness > 0
+    → `limit = Clip3( 1, 9 - loop_filter_sharpness, lvl >> shift
+    )`; sharpness = 0 → `limit = Max( 1, lvl >> shift )`. Both
+    branches enforce `limit >= 1`.
+  * Step 4 `blimit` per line 5660: `blimit = 2 * (lvl + 2) +
+    limit`. The §8.8.1 `Clip3( 0, MAX_LOOP_FILTER, … )` ceiling
+    bounds `blimit <= 2 * 65 + 63 = 193 < u8::MAX`.
+  * Step 5 `thresh` per line 5661: `thresh = lvl >> 4`, the §8.8.5.1
+    high-edge-variance threshold.
+  * New public constants verbatim from §7.4.11 (`vp9-spec.txt`
+    lines 3957-3961): `NEARESTMV: u8 = 10`, `NEARMV: u8 = 11`,
+    `ZEROMV: u8 = 12`, `NEWMV: u8 = 13`.
+  * New public helper `mode_to_mode_type(mode: u8) -> usize` —
+    exposes the §8.8.4 step-1 classification so a future §8.8.2
+    raster walker can derive `modeType` directly from `YModes[ ][
+    ]` without re-reading the lookup.
+  * 11 new lib-side `adaptive_filter_strength::tests` (lib total
+    496 -> 507): mode→modeType classification across the §7.4.11
+    inter modes and the §7.4.5 intra modes, sharpness = 0 baseline
+    `(lvl=16, limit=16, blimit=52, thresh=1)`, sharpness = 5 shift =
+    2 + Clip3, sharpness = 1 shift = 1 + Clip3, sharpness = 0 Max
+    lower clip at `lvl = 0`, sharpness > 0 Clip3 lower clip at `lvl
+    = 0`, sharpness = 7 Clip3 cap at `limit = 2`, blimit high-water
+    mark at `lvl = 63` / sharpness = 1, modeType dispatch picks the
+    correct `LvlLookup[s][ref][m]` column under non-zero mode-
+    delta, segment override propagates into the lookup, out-of-
+    range axes return `None` without panic.
+  * 7 new integration tests in `tests/adaptive_filter_strength.rs`:
+    end-to-end `level = 25 / sharpness = 0 / intra` returns
+    `(lvl=25, limit=25, blimit=79, thresh=1)`; end-to-end
+    NEARESTMV / LAST_FRAME with `delta_enabled = 1`; modeType
+    column routing under non-zero mode-delta; full `0..=7`
+    sharpness sweep at `lvl = 40` against an independent
+    re-derivation of the §8.8.4 formulas; `thresh` partition over
+    `lvl ∈ {15, 16, 31, 32, 47, 48, 63}`; public `mode_to_mode_type`
+    surface; `MAX_LOOP_FILTER` caps `thresh` at 3.
+  * Out of scope: §8.8.2 superblock raster walk, §8.8.5 sample
+    filtering, §6.2.5 frame_size_with_refs.
 * **Round 244: §8.8.3 `filter_size( )` lifted to a public leaf
   primitive — [`filter_size`].** New per-edge filter-size derivation
   built from the `(tx_sz, is_32_edge, pass, x, y, sub_x, sub_y,

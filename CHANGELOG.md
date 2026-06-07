@@ -6,6 +6,51 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 255: §8.8.5.2 `narrow filter process` lifted to a public
+  leaf primitive — [`narrow_filter`].** New per-edge sample-mutation
+  the §8.8.5 outer driver will call after the round-253 §8.8.5.1
+  [`filter_mask`] step picks the narrow branch per spec
+  `vp9-spec.txt` §8.8.5.2 lines 5795-5853. Signature:
+  `narrow_filter(samples: &NarrowFilterSamples, hev_mask: bool,
+  bit_depth: u8) -> NarrowFilterOutput`.
+  * `hev_mask == 1` (high edge variance) per lines 5809-5811:
+    modifies only `op0` and `oq0`, leaves `op1` / `oq1` equal to
+    the input. The filter is derived from all four input samples
+    via `filter = filter4_clamp(ps1 - qs1)` (line 5838) → `filter
+    = filter4_clamp(filter + 3 * (qs0 - ps0))` (line 5839).
+  * `hev_mask == 0` (smooth / low variance) per lines 5806-5808
+    and 5846-5852: modifies all four samples. The filter's
+    `ps1 - qs1` term drops out so `filter` starts at 0, and a
+    half-strength pass via `Round2(filter1, 1)` is added to
+    `op1` / `oq1`.
+  * `filter4_clamp` (lines 5824-5826) clips into the signed range
+    `[-(1 << (BitDepth - 1)), (1 << (BitDepth - 1)) - 1]` per
+    `Clip3` (§3); the `0x80 << (BitDepth - 8)` offset (lines
+    5834-5837) is applied and undone verbatim per
+    `BitDepth ∈ {8, 10, 12}` (§6.2.2).
+  * `filter1 = filter4_clamp(filter + 4) >> 3` and
+    `filter2 = filter4_clamp(filter + 3) >> 3` (lines 5840-5841)
+    bias the rounding for `oq0` vs `op0` asymmetrically.
+  * `NarrowFilterSamples` carries the 4-sample stencil
+    (`p1`, `p0`, `q0`, `q1`) the §8.8.5 outer driver assembles
+    from `CurrFrame[ plane ][ y +/- dy*k ][ x +/- dx*k ]` per
+    lines 5830-5833.
+  * `NarrowFilterOutput` carries the four mutated samples
+    (`op1`, `op0`, `oq0`, `oq1`) the caller writes back to
+    `CurrFrame` at the matching `(y +/- dy*k, x +/- dx*k)` per
+    lines 5844-5851.
+  * Public surface: `narrow_filter` + `NarrowFilterSamples` +
+    `NarrowFilterOutput` exposed at the crate root.
+  * +12 lib tests and +9 integration tests in
+    `tests/narrow_filter.rs`: baseline flat-stencil no-op at
+    8/10/12-bit on both hev / smooth branches, hev branch
+    outer-pair preservation, smooth branch outer-pair mutation
+    via `Round2(filter1, 1)`, `filter4_clamp` saturation at the
+    8-bit and 10-bit signed-range edges, `filter1` / `filter2`
+    asymmetric rounding for `qs0` vs `ps0` outputs, matched
+    outer samples collapsing the hev `ps1 - qs1` term, and a
+    `op0 + oq0` symmetry property over a 5×5 stencil grid.
+
 * **Round 253: §8.8.5.1 `filter mask process` lifted to a public
   leaf primitive — [`filter_mask`].** New per-edge mask derivation
   the §8.8.5 outer driver will call before dispatching to the

@@ -3,13 +3,88 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
-## Status — 2026-06-08 (round 253)
+## Status — 2026-06-08 (round 255)
 
-**Round 253: §8.8.5.1 `filter mask process` lifted to a public leaf
-primitive — [`filter_mask`].** Round 253 lands the per-edge mask
-derivation as a pure-state function the §8.8.5 outer driver will
-call before dispatching to the §8.8.5.2 narrow filter or the
-§8.8.5.3 wide filter at every loop-filter edge:
+**Round 255: §8.8.5.2 `narrow filter process` lifted to a public
+leaf primitive — [`narrow_filter`].** Round 255 lands the per-edge
+sample-mutation primitive the §8.8.5 outer driver will call after
+the round-253 §8.8.5.1 `filter_mask` step picks the narrow branch:
+
+* `pub fn narrow_filter(samples: &NarrowFilterSamples, hev_mask:
+  bool, bit_depth: u8) -> NarrowFilterOutput` per spec
+  `vp9-spec.txt` §8.8.5.2 lines 5795-5853.
+* `hev_mask == 1` (lines 5809-5811): modifies only `op0` / `oq0`;
+  `op1` / `oq1` are returned equal to the input so the caller can
+  write them back unconditionally. The filter draws from all four
+  input samples via `filter = filter4_clamp(ps1 - qs1)` →
+  `filter = filter4_clamp(filter + 3 * (qs0 - ps0))`.
+* `hev_mask == 0` (lines 5806-5808 + 5846-5852): modifies all four
+  samples. The `ps1 - qs1` term drops out so `filter` starts at 0,
+  and a half-strength pass via `Round2(filter1, 1)` is added to
+  `op1` / `oq1`.
+* `filter1 = filter4_clamp(filter + 4) >> 3` and
+  `filter2 = filter4_clamp(filter + 3) >> 3` (lines 5840-5841)
+  bias the rounding for `oq0` vs `op0` asymmetrically.
+* `filter4_clamp` (lines 5824-5826) clips into the signed range
+  `[-(1 << (BitDepth - 1)), (1 << (BitDepth - 1)) - 1]`; the
+  `0x80 << (BitDepth - 8)` offset (lines 5834-5837) is applied and
+  undone verbatim for `BitDepth ∈ {8, 10, 12}`.
+* `NarrowFilterSamples` carries the 4-sample stencil
+  (`p1`, `p0`, `q0`, `q1`) the §8.8.5 outer driver assembles from
+  `CurrFrame[ plane ][ y +/- dy*k ][ x +/- dx*k ]` per lines
+  5830-5833. `NarrowFilterOutput` carries the four mutated samples
+  the caller writes back to `CurrFrame`.
+
+`pub use narrow_filter::{narrow_filter, NarrowFilterOutput,
+NarrowFilterSamples};` exposes the §8.8.5.2 surface on the crate
+root alongside the round-253 §8.8.5.1 surface (`filter_mask` /
+`FilterMask` / `FilterMaskSamples`).
+
+Validation (+12 lib tests, lib total 522 -> 534; +9 integration
+tests in `tests/narrow_filter.rs`):
+
+* §8.8.5.2 baseline at `BitDepth ∈ {8, 10, 12}`: a flat stencil at
+  the bit-depth midpoint (128 / 512 / 2048) yields no change on
+  either `hev_mask` branch.
+* §8.8.5.2 lead paragraph (lines 5806-5811): the `hev_mask == 1`
+  branch leaves `op1` / `oq1` equal to the input even when the
+  inner step is sharp; the `hev_mask == 0` branch mutates all
+  four samples via `Round2(filter1, 1)`.
+* §8.8.5.2 line 5825 — `filter4_clamp` saturates at the bit-depth
+  range: 8-bit `(255, 255, 0, 0)` → `(_, 239, 16, _)`; 10-bit
+  `(1023, 1023, 0, 0)` → `(_, 959, 64, _)` (wider working range
+  shifts the saturation point).
+* §8.8.5.2 lines 5840-5841 — `filter1` / `filter2` asymmetric
+  rounding: with `filter == 4`, `filter1 = 1` (shifts `q0`) but
+  `filter2 = 0` (leaves `p0`).
+* §8.8.5.2 line 5847 — `Round2(filter1, 1)` half-strength pass:
+  with `filter1 == 3` the smooth pass shifts `p1` / `q1` by 2;
+  with `filter1 == 0` it leaves them alone.
+* §8.8.5.2 collapse case: when `ps1 == qs1` (matched outer
+  samples), the `filter4_clamp(ps1 - qs1)` term equals 0, so the
+  hev and smooth branches agree on `op0` / `oq0` (they still
+  differ on `op1` / `oq1`).
+* §8.8.5.2 round-trip property: `op0 + oq0` stays within 1 of
+  `p0 + q0` over a 5×5 stencil grid (the offset cancels and the
+  `+3`/`+4` rounding asymmetry is the only source of drift).
+
+Out of scope for round 255 and queued for later rounds:
+
+* §8.8.5 `sample_filtering( )` — the per-edge outer driver that
+  reads the stencil from `CurrFrame`, runs §8.8.5.1, dispatches to
+  §8.8.5.2 (this round) or §8.8.5.3, and writes the result back.
+* §8.8.5.3 `wide_filter` — the `log2Size`-tap low-pass primitive
+  the driver invokes when `flatMask` / `flatMask2` are set.
+* §8.8.2 `superblock_loop_filter` — the per-superblock raster walk
+  that calls §8.8.3 + §8.8.4 + §8.8.5 for each `(loopRow,
+  loopCol)` step.
+
+## Previously — round 253 (§8.8.5.1 `filter mask process`)
+
+Round 253 lands the per-edge mask derivation as a pure-state
+function the §8.8.5 outer driver will call before dispatching to
+the §8.8.5.2 narrow filter or the §8.8.5.3 wide filter at every
+loop-filter edge:
 
 * `pub fn filter_mask(samples: &FilterMaskSamples, limit: u8,
   blimit: u8, thresh: u8, filter_size: u8, bit_depth: u8) ->

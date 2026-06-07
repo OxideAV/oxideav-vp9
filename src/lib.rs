@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19 + 20 + 21 + 22 + 37 + 244 + 250 + 253)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19 + 20 + 21 + 22 + 37 + 244 + 250 + 253 + 255)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -415,6 +415,26 @@
 //!   the stencil from `CurrFrame[ plane ][ y +/- dy*k ][ x +/- dx*k
 //!   ]` and the §8.8.5.2 / §8.8.5.3 sample-filter primitives that
 //!   read the mask remain deferred.
+//! * Round 255 lifts §8.8.5.2 `narrow filter process` to a public
+//!   leaf primitive — [`narrow_filter`] — covering the per-edge
+//!   sample mutation `vp9-spec.txt` §8.8.5.2 lines 5795-5853
+//!   verbatim. The primitive accepts a 4-sample stencil
+//!   [`NarrowFilterSamples`] (`p1`, `p0`, `q0`, `q1`), the
+//!   §8.8.5.1 `hev_mask` boolean, and `BitDepth`. It returns
+//!   [`NarrowFilterOutput`] (`op1`, `op0`, `oq0`, `oq1`). Both the
+//!   `hev_mask == 1` "two-sample" branch (lines 5809-5811, modifies
+//!   only `op0` / `oq0`) and the `hev_mask == 0` "four-sample"
+//!   branch (lines 5806-5808 + 5846-5852, modifies all four with
+//!   the `Round2( filter1, 1 )` half-strength pass into `op1` /
+//!   `oq1`) are wired. The internal `filter4_clamp` helper (line
+//!   5825) clips into the bit-depth-scaled signed range
+//!   `[-(1 << (BitDepth - 1)), (1 << (BitDepth - 1)) - 1]`; the
+//!   `0x80 << (BitDepth - 8)` working-range offset (lines 5834-5837)
+//!   is applied and undone verbatim. The §8.8.5 outer driver that
+//!   reads the stencil from `CurrFrame[ plane ][ y +/- dy*k ][ x
+//!   +/- dx*k ]` and writes the four outputs back, the §8.8.5.3
+//!   wide-filter primitive, and the §8.8.2 superblock raster walk
+//!   all remain deferred.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return
@@ -449,6 +469,7 @@ mod idct;
 mod intra;
 mod loop_filter;
 mod mode_info;
+mod narrow_filter;
 mod partition;
 mod reconstruct;
 mod residual;
@@ -474,6 +495,7 @@ pub use header::{
     SEGMENTATION_FEATURE_BITS, SEGMENTATION_FEATURE_SIGNED, SEG_LVL_MAX,
 };
 pub use loop_filter::{loop_filter_frame_init, LvlLookup, MAX_LOOP_FILTER, MAX_MODE_LF_DELTAS};
+pub use narrow_filter::{narrow_filter, NarrowFilterOutput, NarrowFilterSamples};
 pub use partition::tile_payload_sizes;
 
 /// Crate-local error type.

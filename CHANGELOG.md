@@ -6,6 +6,42 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 253: §8.8.5.1 `filter mask process` lifted to a public
+  leaf primitive — [`filter_mask`].** New per-edge mask derivation
+  the §8.8.5 outer driver will call before dispatching to the
+  §8.8.5.2 narrow filter or the §8.8.5.3 wide filter per spec
+  `vp9-spec.txt` §8.8.5.1 lines 5685-5792. Signature:
+  `filter_mask(samples: &FilterMaskSamples, limit: u8, blimit: u8,
+  thresh: u8, filter_size: u8, bit_depth: u8) -> FilterMask`.
+  * `hevMask` per lines 5730-5734: `(Abs(p1 - p0) > threshBd) ||
+    (Abs(q1 - q0) > threshBd)` with `threshBd = thresh <<
+    (BitDepth - 8)`.
+  * `filterMask` per lines 5737-5750: seven inner abs-diff pair
+    tests against `limitBd = limit << (BitDepth - 8)` plus the
+    boundary term `Abs(p0 - q0) * 2 + Abs(p1 - q1) / 2 >
+    blimitBd`. `filterMask = (mask == 0)`.
+  * `flatMask` per lines 5753-5774: six abs-diff tests over the
+    inner four samples on each side relative to `p0` / `q0`,
+    gated by `filterSize >= TX_8X8` (returned as `None`
+    otherwise per line 5697).
+  * `flatMask2` per lines 5777-5792: eight abs-diff tests over
+    the outer four samples on each side relative to `p0` / `q0`,
+    gated by `filterSize >= TX_16X16` (returned as `None`
+    otherwise per line 5698).
+  * `FilterMaskSamples` carries the 16-sample stencil `p7..p0` /
+    `q0..q7` the §8.8.5 outer driver assembles from `CurrFrame[
+    plane ][ y +/- dy*k ][ x +/- dx*k ]` per lines 5703-5727.
+  * Public surface: `filter_mask` + `FilterMask` +
+    `FilterMaskSamples` exposed at the crate root.
+  * +15 lib tests and +9 integration tests in
+    `tests/filter_mask.rs`: baseline, lead-paragraph gating
+    (`TX_4X4` / `TX_8X8` / `TX_16X16`), per-side `hevMask`
+    triggers, equality-vs-strict-`>` cutoff, every `filterMask`
+    reset path including the integer-division floor on `/ 2`,
+    inner-region `flatMask` reset, outer-ring `flatMask2`
+    reset, rising-slope mixed stencil, and BitDepth scaling at
+    10-bit and 12-bit.
+
 * **Round 250: §8.8.4 `adaptive_filter_strength( )` lifted to a
   public leaf primitive — [`adaptive_filter_strength`].** New per-
   `(loopRow, loopCol)` filter-strength derivation built from the

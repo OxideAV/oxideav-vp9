@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19 + 20 + 21 + 22 + 37 + 244 + 250)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19 + 20 + 21 + 22 + 37 + 244 + 250 + 253)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -397,6 +397,24 @@
 //!   superblock raster walk that calls this primitive at every
 //!   `(loopRow, loopCol)` step and the §8.8.5 sample-filter pass
 //!   that consumes its output both remain deferred.
+//! * Round 253 lifts §8.8.5.1 `filter mask process` to a public leaf
+//!   primitive — [`filter_mask`] — covering the four mask outputs
+//!   verbatim. The primitive accepts a 16-sample stencil
+//!   [`FilterMaskSamples`] (`p7`..`p0`, `q0`..`q7`) and the §8.8.4
+//!   [`FilterStrength`] tuple, plus `filterSize` and `BitDepth`. It
+//!   returns [`FilterMask`] with `hev_mask` from `vp9-spec.txt` lines
+//!   5730-5734, `filter_mask` from lines 5737-5750 (the seven inner
+//!   abs-diff thresholds plus the `Abs(p0 - q0)*2 + Abs(p1 - q1)/2`
+//!   boundary term), `flat_mask` from lines 5753-5774 (six diffs
+//!   relative to `p0` / `q0`, gated by `filterSize >= TX_8X8`), and
+//!   `flat_mask2` from lines 5777-5792 (eight outer diffs relative
+//!   to `p0` / `q0`, gated by `filterSize >= TX_16X16`). The
+//!   bit-depth scalings `threshBd = thresh << (BitDepth - 8)`,
+//!   `limitBd`, `blimitBd`, and `thresholdBd = 1 << (BitDepth - 8)`
+//!   are all honoured verbatim. The §8.8.5 outer driver that builds
+//!   the stencil from `CurrFrame[ plane ][ y +/- dy*k ][ x +/- dx*k
+//!   ]` and the §8.8.5.2 / §8.8.5.3 sample-filter primitives that
+//!   read the mask remain deferred.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return
@@ -424,6 +442,7 @@ mod coef_probs;
 mod compressed;
 mod decode_block;
 mod dequant;
+mod filter_mask;
 mod filter_size;
 mod header;
 mod idct;
@@ -445,6 +464,7 @@ pub use compressed::{
     RefFrameSignBias, ReferenceMode, TxMode, Vp9CompressedHeader, Vp9CompressedHeaderInter,
     Vp9CompressedHeaderInterInputs,
 };
+pub use filter_mask::{filter_mask, FilterMask, FilterMaskSamples};
 pub use filter_size::{
     filter_size, PASS_HORIZONTAL, PASS_VERTICAL, TX_16X16, TX_32X32, TX_4X4, TX_8X8,
 };

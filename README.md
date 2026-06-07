@@ -3,6 +3,87 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-06-08 (round 253)
+
+**Round 253: §8.8.5.1 `filter mask process` lifted to a public leaf
+primitive — [`filter_mask`].** Round 253 lands the per-edge mask
+derivation as a pure-state function the §8.8.5 outer driver will
+call before dispatching to the §8.8.5.2 narrow filter or the
+§8.8.5.3 wide filter at every loop-filter edge:
+
+* `pub fn filter_mask(samples: &FilterMaskSamples, limit: u8,
+  blimit: u8, thresh: u8, filter_size: u8, bit_depth: u8) ->
+  FilterMask` per spec `vp9-spec.txt` §8.8.5.1 lines 5685-5792.
+* Step 1 (`hevMask`, lines 5730-5734): `hevMask = (Abs(p1 - p0) >
+  threshBd) || (Abs(q1 - q0) > threshBd)`, with `threshBd = thresh
+  << (BitDepth - 8)`. Strict `>` per the listing.
+* Step 2 (`filterMask`, lines 5737-5750): the seven inner abs-diff
+  pair tests against `limitBd = limit << (BitDepth - 8)` plus the
+  `Abs(p0 - q0) * 2 + Abs(p1 - q1) / 2 > blimitBd` boundary term
+  (with `blimitBd = blimit << (BitDepth - 8)`). Integer division
+  on the `/ 2` floor is honoured verbatim. `filterMask = (mask ==
+  0)` — `true` only when every test stays at false.
+* Step 3 (`flatMask`, lines 5753-5774): six abs-diff tests
+  relative to `p0` / `q0` over the inner four samples on each
+  side, against `thresholdBd = 1 << (BitDepth - 8)`. Gated by
+  `filterSize >= TX_8X8` per line 5697; returned as `None`
+  otherwise.
+* Step 4 (`flatMask2`, lines 5777-5792): eight abs-diff tests
+  relative to `p0` / `q0` over the outer four samples on each
+  side, against the same `thresholdBd`. Gated by `filterSize >=
+  TX_16X16` per line 5698; returned as `None` otherwise.
+* `FilterMaskSamples` carries the 16-sample stencil
+  (`p7..p0` / `q0..q7`) the §8.8.5 outer driver assembles from
+  `CurrFrame[ plane ][ y +/- dy*k ][ x +/- dx*k ]` per lines
+  5703-5727. Samples are `i32` so the abs-diff subtractions don't
+  underflow at 10-bit / 12-bit pixels.
+
+`pub use filter_mask::{filter_mask, FilterMask, FilterMaskSamples};`
+exposes the §8.8.5.1 surface on the crate root alongside the
+round-250 §8.8.4 surface (`adaptive_filter_strength` /
+`FilterStrength` / `mode_to_mode_type`) and the round-244 §8.8.3
+surface (`filter_size` / `TX_4X4` / `TX_8X8` / `TX_16X16` /
+`TX_32X32` / `PASS_VERTICAL` / `PASS_HORIZONTAL`).
+
+Validation (+15 lib tests, lib total 507 -> 522; +9 integration
+tests in `tests/filter_mask.rs`; suite total 557 -> 581):
+
+* §8.8.5.1 baseline: a flat 16-sample stencil at `BitDepth = 8` /
+  `TX_16X16` yields `hev_mask = false`, `filter_mask = true`,
+  `flat_mask = Some(true)`, `flat_mask2 = Some(true)`.
+* §8.8.5.1 lead paragraph gating (lines 5697-5698): `TX_4X4`
+  collapses both flat masks to `None`; `TX_8X8` keeps `flat_mask`
+  populated but gates `flat_mask2` to `None`.
+* §8.8.5.1 step 1 `hevMask` triggers on both `Abs(p1 - p0)` and
+  `Abs(q1 - q0)` terms; equality with `threshBd` keeps the mask at
+  `0` (strict `>` per line 5733).
+* §8.8.5.1 step 2 `filterMask`: outer-pair resets (`p3 - p2` /
+  `q3 - q2`) and the boundary term `|p0 - q0|*2 + |p1 - q1|/2 >
+  blimitBd` reset independently.
+* §8.8.5.1 step 2 integer-division `/ 2`: a `p1/q1` diff of 3
+  floors to 1 (not 1.5), so the boundary term reads `|p0 - q0|*2
+  + 1`.
+* §8.8.5.1 step 3 `flatMask`: resets when `Abs(p2 - p0) >
+  thresholdBd` even with a flat `(p0, q0)` boundary.
+* §8.8.5.1 step 4 `flatMask2`: outer-ring `p7 - p0` diff of 2
+  resets `flatMask2` while `flatMask` survives. Rising-slope
+  stencil (p7..p4 ascending toward p0; q4..q7 descending from q0)
+  confirms the same partition.
+* §8.8.5.1 BitDepth scaling: at 10-bit, `thresh = 4` scales to
+  `threshBd = 16`; at 12-bit, `thresholdBd = 16`. Strict `>` cutoff
+  verified at the boundary in both depths.
+
+Out of scope for round 253 and queued for later rounds:
+
+* §8.8.5 `sample_filtering( )` — the per-edge outer driver that
+  reads the stencil from `CurrFrame` and dispatches to narrow /
+  wide filters based on this round's [`FilterMask`].
+* §8.8.5.2 `filter4` / §8.8.5.3 `filter6` / `filter8` / `filter16`
+  — the sample-mutating filter primitives that consume the mask.
+* §8.8.2 `superblock_loop_filter( )` — the per-superblock raster
+  walk that invokes §8.8.3 + §8.8.4 + §8.8.5 in sequence at every
+  `(loopRow, loopCol)` step.
+
 ## Status — 2026-06-07 (round 250)
 
 **Round 250: §8.8.4 `adaptive_filter_strength( )` lifted to a public

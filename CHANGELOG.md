@@ -6,6 +6,62 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 259: §8.8.5.3 `wide filter process` lifted to a public
+  leaf primitive — [`wide_filter`].** New per-edge low-pass
+  the §8.8.5 outer driver will call after the round-253 §8.8.5.1
+  [`filter_mask`] step picks the wide branch via the §8.8.5
+  dispatch table at `vp9-spec.txt` lines 5681-5684. Signature:
+  `wide_filter(samples: &WideFilterSamples, log2_size: u32,
+  bit_depth: u8) -> WideFilterOutput` per
+  `vp9-spec.txt` §8.8.5.3 lines 5855-5888.
+  * `log2_size == 3` (8-tap kernel, `n == 3`) per lines
+    5681-5682: loop walks `i ∈ [-3, 2]` producing six mutated
+    outputs at positions `p2..p0`, `q0..q2`. The remaining
+    `op6..op3`, `oq3..oq6` fields echo the corresponding input
+    through unchanged so the caller can write all 14 fields
+    without branching.
+  * `log2_size == 4` (16-tap kernel, `n == 7`) per lines
+    5683-5684: loop walks `i ∈ [-7, 6]` producing fourteen
+    mutated outputs at positions `p6..p0`, `q0..q6`.
+  * Kernel verbatim from lines 5868-5885:
+    `F[ i ] = Round2( CurrFrame[i] + sum_{j=-n..n}
+    CurrFrame[Clip3(-(n+1), n, i+j)], log2Size )` with
+    `n = (1 << (log2Size - 1)) - 1` (lines 5864-5865) and
+    `Round2( t, k ) = (t + (1 << (k - 1))) >> k` (§3). Total
+    samples summed per output: `2n + 2`.
+  * `Clip3( -(n+1), n, i+j )` edge-replication (line 5879) pulls
+    in duplicates of the outermost in-range sample when the
+    index walk overshoots either side of the stencil window.
+  * Unlike §8.8.5.2 the wide filter operates directly on
+    unsigned pixel values — no `0x80 << (BitDepth - 8)` working-
+    range offset, no `filter4_clamp` BitDepth scaling. The
+    `bit_depth` parameter is carried for API symmetry with
+    [`narrow_filter`] only.
+  * `WideFilterSamples` carries the 16-sample stencil
+    (`p7..p0`, `q0..q7`) the §8.8.5 outer driver assembles from
+    `CurrFrame[ plane ][ y +/- dy*k ][ x +/- dx*k ]` per
+    §8.8.5.1 lines 5703-5727.
+  * `WideFilterOutput` carries up to 14 mutated samples
+    (`op6..op0`, `oq0..oq6`) the caller writes back to
+    `CurrFrame` at the matching `(y + i*dy, x + i*dx)` for
+    `i ∈ [-n, n-1]` per lines 5884-5885.
+  * `log2_size ∉ {3, 4}` panics with `§8.8.5.3: log2_size must
+    be 3 or 4 per §8.8.5 dispatch table` — the §8.8.5 outer
+    driver's two-arm dispatch (lines 5682 / 5684) is the only
+    producer of `log2_size` values.
+  * Public surface: `wide_filter` + `WideFilterSamples` +
+    `WideFilterOutput` exposed at the crate root.
+  * +12 lib tests and +9 integration tests in
+    `tests/wide_filter.rs`: unity-gain on flat stencils at
+    `(3, 8)`, `(4, 8)`, `(3, 10)`, `(4, 12)`; outer-field echo
+    on `log2_size == 3`; hand-traced step response producing
+    exact `(op2, op1, op0, oq0, oq1, oq2) = (13, 25, 38, 63,
+    75, 88)` for a 0→100 step on the 8-tap kernel; `Clip3` edge-
+    replication isolating `p3 = 80` driving `op2 = 30`; 16-tap
+    boundary `op0 = 56` for the (0 → 128) step; `Round2` half-up
+    rounding verified at the boundary; `log2_size` precondition
+    panics on `2`, `5`, `7`.
+
 * **Round 255: §8.8.5.2 `narrow filter process` lifted to a public
   leaf primitive — [`narrow_filter`].** New per-edge sample-mutation
   the §8.8.5 outer driver will call after the round-253 §8.8.5.1

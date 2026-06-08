@@ -8,7 +8,7 @@
 //! prediction, transforms and loop filtering are all out of scope and
 //! land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19 + 20 + 21 + 22 + 37 + 244 + 250 + 253 + 255)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19 + 20 + 21 + 22 + 37 + 244 + 250 + 253 + 255 + 259)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -432,9 +432,28 @@
 //!   `0x80 << (BitDepth - 8)` working-range offset (lines 5834-5837)
 //!   is applied and undone verbatim. The §8.8.5 outer driver that
 //!   reads the stencil from `CurrFrame[ plane ][ y +/- dy*k ][ x
-//!   +/- dx*k ]` and writes the four outputs back, the §8.8.5.3
-//!   wide-filter primitive, and the §8.8.2 superblock raster walk
-//!   all remain deferred.
+//!   +/- dx*k ]` and writes the four outputs back and the §8.8.2
+//!   superblock raster walk remain deferred.
+//! * Round 259 lifts §8.8.5.3 `wide filter process` to a public
+//!   leaf primitive — [`wide_filter`] — covering the per-edge
+//!   sample mutation `vp9-spec.txt` §8.8.5.3 lines 5855-5888
+//!   verbatim. The primitive accepts a 16-sample stencil
+//!   [`WideFilterSamples`] (`p7`..`p0`, `q0`..`q7`), a `log2_size`
+//!   ∈ `{3, 4}` per the §8.8.5 dispatch table (lines 5681-5684),
+//!   and `BitDepth` (carried for API symmetry — the §8.8.5.3
+//!   listing makes no reference to `BitDepth`). Returns
+//!   [`WideFilterOutput`] with up to 14 mutated samples (`op6`..
+//!   `op0`, `oq0`..`oq6`). The §8.8.5.3 kernel
+//!   `F[ i ] = Round2( CurrFrame[i] + sum_{j=-n..n} CurrFrame[Clip3(-(n+1), n, i+j)], log2Size )`
+//!   is implemented verbatim with `n = (1 << (log2Size - 1)) - 1`
+//!   (lines 5864-5865) and the `Clip3` edge-replication extension
+//!   (line 5879). For `log2_size == 3` only the inner six
+//!   positions (`p2..p0`, `q0..q2`) are mutated; the outer eight
+//!   output fields echo the corresponding input so the caller can
+//!   write all 14 fields unconditionally. The §8.8.5 outer driver
+//!   (which builds the stencil, picks `log2_size`, and writes the
+//!   outputs back) and the §8.8.2 superblock raster walk both remain
+//!   deferred.
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return
@@ -475,6 +494,7 @@ mod reconstruct;
 mod residual;
 mod scan;
 mod tokens;
+mod wide_filter;
 
 pub use adaptive_filter_strength::{
     adaptive_filter_strength, mode_to_mode_type, FilterStrength, NEARESTMV, NEARMV, NEWMV, ZEROMV,
@@ -497,6 +517,7 @@ pub use header::{
 pub use loop_filter::{loop_filter_frame_init, LvlLookup, MAX_LOOP_FILTER, MAX_MODE_LF_DELTAS};
 pub use narrow_filter::{narrow_filter, NarrowFilterOutput, NarrowFilterSamples};
 pub use partition::tile_payload_sizes;
+pub use wide_filter::{wide_filter, WideFilterOutput, WideFilterSamples};
 
 /// Crate-local error type.
 ///

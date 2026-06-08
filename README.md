@@ -3,12 +3,89 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
-## Status — 2026-06-08 (round 255)
+## Status — 2026-06-08 (round 259)
 
-**Round 255: §8.8.5.2 `narrow filter process` lifted to a public
-leaf primitive — [`narrow_filter`].** Round 255 lands the per-edge
-sample-mutation primitive the §8.8.5 outer driver will call after
-the round-253 §8.8.5.1 `filter_mask` step picks the narrow branch:
+**Round 259: §8.8.5.3 `wide filter process` lifted to a public
+leaf primitive — [`wide_filter`].** Round 259 lands the per-edge
+low-pass primitive the §8.8.5 outer driver will call after the
+round-253 §8.8.5.1 `filter_mask` step picks the wide branch via
+the §8.8.5 dispatch table at `vp9-spec.txt` lines 5681-5684:
+
+* `pub fn wide_filter(samples: &WideFilterSamples, log2_size: u32,
+  bit_depth: u8) -> WideFilterOutput` per spec
+  `vp9-spec.txt` §8.8.5.3 lines 5855-5888.
+* `log2_size == 3` (8-tap kernel, `n == 3`): the loop walks
+  `i ∈ [-3, 2]` (6 mutated outputs at positions `p2..p0`,
+  `q0..q2`). The outer eight fields of [`WideFilterOutput`]
+  (`op6..op3`, `oq3..oq6`) echo the corresponding input through
+  so the caller can write all 14 fields unconditionally.
+* `log2_size == 4` (16-tap kernel, `n == 7`): the loop walks
+  `i ∈ [-7, 6]` (14 mutated outputs at positions `p6..p0`,
+  `q0..q6`).
+* The kernel `F[ i ] = Round2( CurrFrame[i] + sum_{j=-n..n}
+  CurrFrame[Clip3(-(n+1), n, i+j)], log2Size )` is implemented
+  verbatim with `n = (1 << (log2Size - 1)) - 1` (lines
+  5864-5865) and `Clip3` edge-replication (line 5879). Total
+  samples summed: `2n + 2`. `Round2( t, log2Size ) = (t + (1 <<
+  (log2Size - 1))) >> log2Size` matches the §3 half-up rounding.
+* Unlike §8.8.5.2 the wide filter does NOT subtract the `0x80 <<
+  (BitDepth - 8)` working-range offset — arithmetic happens in
+  the original unsigned-pixel domain per `vp9-spec.txt` lines
+  5868-5885 verbatim.
+* `WideFilterSamples` carries the 16-sample stencil
+  (`p7..p0`, `q0..q7`) the §8.8.5 outer driver assembles from
+  `CurrFrame[ plane ][ y +/- dy*k ][ x +/- dx*k ]` per
+  §8.8.5.1 lines 5703-5727.
+
+`pub use wide_filter::{wide_filter, WideFilterOutput,
+WideFilterSamples};` exposes the §8.8.5.3 surface on the crate
+root alongside the round-255 §8.8.5.2 surface (`narrow_filter` /
+`NarrowFilterOutput` / `NarrowFilterSamples`) and the round-253
+§8.8.5.1 surface (`filter_mask` / `FilterMask` /
+`FilterMaskSamples`).
+
+Validation (+12 lib tests, lib total 534 -> 546; +9 integration
+tests in `tests/wide_filter.rs`):
+
+* §8.8.5.3 unity-gain on flat stencils at every supported
+  `(log2_size, BitDepth)` combination: `(3, 8)`, `(4, 8)`,
+  `(3, 10)`, `(4, 12)` all return the input value at every
+  output position.
+* §8.8.5.3 outer-field echo on `log2_size == 3`: arbitrary
+  values in `p7..p4` / `q4..q7` come through unchanged on the
+  outer eight output fields; only the inner six are filtered.
+* §8.8.5.3 hand-traced step response (`p = 0`, `q = 100`,
+  `log2_size = 3`): six exact mutated values
+  `(op2, op1, op0, oq0, oq1, oq2) = (13, 25, 38, 63, 75, 88)`
+  derived from the listing verbatim.
+* §8.8.5.3 line 5879 `Clip3` edge-replication: isolating `p3 =
+  80` in an otherwise-zero stencil drives `op2 = 30` (three
+  extra copies of `p3` pulled in via the clamp).
+* §8.8.5.3 log2_4 (16-tap) step response at the boundary:
+  `op0 = 56` for the `(0 → 128)` step.
+* §8.8.5.3 line 5882 `Round2` half-up rounding verified at the
+  `Round2(8, 3) = 1` boundary.
+* §8.8.5 dispatch precondition: `log2_size ∉ {3, 4}` panics
+  with the §8.8.5.3 message — `log2_size = 2`, `5`, `7` all
+  rejected.
+
+Out of scope for round 259 and queued for later rounds:
+
+* §8.8.5 `sample_filtering( )` — the per-edge outer driver that
+  reads the stencil from `CurrFrame`, runs §8.8.5.1, dispatches
+  to §8.8.5.2 or §8.8.5.3 (this round), and writes the result
+  back.
+* §8.8.2 `superblock_loop_filter` — the per-superblock raster
+  walk that calls §8.8.3 + §8.8.4 + §8.8.5 for each `(loopRow,
+  loopCol)` step.
+* §6.2.5 inter-frame header walker (decode side); §6.4.4
+  `decode_block_apply` per-block apply driver.
+
+## Previously — round 255 (§8.8.5.2 `narrow filter process`)
+
+Round 255 lands the per-edge sample-mutation primitive the §8.8.5
+outer driver calls when the round-253 §8.8.5.1 `filter_mask`
+output picks the narrow branch:
 
 * `pub fn narrow_filter(samples: &NarrowFilterSamples, hev_mask:
   bool, bit_depth: u8) -> NarrowFilterOutput` per spec
@@ -67,17 +144,6 @@ tests in `tests/narrow_filter.rs`):
 * §8.8.5.2 round-trip property: `op0 + oq0` stays within 1 of
   `p0 + q0` over a 5×5 stencil grid (the offset cancels and the
   `+3`/`+4` rounding asymmetry is the only source of drift).
-
-Out of scope for round 255 and queued for later rounds:
-
-* §8.8.5 `sample_filtering( )` — the per-edge outer driver that
-  reads the stencil from `CurrFrame`, runs §8.8.5.1, dispatches to
-  §8.8.5.2 (this round) or §8.8.5.3, and writes the result back.
-* §8.8.5.3 `wide_filter` — the `log2Size`-tap low-pass primitive
-  the driver invokes when `flatMask` / `flatMask2` are set.
-* §8.8.2 `superblock_loop_filter` — the per-superblock raster walk
-  that calls §8.8.3 + §8.8.4 + §8.8.5 for each `(loopRow,
-  loopCol)` step.
 
 ## Previously — round 253 (§8.8.5.1 `filter mask process`)
 

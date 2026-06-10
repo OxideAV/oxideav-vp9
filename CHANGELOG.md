@@ -6,6 +6,37 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 267: §8.8.5 `sample filtering process` outer driver lifted
+  to a public leaf primitive — [`sample_filtering`].** New per-edge
+  dispatcher composing the three §8.8.5 sub-processes (§8.8.5.1
+  [`filter_mask`], §8.8.5.2 [`narrow_filter`], §8.8.5.3
+  [`wide_filter`]). Signature: `sample_filtering(samples:
+  &SampleFilterSamples, limit: u8, blimit: u8, thresh: u8,
+  filter_size: u8, bit_depth: u8) -> SampleFilterOutput` per
+  `vp9-spec.txt` §8.8.5 lines 5662-5684.
+  * Runs §8.8.5.1 `filter_mask` on the 16-sample stencil first
+    (lines 5672-5674), then dispatches per the §8.8.5 table (lines
+    5678-5684): `filterMask == 0` → no filter; `filterSize ==
+    TX_4X4 || flatMask == 0` → §8.8.5.2 narrow (fed `hevMask`);
+    `filterSize == TX_8X8 || flatMask2 == 0` → §8.8.5.3 wide
+    `log2Size = 3`; otherwise → wide `log2Size = 4`.
+  * The `flatMask` / `flatMask2` reads sit behind `filterSize`
+    short-circuits, so the §8.8.5.1 `None` returns are never
+    dereferenced.
+  * `SampleFilterSamples` carries the `p7..p0` / `q0..q7` stencil;
+    `SampleFilterOutput` carries the full 16-sample post-filter
+    stencil with positions outside the mutation window echoed
+    through, so the caller writes the whole stencil back to
+    `CurrFrame` unconditionally.
+  * `pub use sample_filtering::{sample_filtering,
+    SampleFilterOutput, SampleFilterSamples};` on the crate root.
+  * Validation: +8 lib tests (lib total 546 → 554) + 8 integration
+    tests in `tests/sample_filtering.rs`. Covers the flat-region
+    identity at BitDepth 8/10/12, the `filterMask == 0` no-op, and
+    all four dispatch arms (narrow / wide-log2-3 / wide-log2-4 /
+    `flatMask2 == 0` drop-back) cross-checked against the three
+    sub-process primitives run directly.
+
 * **Round 259: §8.8.5.3 `wide filter process` lifted to a public
   leaf primitive — [`wide_filter`].** New per-edge low-pass
   the §8.8.5 outer driver will call after the round-253 §8.8.5.1

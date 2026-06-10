@@ -492,6 +492,7 @@ mod narrow_filter;
 mod partition;
 mod reconstruct;
 mod residual;
+mod sample_filtering;
 mod scan;
 mod tokens;
 mod wide_filter;
@@ -517,6 +518,7 @@ pub use header::{
 pub use loop_filter::{loop_filter_frame_init, LvlLookup, MAX_LOOP_FILTER, MAX_MODE_LF_DELTAS};
 pub use narrow_filter::{narrow_filter, NarrowFilterOutput, NarrowFilterSamples};
 pub use partition::tile_payload_sizes;
+pub use sample_filtering::{sample_filtering, SampleFilterOutput, SampleFilterSamples};
 pub use wide_filter::{wide_filter, WideFilterOutput, WideFilterSamples};
 
 /// Crate-local error type.

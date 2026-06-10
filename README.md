@@ -3,7 +3,87 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
-## Status — 2026-06-08 (round 259)
+## Status — 2026-06-10 (round 267)
+
+**Round 267: §8.8.5 `sample filtering process` outer driver lifted
+to a public leaf primitive — [`sample_filtering`].** Round 267
+composes the three §8.8.5 sub-processes landed in earlier rounds
+(§8.8.5.1 [`filter_mask`] r253, §8.8.5.2 [`narrow_filter`] r255,
+§8.8.5.3 [`wide_filter`] r259) into the per-edge dispatcher the
+§8.8.2 superblock raster walk invokes at every loop-filter edge:
+
+* `pub fn sample_filtering(samples: &SampleFilterSamples, limit: u8,
+  blimit: u8, thresh: u8, filter_size: u8, bit_depth: u8) ->
+  SampleFilterOutput` per spec `vp9-spec.txt` §8.8.5 lines
+  5662-5684. Runs §8.8.5.1 `filter_mask` on the 16-sample stencil
+  first (lines 5672-5674), then dispatches per the §8.8.5 table
+  (lines 5678-5684).
+* Dispatch (verbatim from lines 5678-5684):
+  `filterMask == 0` → no filter (stencil echoed through);
+  `filterSize == TX_4X4 || flatMask == 0` → §8.8.5.2 narrow
+  filter (fed `hevMask`); `filterSize == TX_8X8 || flatMask2 == 0`
+  → §8.8.5.3 wide filter, `log2Size = 3`; otherwise → wide filter,
+  `log2Size = 4`.
+* The `flatMask` / `flatMask2` reads sit behind `filterSize ==
+  TX_4X4` / `filterSize == TX_8X8` short-circuits, so the §8.8.5.1
+  `None` returns (emitted exactly when the matching `filterSize >=`
+  precondition fails) are never dereferenced.
+* `SampleFilterSamples` carries the 16-sample stencil
+  (`p7..p0` / `q0..q7`) the §8.8.2 raster walk assembles from
+  `CurrFrame[ plane ][ y +/- dy*k ][ x +/- dx*k ]` per §8.8.5.1
+  lines 5703-5727. `SampleFilterOutput` carries the full 16-sample
+  post-filter stencil: positions outside the chosen filter's
+  mutation window are echoed unchanged so the caller writes the
+  whole stencil back to `CurrFrame` unconditionally (`p7` / `q7`
+  are never mutated by any branch — positions `-8` / `+7` lie
+  outside the `i ∈ [-n, n-1]` write window even for `log2Size ==
+  4`).
+
+`pub use sample_filtering::{sample_filtering, SampleFilterOutput,
+SampleFilterSamples};` exposes the §8.8.5 surface on the crate root
+alongside the round-253 §8.8.5.1 surface (`filter_mask`), the
+round-255 §8.8.5.2 surface (`narrow_filter`), and the round-259
+§8.8.5.3 surface (`wide_filter`).
+
+Validation (+8 lib tests, lib total 546 -> 554; +8 integration
+tests in `tests/sample_filtering.rs`):
+
+* §8.8.5 baseline: a flat stencil passes `filterMask` but every
+  filter branch is the identity on a flat region — verified at
+  every `filterSize` and at BitDepth 8 / 10 / 12 (midpoints 128 /
+  512 / 2048).
+* §8.8.5 line 5678 `filterMask == 0`: a `limit`-tripping inner
+  jump resets `filterMask` and the whole stencil echoes through
+  untouched.
+* §8.8.5 line 5679 narrow dispatch: `filterSize == TX_4X4` routes
+  to §8.8.5.2; the 4-sample window matches the `narrow_filter`
+  primitive run directly and the rest of the stencil stays put.
+* §8.8.5 line 5679 `flatMask == 0`: a non-flat inner four samples
+  forces the narrow branch even at `filterSize == TX_8X8`.
+* §8.8.5 line 5681 wide `log2Size == 3`: `filterSize == TX_8X8`
+  with a flat inner region routes to §8.8.5.3 (`log2Size = 3`);
+  `p2..q2` match the wide primitive, `p3` / `q3` and the outer
+  ring stay put.
+* §8.8.5 lines 5683-5684 wide `log2Size == 4`: a fully flat
+  `filterSize == TX_16X16` region routes to the 16-tap kernel;
+  only `p7` / `q7` echo through.
+* §8.8.5 line 5682 `flatMask2 == 0`: an outer-ring outlier at
+  `filterSize == TX_16X16` drops the dispatch back from `log2Size
+  == 4` to `log2Size == 3`.
+
+Out of scope for round 267 and queued for later rounds:
+
+* §8.8.2 `superblock_loop_filter( )` — the per-superblock raster
+  walk that assembles the stencil from `CurrFrame`, derives
+  `(filterSize, limit, blimit, thresh)` via §8.8.3 + §8.8.4, calls
+  this primitive for each `(plane, pass, row, col)` edge, and
+  writes [`SampleFilterOutput`] back into `CurrFrame`. Needs the
+  `MiSizes` / `TxSizes` / `Skips` / `RefFrames` / `YModes` /
+  `SegmentIds` arrays the §6.4.4 `decode_block` fan-out produces.
+* §6.2.5 inter-frame header walker (decode side); §6.4.4
+  `decode_block_apply` per-block apply driver.
+
+## Previously — round 259 (§8.8.5.3 `wide filter process`)
 
 **Round 259: §8.8.5.3 `wide filter process` lifted to a public
 leaf primitive — [`wide_filter`].** Round 259 lands the per-edge

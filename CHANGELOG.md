@@ -6,6 +6,51 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 274: §8.8.2 `superblock loop filter process` per-edge
+  predicate derivation (steps 1-14) lifted to a public leaf primitive
+  — [`superblock_filter_edge`] + [`superblock_filter_geometry`].** The
+  §8.8.2 driver's per-edge book-keeping that turns the raster position
+  `(pass, row, col, edge, i)` plus the per-MI decode state at the
+  resolved `(loopRow, loopCol)` into the
+  `(x, y, loopRow, loopCol, isBlockEdge, isTxEdge, is32Edge, onScreen,
+  applyFilter)` bundle the §8.8.2 steps 15-17 hand-off consumes, per
+  `vp9-spec.txt` §8.8.2 lines 5491-5586.
+  * `superblock_filter_geometry(pass, sub_x, sub_y) ->
+    SuperblockFilterGeometry` lifts the §8.8.2 `dx` / `dy` / `sub` /
+    `edgeLen` header (lines 5510-5519): vertical edges (`pass == 0`)
+    give `dx=1, dy=0, sub=subX, edgeLen=64>>subY`; horizontal edges
+    give `dx=0, dy=1, sub=subY, edgeLen=64>>subX`. The driver iterates
+    `edge ∈ 0..(16>>sub)-1` and `i ∈ 0..edgeLen-1`.
+  * `superblock_filter_edge(pass, row, col, edge, i, sub_x, sub_y,
+    mi_cols, mi_rows, &SuperblockFilterMi) -> SuperblockFilterEdge`
+    runs steps 1-14: the §8.8.2 step-1 `x`/`y` luma coordinates, the
+    step-2/3 `loopCol`/`loopRow` sub-sampling align-down, the step-7
+    `sbSize = sub==0 ? MiSize : Max(BLOCK_16X16, MiSize)`, step-10
+    `isBlockEdge` against `8*num_8x8_blocks_{wide,high}_lookup[sbSize]`,
+    step-11 `isTxEdge` (including the chroma horizontal-boundary
+    right-image-edge suppression), step-12 `is32Edge` (the §8.8.3
+    filter-size input), step-13 `onScreen` (right/bottom + implicit
+    left/top frame-edge exclusion), and the step-14 `applyFilter`
+    gate `onScreen && (isBlockEdge || (isTxEdge && (isIntra ||
+    !skip)))`.
+  * `txSz` is supplied already-resolved by the caller (step 6's
+    `(plane>0) ? get_uv_tx_size( ) : tx_size`), exactly as the §8.8.3
+    [`filter_size`] caller does; `SuperblockFilterMi` carries
+    `(mi_size, tx_sz, skip, ref_frame_0)` read at `(loopRow,
+    loopCol)`.
+  * `pub use superblock_filter::{superblock_filter_edge,
+    superblock_filter_geometry, SuperblockFilterEdge,
+    SuperblockFilterGeometry, SuperblockFilterMi};` on the crate root.
+  * Validation: +30 lib tests (lib total 548 → 578) + 8 integration
+    tests in `tests/superblock_filter.rs`. Covers the luma / 4:2:0
+    chroma geometry, the step-1 `x`/`y` and step-2/3 align-down, the
+    `isBlockEdge` block-size scaling (incl. the chroma `sbSize`
+    promotion to `BLOCK_16X16`), the `isTxEdge` tx-size multiples plus
+    the chroma right-edge suppression, the `is32Edge` multiple-of-8
+    rule, the `onScreen` frame-edge exclusions, and every `applyFilter`
+    arm (block edge / intra-tx-edge-even-when-skip / inter-tx-edge skip
+    vs non-skip).
+
 * **Round 267: §8.8.5 `sample filtering process` outer driver lifted
   to a public leaf primitive — [`sample_filtering`].** New per-edge
   dispatcher composing the three §8.8.5 sub-processes (§8.8.5.1

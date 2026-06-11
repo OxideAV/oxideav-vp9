@@ -495,6 +495,7 @@ mod residual;
 mod sample_filtering;
 mod scan;
 mod superblock_filter;
+mod superblock_loop_filter;
 mod tokens;
 mod wide_filter;
 
@@ -523,6 +524,9 @@ pub use sample_filtering::{sample_filtering, SampleFilterOutput, SampleFilterSam
 pub use superblock_filter::{
     superblock_filter_edge, superblock_filter_geometry, SuperblockFilterEdge,
     SuperblockFilterGeometry, SuperblockFilterMi,
+};
+pub use superblock_loop_filter::{
+    superblock_loop_filter, SuperblockFilterFrame, SuperblockFilterPlane,
 };
 pub use wide_filter::{wide_filter, WideFilterOutput, WideFilterSamples};
 

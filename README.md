@@ -3,7 +3,112 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
-## Status — 2026-06-10 (round 267)
+## Status — 2026-06-11 (round 278)
+
+**Round 278: §8.8.2 `superblock loop filter process` — the full
+per-plane, per-pass driver landed as a public entry point —
+[`superblock_loop_filter`].** Round 278 closes the §8.8 loop-filter
+arc's per-superblock layer: the new driver composes every
+previously-landed primitive (§8.8.1 r37, §8.8.3 r244, §8.8.4 r250,
+§8.8.5.1/.2/.3 r253/r255/r259, §8.8.5 r267, §8.8.2 steps 1-14 r274)
+into the complete §8.8.2 process per `vp9-spec.txt` lines 5491-5586,
+modifying a `CurrFrame[ plane ]` sample plane in place:
+
+* `pub fn superblock_loop_filter(plane_buf: &mut
+  SuperblockFilterPlane, frame: &SuperblockFilterFrame, plane: u8,
+  pass: u8, row: u32, col: u32)` walks the §8.8.2
+  `edge ∈ 0..(16 >> sub) - 1` / `i ∈ 0..edgeLen - 1` raster (lines
+  5524-5525) using the round-274 [`superblock_filter_geometry`]
+  header, runs the round-274 steps 1-14 predicate bundle
+  ([`superblock_filter_edge`]), then threads steps 15-17 in spec
+  order: §8.8.3 [`filter_size`] (lines 5579-5581), §8.8.4
+  [`adaptive_filter_strength`] at `(loopRow, loopCol)` (lines
+  5582-5583), and — when `applyFilter == 1 && lvl > 0` — §8.8.5
+  [`sample_filtering`] at `(x >> subX, y >> subY)` along `(dx, dy)`
+  (lines 5584-5586), gathering and writing back the §8.8.5.1
+  16-sample stencil per lines 5703-5727.
+* Step 6's chroma `txSz` resolves through the §6.4.22
+  `get_uv_tx_size( )` helper (lines 2871-2876) from the `MiSize` /
+  `tx_size` read at `(loopRow, loopCol)`.
+* [`SuperblockFilterPlane`] is a mutable `data / stride / width /
+  height` view of one `CurrFrame[ plane ]` plane (`i32` samples,
+  the §8.8.5 working type). [`SuperblockFilterFrame`] carries the
+  six row-major `MiRows x MiCols` per-MI arrays (`MiSizes` /
+  `TxSizes` / `Skips` / `RefFrames[..][..][0]` / `YModes` /
+  `SegmentIds`), the frame scalars (`mi_cols` / `mi_rows` /
+  `subsampling_x` / `subsampling_y` / `loop_filter_sharpness` /
+  `bit_depth`), and the §8.8.1 [`LvlLookup`].
+* Right / bottom off-screen raster positions short-circuit *before*
+  the steps 4-9 per-MI reads (step 13 forces `applyFilter = 0`
+  there, making the reads dead), keeping every array access inside
+  `MiRows x MiCols`. Out-of-plane stencil reads — possible only for
+  the unused outer ring per the §8.8.5.1 NOTE — are edge-clamped;
+  write-back drops positions whose true coordinate lies outside the
+  plane.
+* Edges process in the §8.8.2 raster order with in-place
+  write-back, so later edges read samples earlier edges already
+  filtered — the spec's ordered-steps semantics (and the §8.8 NOTE
+  that the edge order must be respected).
+
+`pub use superblock_loop_filter::{superblock_loop_filter,
+SuperblockFilterFrame, SuperblockFilterPlane};` joins the §8.8
+surface on the crate root.
+
+Validation (+13 lib tests, lib total 578 -> 591; +8 integration
+tests in `tests/superblock_loop_filter.rs`):
+
+* Flat-plane identity across both passes (every §8.8.5 branch is the
+  identity on flat content) and the step-17 `lvl > 0` gate
+  (`loop_filter_level == 0` leaves a sharp step untouched).
+* Vertical / horizontal / 4:2:0-chroma step responses cross-checked
+  against §8.8.4 + §8.8.5 invoked directly on the same two-level
+  stencil — the narrow window (4 samples around the boundary) moves
+  to the exact direct-call values; everything else stays put.
+* Step-14 gating threaded end-to-end: a pure tx edge on a skipped
+  inter block is untouched; clearing `skip` filters it; a BLOCK_8X8
+  block edge filters even when skipped inter.
+* Step-13 left / top frame-edge exclusions: a discontinuity hugging
+  `x == 0` / `y == 0` never changes (it would trip the §8.8.5.2 hev
+  branch against clamped reads if the excluded edge ran).
+* Step-16 indexing at `(loopRow, loopCol)`: a segment-1
+  `SEG_LVL_ALT_L` absolute override of 0 turns off exactly the edge
+  whose MI sits in segment 1 while the segment-0 edge still
+  filters.
+* A frame ending mid-superblock (`MiCols = MiRows = 6`, 48x48 luma)
+  walks the full 64x64 raster with no out-of-bounds access.
+* 10-bit step response matches the direct §8.8.5 call at
+  `BitDepth = 10`.
+* Up-front consistency panics: per-MI arrays shorter than
+  `MiRows * MiCols`; `stride < width` plane views.
+
+Out of scope for round 278 and queued for later rounds:
+
+* §8.8 frame-level walk — the four-deep
+  `row / col / plane / pass` raster over all superblocks (spec lines
+  5450-5455) plus a 3-plane `CurrFrame` container; a thin loop once
+  the §7.4 frame state lands.
+* Wiring the §6.4.4 `decode_block` fan-out's per-frame `MiSizes` /
+  `TxSizes` / `Skips` / `RefFrames` / `YModes` / `SegmentIds`
+  arrays into [`SuperblockFilterFrame`] from inside [`decode_vp9`].
+* §6.2.5 inter-frame header walker (decode side); §6.4.4
+  `decode_block_apply` per-block apply driver.
+
+## Previously — round 274 (§8.8.2 steps 1-14 per-edge predicates)
+
+**Round 274: §8.8.2 per-edge predicate derivation (steps 1-14)
+lifted to a public leaf primitive — [`superblock_filter_edge`] +
+[`superblock_filter_geometry`].** The §8.8.2 driver's per-edge
+book-keeping that turns the raster position `(pass, row, col, edge,
+i)` plus the per-MI decode state at the resolved `(loopRow,
+loopCol)` into the `(x, y, loopRow, loopCol, isBlockEdge, isTxEdge,
+is32Edge, onScreen, applyFilter)` bundle the steps 15-17 hand-off
+consumes, per `vp9-spec.txt` §8.8.2 lines 5491-5586.
+`superblock_filter_geometry` lifts the `dx` / `dy` / `sub` /
+`edgeLen` header (lines 5510-5519); `txSz` is supplied
+already-resolved by the caller. Validation: +30 lib tests (548 ->
+578) + 8 integration tests in `tests/superblock_filter.rs`.
+
+## Previously — round 267 (§8.8.5 `sample filtering process` outer driver)
 
 **Round 267: §8.8.5 `sample filtering process` outer driver lifted
 to a public leaf primitive — [`sample_filtering`].** Round 267

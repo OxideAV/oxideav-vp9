@@ -6,6 +6,62 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 278: §8.8.2 `superblock loop filter process` — the full
+  per-plane, per-pass driver landed as a public entry point —
+  [`superblock_loop_filter`].** Composes every previously-landed
+  loop-filter primitive into the complete §8.8.2 process per
+  `vp9-spec.txt` lines 5491-5586, modifying a `CurrFrame[ plane ]`
+  sample plane in place:
+  * `superblock_loop_filter(plane_buf: &mut SuperblockFilterPlane,
+    frame: &SuperblockFilterFrame, plane: u8, pass: u8, row: u32,
+    col: u32)` walks the §8.8.2 `edge ∈ 0..(16 >> sub) - 1` /
+    `i ∈ 0..edgeLen - 1` raster (lines 5524-5525) using the
+    round-274 [`superblock_filter_geometry`] header, runs the
+    round-274 steps 1-14 predicate bundle
+    ([`superblock_filter_edge`]), then threads steps 15-17: §8.8.3
+    [`filter_size`] (lines 5579-5581), §8.8.4
+    [`adaptive_filter_strength`] at `(loopRow, loopCol)` (lines
+    5582-5583), and — when `applyFilter == 1 && lvl > 0` — §8.8.5
+    [`sample_filtering`] at `(x >> subX, y >> subY)` along
+    `(dx, dy)` (lines 5584-5586), including the §8.8.5.1 16-sample
+    stencil gather / write-back (lines 5703-5727).
+  * Step 6's chroma `txSz` is resolved through the §6.4.22
+    `get_uv_tx_size( )` helper (lines 2871-2876) from the `MiSize` /
+    `tx_size` read at `(loopRow, loopCol)` — the first caller to
+    thread it outside the §6.4 residual path.
+  * New public type `SuperblockFilterPlane` — a mutable
+    `data / stride / width / height` view of one `CurrFrame[ plane ]`
+    sample plane (`i32` samples, matching the §8.8.5 working type).
+  * New public type `SuperblockFilterFrame` — the per-frame decode
+    state: the six row-major `MiRows x MiCols` per-MI arrays
+    (`MiSizes` / `TxSizes` / `Skips` / `RefFrames[..][..][0]` /
+    `YModes` / `SegmentIds`), the frame scalars (`mi_cols` /
+    `mi_rows` / `subsampling_x` / `subsampling_y` /
+    `loop_filter_sharpness` / `bit_depth`), and the §8.8.1
+    [`LvlLookup`].
+  * Right / bottom off-screen raster positions are short-circuited
+    *before* the steps 4-9 per-MI reads: step 13 forces
+    `applyFilter = 0` there, so the reads are dead, and the
+    short-circuit keeps every array access inside `MiRows x MiCols`.
+    Out-of-plane stencil reads (possible only for the unused outer
+    ring per the §8.8.5.1 NOTE) are edge-clamped; write-back drops
+    positions whose true coordinate is outside the plane.
+  * `pub use superblock_loop_filter::{superblock_loop_filter,
+    SuperblockFilterFrame, SuperblockFilterPlane};` on the crate
+    root.
+  * Validation: +13 lib tests (lib total 578 → 591) + 8 integration
+    tests in `tests/superblock_loop_filter.rs`. Covers flat-plane
+    identity on both passes, the step-17 `lvl > 0` gate
+    (`loop_filter_level == 0` no-op), vertical / horizontal /
+    4:2:0-chroma step responses cross-checked against the §8.8.4 +
+    §8.8.5 primitives invoked directly on the same stencil, the
+    step-14 skip / block-edge / tx-edge gating threaded end-to-end,
+    the step-13 left / top frame-edge exclusions, the per-segment
+    `SEG_LVL_ALT_L` lvl partition (step-16 indexing at
+    `(loopRow, loopCol)`), a mid-superblock frame end (MiCols =
+    MiRows = 6) with no out-of-bounds access, the 10-bit path, and
+    the up-front plane-view / per-MI-array consistency panics.
+
 * **Round 274: §8.8.2 `superblock loop filter process` per-edge
   predicate derivation (steps 1-14) lifted to a public leaf primitive
   — [`superblock_filter_edge`] + [`superblock_filter_geometry`].** The

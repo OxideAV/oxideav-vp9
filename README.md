@@ -3,7 +3,72 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
-## Status — 2026-06-11 (round 278)
+## Status — 2026-06-12 (round 281)
+
+**Round 281: §8.8 `loop filter process` — the frame-level driver —
+[`frame_loop_filter`] + the 3-plane [`CurrFrame`] container.** Round
+281 lands the outermost layer of the §8.8 loop-filter arc: the raster
+walk over every superblock of the frame per `vp9-spec.txt` lines
+5436-5455, deblocking a whole reconstructed frame in place:
+
+* `pub fn frame_loop_filter(curr: &mut CurrFrame, frame:
+  &SuperblockFilterFrame)` walks the §8.8 four-deep raster — `row`
+  over `0, 8, .. < MiRows`, `col` over `0, 8, .. < MiCols`, `plane`
+  over `0..2`, `pass` over `0..1` — invoking the round-278 §8.8.2
+  [`superblock_loop_filter`] driver at each step (lines 5451-5455),
+  in exactly the listing's nesting order per the §8.8 ordering NOTE
+  (lines 5458-5460): many samples are filtered more than once, so
+  every §8.8.2 call mutates the plane in place before the next call
+  reads it.
+* The §8.8 first step — the §8.8.1 frame init (line 5441) — is the
+  caller's [`loop_filter_frame_init`] invocation; its `LvlLookup`
+  output arrives via `SuperblockFilterFrame::lvl_lookup`, keeping
+  the driver free of the §6.2.8 / §6.2.11 header state §8.8.1
+  consumes.
+* [`CurrFrame`] is the §8.8 input/output (lines 5437-5438): three
+  [`SuperblockFilterPlane`] views — Y at `FrameWidth x FrameHeight`,
+  U / V at the §8.10 subsampled extents
+  `((FrameWidth + subsampling_x) >> subsampling_x) x
+  ((FrameHeight + subsampling_y) >> subsampling_y)` (lines
+  5944-5948).
+* Up-front consistency panics tie the luma extent to the §7.2.6
+  `MiCols = (FrameWidth + 7) >> 3` / `MiRows = (FrameHeight + 7) >>
+  3` grid (lines 1760-1761) and the chroma extents to the §8.10
+  subsampling; partial right / bottom superblocks then ride the
+  §8.8.2 driver's off-screen short-circuit.
+
+`pub use frame_loop_filter::{frame_loop_filter, CurrFrame};` joins
+the §8.8 surface on the crate root.
+
+Validation (+10 lib tests, lib total 591 -> 601; +6 integration
+tests in `tests/frame_loop_filter.rs`):
+
+* Flat-frame identity on all three planes and the step-17 `lvl > 0`
+  gate threaded through the whole frame raster.
+* Sample-exact equivalence against the §8.8 raster transcribed
+  directly from the listing over individual §8.8.2 calls, on
+  order-sensitive pseudo-random frames: full 2x2-superblock 4:2:0
+  (128x128), partial-superblock `MiCols = MiRows = 12` (96x96),
+  non-MI-aligned 52x36 luma / 26x18 chroma extents, and 10-bit
+  content.
+* A 60 -> 68 luma step exactly at `x = 64` — the boundary between
+  the `col = 0` and `col = 8` superblocks, reached as the `col = 8`
+  call's edge 0 — filters while far-from-edge columns and the flat
+  chroma planes stay put; a U-plane step routes through the
+  subsampled raster with Y / V untouched.
+* Extent-mismatch panics: a luma plane disagreeing with `MiCols` /
+  `MiRows`, and an unsubsampled chroma plane under 4:2:0.
+
+Out of scope for round 281 and queued for later rounds:
+
+* Wiring the §6.4.4 `decode_block` fan-out's per-frame `MiSizes` /
+  `TxSizes` / `Skips` / `RefFrames` / `YModes` / `SegmentIds`
+  arrays into [`SuperblockFilterFrame`] from inside [`decode_vp9`],
+  and calling [`frame_loop_filter`] after frame reconstruction.
+* §6.2.5 inter-frame header walker (decode side); §6.4.4
+  `decode_block_apply` per-block apply driver.
+
+## Previously — round 278 (§8.8.2 superblock loop filter driver)
 
 **Round 278: §8.8.2 `superblock loop filter process` — the full
 per-plane, per-pass driver landed as a public entry point —

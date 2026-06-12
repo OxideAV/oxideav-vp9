@@ -483,6 +483,7 @@ mod decode_block;
 mod dequant;
 mod filter_mask;
 mod filter_size;
+mod frame_loop_filter;
 mod header;
 mod idct;
 mod intra;
@@ -512,6 +513,7 @@ pub use filter_mask::{filter_mask, FilterMask, FilterMaskSamples};
 pub use filter_size::{
     filter_size, PASS_HORIZONTAL, PASS_VERTICAL, TX_16X16, TX_32X32, TX_4X4, TX_8X8,
 };
+pub use frame_loop_filter::{frame_loop_filter, CurrFrame};
 pub use header::{
     parse_uncompressed_header, ColorConfig, ColorSpace, FrameType, LoopFilterParams,
     QuantizationParams, SegmentationParams, TileInfo, Vp9FrameHeader, MAX_SEGMENTS,

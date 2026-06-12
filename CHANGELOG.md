@@ -6,6 +6,42 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 281: §8.8 `loop filter process` — the frame-level driver —
+  [`frame_loop_filter`] + the 3-plane [`CurrFrame`] container.**
+  Lands the outermost layer of the §8.8 loop-filter arc per
+  `vp9-spec.txt` lines 5436-5455:
+  * `frame_loop_filter(curr: &mut CurrFrame, frame:
+    &SuperblockFilterFrame)` walks the §8.8 four-deep raster — `row`
+    over `0, 8, .. < MiRows`, `col` over `0, 8, .. < MiCols`,
+    `plane` over `0..2`, `pass` over `0..1` — invoking the
+    round-278 §8.8.2 [`superblock_loop_filter`] driver at each step
+    (lines 5451-5455), in exactly the listing's nesting order per
+    the §8.8 ordering NOTE (lines 5458-5460: many samples filter
+    more than once, so each call mutates the plane in place before
+    the next call reads it).
+  * The §8.8 first step — the §8.8.1 frame init (line 5441) — is
+    the caller's [`loop_filter_frame_init`] invocation; its
+    `LvlLookup` output arrives via
+    `SuperblockFilterFrame::lvl_lookup`.
+  * New public type `CurrFrame` — the §8.8 input/output (lines
+    5437-5438): three [`SuperblockFilterPlane`] views, Y at
+    `FrameWidth x FrameHeight` and U / V at the §8.10 subsampled
+    extents (lines 5944-5948).
+  * Up-front consistency panics: luma extent vs. the §7.2.6
+    `MiCols = (FrameWidth + 7) >> 3` / `MiRows = (FrameHeight + 7)
+    >> 3` grid (lines 1760-1761); chroma extents vs. the §8.10
+    subsampled extents.
+  * Validation (+10 lib tests, 591 -> 601; +6 integration tests in
+    `tests/frame_loop_filter.rs`): flat-frame identity on all three
+    planes; the step-17 `lvl > 0` gate at frame level; sample-exact
+    equivalence against the §8.8 raster transcribed directly from
+    the listing over individual §8.8.2 calls on order-sensitive
+    noise frames (full 2x2-superblock 4:2:0, partial-superblock
+    `MiCols = MiRows = 12`, non-MI-aligned 52x36 / 26x18 extents,
+    and 10-bit); a cross-superblock vertical boundary at `x = 64`
+    filtering via the `col = 8` call's edge 0; chroma routing
+    through the subsampled raster; extent-mismatch panics.
+
 * **Round 278: §8.8.2 `superblock loop filter process` — the full
   per-plane, per-pass driver landed as a public entry point —
   [`superblock_loop_filter`].** Composes every previously-landed

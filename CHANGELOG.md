@@ -6,6 +6,45 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 284: top-level intra decode wiring — `decode_vp9` /
+  `decode_intra_frame` decode whole keyframes end-to-end.** The
+  §6.4 / §6.4.4 / §8.8 composition round: every previously-landed
+  primitive is now driven by a real frame walk (new module
+  `decode_frame`):
+  * §6.2 + §6.3 headers → §6.4 `decode_tiles( )` (per-tile
+    `init_bool` / `exit_bool`, §7.4.1 `clear_above_context` once per
+    frame, §7.4.2 `clear_left_context` per superblock row) → §6.4.2
+    superblock raster → §6.4.3 `decode_partition( )` → §6.4.4
+    `decode_block( )` at every leaf, with the block syntax decoded
+    inline from the same §9.2 coder as the partition syntax.
+  * §6.4.4 block composition: §6.4.6 `intra_frame_mode_info( )`
+    (with the §6.4.7 segment-id decode hoisted so the §6.4.9
+    `SEG_LVL_SKIP` gate sees the decoded segment), the §6.4.21
+    `residual( )` walk decoding §6.4.24 `tokens( )` inline and
+    reconstructing each transform block (§8.5.1 `predict_intra` with
+    per-`blockIdx` sub-8x8 modes → §8.6 dequant → §8.7 inverse
+    transform → `Clip1` add), then the §6.4.4 fan-out via
+    `decode_block_apply`.
+  * §8.8 loop filter wired over the reconstructed frame:
+    `loop_filter_frame_init` from the §6.2.8 deltas resolved against
+    the §7.2 `setup_past_independence` defaults, then
+    `frame_loop_filter` with the §6.4.4 frame-wide arrays.
+  * §8.10 output crop: `Vp9DecodedFrame` carries the planar `u16`
+    samples plus geometry; `to_planar_bytes( )` packs 8-bit content
+    one byte per sample and 10/12-bit as little-endian pairs.
+  * `decode_partition` / `decode_tile` now invoke a `LeafSink` at
+    every §6.4.4 call site (a `Vec<LeafBlock>` sink preserves the
+    old leaf-log behaviour for partition-only streams).
+  * Validation (+7 integration tests in `tests/decode_vp9.rs`):
+    byte-exact decodes of the staged corpus fixtures
+    `tiny-i-only-16x16`, `lossless-i-only` (§8.7.1.10 WHT path) and
+    `q-low` (embedded verbatim so standalone CI runs them), plus a
+    workspace-checkout sweep decoding the leading keyframe of all 13
+    intra-leading `docs/video/vp9/fixtures/` entries byte-exactly
+    against `expected.yuv` (4:2:0 + 4:4:4, 8/10/12-bit, RGB,
+    2-tile-column, segmentation-AQ, lossless, q extremes), and
+    truncation / `show_existing_frame` error-path checks.
+
 * **Round 282: cargo-fuzz scaffold — `fuzz/` stood back up so the
   scheduled Fuzz workflow runs again.** Two panic-surface targets,
   auto-discovered by the org reusable fuzz workflow:

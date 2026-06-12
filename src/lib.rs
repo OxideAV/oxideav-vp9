@@ -1,14 +1,14 @@
 //! # oxideav-vp9
 //!
-//! Pure-Rust, clean-room VP9 codec crate. Round-1 cut covers the
-//! uncompressed-header structural walker per VP9 Bitstream & Decoding
-//! Process Specification v0.7 §6.2 / §7.2 — enough to extract profile,
-//! frame type, color config, frame size and render size from a VP9
-//! frame byte stream. Entropy decoding, intra prediction, inter
-//! prediction, transforms and loop filtering are all out of scope and
-//! land in later rounds.
+//! Pure-Rust, clean-room VP9 codec crate, implemented against the VP9
+//! Bitstream & Decoding Process Specification v0.7. [`decode_vp9`] /
+//! [`decode_intra_frame`] decode intra (key / intra-only) frames
+//! end-to-end — §6.2 / §6.3 headers, the §6.4 tile + partition +
+//! block walk, §8.5.1 intra prediction, §8.6 dequantization, §8.7
+//! inverse transforms and the §8.8 loop filter. Inter frames need
+//! reference-buffer state and land in later rounds.
 //!
-//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19 + 20 + 21 + 22 + 37 + 244 + 250 + 253 + 255 + 259)
+//! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19 + 20 + 21 + 22 + 37 + 244 + 250 + 253 + 255 + 259 + … + 284)
 //!
 //! * MSB-first `f(n)` bit reader plus `s(n)` signed-integer reader
 //!   (spec §9.1 + §4.9.2).
@@ -454,15 +454,26 @@
 //!   (which builds the stencil, picks `log2_size`, and writes the
 //!   outputs back) and the §8.8.2 superblock raster walk both remain
 //!   deferred.
+//! * Round 284 composes everything above into the public
+//!   [`decode_vp9`] / [`decode_intra_frame`] entry points (module
+//!   `decode_frame`): the §6.4 `decode_tiles( )` walk (per-tile
+//!   §9.2 coder bracket, §7.4.1 / §7.4.2 context resets), the
+//!   §6.4.3 partition recursion firing a `LeafSink` at every §6.4.4
+//!   `decode_block( )` site, the §6.4.6 mode-info → §6.4.21
+//!   residual → §6.4.24 token → §8.6.2 reconstruct chain per block,
+//!   the §6.4.4 frame-wide fan-out, the §8.8 loop filter over the
+//!   reconstructed planes, and the §8.10 output crop into
+//!   [`Vp9DecodedFrame`]. Byte-exact against the staged corpus
+//!   fixtures (4:2:0 / 4:4:4, 8 / 10 / 12-bit, lossless WHT,
+//!   multi-tile, segmentation AQ).
 //! * Both key-frame and intra-only inter-frame paths are walked.
 //! * Inter-frame (non-intra-only) headers — `frame_size_with_refs`,
 //!   motion-vector / interpolation-filter flags — return
 //!   [`Error::Unsupported`] for now; they need reference-buffer
 //!   state.
 //!
-//! The remaining §6.3 fields and the entropy / transform / loop
-//! filter pipelines remain out of scope and land in subsequent
-//! rounds.
+//! Inter-frame decode (reference buffers, §8.5.2 inter prediction,
+//! §8.4 probability adaptation) lands in subsequent rounds.
 //!
 //! ## Provenance
 //!
@@ -480,6 +491,7 @@ mod bool_coder;
 mod coef_probs;
 mod compressed;
 mod decode_block;
+mod decode_frame;
 mod dequant;
 mod filter_mask;
 mod filter_size;
@@ -509,6 +521,7 @@ pub use compressed::{
     RefFrameSignBias, ReferenceMode, TxMode, Vp9CompressedHeader, Vp9CompressedHeaderInter,
     Vp9CompressedHeaderInterInputs,
 };
+pub use decode_frame::{decode_intra_frame, Vp9DecodedFrame};
 pub use filter_mask::{filter_mask, FilterMask, FilterMaskSamples};
 pub use filter_size::{
     filter_size, PASS_HORIZONTAL, PASS_VERTICAL, TX_16X16, TX_32X32, TX_4X4, TX_8X8,
@@ -534,10 +547,10 @@ pub use wide_filter::{wide_filter, WideFilterOutput, WideFilterSamples};
 
 /// Crate-local error type.
 ///
-/// `decode_vp9` / `encode_vp9` still return [`Error::NotImplemented`]
-/// — the current cut only lands the uncompressed-header walker
-/// (see [`parse_uncompressed_header`]). Future rounds will wire the
-/// full decode/encode pipeline.
+/// [`decode_vp9`] decodes intra (key / intra-only) frames end-to-end;
+/// inter frames return [`Error::Unsupported`] until reference-buffer
+/// state lands. [`encode_vp9`] still returns
+/// [`Error::NotImplemented`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     /// The decoder or encoder pipeline is not wired up yet.
@@ -578,13 +591,21 @@ impl core::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Decode a VP9 elementary stream.
+/// Decode one VP9 intra frame to planar YUV bytes.
 ///
-/// Returns [`Error::NotImplemented`] — the full decode pipeline lands
-/// in a later round. For header introspection, use
-/// [`parse_uncompressed_header`] directly.
-pub fn decode_vp9(_bytes: &[u8]) -> Result<Vec<u8>, Error> {
-    Err(Error::NotImplemented)
+/// `bytes` is a single frame's payload (e.g. one IVF frame body):
+/// §6.2 uncompressed header + §6.3 compressed header + §6.4 tile
+/// data. Key frames and intra-only frames decode end-to-end (mode
+/// info → intra prediction → coefficient decode → dequant → inverse
+/// transform → reconstruction → §8.8 loop filter); inter frames
+/// return [`Error::Unsupported`] until reference-buffer state lands.
+///
+/// The output is planar Y then U then V at the §8.10 cropped extents
+/// — one byte per sample for 8-bit content, little-endian `u16` pairs
+/// for 10 / 12-bit. For plane geometry and native `u16` samples use
+/// [`decode_intra_frame`] directly.
+pub fn decode_vp9(bytes: &[u8]) -> Result<Vec<u8>, Error> {
+    Ok(decode_intra_frame(bytes)?.to_planar_bytes())
 }
 
 /// Encode YUV data into a VP9 elementary stream.

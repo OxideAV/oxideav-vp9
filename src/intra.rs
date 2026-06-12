@@ -141,6 +141,13 @@ impl Plane {
     pub fn set(&mut self, x: usize, y: usize, value: i32) {
         self.samples[y * self.width + x] = value;
     }
+
+    /// Row-major sample slice (stride = `width`). Used by the §8.8
+    /// loop-filter driver, which operates on the same `CurrFrame`
+    /// storage through its own plane view.
+    pub(crate) fn samples_mut(&mut self) -> &mut [i32] {
+        &mut self.samples
+    }
 }
 
 /// `Round2( x, n ) = ( x + (1 << (n - 1)) ) >> n` per §3.

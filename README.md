@@ -3,7 +3,69 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
-## Status — 2026-06-12 (round 282)
+## Status — 2026-06-12 (round 284)
+
+**Round 284: top-level intra decode wiring — [`decode_vp9`] /
+[`decode_intra_frame`] decode whole VP9 keyframes end-to-end,
+byte-exact on all 13 intra-leading fixtures of the staged corpus.**
+The composition round: the §6.2 / §6.3 header walkers, §9.2 bool
+decoder, §6.4.3 partition driver, §6.4.6 intra mode-info, §6.4.21 /
+§6.4.24 residual + token decode, §8.5.1 intra prediction, §8.6
+dequant, §8.7 inverse transforms and the complete §8.8 loop filter
+are now driven by one §6.4 frame walk (new module `decode_frame`):
+
+* §6.4 `decode_tiles( )`: per-tile `f(32)` size prefixes
+  ([`tile_payload_sizes`]) + §6.4.1 `get_tile_offset( )` extents,
+  §9.2 `init_bool / exit_bool` bracketing each tile, §7.4.1
+  `clear_above_context( )` once per frame and §7.4.2
+  `clear_left_context( )` per superblock row (partition strips +
+  `LeftNonzeroContext`).
+* §6.4.3 `decode_partition( )` now fires a `LeafSink` at every
+  §6.4.4 `decode_block( )` call site, so the per-block syntax
+  decodes inline from the same bool coder the partition syntax uses
+  (the `Vec<LeafBlock>` sink keeps the round-19 leaf-log shape for
+  partition-only streams).
+* §6.4.4 `decode_block( )`: `AvailU = r > 0` / `AvailL = c >
+  MiColStart`, §6.4.6 `intra_frame_mode_info( )` with the §6.4.7
+  segment-id decode hoisted ahead so the §6.4.9 `SEG_LVL_SKIP` gate
+  reads the decoded segment (bit order unchanged), then the §6.4.21
+  residual walk — §8.5.1 `predict_intra` per transform block (with
+  the §8.5.1 `sub_modes[ blockIdx ]` selection for sub-8x8 luma),
+  §6.4.24 `tokens( )` against the frame `coef_probs` and the
+  above/left nonzero strips, §8.6.2 reconstruct (per-segment §8.6.1
+  quantizers, §6.4.25 `TxType`, lossless WHT path) — and finally the
+  §6.4.4 fan-out via the round-31 `decode_block_apply`.
+* §8.8 loop filter over the reconstructed planes:
+  [`loop_filter_frame_init`] with the §6.2.8 deltas resolved against
+  the §7.2 `setup_past_independence` defaults, then
+  [`frame_loop_filter`] reading the §6.4.4 frame-wide arrays.
+* §8.10 output: [`Vp9DecodedFrame`] (planar `u16` samples + geometry
+  + `to_planar_bytes( )` packing — bytes for 8-bit, little-endian
+  pairs for 10/12-bit), and [`decode_vp9`] returning the packed
+  planar frame. Inter frames and `show_existing_frame` still return
+  `Error::Unsupported` (reference-buffer state is the next arc).
+
+Validation (+7 integration tests in `tests/decode_vp9.rs`, suite
+total 690 -> 697): `tiny-i-only-16x16`, `lossless-i-only` (§8.7.1.10
+WHT) and `q-low` are embedded verbatim and decode byte-exactly in
+standalone CI; a workspace-checkout sweep decodes the leading
+keyframe of every intra-leading fixture under
+`docs/video/vp9/fixtures/` byte-for-byte against `expected.yuv` —
+all 13 pass: 4:2:0 and 4:4:4, 8/10/12-bit, RGB, two tile columns,
+segmentation AQ, lossless, both quantizer extremes and
+frame-parallel mode. Truncation at every byte boundary of the tiny
+fixture errors cleanly.
+
+Out of scope for round 284 and queued for later rounds:
+
+* Inter frames: reference-buffer state, §6.4.5's inter arm
+  (`inter_frame_mode_info( )`), §8.5.2 inter prediction, §8.4.1
+  motion-vector prediction, and superframe-index splitting.
+* §8.4 probability adaptation / §6.1.2 frame-context refresh
+  (single-frame decode does not persist contexts yet).
+* §9.2.4 multi-coder tile parallelism (tiles decode sequentially).
+
+## Previously — round 282 (cargo-fuzz scaffold)
 
 **Round 282: cargo-fuzz scaffold — `fuzz/` stood back up so the
 scheduled Fuzz workflow runs again.** The post-rebuild tree had no

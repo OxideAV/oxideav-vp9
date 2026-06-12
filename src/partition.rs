@@ -650,6 +650,36 @@ pub(crate) struct LeafBlock {
     pub subsize: u8,
 }
 
+/// Sink invoked by [`decode_partition`] at every §6.4.4
+/// `decode_block( r, c, subsize )` call site, in §6.4.3 traversal
+/// order.
+///
+/// The §6.4.4 per-block syntax (`mode_info( )` + `residual( )`)
+/// interleaves with the §6.4.3 partition syntax in the SAME §9.2 bool
+/// coder, so the sink receives the live coder positioned exactly at
+/// the block's first mode-info bit. A full decoder implements this on
+/// its per-frame block-decode state; the leaf-log implementation on
+/// `Vec<LeafBlock>` records the call site without consuming bits
+/// (sufficient for partition-only streams).
+pub(crate) trait LeafSink {
+    /// Handle one §6.4.4 `decode_block( r, c, subsize )` call site.
+    fn leaf(&mut self, coder: &mut BoolCoder<'_>, r: u32, c: u32, subsize: u8)
+        -> Result<(), Error>;
+}
+
+impl LeafSink for Vec<LeafBlock> {
+    fn leaf(
+        &mut self,
+        _coder: &mut BoolCoder<'_>,
+        r: u32,
+        c: u32,
+        subsize: u8,
+    ) -> Result<(), Error> {
+        self.push(LeafBlock { r, c, subsize });
+        Ok(())
+    }
+}
+
 /// Apply the §6.4.3 tail write-back to the partition-context strips.
 ///
 /// The spec listing is:
@@ -702,11 +732,13 @@ fn write_back_partition_context(
 /// `subsize_lookup` traversal and the §6.4.3 tail write-back into the
 /// `AbovePartitionContext[ ]` / `LeftPartitionContext[ ]` strips.
 ///
-/// `leaves` accumulates one [`LeafBlock`] per `decode_block( r, c,
-/// subsize )` call site the spec listing would invoke. The
-/// §6.4.4 `decode_block( )` decode itself (`mode_info` + `residual`) is
-/// downstream of this driver and not yet wired; the per-leaf log is
-/// the stand-in this round validates.
+/// `on_leaf` is invoked once per §6.4.4 `decode_block( r, c, subsize )`
+/// call site the spec listing reaches, with the live coder positioned
+/// at the block's first mode-info bit (the §6.4.4 block syntax shares
+/// the §9.2 coder with the partition syntax). A `Vec<LeafBlock>` sink
+/// records the traversal order without consuming bits; the §6.4.4
+/// frame decoder consumes the block's `mode_info( )` + `residual( )`
+/// bits inline.
 ///
 /// Recursion order on `PARTITION_SPLIT` is `(r, c) → (r, c+half) →
 /// (r+half, c) → (r+half, c+half)` per the §6.4.3 listing lines
@@ -737,7 +769,7 @@ pub(crate) fn decode_partition(
     mi_cols: u32,
     ctx_state: &mut PartitionContextState,
     probs_kind: PartitionProbsKind<'_>,
-    leaves: &mut Vec<LeafBlock>,
+    on_leaf: &mut dyn LeafSink,
 ) -> Result<(), Error> {
     // §6.4.3 line 2354: out-of-frame quadrants short-circuit without
     // touching the bool coder or the context strips.
@@ -792,30 +824,22 @@ pub(crate) fn decode_partition(
 
     // §6.4.3 lines 2362-2385: leaf vs recursive dispatch.
     if (subsize as usize) < (BLOCK_8X8 as usize) || partition == PARTITION_NONE {
-        leaves.push(LeafBlock { r, c, subsize });
+        on_leaf.leaf(coder, r, c, subsize)?;
     } else if partition == PARTITION_HORZ {
-        leaves.push(LeafBlock { r, c, subsize });
+        on_leaf.leaf(coder, r, c, subsize)?;
         if has_rows {
-            leaves.push(LeafBlock {
-                r: r + half,
-                c,
-                subsize,
-            });
+            on_leaf.leaf(coder, r + half, c, subsize)?;
         }
     } else if partition == PARTITION_VERT {
-        leaves.push(LeafBlock { r, c, subsize });
+        on_leaf.leaf(coder, r, c, subsize)?;
         if has_cols {
-            leaves.push(LeafBlock {
-                r,
-                c: c + half,
-                subsize,
-            });
+            on_leaf.leaf(coder, r, c + half, subsize)?;
         }
     } else {
         // PARTITION_SPLIT: four recursive calls in §6.4.3 spec order
         // (TL → TR → BL → BR per lines 2381-2384).
         decode_partition(
-            coder, r, c, subsize, mi_rows, mi_cols, ctx_state, probs_kind, leaves,
+            coder, r, c, subsize, mi_rows, mi_cols, ctx_state, probs_kind, on_leaf,
         )?;
         decode_partition(
             coder,
@@ -826,7 +850,7 @@ pub(crate) fn decode_partition(
             mi_cols,
             ctx_state,
             probs_kind,
-            leaves,
+            on_leaf,
         )?;
         decode_partition(
             coder,
@@ -837,7 +861,7 @@ pub(crate) fn decode_partition(
             mi_cols,
             ctx_state,
             probs_kind,
-            leaves,
+            on_leaf,
         )?;
         decode_partition(
             coder,
@@ -848,7 +872,7 @@ pub(crate) fn decode_partition(
             mi_cols,
             ctx_state,
             probs_kind,
-            leaves,
+            on_leaf,
         )?;
     }
 
@@ -934,9 +958,9 @@ pub(crate) fn get_tile_offset(tile_num: u32, mis: u32, tile_sz_log2: u32) -> u32
 ///   superblock row, matching the spec listing).
 /// * `probs_kind` — the §9.3.2 `partition` probability source
 ///   (`Keyframe` for `FrameIsIntra == 1`, `Inter(...)` otherwise).
-/// * `leaves` — per-leaf log sink threaded through every
-///   [`decode_partition`] call so the tile's full traversal order is
-///   recoverable by the caller.
+/// * `on_leaf` — the [`LeafSink`] threaded through every
+///   [`decode_partition`] call: either a `Vec<LeafBlock>` log or the
+///   §6.4.4 inline block decoder.
 ///
 /// Returns [`Error::InvalidBitstream`] if any inner [`decode_partition`]
 /// underflows the §9.2 bool coder.
@@ -963,7 +987,7 @@ pub(crate) fn decode_tile(
     mi_cols: u32,
     ctx_state: &mut PartitionContextState,
     probs_kind: PartitionProbsKind<'_>,
-    leaves: &mut Vec<LeafBlock>,
+    on_leaf: &mut dyn LeafSink,
 ) -> Result<(), Error> {
     assert!(
         mi_row_end >= mi_row_start,
@@ -991,7 +1015,7 @@ pub(crate) fn decode_tile(
                 mi_cols,
                 ctx_state,
                 probs_kind,
-                leaves,
+                on_leaf,
             )?;
             c += 8;
         }

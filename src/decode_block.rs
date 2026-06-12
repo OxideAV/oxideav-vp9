@@ -68,12 +68,10 @@
 //! header's `skip` rewrite plus the fan-out loop against a
 //! [`Vp9FrameState`] that owns the §6.4.4 frame-wide arrays.
 //!
-//! Wiring `decode_block_apply` into the §6.4.3 [`partition::decode_partition`]
-//! driver — i.e. invoking it at every `LeafBlock` site rather than
-//! logging the leaf — is the natural follow-up round. That swap is
-//! purely mechanical (the leaf log already carries `(r, c, subsize)`),
-//! but it requires a frame-state allocator and per-leaf §6.4.5
-//! `mode_info( )` invocation which sits outside the §6.4.4 scope.
+//! The round-284 `decode_frame` module wires `decode_block_apply`
+//! into the §6.4.3 partition walk: its `BlockDecoder` leaf sink runs
+//! the §6.4.6 mode-info + §6.4.21 residual decode inline and applies
+//! this driver's fan-out at every leaf.
 //!
 //! ## Provenance
 //!
@@ -84,12 +82,11 @@
 //! `NONE = -1` sentinel for `ref_frame[ 1 ]` on intra blocks is the
 //! [`crate::mode_info::NONE_REF_FRAME`] constant.
 
-#![allow(dead_code)] // surfaces are pub(crate) — round 31 lands the
-                     // §6.4.4 driver as a standalone primitive; the
-                     // §6.4.3 wire-up that invokes it lives in a later
-                     // round (the partition driver currently emits
-                     // LeafBlock log entries rather than calling
-                     // decode_block_apply, but the swap is mechanical).
+#![allow(dead_code)] // surfaces are pub(crate); the inter-only fields
+                     // (Mvs / SubMvs / InterpFilters accessors) have
+                     // no production reader until the inter-frame
+                     // rounds land — the intra path is wired via the
+                     // round-284 decode_frame module.
 
 use crate::mode_info::NONE_REF_FRAME;
 use crate::partition::{NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP};

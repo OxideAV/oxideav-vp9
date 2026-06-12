@@ -1652,6 +1652,12 @@ pub(crate) fn inter_segment_id(
 /// SEG_LVL_REF_FRAME ] != INTRA_FRAME` without consuming any bits.
 pub(crate) const SEG_LVL_REF_FRAME: usize = 2;
 
+/// `SEG_LVL_SKIP = 3` per §3 (`vp9-spec.txt` line 478) — the
+/// segmentation feature index for the per-segment skip override. When
+/// `seg_feature_active( SEG_LVL_SKIP )` is set, §6.4.8 `read_skip( )`
+/// hardwires `skip = 1` without consuming any bits.
+pub(crate) const SEG_LVL_SKIP: usize = 3;
+
 /// `IS_INTER_CONTEXTS = 4` per §3 — number of contexts for the
 /// §6.4.13 `is_inter` syntax element. Indexes the
 /// `is_inter_prob[IS_INTER_CONTEXTS]` array per §9.3.2.

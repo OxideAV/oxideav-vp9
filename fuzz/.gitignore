@@ -1,0 +1,9 @@
+target/
+artifacts/
+coverage/
+Cargo.lock
+# Fuzz-grown corpus entries stay local; only the hand-built seed-*
+# inputs (derived from the crate's synthetic test vectors) are tracked.
+corpus/**
+!corpus/*/
+!corpus/*/seed-*

@@ -1,0 +1,40 @@
+# cargo-fuzz harness package for oxideav-vp9.
+#
+# Self-contained: the `[workspace]` table at the bottom stops cargo's
+# upward manifest search so the harness builds identically both in a
+# standalone repo checkout (CI) and inside the umbrella workspace
+# checkout. The scheduled Fuzz workflow auto-discovers targets from
+# `fuzz_targets/*.rs` and splits its time budget across them.
+
+[package]
+name = "oxideav-vp9-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-vp9]
+path = ".."
+
+[[bin]]
+name = "frame_header"
+path = "fuzz_targets/frame_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "compressed_header"
+path = "fuzz_targets/compressed_header.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

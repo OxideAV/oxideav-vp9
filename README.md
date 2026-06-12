@@ -3,7 +3,39 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
-## Status — 2026-06-12 (round 281)
+## Status — 2026-06-12 (round 282)
+
+**Round 282: cargo-fuzz scaffold — `fuzz/` stood back up so the
+scheduled Fuzz workflow runs again.** The post-rebuild tree had no
+`fuzz/` directory, leaving the daily Fuzz workflow red. Round 282
+lands a self-contained cargo-fuzz harness package
+(`fuzz/Cargo.toml` + `fuzz/fuzz_targets/`) with two panic-surface
+targets, auto-discovered by the org reusable fuzz workflow:
+
+* `frame_header` — fuzzes [`parse_uncompressed_header`] and, when
+  the header parses, walks the rest of the frame: the §6.3
+  compressed-header slice (`header_size_in_bytes` bytes plus the
+  header-derived `Lossless` flag into [`parse_compressed_header`])
+  and the §6.4 tile-size prefix chain ([`tile_payload_sizes`]).
+* `compressed_header` — fuzzes the §9.2 Boolean-decoder walkers
+  directly: a leading control byte steers `Lossless`, the
+  intra-vs-inter entry point, `interpolation_filter == SWITCHABLE`,
+  `allow_high_precision_mv` and the §6.2.5 `ref_frame_sign_bias`
+  triple; the remaining bytes feed [`parse_compressed_header`] /
+  [`parse_compressed_header_inter`] verbatim.
+
+A 9-entry seed corpus (`fuzz/corpus/*/seed-*`, tracked in git) is
+derived from the crate's synthetic test vectors: minimal keyframe
+headers (1280x720, 64x64 lossless + non-lossless,
+`show_existing_frame`), TX_MODE_SELECT golden buffers, and inter
+walks exercising the switchable-filter / high-precision-MV /
+sign-bias gates. Local soak: 320 s per target under
+AddressSanitizer — 96.4 M execs (`frame_header`) + 43.6 M execs
+(`compressed_header`), zero panics / overflows / OOMs. The stale
+`fuzz.yml` preamble (describing pre-rebuild harnesses) was
+rewritten to match the new target set.
+
+## Previously — round 281 (§8.8 frame-level loop-filter driver)
 
 **Round 281: §8.8 `loop filter process` — the frame-level driver —
 [`frame_loop_filter`] + the 3-plane [`CurrFrame`] container.** Round

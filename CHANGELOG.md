@@ -6,6 +6,26 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 282: cargo-fuzz scaffold — `fuzz/` stood back up so the
+  scheduled Fuzz workflow runs again.** Two panic-surface targets,
+  auto-discovered by the org reusable fuzz workflow:
+  * `frame_header` — `parse_uncompressed_header` plus the frame
+    walk that hangs off it (§6.3 compressed-header slice via
+    `header_size_in_bytes` + the header-derived `Lossless` flag,
+    then the §6.4 tile-size prefix chain via `tile_payload_sizes`).
+  * `compressed_header` — the §9.2 Boolean-decoder walkers
+    (`parse_compressed_header` / `parse_compressed_header_inter`)
+    with a leading control byte steering the caller-supplied flags
+    (`Lossless`, intra vs. inter, `SWITCHABLE` interpolation
+    filter, `allow_high_precision_mv`, §6.2.5
+    `ref_frame_sign_bias`).
+  * 9-entry tracked seed corpus (`fuzz/corpus/*/seed-*`) derived
+    from the crate's synthetic test vectors.
+  * Local soak: 320 s per target under AddressSanitizer — 96.4 M +
+    43.6 M execs, zero findings.
+  * `fuzz.yml` preamble rewritten to describe the new target set
+    (the old preamble described pre-rebuild harnesses).
+
 * **Round 281: §8.8 `loop filter process` — the frame-level driver —
   [`frame_loop_filter`] + the 3-plane [`CurrFrame`] container.**
   Lands the outermost layer of the §8.8 loop-filter arc per

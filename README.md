@@ -3,6 +3,34 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-06-14 (round 293)
+
+**Round 293: §6.5.2 / §6.5.3 / §6.5.4 / §6.5.5 / §6.5.12
+motion-vector reference geometry — the `is_inside( )` /
+`clamp_mv_ref( )` / `clamp_mv_row( )` / `clamp_mv_col( )` /
+`find_best_ref_mvs( )` primitives (new module `mv_ref`).** The layer
+directly above round 288's `read_mv( )`: `find_best_ref_mvs( )` is
+what derives the `BestMv[ ref ]` predictor that `read_mv( )` adds the
+decoded difference onto. §6.5.4/§6.5.5 `clamp_mv_row/col( )` clip a
+motion-vector component into the frame's vertical/horizontal range
+(`mbToTopEdge = -((MiRow*MI_SIZE)*8)` etc., in eighth-pel units);
+§6.5.3 `clamp_mv_ref( )` applies both with the §3 `MV_BORDER = 128`
+border; §6.5.2 `is_inside( )` gates a candidate position against the
+frame rows and the *tile* column band (`MiColStart`/`MiColEnd`); and
+§6.5.12 `find_best_ref_mvs( )` rounds each odd eighth-pel component
+toward zero when high precision is off (or the candidate is too large
+per §6.5.13 `use_mv_hp( )`) then clamps with the wide
+`(BORDERINPIXELS - INTERP_EXTEND) << 3 == 1248` border, yielding
+`NearestMv` / `NearMv` / `BestMv`. All clamps are pure functions of
+the per-block [`MvRefGeometry`] (`MiRow`/`MiCol`/`MiRows`/`MiCols`/
+`MiSize` + tile column extents). 10 new unit tests (lib 610 -> 620);
+intra decode unchanged. Still missing for end-to-end inter: §6.5.1
+`find_mv_refs( )` candidate scan (needs the frame-wide `Mvs` /
+`RefFrames` arrays + §6.5.6-6.5.11 `add_mv_ref_list( )` /
+`get_block_mv( )` helpers), §6.4.16 `inter_block_mode_info( )` /
+§6.4.17 `read_ref_frames( )` / §6.4.18 `assign_mv( )` driver, and the
+§8.5.2 inter prediction (motion compensation) process.
+
 ## Status — 2026-06-13 (round 288)
 
 **Round 288: §6.4.19 / §6.4.20 motion-vector residual syntax — the

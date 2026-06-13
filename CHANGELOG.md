@@ -6,6 +6,34 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 293: §6.5.2 / §6.5.3 / §6.5.4 / §6.5.5 / §6.5.12
+  motion-vector reference geometry — `is_inside( )` /
+  `clamp_mv_ref( )` / `clamp_mv_row( )` / `clamp_mv_col( )` /
+  `find_best_ref_mvs( )` primitives (new module `mv_ref`).** The layer
+  above round 288's `read_mv( )` — `find_best_ref_mvs( )` produces the
+  `BestMv[ ref ]` predictor `read_mv( )` consumes:
+  * §6.5.4 `clamp_mv_row( mvec, border )` / §6.5.5 `clamp_mv_col(
+    mvec, border )` — `Clip3` of a component into
+    `[mbToTopEdge - border, mbToBottomEdge + border]` (and the
+    left/right analogue), with the edges derived from `MiRow` /
+    `MiCol` / `MiRows` / `MiCols` / `MiSize` in eighth-pel units.
+  * §6.5.3 `clamp_mv_ref( i )` — both component clamps with the §3
+    `MV_BORDER = 128` border.
+  * §6.5.2 `is_inside( candidateR, candidateC )` — candidate-position
+    gate: whole-frame rows (`0 .. MiRows`) but per-*tile* columns
+    (`MiColStart .. MiColEnd`), since tile column edges are not
+    crossable.
+  * §6.5.12 `find_best_ref_mvs( refList )` — odd eighth-pel components
+    rounded toward zero when `!allow_high_precision_mv ||
+    !use_mv_hp( )`, then the wide
+    `(BORDERINPIXELS - INTERP_EXTEND) << 3 == 1248` clamp, yielding
+    `NearestMv` / `NearMv` / `BestMv`.
+  All clamps are pure functions of a per-block `MvRefGeometry`. 10 new
+  unit tests (lib 610 -> 620). Still deferred for end-to-end inter:
+  §6.5.1 `find_mv_refs( )` candidate scan, §6.4.16-18
+  `inter_block_mode_info( )` / `read_ref_frames( )` / `assign_mv( )`,
+  and §8.5.2 inter prediction.
+
 * **Round 288: §6.4.19 / §6.4.20 motion-vector residual syntax —
   `read_mv( )` / `read_mv_component( )` leaf primitives.** The first
   step of the inter-block motion-vector decode (new module `mv`):

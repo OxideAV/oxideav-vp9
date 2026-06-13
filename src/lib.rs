@@ -501,6 +501,7 @@ mod idct;
 mod intra;
 mod loop_filter;
 mod mode_info;
+mod mv;
 mod narrow_filter;
 mod partition;
 mod reconstruct;

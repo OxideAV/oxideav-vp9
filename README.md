@@ -3,6 +3,25 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-06-13 (round 288)
+
+**Round 288: §6.4.19 / §6.4.20 motion-vector residual syntax — the
+`read_mv( )` / `read_mv_component( )` leaf primitives (new module
+`mv`).** First step of the inter-block motion-vector decode: §6.5.13
+`use_mv_hp( )` derives the local `UseHp` from
+`allow_high_precision_mv`; §6.4.20 `read_mv_component( comp )` decodes
+`mv_sign` + `mv_class` (and the class-0 vs class-`n` magnitude arms,
+with the §9.3.3 `mv_hp` / `mv_class0_hp` fixed-to-`1` rule when
+`UseHp == 0`); §6.4.19 `read_mv( ref )` reads `mv_joint` and adds the
+decoded difference to the §6.5.3 `BestMv[ ref ]` predictor. Every read
+is driven by the §6.3.16 compressed-header `MvProbs` bundle per the
+§9.3.2 probability-selection listing. 9 new unit tests; intra decode
+unchanged (still byte-exact on the 13-fixture corpus). Still missing
+for end-to-end inter: §6.4.16 `inter_block_mode_info` / §6.4.17
+`read_ref_frames` / §6.4.18 `assign_mv` driver, §6.5
+`find_mv_refs` / `find_best_ref_mvs` motion-vector prediction, and the
+§8.5.2 inter prediction (motion compensation) process.
+
 ## Status — 2026-06-12 (round 284)
 
 **Round 284: top-level intra decode wiring — [`decode_vp9`] /

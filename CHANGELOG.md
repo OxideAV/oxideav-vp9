@@ -6,6 +6,32 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 288: §6.4.19 / §6.4.20 motion-vector residual syntax —
+  `read_mv( )` / `read_mv_component( )` leaf primitives.** The first
+  step of the inter-block motion-vector decode (new module `mv`):
+  * §6.5.13 `use_mv_hp( deltaMv )` — the high-precision predicate
+    `(Abs(deltaMv[0]) >> 3) < COMPANDED_MVREF_THRESH && (Abs(deltaMv[1])
+    >> 3) < COMPANDED_MVREF_THRESH` that, combined with the frame-level
+    `allow_high_precision_mv`, derives the local `UseHp`.
+  * §6.4.20 `read_mv_component( comp )` — `mv_sign` + `mv_class`
+    (`mv_class_tree`) and the two magnitude arms: the class-0 path
+    (`mv_class0_bit` / `mv_class0_fr` over `mv_fr_tree` /
+    `mv_class0_hp`) with `mag = ((bit<<3)|(fr<<1)|hp)+1`, and the
+    class-`n` path (`mv_bit` offset loop, `mag = CLASS0_SIZE <<
+    (mv_class+2)`, then `mv_fr` / `mv_hp`). The §9.3.3 rule that
+    `mv_class0_hp` / `mv_hp` are absent and read as `1` when `UseHp ==
+    0` is honoured.
+  * §6.4.19 `read_mv( ref )` — `mv_joint` (`mv_joint_tree`) selects
+    which of the (row, col) components are read, then the decoded
+    difference is added to the §6.5.3 `BestMv[ ref ]` predictor to
+    yield the final `Mv[ ref ]`. The §9.3.2 per-component probability
+    selection drives every read against the `MvProbs` bundle the
+    §6.3.16 compressed header parsed.
+  * 9 unit tests over constructed bool-coder buffers cover the
+    `use_mv_hp` threshold boundary, the joint-zero fast path, the
+    class-0 minimum-magnitude formula, the no-hp fixed bit, and the
+    `mv_class_tree` / `mv_joint_tree` leaf coverage.
+
 * **Round 284: top-level intra decode wiring — `decode_vp9` /
   `decode_intra_frame` decode whole keyframes end-to-end.** The
   §6.4 / §6.4.4 / §8.8 composition round: every previously-landed

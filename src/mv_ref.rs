@@ -778,6 +778,111 @@ impl MvRefGeometry {
             mode_context,
         }
     }
+
+    /// §6.5.14 `append_sub8x8_mvs( block, refList )` (`vp9-spec.txt` lines
+    /// 3339-3357) — derive the `NearestMv[ refList ]` / `NearMv[ refList ]`
+    /// predictors for one sub-block of a sub-8x8 inter block.
+    ///
+    /// ```text
+    /// append_sub8x8_mvs( block, refList ) {
+    ///   find_mv_refs( ref_frame[ refList ], block )
+    ///   dst = 0
+    ///   if ( block == 0 ) {
+    ///     for ( i = 0; i < 2; i++ ) sub8x8Mvs[ dst++ ] = RefListMv[ i ]
+    ///   } else if ( block <= 2 ) {
+    ///     sub8x8Mvs[ dst++ ] = BlockMvs[ refList ][ 0 ]
+    ///   } else {
+    ///     sub8x8Mvs[ dst++ ] = BlockMvs[ refList ][ 2 ]
+    ///     for ( idx = 1; idx >= 0 && dst < 2; idx-- )
+    ///       if ( BlockMvs[ refList ][ idx ] != sub8x8Mvs[ 0 ] )
+    ///         sub8x8Mvs[ dst++ ] = BlockMvs[ refList ][ idx ]
+    ///   }
+    ///   for ( n = 0; n < 2 && dst < 2; n++ )
+    ///     if ( RefListMv[ n ] != sub8x8Mvs[ 0 ] )
+    ///       sub8x8Mvs[ dst++ ] = RefListMv[ n ]
+    ///   if ( dst < 2 ) sub8x8Mvs[ dst++ ] = ZeroMv
+    ///   NearestMv[ refList ] = sub8x8Mvs[ 0 ]
+    ///   NearMv[ refList ]    = sub8x8Mvs[ 1 ]
+    /// }
+    /// ```
+    ///
+    /// `block` is the §6.4.16 `idy * 2 + idx` sub-block index in `0..=3`;
+    /// `ref_frame` is `ref_frame[ refList ]` for the current block; `block_mvs`
+    /// is `BlockMvs[ refList ]` — the four sub-block motion vectors decoded so
+    /// far for this 8x8 block (lower-indexed sub-blocks of the same 8x8 are
+    /// already filled by §6.4.16's per-sub-block loop). The remaining
+    /// arguments are forwarded to §6.5.1 [`MvRefGeometry::find_mv_refs`]: the
+    /// neighbour-candidate `src`, the §6.2.5 `ref_frame_sign_bias[ ]` array,
+    /// and the §6.2.5 `UsePrevFrameMvs` flag. The §6.5.14 `refList` parameter
+    /// is not taken explicitly: the spec uses it only to index `BlockMvs[ ]`,
+    /// `NearestMv[ ]` and `NearMv[ ]`, all of which the caller already
+    /// resolves — `block_mvs` is the `BlockMvs[ refList ]` row and the return
+    /// value is the per-`refList` `[NearestMv, NearMv]` pair.
+    ///
+    /// Returns `[NearestMv, NearMv]` for the caller's `refList`. The two
+    /// `RefListMv[ ]` candidates come from `find_mv_refs( )` (already
+    /// §6.5.3-clamped); the `BlockMvs` entries are inserted verbatim per the
+    /// listing (no further clamp), and a §3 `ZeroMv` backfills any slot the
+    /// dedup left empty.
+    pub(crate) fn append_sub8x8_mvs<S: MvCandidateSource>(
+        &self,
+        src: &S,
+        block: usize,
+        ref_frame: i32,
+        block_mvs: &[[i32; 2]; 4],
+        sign_bias: &[bool; 4],
+        use_prev_frame_mvs: bool,
+    ) -> [[i32; 2]; MAX_MV_REF_CANDIDATES] {
+        let ref_list_mv = self
+            .find_mv_refs(src, ref_frame, block as i32, sign_bias, use_prev_frame_mvs)
+            .ref_list_mv;
+
+        let mut sub8x8_mvs = [ZERO_MV; MAX_MV_REF_CANDIDATES];
+        let mut dst = 0usize;
+
+        if block == 0 {
+            // The candidate predictors fill both slots directly.
+            for cand in ref_list_mv.iter().take(MAX_MV_REF_CANDIDATES) {
+                sub8x8_mvs[dst] = *cand;
+                dst += 1;
+            }
+        } else if block <= 2 {
+            // Top-right / bottom-left sub-blocks seed from sub-block 0.
+            sub8x8_mvs[dst] = block_mvs[0];
+            dst += 1;
+        } else {
+            // Bottom-right sub-block seeds from sub-block 2, then walks
+            // sub-blocks 1 then 0, adding any that differ from slot 0.
+            sub8x8_mvs[dst] = block_mvs[2];
+            dst += 1;
+            let mut idx = 1i32;
+            while idx >= 0 && dst < MAX_MV_REF_CANDIDATES {
+                if block_mvs[idx as usize] != sub8x8_mvs[0] {
+                    sub8x8_mvs[dst] = block_mvs[idx as usize];
+                    dst += 1;
+                }
+                idx -= 1;
+            }
+        }
+
+        // Fill any remaining slot from the find_mv_refs candidates, skipping
+        // a duplicate of slot 0.
+        let mut n = 0usize;
+        while n < MAX_MV_REF_CANDIDATES && dst < MAX_MV_REF_CANDIDATES {
+            if ref_list_mv[n] != sub8x8_mvs[0] {
+                sub8x8_mvs[dst] = ref_list_mv[n];
+                dst += 1;
+            }
+            n += 1;
+        }
+
+        // ZeroMv backfill for a still-empty second slot.
+        if dst < MAX_MV_REF_CANDIDATES {
+            sub8x8_mvs[dst] = ZERO_MV;
+        }
+
+        sub8x8_mvs
+    }
 }
 
 #[cfg(test)]
@@ -1217,5 +1322,137 @@ mod tests {
         // Disable position-0 above neighbour by leaving it intra.
         let out = g.find_mv_refs(&src, LAST_FRAME, 0, &NO_BIAS, false);
         assert_eq!(out.ref_list_mv[0], [22, 22]); // sub_mv index 1.
+    }
+
+    // --- §6.5.14 append_sub8x8_mvs --------------------------------------
+
+    /// The four `BlockMvs[ refList ]` sub-block vectors used by the
+    /// §6.5.14 tests for non-zero `block`.
+    const NO_BLOCK_MVS: [[i32; 2]; 4] = [ZERO_MV; 4];
+
+    #[test]
+    fn append_sub8x8_block0_takes_both_ref_list_candidates() {
+        // block == 0: sub8x8Mvs is exactly RefListMv[0], RefListMv[1].
+        // Two distinct neighbours fill both find_mv_refs slots.
+        let g = interior_geom();
+        let mut src = TestSource::new(64);
+        src.set(7, 8, Cell::inter(LAST_FRAME, [2, 2], NEARESTMV));
+        src.set(8, 7, Cell::inter(LAST_FRAME, [10, -4], NEARESTMV));
+        let out = g.append_sub8x8_mvs(&src, 0, LAST_FRAME, &NO_BLOCK_MVS, &NO_BIAS, false);
+        assert_eq!(out, [[2, 2], [10, -4]]);
+    }
+
+    #[test]
+    fn append_sub8x8_block0_empty_neighbourhood_is_zero() {
+        // block == 0 with no candidates: both slots ZeroMv (RefListMv is
+        // all-zero, the dedup keeps slot 1 at zero too).
+        let g = interior_geom();
+        let src = TestSource::new(64);
+        let out = g.append_sub8x8_mvs(&src, 0, LAST_FRAME, &NO_BLOCK_MVS, &NO_BIAS, false);
+        assert_eq!(out, [ZERO_MV, ZERO_MV]);
+    }
+
+    #[test]
+    fn append_sub8x8_block1_seeds_from_block_mv0_then_ref_list() {
+        // block == 1 (<= 2): slot 0 = BlockMvs[refList][0]; slot 1 filled
+        // from the first RefListMv that differs from slot 0.
+        let g = interior_geom();
+        let mut src = TestSource::new(64);
+        src.set(7, 8, Cell::inter(LAST_FRAME, [10, -4], NEARESTMV));
+        let block_mvs = [[5, 5], [0, 0], [0, 0], [0, 0]];
+        let out = g.append_sub8x8_mvs(&src, 1, LAST_FRAME, &block_mvs, &NO_BIAS, false);
+        assert_eq!(out, [[5, 5], [10, -4]]);
+    }
+
+    #[test]
+    fn append_sub8x8_block2_ref_list_dedup_drops_match() {
+        // block == 2 (<= 2): slot 0 = BlockMvs[0]; a RefListMv equal to
+        // slot 0 is skipped, the next distinct one fills slot 1.
+        let g = interior_geom();
+        let mut src = TestSource::new(64);
+        // RefListMv[0] duplicates BlockMvs[0]; RefListMv[1] is distinct.
+        src.set(7, 8, Cell::inter(LAST_FRAME, [5, 5], NEARESTMV));
+        src.set(8, 7, Cell::inter(LAST_FRAME, [9, 9], NEARESTMV));
+        let block_mvs = [[5, 5], [0, 0], [0, 0], [0, 0]];
+        let out = g.append_sub8x8_mvs(&src, 2, LAST_FRAME, &block_mvs, &NO_BIAS, false);
+        assert_eq!(out, [[5, 5], [9, 9]]);
+    }
+
+    #[test]
+    fn append_sub8x8_block1_zero_backfill_when_no_distinct_candidate() {
+        // block == 1: slot 0 from BlockMvs[0]; no neighbour candidate and
+        // the all-zero RefListMv duplicates nothing distinct, so the
+        // ZeroMv backfill fills slot 1.
+        let g = interior_geom();
+        let src = TestSource::new(64);
+        let block_mvs = [[7, -7], [0, 0], [0, 0], [0, 0]];
+        let out = g.append_sub8x8_mvs(&src, 1, LAST_FRAME, &block_mvs, &NO_BIAS, false);
+        assert_eq!(out, [[7, -7], ZERO_MV]);
+    }
+
+    #[test]
+    fn append_sub8x8_block3_seeds_from_block_mv2_then_walks_1_0() {
+        // block == 3 (else arm): slot 0 = BlockMvs[2]; then idx 1, 0 are
+        // walked, each added if it differs from slot 0. BlockMvs[1] differs
+        // and fills slot 1; the idx==0 step never runs (dst already 2).
+        let g = interior_geom();
+        let src = TestSource::new(64);
+        let block_mvs = [[1, 1], [8, 8], [3, 3], [0, 0]];
+        let out = g.append_sub8x8_mvs(&src, 3, LAST_FRAME, &block_mvs, &NO_BIAS, false);
+        assert_eq!(out, [[3, 3], [8, 8]]); // slot0 = BlockMvs[2], slot1 = BlockMvs[1].
+    }
+
+    #[test]
+    fn append_sub8x8_block3_skips_block_mv_matching_slot0() {
+        // block == 3: BlockMvs[1] duplicates BlockMvs[2] (slot 0) so it is
+        // skipped; BlockMvs[0] differs and fills slot 1.
+        let g = interior_geom();
+        let src = TestSource::new(64);
+        let block_mvs = [[4, 4], [3, 3], [3, 3], [0, 0]];
+        let out = g.append_sub8x8_mvs(&src, 3, LAST_FRAME, &block_mvs, &NO_BIAS, false);
+        assert_eq!(out, [[3, 3], [4, 4]]); // slot0 = BlockMvs[2]; idx1 dup-skipped; idx0 fills.
+    }
+
+    #[test]
+    fn append_sub8x8_block3_all_block_mvs_equal_then_ref_list_fills() {
+        // block == 3: all BlockMvs equal slot 0, so the idx loop adds
+        // nothing; a distinct RefListMv candidate fills slot 1 instead.
+        let g = interior_geom();
+        let mut src = TestSource::new(64);
+        src.set(7, 8, Cell::inter(LAST_FRAME, [12, -6], NEARESTMV));
+        let block_mvs = [[2, 2], [2, 2], [2, 2], [2, 2]];
+        let out = g.append_sub8x8_mvs(&src, 3, LAST_FRAME, &block_mvs, &NO_BIAS, false);
+        assert_eq!(out, [[2, 2], [12, -6]]);
+    }
+
+    #[test]
+    fn append_sub8x8_block3_zero_backfill_when_nothing_distinct() {
+        // block == 3: all BlockMvs equal slot 0, no neighbour candidate,
+        // RefListMv all zero — ZeroMv backfill fills slot 1.
+        let g = interior_geom();
+        let src = TestSource::new(64);
+        let block_mvs = [[9, 9], [9, 9], [9, 9], [9, 9]];
+        let out = g.append_sub8x8_mvs(&src, 3, LAST_FRAME, &block_mvs, &NO_BIAS, false);
+        assert_eq!(out, [[9, 9], ZERO_MV]);
+    }
+
+    #[test]
+    fn append_sub8x8_block_passes_index_to_find_mv_refs() {
+        // For block != 0 the find_mv_refs call still uses `block` as the
+        // sub-block index. With block == 1 and a left neighbour carrying
+        // distinct sub-block vectors, RefListMv[0] reads sub_mv index 1
+        // (idx_n_column_to_subblock[1][0] for deltaCol != 0), proving the
+        // block index is threaded through.
+        let g = interior_geom();
+        let mut src = TestSource::new(64);
+        let mut cell = Cell::inter(LAST_FRAME, [0, 0], NEARESTMV);
+        cell.sub_mv[0] = [[1, 1], [22, 22], [3, 3], [44, 44]];
+        src.set(8, 7, cell); // left neighbour {0,-1}, deltaCol -1.
+                             // block == 1: idx_n_column_to_subblock[1][deltaCol==0? :] -> [1,3];
+                             // deltaCol != 0 -> column 0 -> sub index 1 -> [22,22].
+        let block_mvs = [[100, 100], [0, 0], [0, 0], [0, 0]];
+        let out = g.append_sub8x8_mvs(&src, 1, LAST_FRAME, &block_mvs, &NO_BIAS, false);
+        // slot 0 from BlockMvs[0]; slot 1 from RefListMv[0] == [22,22].
+        assert_eq!(out, [[100, 100], [22, 22]]);
     }
 }

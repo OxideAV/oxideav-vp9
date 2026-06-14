@@ -6,6 +6,28 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 305: §6.5.14 `append_sub8x8_mvs( )` — the sub-8x8 inter
+  motion-vector predictor builder, added to the `mv_ref` module as
+  `MvRefGeometry::append_sub8x8_mvs`.** Composes round 299's §6.5.1
+  `find_mv_refs( )`: for one sub-block of a sub-8x8 inter block it
+  derives the `[NearestMv, NearMv]` pair the §6.4.18 `assign_mv( )`
+  driver consumes when `y_mode` is `NEARESTMV` / `NEARMV`.
+  * §6.5.14 listing implemented verbatim: `block == 0` takes both
+    `RefListMv[ ]` candidates; `block <= 2` seeds slot 0 from
+    `BlockMvs[ refList ][ 0 ]`; the `block == 3` arm seeds from
+    `BlockMvs[ refList ][ 2 ]` then walks sub-blocks 1 then 0 adding
+    any that differ from slot 0; remaining slots fill from the
+    `RefListMv[ ]` candidates (skipping a slot-0 duplicate), then a §3
+    `ZeroMv` backfills.
+  * The §6.5.14 `refList` index is resolved by the caller — `block_mvs`
+    is the `BlockMvs[ refList ]` row and the return value is the
+    per-`refList` `[NearestMv, NearMv]` pair, so the predictor stays a
+    pure function of geometry plus candidate data.
+  * +10 unit tests (lib 631 -> 641): the three `block` arms, the
+    `RefListMv` / `BlockMvs` dedup against slot 0, the `ZeroMv`
+    backfill, and that the `block` index threads through to the
+    `find_mv_refs( )` sub-block selection. Intra decode unchanged
+    (still byte-exact on the 13-fixture corpus).
 * **Round 299: §6.5.1 `find_mv_refs( )` candidate scan plus the
   §6.5.6-6.5.11 helpers (`add_mv_ref_list( )` /
   `if_same_ref_frame_add_mv( )` / `if_diff_ref_frame_add_mv( )` /

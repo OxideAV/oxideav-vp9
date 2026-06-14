@@ -3,6 +3,35 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-06-15 (round 305)
+
+**Round 305: §6.5.14 `append_sub8x8_mvs( )` — the sub-8x8 inter
+motion-vector predictor builder (extends module `mv_ref`).** The next
+layer on round 299's `find_mv_refs( )`:
+`append_sub8x8_mvs( block, refList )` derives the
+`NearestMv[ refList ]` / `NearMv[ refList ]` predictors for one
+sub-block of a sub-8x8 inter block — the pair the §6.4.18
+`assign_mv( )` driver reads when the sub-block's `y_mode` is `NEARESTMV`
+or `NEARMV`. Per the §6.5.14 listing it first runs §6.5.1
+`find_mv_refs( ref_frame[ refList ], block )` for the two `RefListMv[ ]`
+candidates, then builds `sub8x8Mvs[ 0..2 ]`: `block == 0` takes both
+`RefListMv[ ]` entries; `block <= 2` seeds slot 0 from
+`BlockMvs[ refList ][ 0 ]`; the `block == 3` arm seeds from
+`BlockMvs[ refList ][ 2 ]` and walks sub-blocks 1 then 0, adding any
+that differ from slot 0; any remaining slot fills from the
+`RefListMv[ ]` candidates (skipping a slot-0 duplicate), with a §3
+`ZeroMv` backfill. The §6.5.14 `refList` index is resolved by the
+caller — `block_mvs` is the `BlockMvs[ refList ]` row and the return is
+the per-`refList` `[NearestMv, NearMv]` pair — so the predictor stays a
+pure function of geometry plus the round-299 [`MvCandidateSource`]
+neighbour data. 10 new unit tests (lib 631 -> 641); intra decode
+unchanged (still byte-exact on the 13-fixture corpus). Still missing
+for end-to-end inter: the §6.4.16 `inter_block_mode_info( )` /
+§6.4.17 `read_ref_frames( )` / §6.4.18 `assign_mv( )` driver that
+threads `find_mv_refs( )` / `find_best_ref_mvs( )` / `read_mv( )` /
+`append_sub8x8_mvs( )` together, and the §8.5.2 inter prediction
+(motion compensation) process.
+
 ## Status — 2026-06-14 (round 299)
 
 **Round 299: §6.5.1 `find_mv_refs( )` candidate scan plus the

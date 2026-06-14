@@ -3,6 +3,42 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-06-14 (round 299)
+
+**Round 299: §6.5.1 `find_mv_refs( )` candidate scan plus the
+§6.5.6-6.5.11 helpers — the motion-vector predictor list that feeds
+round 293's `find_best_ref_mvs( )` (extends module `mv_ref`).** The
+next layer up from round 293's clamps:
+`find_mv_refs( refFrame, block )` walks the `mv_ref_blocks[ MiSize ]`
+neighbour positions to build the two `RefListMv[ ]` predictors and the
+`ModeContext[ refFrame ]` value. The scan runs in three passes per the
+§6.5.1 listing: positions 0..2 read the candidate's sub-block vector
+(§6.5.11 `get_sub_block_mv( )` via the `idx_n_column_to_subblock[ ]`
+table) on a same-reference match; positions 2..`MVREF_NEIGHBOURS` use
+§6.5.7 `if_same_ref_frame_add_mv( )`; then, when any in-frame neighbour
+was seen, a §6.5.8 `if_diff_ref_frame_add_mv( )` pass fills any
+remaining slot with a sign-scaled (§6.5.9 `scale_mv( )`)
+different-reference vector. `UsePrevFrameMvs` adds the previous frame's
+vector at `(MiRow, MiCol)` via the `usePrev` arm of §6.5.10
+`get_block_mv( )`. `contextCounter` accumulates
+`mode_2_counter[ YModes ]` over the pass-1 neighbours and
+`counter_to_context[ ]` yields the final `ModeContext`. §6.5.6
+`add_mv_ref_list( )` dedup (cap 2, drop a duplicate of
+`RefListMv[ 0 ]`) and the §6.5.3 `clamp_mv_ref( )` of both candidates
+finish the list. The `mv_ref_blocks` / `mode_2_counter` /
+`counter_to_context` / `idx_n_column_to_subblock` tables are
+transcribed verbatim from the listing. Neighbour mode-info is read
+through a new `MvCandidateSource` trait so the scan stays a pure
+function of geometry plus candidate data; the §6.4.4 `decode_block`
+fan-out's per-MI arrays will back it once the inter decode driver
+threads them. 11 new unit tests (lib 620 -> 631); intra decode
+unchanged (still byte-exact on the 13-fixture corpus). Still missing
+for end-to-end inter: §6.4.16 `inter_block_mode_info( )` / §6.4.17
+`read_ref_frames( )` / §6.4.18 `assign_mv( )` driver (which calls
+`find_mv_refs( )` / `find_best_ref_mvs( )` / `read_mv( )`), §6.5.14
+`append_sub8x8_mvs( )`, and the §8.5.2 inter prediction (motion
+compensation) process.
+
 ## Status — 2026-06-14 (round 293)
 
 **Round 293: §6.5.2 / §6.5.3 / §6.5.4 / §6.5.5 / §6.5.12

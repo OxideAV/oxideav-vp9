@@ -3,6 +3,30 @@
 Pure-Rust VP9 codec — clean-room re-implementation against the VP9
 Bitstream & Decoding Process Specification v0.7.
 
+## Status — 2026-06-15 (round 309)
+
+**Round 309: §6.4.18 `assign_mv( isCompound )` — the per-reference-list
+motion-vector resolver (extends module `mv`).** The driver step that
+turns a decoded inter `y_mode` plus its predictors into the final
+`Mv[ 0 ]` / `Mv[ 1 ]`: `assign_mv( )` pre-sets `Mv[ 1 ]` to the §3
+`ZeroMv`, then for each active reference list `i` in `0..1 + isCompound`
+selects per `y_mode` — `NEWMV` reads one §6.4.19 `read_mv( i )`
+difference onto round-293's `BestMv[ i ]`, `NEARESTMV` / `NEARMV` copy
+the round-293/round-305 `NearestMv[ i ]` / `NearMv[ i ]`, and the
+remaining arm (`ZEROMV`, including the §6.4.16 `SEG_LVL_SKIP`
+forced-`ZEROMV` case) yields `ZeroMv`. A new `MvPredictors { nearest,
+near, best }` bundle carries the §6.5.12 `find_best_ref_mvs( )` (or
+§6.5.14 `append_sub8x8_mvs( )`) outputs for one list slot, so
+`assign_mv( )` stays a pure function of the bool coder, the §6.3.16
+`MvProbs` bundle, the predictor pair, and `allow_high_precision_mv`.
+7 new unit tests (lib 641 -> 648); intra decode unchanged (still
+byte-exact on the 13-fixture corpus). Still missing for end-to-end
+inter: the §6.4.16 `inter_block_mode_info( )` / §6.4.17
+`read_ref_frames( )` driver that threads `read_ref_frames( )` /
+`find_mv_refs( )` / `find_best_ref_mvs( )` / `append_sub8x8_mvs( )` /
+`assign_mv( )` together against the frame-wide per-MI arrays, and the
+§8.5.2 inter prediction (motion compensation) process.
+
 ## Status — 2026-06-15 (round 305)
 
 **Round 305: §6.5.14 `append_sub8x8_mvs( )` — the sub-8x8 inter

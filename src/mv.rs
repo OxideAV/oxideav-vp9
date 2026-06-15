@@ -35,13 +35,14 @@
 //! `UseHp == 0` the bit is not present in the bitstream and the decoded
 //! value is fixed to `1` (§9.3.3 listing, `vp9-spec.txt` lines 6214-6216).
 
-// The §6.4.18 `assign_mv( )` driver that calls [`read_mv`] lands on top
-// of this leaf layer in a later round; until then these primitives are
-// reachable only from the unit tests, so the crate-internal `dead_code`
-// lint is silenced module-wide (mirrors `mode_info`'s deferred-inter
-// primitives).
+// The §6.4.16 `inter_block_mode_info( )` driver that calls the §6.4.18
+// [`assign_mv`] step (and through it [`read_mv`]) lands on top of this
+// leaf layer in a later round; until then these primitives are reachable
+// only from the unit tests, so the crate-internal `dead_code` lint is
+// silenced module-wide (mirrors `mode_info`'s deferred-inter primitives).
 #![allow(dead_code)]
 
+use crate::adaptive_filter_strength::{NEARESTMV, NEARMV, NEWMV};
 use crate::bool_coder::BoolCoder;
 use crate::compressed::MvProbs;
 use crate::mode_info::{tree_decode, BINARY_TREE};
@@ -254,6 +255,80 @@ pub(crate) fn read_mv(
     Ok([best_mv[0] + diff[0], best_mv[1] + diff[1]])
 }
 
+/// The per-reference-list motion-vector predictors `assign_mv( )` reads.
+///
+/// One [`MvPredictors`] holds the §6.5.12 / §6.5.14 outputs for a single
+/// reference list slot `i`: `nearest = NearestMv[ i ]`, `near =
+/// NearMv[ i ]`, and `best = BestMv[ i ]`. For a `MiSize >= BLOCK_8X8`
+/// block these come from §6.5.12 `find_best_ref_mvs( i )`; for a sub-8x8
+/// block the `NEARESTMV` / `NEARMV` pair is replaced by §6.5.14
+/// `append_sub8x8_mvs( )` per sub-block while `best` still carries the
+/// `find_best_ref_mvs( )` value the `NEWMV` `read_mv( )` predicts onto.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MvPredictors {
+    /// `NearestMv[ i ]` — the §6.4.18 `NEARESTMV` result for list `i`.
+    pub nearest: [i32; 2],
+    /// `NearMv[ i ]` — the §6.4.18 `NEARMV` result for list `i`.
+    pub near: [i32; 2],
+    /// `BestMv[ i ]` — the §6.5.3 predictor a `NEWMV` `read_mv( i )`
+    /// difference is added onto.
+    pub best: [i32; 2],
+}
+
+/// §6.4.18 `assign_mv( isCompound )` — resolve the final per-list motion
+/// vectors `Mv[ 0 ]` / `Mv[ 1 ]` from the just-decoded `y_mode`.
+///
+/// ```text
+/// assign_mv( isCompound ) {
+///   Mv[ 1 ] = ZeroMv
+///   for ( i = 0; i < 1 + isCompound; i++ ) {
+///     if ( y_mode == NEWMV )
+///       read_mv( i )
+///     else if ( y_mode == NEARESTMV )
+///       Mv[ i ] = NearestMv[ i ]
+///     else if ( y_mode == NEARMV )
+///       Mv[ i ] = NearMv[ i ]
+///     else
+///       Mv[ i ] = ZeroMv
+///   }
+/// }
+/// ```
+///
+/// `y_mode` is one of the four §7.4.11 inter modes (`NEARESTMV = 10`,
+/// `NEARMV = 11`, `ZEROMV = 12`, `NEWMV = 13`). `is_compound` is true
+/// when `ref_frame[ 1 ] > INTRA_FRAME`, in which case both list slots are
+/// resolved; otherwise only slot 0 is read and slot 1 stays the
+/// pre-initialised §3 `ZeroMv`. `preds[ i ]` supplies the `NearestMv` /
+/// `NearMv` / `BestMv` predictors for list `i`; only the `NEWMV` arm
+/// touches the shared bool coder, decoding one §6.4.19 `read_mv( i )`
+/// difference onto `BestMv[ i ]`. The returned `[[i32; 2]; 2]` is
+/// `[Mv[ 0 ], Mv[ 1 ]]` in eighth-pel units.
+pub(crate) fn assign_mv(
+    coder: &mut BoolCoder<'_>,
+    probs: &MvProbs,
+    y_mode: u8,
+    is_compound: bool,
+    preds: &[MvPredictors; 2],
+    allow_hp: bool,
+) -> Result<[[i32; 2]; 2], Error> {
+    // Mv[ 1 ] = ZeroMv (set before the loop so a non-compound block
+    // leaves slot 1 zero regardless of y_mode).
+    let mut mv = [[0i32; 2], [0i32; 2]];
+
+    let count = if is_compound { 2 } else { 1 };
+    for i in 0..count {
+        mv[i] = match y_mode {
+            NEWMV => read_mv(coder, probs, preds[i].best, allow_hp)?,
+            NEARESTMV => preds[i].nearest,
+            NEARMV => preds[i].near,
+            // ZEROMV (and the §6.4.16 SEG_LVL_SKIP forced-ZEROMV case).
+            _ => [0, 0],
+        };
+    }
+
+    Ok(mv)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,5 +432,120 @@ mod tests {
             .collect();
         leaves.sort_unstable();
         assert_eq!(leaves, vec![0, 1, 2, 3]);
+    }
+
+    // ----- §6.4.18 assign_mv( ) -----
+
+    const ZEROMV: u8 = 12;
+
+    /// Two distinct predictor triples so a wrong-arm pick is visible.
+    fn sample_preds() -> [MvPredictors; 2] {
+        [
+            MvPredictors {
+                nearest: [3, -4],
+                near: [5, 6],
+                best: [7, 8],
+            },
+            MvPredictors {
+                nearest: [-10, 11],
+                near: [12, -13],
+                best: [14, 15],
+            },
+        ]
+    }
+
+    #[test]
+    fn assign_mv_zeromv_both_lists_zero_no_coder_read() {
+        // ZEROMV reads nothing; slot 1 stays its pre-loop ZeroMv.
+        let buf = [0u8; 16];
+        let mut coder = zero_coder(&buf);
+        let preds = sample_preds();
+        let mv = assign_mv(&mut coder, &MvProbs::defaults(), ZEROMV, true, &preds, true).unwrap();
+        assert_eq!(mv, [[0, 0], [0, 0]]);
+    }
+
+    #[test]
+    fn assign_mv_nearestmv_single_picks_nearest_slot0_only() {
+        let buf = [0u8; 16];
+        let mut coder = zero_coder(&buf);
+        let preds = sample_preds();
+        let mv = assign_mv(
+            &mut coder,
+            &MvProbs::defaults(),
+            NEARESTMV,
+            false,
+            &preds,
+            true,
+        )
+        .unwrap();
+        // Non-compound: slot 0 = NearestMv[0]; slot 1 stays ZeroMv.
+        assert_eq!(mv, [[3, -4], [0, 0]]);
+    }
+
+    #[test]
+    fn assign_mv_nearmv_compound_picks_near_both_lists() {
+        let buf = [0u8; 16];
+        let mut coder = zero_coder(&buf);
+        let preds = sample_preds();
+        let mv = assign_mv(&mut coder, &MvProbs::defaults(), NEARMV, true, &preds, true).unwrap();
+        assert_eq!(mv, [[5, 6], [12, -13]]);
+    }
+
+    #[test]
+    fn assign_mv_nearestmv_compound_picks_nearest_both_lists() {
+        let buf = [0u8; 16];
+        let mut coder = zero_coder(&buf);
+        let preds = sample_preds();
+        let mv = assign_mv(
+            &mut coder,
+            &MvProbs::defaults(),
+            NEARESTMV,
+            true,
+            &preds,
+            true,
+        )
+        .unwrap();
+        assert_eq!(mv, [[3, -4], [-10, 11]]);
+    }
+
+    #[test]
+    fn assign_mv_newmv_reads_difference_onto_best() {
+        // An all-zero buffer makes mv_joint walk to MV_JOINT_ZERO, so
+        // diffMv == ZeroMv and Mv[ i ] == BestMv[ i ] unchanged.
+        let buf = [0u8; 16];
+        let mut coder = zero_coder(&buf);
+        let preds = sample_preds();
+        let mv = assign_mv(&mut coder, &MvProbs::defaults(), NEWMV, false, &preds, true).unwrap();
+        // Slot 0 = BestMv[0] + 0; slot 1 untouched ZeroMv.
+        assert_eq!(mv, [[7, 8], [0, 0]]);
+    }
+
+    #[test]
+    fn assign_mv_newmv_compound_reads_each_best() {
+        let buf = [0u8; 16];
+        let mut coder = zero_coder(&buf);
+        let preds = sample_preds();
+        let mv = assign_mv(&mut coder, &MvProbs::defaults(), NEWMV, true, &preds, true).unwrap();
+        assert_eq!(mv, [[7, 8], [14, 15]]);
+    }
+
+    #[test]
+    fn assign_mv_noncompound_never_touches_slot1_predictors() {
+        // Even with junk NearMv in slot 1, a non-compound NEARMV leaves
+        // slot 1 at ZeroMv (the loop runs i = 0 only).
+        let buf = [0u8; 16];
+        let mut coder = zero_coder(&buf);
+        let preds = sample_preds();
+        let mv = assign_mv(
+            &mut coder,
+            &MvProbs::defaults(),
+            NEARMV,
+            false,
+            &preds,
+            true,
+        )
+        .unwrap();
+        assert_eq!(mv[1], [0, 0]);
+        assert_eq!(mv[0], [5, 6]);
     }
 }

@@ -6,6 +6,27 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+* **Round 309: §6.4.18 `assign_mv( isCompound )` — the per-reference-list
+  motion-vector resolver, added to the `mv` module as `assign_mv` plus
+  the `MvPredictors` predictor bundle.** Threads the round-288
+  `read_mv( )` leaf together with the round-293 / round-305 predictors
+  to produce the final `Mv[ 0 ]` / `Mv[ 1 ]` an inter block uses.
+  * §6.4.18 listing implemented verbatim: `Mv[ 1 ]` is pre-set to the
+    §3 `ZeroMv` before the loop; for each active reference list `i` in
+    `0..1 + isCompound`, `y_mode == NEWMV` reads one §6.4.19
+    `read_mv( i )` difference onto `BestMv[ i ]`, `NEARESTMV` /
+    `NEARMV` copy `NearestMv[ i ]` / `NearMv[ i ]`, and the remaining
+    arm (`ZEROMV`, including the §6.4.16 `SEG_LVL_SKIP` forced case)
+    yields `ZeroMv`.
+  * `MvPredictors { nearest, near, best }` carries the §6.5.12
+    `find_best_ref_mvs( )` (or §6.5.14 `append_sub8x8_mvs( )`) outputs
+    for one list slot, so `assign_mv( )` stays a pure function of the
+    bool coder, the §6.3.16 `MvProbs` bundle, the predictor pair, and
+    `allow_high_precision_mv` — no frame-wide state to thread until the
+    §6.4.16 `inter_block_mode_info( )` driver lands.
+  * 7 new unit tests (lib 641 -> 648); intra decode unchanged (still
+    byte-exact on the 13-fixture corpus).
+
 * **Round 305: §6.5.14 `append_sub8x8_mvs( )` — the sub-8x8 inter
   motion-vector predictor builder, added to the `mv_ref` module as
   `MvRefGeometry::append_sub8x8_mvs`.** Composes round 299's §6.5.1

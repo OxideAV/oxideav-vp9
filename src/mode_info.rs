@@ -1945,6 +1945,113 @@ pub(crate) fn is_inter_context(nb: IsInterNeighbours) -> usize {
     }
 }
 
+/// Per-side neighbour reference-frame state consumed by
+/// [`comp_mode_context`] to compute the §9.3.2 `comp_mode` context.
+///
+/// The §6.4.11 prelude derives, for each of the above/left neighbours,
+/// the pair `RefFrame[ 0 ]` / `RefFrame[ 1 ]`:
+///
+/// ```text
+/// LeftRefFrame[ 0 ]  = AvailL ? RefFrames[ MiRow ][ MiCol-1 ][ 0 ] : INTRA_FRAME
+/// LeftRefFrame[ 1 ]  = AvailL ? RefFrames[ MiRow ][ MiCol-1 ][ 1 ] : NONE
+/// AboveRefFrame[ 0 ] = AvailU ? RefFrames[ MiRow-1 ][ MiCol ][ 0 ] : INTRA_FRAME
+/// AboveRefFrame[ 1 ] = AvailU ? RefFrames[ MiRow-1 ][ MiCol ][ 1 ] : NONE
+/// ```
+///
+/// and the derived predicates
+///
+/// ```text
+/// LeftIntra   = LeftRefFrame[ 0 ]  <= INTRA_FRAME
+/// AboveIntra  = AboveRefFrame[ 0 ] <= INTRA_FRAME
+/// LeftSingle  = LeftRefFrame[ 1 ]  <= NONE
+/// AboveSingle = AboveRefFrame[ 1 ] <= NONE
+/// ```
+///
+/// (`INTRA_FRAME = 0`, `NONE = -1` per §3.) `None` here encodes the
+/// `!AvailU` / `!AvailL` cases — the §9.3.2 `comp_mode` listing branches
+/// on `AvailU` / `AvailL` directly, so availability is modelled
+/// explicitly rather than folded into the forced sentinel values.
+/// `Some(( rf0, rf1 ))` carries `RefFrame[ 0 ]` and `RefFrame[ 1 ]` for
+/// an available neighbour.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CompModeNeighbours {
+    /// `AvailU ? ( AboveRefFrame[ 0 ], AboveRefFrame[ 1 ] ) : None`.
+    pub above: Option<(i32, i32)>,
+    /// `AvailL ? ( LeftRefFrame[ 0 ], LeftRefFrame[ 1 ] ) : None`.
+    pub left: Option<(i32, i32)>,
+}
+
+/// `comp_mode` context per §9.3.2 (`vp9-spec.txt` lines 6326-6359).
+///
+/// ```text
+/// if ( AvailU && AvailL ) {
+///     if ( AboveSingle && LeftSingle )
+///         ctx = (AboveRefFrame[0] == CompFixedRef) ^ (LeftRefFrame[0] == CompFixedRef)
+///     else if ( AboveSingle )
+///         ctx = 2 + (AboveRefFrame[0] == CompFixedRef || AboveIntra)
+///     else if ( LeftSingle )
+///         ctx = 2 + (LeftRefFrame[0] == CompFixedRef || LeftIntra)
+///     else
+///         ctx = 4
+/// } else if ( AvailU ) {
+///     ctx = AboveSingle ? (AboveRefFrame[0] == CompFixedRef) : 3
+/// } else if ( AvailL ) {
+///     ctx = LeftSingle ? (LeftRefFrame[0] == CompFixedRef) : 3
+/// } else {
+///     ctx = 1
+/// }
+/// ```
+///
+/// Returns one of `0..=4` indexing `comp_mode_prob[ ctx ]` (sized by
+/// [`COMP_MODE_CONTEXTS`]). `comp_fixed_ref` is the `CompFixedRef`
+/// value derived by §6.3.18 `setup_compound_reference_mode( )`.
+///
+/// `*Intra` is `RefFrame[ 0 ] <= INTRA_FRAME` and `*Single` is
+/// `RefFrame[ 1 ] <= NONE` per the §6.4.11 derivation above.
+pub(crate) fn comp_mode_context(nb: CompModeNeighbours, comp_fixed_ref: i32) -> usize {
+    // §6.4.11 per-side predicate derivation.
+    let derive = |side: (i32, i32)| {
+        let (rf0, rf1) = side;
+        let intra = rf0 <= INTRA_FRAME;
+        let single = rf1 <= NONE_REF_FRAME;
+        let is_fixed = rf0 == comp_fixed_ref;
+        (intra, single, is_fixed)
+    };
+
+    match (nb.above, nb.left) {
+        (Some(a), Some(l)) => {
+            let (above_intra, above_single, above_fixed) = derive(a);
+            let (left_intra, left_single, left_fixed) = derive(l);
+            if above_single && left_single {
+                usize::from(above_fixed) ^ usize::from(left_fixed)
+            } else if above_single {
+                2 + usize::from(above_fixed || above_intra)
+            } else if left_single {
+                2 + usize::from(left_fixed || left_intra)
+            } else {
+                4
+            }
+        }
+        (Some(a), None) => {
+            let (_, above_single, above_fixed) = derive(a);
+            if above_single {
+                usize::from(above_fixed)
+            } else {
+                3
+            }
+        }
+        (None, Some(l)) => {
+            let (_, left_single, left_fixed) = derive(l);
+            if left_single {
+                usize::from(left_fixed)
+            } else {
+                3
+            }
+        }
+        (None, None) => 1,
+    }
+}
+
 /// `read_is_inter( )` per §6.4.13.
 ///
 /// ```text
@@ -4082,6 +4189,148 @@ mod tests {
             left: Some(NONE_REF_FRAME),
         };
         assert_eq!(is_inter_context(nb), 3);
+    }
+
+    // ----- §9.3.2 comp_mode_context -----
+
+    #[test]
+    fn comp_mode_context_neither_available_returns_one() {
+        // §9.3.2: else branch (!AvailU && !AvailL) → ctx = 1.
+        assert_eq!(
+            comp_mode_context(CompModeNeighbours::default(), ALTREF_FRAME),
+            1
+        );
+    }
+
+    #[test]
+    fn comp_mode_context_only_above_single_returns_fixed_match() {
+        // §9.3.2: else if (AvailU) → AboveSingle ? (AboveRefFrame[0] ==
+        // CompFixedRef) : 3. Single above neighbour (ref_frame[1] =
+        // NONE). ref_frame[0] == CompFixedRef → 1, else → 0.
+        let nb_match = CompModeNeighbours {
+            above: Some((ALTREF_FRAME, NONE_REF_FRAME)),
+            left: None,
+        };
+        assert_eq!(comp_mode_context(nb_match, ALTREF_FRAME), 1);
+        let nb_no_match = CompModeNeighbours {
+            above: Some((LAST_FRAME, NONE_REF_FRAME)),
+            left: None,
+        };
+        assert_eq!(comp_mode_context(nb_no_match, ALTREF_FRAME), 0);
+    }
+
+    #[test]
+    fn comp_mode_context_only_above_compound_returns_three() {
+        // §9.3.2: else if (AvailU), !AboveSingle (ref_frame[1] > NONE)
+        // → ctx = 3.
+        let nb = CompModeNeighbours {
+            above: Some((LAST_FRAME, ALTREF_FRAME)),
+            left: None,
+        };
+        assert_eq!(comp_mode_context(nb, ALTREF_FRAME), 3);
+    }
+
+    #[test]
+    fn comp_mode_context_only_left_single_returns_fixed_match() {
+        // §9.3.2: else if (AvailL) → LeftSingle ? (LeftRefFrame[0] ==
+        // CompFixedRef) : 3.
+        let nb_match = CompModeNeighbours {
+            above: None,
+            left: Some((ALTREF_FRAME, NONE_REF_FRAME)),
+        };
+        assert_eq!(comp_mode_context(nb_match, ALTREF_FRAME), 1);
+        let nb_no = CompModeNeighbours {
+            above: None,
+            left: Some((GOLDEN_FRAME, NONE_REF_FRAME)),
+        };
+        assert_eq!(comp_mode_context(nb_no, ALTREF_FRAME), 0);
+    }
+
+    #[test]
+    fn comp_mode_context_only_left_compound_returns_three() {
+        // §9.3.2: else if (AvailL), !LeftSingle → ctx = 3.
+        let nb = CompModeNeighbours {
+            above: None,
+            left: Some((LAST_FRAME, GOLDEN_FRAME)),
+        };
+        assert_eq!(comp_mode_context(nb, ALTREF_FRAME), 3);
+    }
+
+    #[test]
+    fn comp_mode_context_both_single_xors_fixed_match() {
+        // §9.3.2: AvailU && AvailL, AboveSingle && LeftSingle → ctx =
+        // (AboveRefFrame[0] == CompFixedRef) ^ (LeftRefFrame[0] ==
+        // CompFixedRef).
+        // both match → 1 ^ 1 = 0
+        let both = CompModeNeighbours {
+            above: Some((ALTREF_FRAME, NONE_REF_FRAME)),
+            left: Some((ALTREF_FRAME, NONE_REF_FRAME)),
+        };
+        assert_eq!(comp_mode_context(both, ALTREF_FRAME), 0);
+        // only above matches → 1 ^ 0 = 1
+        let above_only = CompModeNeighbours {
+            above: Some((ALTREF_FRAME, NONE_REF_FRAME)),
+            left: Some((LAST_FRAME, NONE_REF_FRAME)),
+        };
+        assert_eq!(comp_mode_context(above_only, ALTREF_FRAME), 1);
+        // neither matches → 0 ^ 0 = 0
+        let neither = CompModeNeighbours {
+            above: Some((LAST_FRAME, NONE_REF_FRAME)),
+            left: Some((GOLDEN_FRAME, NONE_REF_FRAME)),
+        };
+        assert_eq!(comp_mode_context(neither, ALTREF_FRAME), 0);
+    }
+
+    #[test]
+    fn comp_mode_context_above_single_left_compound_branch() {
+        // §9.3.2: AvailU && AvailL, AboveSingle, !LeftSingle → ctx = 2
+        // + (AboveRefFrame[0] == CompFixedRef || AboveIntra).
+        // above is fixed-ref, not intra → 2 + (true) = 3
+        let fixed = CompModeNeighbours {
+            above: Some((ALTREF_FRAME, NONE_REF_FRAME)),
+            left: Some((LAST_FRAME, GOLDEN_FRAME)),
+        };
+        assert_eq!(comp_mode_context(fixed, ALTREF_FRAME), 3);
+        // above is intra (ref_frame[0] = INTRA_FRAME), not fixed → 2 +
+        // (false || true) = 3
+        let intra = CompModeNeighbours {
+            above: Some((INTRA_FRAME, NONE_REF_FRAME)),
+            left: Some((LAST_FRAME, GOLDEN_FRAME)),
+        };
+        assert_eq!(comp_mode_context(intra, ALTREF_FRAME), 3);
+        // above neither fixed nor intra → 2 + (false) = 2
+        let plain = CompModeNeighbours {
+            above: Some((LAST_FRAME, NONE_REF_FRAME)),
+            left: Some((LAST_FRAME, GOLDEN_FRAME)),
+        };
+        assert_eq!(comp_mode_context(plain, ALTREF_FRAME), 2);
+    }
+
+    #[test]
+    fn comp_mode_context_left_single_above_compound_branch() {
+        // §9.3.2: AvailU && AvailL, !AboveSingle, LeftSingle → ctx = 2
+        // + (LeftRefFrame[0] == CompFixedRef || LeftIntra).
+        let plain = CompModeNeighbours {
+            above: Some((LAST_FRAME, GOLDEN_FRAME)),
+            left: Some((GOLDEN_FRAME, NONE_REF_FRAME)),
+        };
+        assert_eq!(comp_mode_context(plain, ALTREF_FRAME), 2);
+        let fixed = CompModeNeighbours {
+            above: Some((LAST_FRAME, GOLDEN_FRAME)),
+            left: Some((ALTREF_FRAME, NONE_REF_FRAME)),
+        };
+        assert_eq!(comp_mode_context(fixed, ALTREF_FRAME), 3);
+    }
+
+    #[test]
+    fn comp_mode_context_both_compound_returns_four() {
+        // §9.3.2: AvailU && AvailL, !AboveSingle && !LeftSingle → ctx
+        // = 4.
+        let nb = CompModeNeighbours {
+            above: Some((LAST_FRAME, ALTREF_FRAME)),
+            left: Some((GOLDEN_FRAME, ALTREF_FRAME)),
+        };
+        assert_eq!(comp_mode_context(nb, GOLDEN_FRAME), 4);
     }
 
     #[test]

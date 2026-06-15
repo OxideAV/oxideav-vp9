@@ -4,6 +4,10 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ## [Unreleased]
 
+### Other
+
+- §9.3.2 comp_mode_context — `comp_mode` probability-context derivation (5-context, neighbour ref-frame `*Single` / `*Intra` / `CompFixedRef` predicates) toward the §6.4.17 read_ref_frames driver (round 314)
+
 ## [0.0.12](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.11...v0.0.12) - 2026-06-15
 
 ### Other

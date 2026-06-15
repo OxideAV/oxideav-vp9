@@ -35,7 +35,9 @@ A substantial portion of the inter-frame motion-vector machinery is
 also present as standalone, tested primitives: §6.4.19 / §6.4.20
 `read_mv` / `read_mv_component`, the §6.5 motion-vector reference
 geometry (`find_best_ref_mvs`, `find_mv_refs`, `append_sub8x8_mvs`,
-`clamp_mv_*`), and §6.4.18 `assign_mv`.
+`clamp_mv_*`), §6.4.18 `assign_mv`, and the §9.3.2 reference-frame
+probability-context derivations feeding §6.4.17 `read_ref_frames`
+(`comp_mode_context`).
 
 ### Not yet supported
 

@@ -82,7 +82,9 @@
 #![allow(dead_code)]
 
 use crate::bool_coder::BoolCoder;
-use crate::compressed::{tx_mode_to_biggest_tx_size, TxMode};
+use crate::compressed::{
+    tx_mode_to_biggest_tx_size, CompoundReferenceConfig, ReferenceMode, TxMode,
+};
 use crate::partition::{NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP};
 use crate::residual::{
     BLOCK_8X8, BLOCK_SIZES, MAX_TXSIZE_LOOKUP, NUM_4X4_BLOCKS_HIGH_LOOKUP,
@@ -2049,6 +2051,470 @@ pub(crate) fn comp_mode_context(nb: CompModeNeighbours, comp_fixed_ref: i32) -> 
             }
         }
         (None, None) => 1,
+    }
+}
+
+/// Per-side neighbour reference-frame pairs consumed by the §9.3.2
+/// `comp_ref` / `single_ref_p1` / `single_ref_p2` context derivations
+/// and threaded into [`read_ref_frames`].
+///
+/// Each side carries the §6.4.11 prelude pair
+/// (`RefFrame[ 0 ]`, `RefFrame[ 1 ]`):
+///
+/// ```text
+/// LeftRefFrame[ 0 ]  = AvailL ? RefFrames[ MiRow ][ MiCol-1 ][ 0 ] : INTRA_FRAME
+/// LeftRefFrame[ 1 ]  = AvailL ? RefFrames[ MiRow ][ MiCol-1 ][ 1 ] : NONE
+/// AboveRefFrame[ 0 ] = AvailU ? RefFrames[ MiRow-1 ][ MiCol ][ 0 ] : INTRA_FRAME
+/// AboveRefFrame[ 1 ] = AvailU ? RefFrames[ MiRow-1 ][ MiCol ][ 1 ] : NONE
+/// ```
+///
+/// with the derived predicates `LeftIntra = LeftRefFrame[ 0 ] <= INTRA_FRAME`,
+/// `AboveIntra = AboveRefFrame[ 0 ] <= INTRA_FRAME`,
+/// `LeftSingle = LeftRefFrame[ 1 ] <= NONE`,
+/// `AboveSingle = AboveRefFrame[ 1 ] <= NONE` (`INTRA_FRAME = 0`,
+/// `NONE = -1` per §3). As with [`CompModeNeighbours`], `None` encodes
+/// the `!AvailU` / `!AvailL` cases because the §9.3.2 listings branch
+/// on `AvailU` / `AvailL` directly. `Some(( rf0, rf1 ))` carries
+/// `RefFrame[ 0 ]` and `RefFrame[ 1 ]` for an available neighbour.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RefFrameNeighbours {
+    /// `AvailU ? ( AboveRefFrame[ 0 ], AboveRefFrame[ 1 ] ) : None`.
+    pub above: Option<(i32, i32)>,
+    /// `AvailL ? ( LeftRefFrame[ 0 ], LeftRefFrame[ 1 ] ) : None`.
+    pub left: Option<(i32, i32)>,
+}
+
+/// `comp_ref` context per §9.3.2 (`vp9-spec.txt` lines 6361-6433).
+///
+/// ```text
+/// FixRefIdx = ref_frame_sign_bias[ CompFixedRef ]
+/// VarRefIdx = ! FixRefIdx
+/// if ( AvailU && AvailL ) {
+///     if ( AboveIntra && LeftIntra )         ctx = 2
+///     else if ( LeftIntra )  ctx = 1 + 2 * (Above[ AboveSingle?0:VarRefIdx ] != CompVarRef[1])
+///     else if ( AboveIntra ) ctx = 1 + 2 * (Left[ LeftSingle?0:VarRefIdx ] != CompVarRef[1])
+///     else {
+///         vrfa = AboveSingle ? AboveRefFrame[0] : AboveRefFrame[VarRefIdx]
+///         vrfl = LeftSingle  ? LeftRefFrame[0]  : LeftRefFrame[VarRefIdx]
+///         if ( vrfa == vrfl && CompVarRef[1] == vrfa ) ctx = 0
+///         else if ( LeftSingle && AboveSingle ) { ... 4 / 3 / 1 ... }
+///         else if ( LeftSingle || AboveSingle ) { ... 1 / 2 / 4 ... }
+///         else if ( vrfa == vrfl ) ctx = 4
+///         else ctx = 2
+///     }
+/// } else if ( AvailU ) { AboveIntra ? 2 : (AboveSingle ? 3*… : 4*…) }
+/// else if ( AvailL )   { LeftIntra  ? 2 : (LeftSingle  ? 3*… : 4*…) }
+/// else ctx = 2
+/// ```
+///
+/// Returns one of `0..=4` indexing `comp_ref_prob[ ctx ]` (sized by
+/// [`REF_CONTEXTS`]). `comp_fixed_ref` is `CompFixedRef`,
+/// `comp_var_ref` is `CompVarRef[ ]`, and `fix_ref_idx` is
+/// `ref_frame_sign_bias[ CompFixedRef ]` (`0` or `1`) — all derived
+/// by §6.3.18 `setup_compound_reference_mode( )`.
+///
+/// `*Intra` is `RefFrame[ 0 ] <= INTRA_FRAME` and `*Single` is
+/// `RefFrame[ 1 ] <= NONE` per the §6.4.11 derivation.
+pub(crate) fn comp_ref_context(
+    nb: RefFrameNeighbours,
+    comp_var_ref: [i32; 2],
+    fix_ref_idx: u8,
+) -> usize {
+    let var_ref_idx = usize::from(fix_ref_idx == 0);
+    let cvr1 = comp_var_ref[1];
+    // Per-side: (intra, single, RefFrame[0], RefFrame[1]).
+    let derive = |side: (i32, i32)| {
+        let (rf0, rf1) = side;
+        (rf0 <= INTRA_FRAME, rf1 <= NONE_REF_FRAME, rf0, rf1)
+    };
+    // §6.4.11 `vrf` selection: AboveSingle/LeftSingle ? RefFrame[0] : RefFrame[VarRefIdx].
+    let pick_var = |single: bool, rf0: i32, rf1: i32| {
+        if single || var_ref_idx == 0 {
+            rf0
+        } else {
+            rf1
+        }
+    };
+
+    match (nb.above, nb.left) {
+        (Some(a), Some(l)) => {
+            let (above_intra, above_single, a0, a1) = derive(a);
+            let (left_intra, left_single, l0, l1) = derive(l);
+            if above_intra && left_intra {
+                2
+            } else if left_intra {
+                1 + 2 * usize::from(pick_var(above_single, a0, a1) != cvr1)
+            } else if above_intra {
+                1 + 2 * usize::from(pick_var(left_single, l0, l1) != cvr1)
+            } else {
+                let vrfa = pick_var(above_single, a0, a1);
+                let vrfl = pick_var(left_single, l0, l1);
+                if vrfa == vrfl && cvr1 == vrfa {
+                    0
+                } else if left_single && above_single {
+                    let fixed = comp_var_ref_fixed(comp_var_ref);
+                    if (vrfa == fixed && vrfl == comp_var_ref[0])
+                        || (vrfl == fixed && vrfa == comp_var_ref[0])
+                    {
+                        4
+                    } else if vrfa == vrfl {
+                        3
+                    } else {
+                        1
+                    }
+                } else if left_single || above_single {
+                    let vrfc = if left_single { vrfa } else { vrfl };
+                    let rfs = if above_single { vrfa } else { vrfl };
+                    if vrfc == cvr1 && rfs != cvr1 {
+                        1
+                    } else if rfs == cvr1 && vrfc != cvr1 {
+                        2
+                    } else {
+                        4
+                    }
+                } else if vrfa == vrfl {
+                    4
+                } else {
+                    2
+                }
+            }
+        }
+        (Some(a), None) => {
+            let (above_intra, above_single, a0, a1) = derive(a);
+            if above_intra {
+                2
+            } else if above_single {
+                3 * usize::from(a0 != cvr1)
+            } else {
+                let v = if var_ref_idx == 0 { a0 } else { a1 };
+                4 * usize::from(v != cvr1)
+            }
+        }
+        (None, Some(l)) => {
+            let (left_intra, left_single, l0, l1) = derive(l);
+            if left_intra {
+                2
+            } else if left_single {
+                3 * usize::from(l0 != cvr1)
+            } else {
+                let v = if var_ref_idx == 0 { l0 } else { l1 };
+                4 * usize::from(v != cvr1)
+            }
+        }
+        (None, None) => 2,
+    }
+}
+
+/// `CompFixedRef` recovered from the §6.3.18 partition: the §3
+/// ref-frame index *not* present in `CompVarRef[ ]`. The compound
+/// trio `{LAST, GOLDEN, ALTREF}` sums to `LAST + GOLDEN + ALTREF =
+/// 1 + 2 + 3 = 6`, so `CompFixedRef = 6 - CompVarRef[0] - CompVarRef[1]`.
+/// Used inside [`comp_ref_context`]'s `LeftSingle && AboveSingle`
+/// branch where the §9.3.2 listing compares against `CompFixedRef`.
+fn comp_var_ref_fixed(comp_var_ref: [i32; 2]) -> i32 {
+    (LAST_FRAME + GOLDEN_FRAME + ALTREF_FRAME) - comp_var_ref[0] - comp_var_ref[1]
+}
+
+/// `single_ref_p1` context per §9.3.2 (`vp9-spec.txt` lines 6436-6507).
+///
+/// Returns one of `0..=4` indexing `single_ref_prob[ ctx ][ 0 ]`
+/// (sized by [`REF_CONTEXTS`]). The full branch ladder mirrors the
+/// §9.3.2 listing exactly. `*Intra` is `RefFrame[ 0 ] <= INTRA_FRAME`
+/// and `*Single` is `RefFrame[ 1 ] <= NONE` per §6.4.11; all
+/// comparisons are against `LAST_FRAME`.
+pub(crate) fn single_ref_p1_context(nb: RefFrameNeighbours) -> usize {
+    let is_last = |rf: i32| rf == LAST_FRAME;
+    let derive = |side: (i32, i32)| {
+        let (rf0, rf1) = side;
+        (rf0 <= INTRA_FRAME, rf1 <= NONE_REF_FRAME, rf0, rf1)
+    };
+    match (nb.above, nb.left) {
+        (Some(a), Some(l)) => {
+            let (above_intra, above_single, a0, a1) = derive(a);
+            let (left_intra, left_single, l0, l1) = derive(l);
+            if above_intra && left_intra {
+                2
+            } else if left_intra {
+                if above_single {
+                    4 * usize::from(is_last(a0))
+                } else {
+                    1 + usize::from(is_last(a0) || is_last(a1))
+                }
+            } else if above_intra {
+                if left_single {
+                    4 * usize::from(is_last(l0))
+                } else {
+                    1 + usize::from(is_last(l0) || is_last(l1))
+                }
+            } else if above_single && left_single {
+                2 * usize::from(is_last(a0)) + 2 * usize::from(is_last(l0))
+            } else if !above_single && !left_single {
+                1 + usize::from(is_last(a0) || is_last(a1) || is_last(l0) || is_last(l1))
+            } else {
+                let (rfs, crf1, crf2) = if above_single {
+                    (a0, l0, l1)
+                } else {
+                    (l0, a0, a1)
+                };
+                if is_last(rfs) {
+                    3 + usize::from(is_last(crf1) || is_last(crf2))
+                } else {
+                    usize::from(is_last(crf1) || is_last(crf2))
+                }
+            }
+        }
+        (Some(a), None) => {
+            let (above_intra, above_single, a0, a1) = derive(a);
+            if above_intra {
+                2
+            } else if above_single {
+                4 * usize::from(is_last(a0))
+            } else {
+                1 + usize::from(is_last(a0) || is_last(a1))
+            }
+        }
+        (None, Some(l)) => {
+            let (left_intra, left_single, l0, l1) = derive(l);
+            if left_intra {
+                2
+            } else if left_single {
+                4 * usize::from(is_last(l0))
+            } else {
+                1 + usize::from(is_last(l0) || is_last(l1))
+            }
+        }
+        (None, None) => 2,
+    }
+}
+
+/// `single_ref_p2` context per §9.3.2 (`vp9-spec.txt` lines 6510-6584).
+///
+/// Returns one of `0..=4` indexing `single_ref_prob[ ctx ][ 1 ]`
+/// (sized by [`REF_CONTEXTS`]). The full branch ladder mirrors the
+/// §9.3.2 listing exactly. `*Intra` is `RefFrame[ 0 ] <= INTRA_FRAME`
+/// and `*Single` is `RefFrame[ 1 ] <= NONE` per §6.4.11; comparisons
+/// are against `LAST_FRAME` / `GOLDEN_FRAME` / `ALTREF_FRAME`.
+pub(crate) fn single_ref_p2_context(nb: RefFrameNeighbours) -> usize {
+    let is_last = |rf: i32| rf == LAST_FRAME;
+    let is_gold = |rf: i32| rf == GOLDEN_FRAME;
+    let is_alt = |rf: i32| rf == ALTREF_FRAME;
+    let derive = |side: (i32, i32)| {
+        let (rf0, rf1) = side;
+        (rf0 <= INTRA_FRAME, rf1 <= NONE_REF_FRAME, rf0, rf1)
+    };
+    match (nb.above, nb.left) {
+        (Some(a), Some(l)) => {
+            let (above_intra, above_single, a0, a1) = derive(a);
+            let (left_intra, left_single, l0, l1) = derive(l);
+            if above_intra && left_intra {
+                2
+            } else if left_intra {
+                if above_single {
+                    if is_last(a0) {
+                        3
+                    } else {
+                        4 * usize::from(is_gold(a0))
+                    }
+                } else {
+                    1 + 2 * usize::from(is_gold(a0) || is_gold(a1))
+                }
+            } else if above_intra {
+                if left_single {
+                    if is_last(l0) {
+                        3
+                    } else {
+                        4 * usize::from(is_gold(l0))
+                    }
+                } else {
+                    1 + 2 * usize::from(is_gold(l0) || is_gold(l1))
+                }
+            } else if above_single && left_single {
+                if is_last(a0) && is_last(l0) {
+                    3
+                } else if is_last(a0) {
+                    4 * usize::from(is_gold(l0))
+                } else if is_last(l0) {
+                    4 * usize::from(is_gold(a0))
+                } else {
+                    2 * usize::from(is_gold(a0)) + 2 * usize::from(is_gold(l0))
+                }
+            } else if !above_single && !left_single {
+                if a0 == l0 && a1 == l1 {
+                    3 * usize::from(is_gold(a0) || is_gold(a1))
+                } else {
+                    2
+                }
+            } else {
+                let (rfs, crf1, crf2) = if above_single {
+                    (a0, l0, l1)
+                } else {
+                    (l0, a0, a1)
+                };
+                if is_gold(rfs) {
+                    3 + usize::from(is_gold(crf1) || is_gold(crf2))
+                } else if is_alt(rfs) {
+                    usize::from(is_gold(crf1) || is_gold(crf2))
+                } else {
+                    1 + 2 * usize::from(is_gold(crf1) || is_gold(crf2))
+                }
+            }
+        }
+        (Some(a), None) => {
+            let (above_intra, above_single, a0, a1) = derive(a);
+            if above_intra || (is_last(a0) && above_single) {
+                2
+            } else if above_single {
+                4 * usize::from(is_gold(a0))
+            } else {
+                3 * usize::from(is_gold(a0) || is_gold(a1))
+            }
+        }
+        (None, Some(l)) => {
+            let (left_intra, left_single, l0, l1) = derive(l);
+            if left_intra || (is_last(l0) && left_single) {
+                2
+            } else if left_single {
+                4 * usize::from(is_gold(l0))
+            } else {
+                3 * usize::from(is_gold(l0) || is_gold(l1))
+            }
+        }
+        (None, None) => 2,
+    }
+}
+
+/// Resolved reference-frame pair output of [`read_ref_frames`].
+///
+/// `ref_frame[ 0 ]` is always a valid reference (`LAST` / `GOLDEN` /
+/// `ALTREF`, or a §SEG_LVL_REF_FRAME override). `ref_frame[ 1 ]` is
+/// `NONE` for single prediction or the compound variable reference
+/// for compound prediction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RefFramePair {
+    /// `ref_frame[ 0 ]` per §6.4.17.
+    pub ref_frame_0: i32,
+    /// `ref_frame[ 1 ]` per §6.4.17 (`NONE` when single).
+    pub ref_frame_1: i32,
+    /// `comp_mode == COMPOUND_REFERENCE` for this block.
+    pub is_compound: bool,
+}
+
+/// `read_ref_frames( )` per §6.4.17 (`vp9-spec.txt` lines 2713-2739).
+///
+/// ```text
+/// read_ref_frames( ) {
+///     if ( seg_feature_active( SEG_LVL_REF_FRAME ) ) {
+///         ref_frame[ 0 ] = FeatureData[ segment_id ][ SEG_LVL_REF_FRAME ]
+///         ref_frame[ 1 ] = NONE
+///     } else {
+///         if ( reference_mode == REFERENCE_MODE_SELECT )  comp_mode  T
+///         else                                            comp_mode = reference_mode
+///         if ( comp_mode == COMPOUND_REFERENCE ) {
+///             idx = ref_frame_sign_bias[ CompFixedRef ]
+///             comp_ref                                               T
+///             ref_frame[ idx ]  = CompFixedRef
+///             ref_frame[ !idx ] = CompVarRef[ comp_ref ]
+///         } else {
+///             single_ref_p1                                         T
+///             if ( single_ref_p1 ) {
+///                 single_ref_p2                                     T
+///                 ref_frame[ 0 ] = single_ref_p2 ? ALTREF_FRAME : GOLDEN_FRAME
+///             } else {
+///                 ref_frame[ 0 ] = LAST_FRAME
+///             }
+///             ref_frame[ 1 ] = NONE
+///         }
+///     }
+/// }
+/// ```
+///
+/// Threads the §9.3.2 context derivations ([`comp_mode_context`],
+/// [`comp_ref_context`], [`single_ref_p1_context`],
+/// [`single_ref_p2_context`]) against the supplied `nb` neighbours.
+/// Each of `comp_mode` / `comp_ref` / `single_ref_p1` / `single_ref_p2`
+/// is a §9.3.3 token under the §9.3.1 [`BINARY_TREE`] (equivalently a
+/// single §9.2.2 `read_bool` at the indicated probability).
+///
+/// * `seg_feature_ref_frame_active` is `seg_feature_active(
+///   SEG_LVL_REF_FRAME )` and `segment_ref_frame_data` is
+///   `FeatureData[ segment_id ][ SEG_LVL_REF_FRAME ]` (the §6.2.10
+///   override slot). On the active path no bool-coder reads occur.
+/// * `reference_mode`, `comp_config` (`CompFixedRef` / `CompVarRef[ ]`),
+///   and `fix_ref_idx` (`ref_frame_sign_bias[ CompFixedRef ]`) come
+///   from §6.3.12 / §6.3.18.
+/// * `comp_mode_prob` / `single_ref_prob` / `comp_ref_prob` are the
+///   §6.3.13-swept probability tables.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn read_ref_frames(
+    coder: &mut BoolCoder<'_>,
+    seg_feature_ref_frame_active: bool,
+    segment_ref_frame_data: i16,
+    reference_mode: ReferenceMode,
+    comp_config: CompoundReferenceConfig,
+    fix_ref_idx: u8,
+    nb: RefFrameNeighbours,
+    comp_mode_prob: &[u8; COMP_MODE_CONTEXTS],
+    single_ref_prob: &[[u8; 2]; REF_CONTEXTS],
+    comp_ref_prob: &[u8; REF_CONTEXTS],
+) -> Result<RefFramePair, Error> {
+    if seg_feature_ref_frame_active {
+        return Ok(RefFramePair {
+            ref_frame_0: i32::from(segment_ref_frame_data),
+            ref_frame_1: NONE_REF_FRAME,
+            is_compound: false,
+        });
+    }
+
+    // §6.4.17: comp_mode is read only under REFERENCE_MODE_SELECT;
+    // otherwise it is the frame-level reference_mode directly.
+    let is_compound = match reference_mode {
+        ReferenceMode::ReferenceModeSelect => {
+            let ctx = comp_mode_context(
+                CompModeNeighbours {
+                    above: nb.above,
+                    left: nb.left,
+                },
+                comp_config.fixed_ref,
+            );
+            tree_decode(coder, &BINARY_TREE, |_| comp_mode_prob[ctx])? != 0
+        }
+        ReferenceMode::CompoundReference => true,
+        ReferenceMode::SingleReference => false,
+    };
+
+    if is_compound {
+        // idx = ref_frame_sign_bias[ CompFixedRef ]; the variable ref
+        // goes to the complementary slot.
+        let idx = usize::from(fix_ref_idx);
+        let ctx = comp_ref_context(nb, comp_config.var_ref, fix_ref_idx);
+        let comp_ref = tree_decode(coder, &BINARY_TREE, |_| comp_ref_prob[ctx])?;
+        let mut ref_frame = [NONE_REF_FRAME; 2];
+        ref_frame[idx] = comp_config.fixed_ref;
+        ref_frame[1 - idx] = comp_config.var_ref[comp_ref as usize];
+        Ok(RefFramePair {
+            ref_frame_0: ref_frame[0],
+            ref_frame_1: ref_frame[1],
+            is_compound: true,
+        })
+    } else {
+        let ctx1 = single_ref_p1_context(nb);
+        let single_ref_p1 = tree_decode(coder, &BINARY_TREE, |_| single_ref_prob[ctx1][0])?;
+        let ref_frame_0 = if single_ref_p1 != 0 {
+            let ctx2 = single_ref_p2_context(nb);
+            let single_ref_p2 = tree_decode(coder, &BINARY_TREE, |_| single_ref_prob[ctx2][1])?;
+            if single_ref_p2 != 0 {
+                ALTREF_FRAME
+            } else {
+                GOLDEN_FRAME
+            }
+        } else {
+            LAST_FRAME
+        };
+        Ok(RefFramePair {
+            ref_frame_0,
+            ref_frame_1: NONE_REF_FRAME,
+            is_compound: false,
+        })
     }
 }
 
@@ -4331,6 +4797,409 @@ mod tests {
             left: Some((GOLDEN_FRAME, ALTREF_FRAME)),
         };
         assert_eq!(comp_mode_context(nb, GOLDEN_FRAME), 4);
+    }
+
+    // ----- §9.3.2 comp_ref_context -----
+    //
+    // The §6.3.18 partition used throughout: CompFixedRef = ALTREF_FRAME,
+    // CompVarRef = { LAST_FRAME, GOLDEN_FRAME }. With
+    // ref_frame_sign_bias[ ALTREF_FRAME ] = 0 → FixRefIdx = 0,
+    // VarRefIdx = 1. CompVarRef[ 1 ] = GOLDEN_FRAME drives the
+    // `!= CompVarRef[1]` comparisons.
+
+    const CVR: [i32; 2] = [LAST_FRAME, GOLDEN_FRAME];
+
+    #[test]
+    fn comp_ref_context_neither_available_returns_two() {
+        assert_eq!(comp_ref_context(RefFrameNeighbours::default(), CVR, 0), 2);
+    }
+
+    #[test]
+    fn comp_ref_context_both_intra_returns_two() {
+        let nb = RefFrameNeighbours {
+            above: Some((INTRA_FRAME, NONE_REF_FRAME)),
+            left: Some((INTRA_FRAME, NONE_REF_FRAME)),
+        };
+        assert_eq!(comp_ref_context(nb, CVR, 0), 2);
+    }
+
+    #[test]
+    fn comp_ref_context_left_intra_above_single_var_matches() {
+        // LeftIntra, AboveSingle, VarRefIdx=1 → since AboveSingle the
+        // pick is AboveRefFrame[0]. Above single GOLDEN == CompVarRef[1]
+        // → ctx = 1 + 2*0 = 1.
+        let nb = RefFrameNeighbours {
+            above: Some((GOLDEN_FRAME, NONE_REF_FRAME)),
+            left: Some((INTRA_FRAME, NONE_REF_FRAME)),
+        };
+        assert_eq!(comp_ref_context(nb, CVR, 0), 1);
+    }
+
+    #[test]
+    fn comp_ref_context_left_intra_above_single_var_differs() {
+        // AboveRefFrame[0] = LAST != GOLDEN → ctx = 1 + 2 = 3.
+        let nb = RefFrameNeighbours {
+            above: Some((LAST_FRAME, NONE_REF_FRAME)),
+            left: Some((INTRA_FRAME, NONE_REF_FRAME)),
+        };
+        assert_eq!(comp_ref_context(nb, CVR, 0), 3);
+    }
+
+    #[test]
+    fn comp_ref_context_both_single_both_var_match_returns_zero() {
+        // Both single, vrfa = vrfl = GOLDEN = CompVarRef[1] → ctx = 0.
+        let nb = RefFrameNeighbours {
+            above: Some((GOLDEN_FRAME, NONE_REF_FRAME)),
+            left: Some((GOLDEN_FRAME, NONE_REF_FRAME)),
+        };
+        assert_eq!(comp_ref_context(nb, CVR, 0), 0);
+    }
+
+    #[test]
+    fn comp_ref_context_both_single_fixed_var0_cross_returns_four() {
+        // Both single, vrfa = ALTREF (=CompFixedRef), vrfl = LAST
+        // (=CompVarRef[0]) → first disjunct true → ctx = 4.
+        let nb = RefFrameNeighbours {
+            above: Some((ALTREF_FRAME, NONE_REF_FRAME)),
+            left: Some((LAST_FRAME, NONE_REF_FRAME)),
+        };
+        assert_eq!(comp_ref_context(nb, CVR, 0), 4);
+    }
+
+    #[test]
+    fn comp_ref_context_both_single_equal_nonvar_returns_three() {
+        // Both single, vrfa = vrfl = LAST, not CompVarRef[1], and the
+        // fixed/var0 cross test fails → vrfa == vrfl → ctx = 3.
+        let nb = RefFrameNeighbours {
+            above: Some((LAST_FRAME, NONE_REF_FRAME)),
+            left: Some((LAST_FRAME, NONE_REF_FRAME)),
+        };
+        assert_eq!(comp_ref_context(nb, CVR, 0), 3);
+    }
+
+    #[test]
+    fn comp_ref_context_only_above_compound_var_match_returns_zero() {
+        // AvailU only, !AboveIntra, !AboveSingle, VarRefIdx=1 →
+        // 4 * (AboveRefFrame[1] != CompVarRef[1]); AboveRefFrame[1] =
+        // GOLDEN == CompVarRef[1] → ctx = 0.
+        let nb = RefFrameNeighbours {
+            above: Some((LAST_FRAME, GOLDEN_FRAME)),
+            left: None,
+        };
+        assert_eq!(comp_ref_context(nb, CVR, 0), 0);
+    }
+
+    #[test]
+    fn comp_ref_context_only_left_single_var_differs_returns_three() {
+        // AvailL only, LeftSingle, LeftRefFrame[0] = LAST != GOLDEN →
+        // 3 * 1 = 3.
+        let nb = RefFrameNeighbours {
+            above: None,
+            left: Some((LAST_FRAME, NONE_REF_FRAME)),
+        };
+        assert_eq!(comp_ref_context(nb, CVR, 0), 3);
+    }
+
+    // ----- §9.3.2 single_ref_p1_context -----
+
+    #[test]
+    fn single_ref_p1_context_neither_available_returns_two() {
+        assert_eq!(single_ref_p1_context(RefFrameNeighbours::default()), 2);
+    }
+
+    #[test]
+    fn single_ref_p1_context_both_single_both_last_returns_four() {
+        // AboveSingle && LeftSingle, both LAST → 2*1 + 2*1 = 4.
+        let nb = RefFrameNeighbours {
+            above: Some((LAST_FRAME, NONE_REF_FRAME)),
+            left: Some((LAST_FRAME, NONE_REF_FRAME)),
+        };
+        assert_eq!(single_ref_p1_context(nb), 4);
+    }
+
+    #[test]
+    fn single_ref_p1_context_both_compound_no_last_returns_one() {
+        // !AboveSingle && !LeftSingle, no LAST anywhere → 1 + 0 = 1.
+        let nb = RefFrameNeighbours {
+            above: Some((GOLDEN_FRAME, ALTREF_FRAME)),
+            left: Some((GOLDEN_FRAME, ALTREF_FRAME)),
+        };
+        assert_eq!(single_ref_p1_context(nb), 1);
+    }
+
+    #[test]
+    fn single_ref_p1_context_mixed_single_last_branch_returns_four() {
+        // AboveSingle, LeftCompound: rfs = AboveRefFrame[0] = LAST →
+        // ctx = 3 + (crf1==LAST || crf2==LAST). crf1/crf2 from left =
+        // GOLDEN/ALTREF → 3 + 0 = 3.
+        let nb = RefFrameNeighbours {
+            above: Some((LAST_FRAME, NONE_REF_FRAME)),
+            left: Some((GOLDEN_FRAME, ALTREF_FRAME)),
+        };
+        assert_eq!(single_ref_p1_context(nb), 3);
+    }
+
+    #[test]
+    fn single_ref_p1_context_only_above_single_last_returns_four() {
+        let nb = RefFrameNeighbours {
+            above: Some((LAST_FRAME, NONE_REF_FRAME)),
+            left: None,
+        };
+        assert_eq!(single_ref_p1_context(nb), 4);
+    }
+
+    // ----- §9.3.2 single_ref_p2_context -----
+
+    #[test]
+    fn single_ref_p2_context_neither_available_returns_two() {
+        assert_eq!(single_ref_p2_context(RefFrameNeighbours::default()), 2);
+    }
+
+    #[test]
+    fn single_ref_p2_context_both_single_both_last_returns_three() {
+        let nb = RefFrameNeighbours {
+            above: Some((LAST_FRAME, NONE_REF_FRAME)),
+            left: Some((LAST_FRAME, NONE_REF_FRAME)),
+        };
+        assert_eq!(single_ref_p2_context(nb), 3);
+    }
+
+    #[test]
+    fn single_ref_p2_context_both_single_both_golden_returns_four() {
+        // Neither LAST → 2*(above==GOLDEN) + 2*(left==GOLDEN) = 4.
+        let nb = RefFrameNeighbours {
+            above: Some((GOLDEN_FRAME, NONE_REF_FRAME)),
+            left: Some((GOLDEN_FRAME, NONE_REF_FRAME)),
+        };
+        assert_eq!(single_ref_p2_context(nb), 4);
+    }
+
+    #[test]
+    fn single_ref_p2_context_mixed_single_golden_branch() {
+        // AboveSingle, LeftCompound: rfs = GOLDEN → 3 + (crf1==GOLDEN ||
+        // crf2==GOLDEN). Left = LAST/ALTREF → 3 + 0 = 3.
+        let nb = RefFrameNeighbours {
+            above: Some((GOLDEN_FRAME, NONE_REF_FRAME)),
+            left: Some((LAST_FRAME, ALTREF_FRAME)),
+        };
+        assert_eq!(single_ref_p2_context(nb), 3);
+    }
+
+    #[test]
+    fn single_ref_p2_context_only_above_last_single_returns_two() {
+        // AvailU only, AboveSingle && AboveRefFrame[0]==LAST → ctx = 2.
+        let nb = RefFrameNeighbours {
+            above: Some((LAST_FRAME, NONE_REF_FRAME)),
+            left: None,
+        };
+        assert_eq!(single_ref_p2_context(nb), 2);
+    }
+
+    #[test]
+    fn single_ref_p2_context_only_left_golden_single_returns_four() {
+        let nb = RefFrameNeighbours {
+            above: None,
+            left: Some((GOLDEN_FRAME, NONE_REF_FRAME)),
+        };
+        assert_eq!(single_ref_p2_context(nb), 4);
+    }
+
+    // ----- §6.4.17 read_ref_frames -----
+
+    fn cfg_altref_fixed() -> CompoundReferenceConfig {
+        // §6.3.18 partition: CompFixedRef = ALTREF_FRAME,
+        // CompVarRef = { LAST_FRAME, GOLDEN_FRAME }.
+        CompoundReferenceConfig {
+            fixed_ref: ALTREF_FRAME,
+            var_ref: [LAST_FRAME, GOLDEN_FRAME],
+        }
+    }
+
+    #[test]
+    fn read_ref_frames_seg_feature_active_uses_override_no_reads() {
+        // Active SEG_LVL_REF_FRAME → ref_frame[0] = override, [1] = NONE,
+        // single. No bool-coder traffic.
+        let mut coder = zero_coder();
+        let out = read_ref_frames(
+            &mut coder,
+            true,
+            GOLDEN_FRAME as i16,
+            ReferenceMode::ReferenceModeSelect,
+            cfg_altref_fixed(),
+            0,
+            RefFrameNeighbours::default(),
+            &[128; COMP_MODE_CONTEXTS],
+            &[[128; 2]; REF_CONTEXTS],
+            &[128; REF_CONTEXTS],
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            RefFramePair {
+                ref_frame_0: GOLDEN_FRAME,
+                ref_frame_1: NONE_REF_FRAME,
+                is_compound: false,
+            }
+        );
+    }
+
+    #[test]
+    fn read_ref_frames_single_reference_mode_p1_zero_picks_last() {
+        // SINGLE_REFERENCE: no comp_mode read. single_ref_p1 from the
+        // zero buffer → 0 → ref_frame[0] = LAST_FRAME, [1] = NONE.
+        let mut coder = zero_coder();
+        let out = read_ref_frames(
+            &mut coder,
+            false,
+            0,
+            ReferenceMode::SingleReference,
+            cfg_altref_fixed(),
+            0,
+            RefFrameNeighbours::default(),
+            &[128; COMP_MODE_CONTEXTS],
+            &[[128; 2]; REF_CONTEXTS],
+            &[128; REF_CONTEXTS],
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            RefFramePair {
+                ref_frame_0: LAST_FRAME,
+                ref_frame_1: NONE_REF_FRAME,
+                is_compound: false,
+            }
+        );
+    }
+
+    #[test]
+    fn read_ref_frames_single_reference_p1_one_p2_zero_picks_golden() {
+        // single_ref_p1 = 1 (bias buffer flips at p=255), single_ref_p2
+        // = 0 (renorm refills zeros) → ref_frame[0] = GOLDEN_FRAME.
+        // Drive single_ref_prob[ctx][0] = 255 so the first read flips.
+        let bytes = make_bias_buffer(0x7F);
+        let mut coder = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let mut single = [[1u8; 2]; REF_CONTEXTS];
+        // p1 prob 255 (flip to 1), p2 prob 1 (stay 0 after refill).
+        for s in single.iter_mut() {
+            s[0] = 255;
+            s[1] = 1;
+        }
+        let out = read_ref_frames(
+            &mut coder,
+            false,
+            0,
+            ReferenceMode::SingleReference,
+            cfg_altref_fixed(),
+            0,
+            RefFrameNeighbours::default(),
+            &[128; COMP_MODE_CONTEXTS],
+            &single,
+            &[128; REF_CONTEXTS],
+        )
+        .unwrap();
+        assert_eq!(out.ref_frame_0, GOLDEN_FRAME);
+        assert_eq!(out.ref_frame_1, NONE_REF_FRAME);
+        assert!(!out.is_compound);
+    }
+
+    #[test]
+    fn read_ref_frames_compound_mode_comp_ref_zero_picks_var0() {
+        // COMPOUND_REFERENCE: no comp_mode read. comp_ref = 0 (zero
+        // buffer). FixRefIdx = 0 → ref_frame[0] = CompFixedRef =
+        // ALTREF_FRAME, ref_frame[1] = CompVarRef[0] = LAST_FRAME.
+        let mut coder = zero_coder();
+        let out = read_ref_frames(
+            &mut coder,
+            false,
+            0,
+            ReferenceMode::CompoundReference,
+            cfg_altref_fixed(),
+            0,
+            RefFrameNeighbours::default(),
+            &[128; COMP_MODE_CONTEXTS],
+            &[[128; 2]; REF_CONTEXTS],
+            &[128; REF_CONTEXTS],
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            RefFramePair {
+                ref_frame_0: ALTREF_FRAME,
+                ref_frame_1: LAST_FRAME,
+                is_compound: true,
+            }
+        );
+    }
+
+    #[test]
+    fn read_ref_frames_compound_fix_ref_idx_one_swaps_slots() {
+        // FixRefIdx = 1 → ref_frame[1] = CompFixedRef, ref_frame[0] =
+        // CompVarRef[comp_ref]. comp_ref = 0 → ref_frame[0] =
+        // CompVarRef[0] = LAST_FRAME, ref_frame[1] = ALTREF_FRAME.
+        let mut coder = zero_coder();
+        let out = read_ref_frames(
+            &mut coder,
+            false,
+            0,
+            ReferenceMode::CompoundReference,
+            cfg_altref_fixed(),
+            1,
+            RefFrameNeighbours::default(),
+            &[128; COMP_MODE_CONTEXTS],
+            &[[128; 2]; REF_CONTEXTS],
+            &[128; REF_CONTEXTS],
+        )
+        .unwrap();
+        assert_eq!(out.ref_frame_0, LAST_FRAME);
+        assert_eq!(out.ref_frame_1, ALTREF_FRAME);
+        assert!(out.is_compound);
+    }
+
+    #[test]
+    fn read_ref_frames_select_mode_comp_mode_zero_is_single() {
+        // REFERENCE_MODE_SELECT: comp_mode read first. Zero buffer →
+        // comp_mode = 0 → single path → single_ref_p1 = 0 → LAST_FRAME.
+        let mut coder = zero_coder();
+        let out = read_ref_frames(
+            &mut coder,
+            false,
+            0,
+            ReferenceMode::ReferenceModeSelect,
+            cfg_altref_fixed(),
+            0,
+            RefFrameNeighbours::default(),
+            &[128; COMP_MODE_CONTEXTS],
+            &[[128; 2]; REF_CONTEXTS],
+            &[128; REF_CONTEXTS],
+        )
+        .unwrap();
+        assert_eq!(out.ref_frame_0, LAST_FRAME);
+        assert!(!out.is_compound);
+    }
+
+    #[test]
+    fn read_ref_frames_select_mode_comp_mode_one_is_compound() {
+        // comp_mode flips to 1 at comp_mode_prob = 255 → compound path.
+        let bytes = make_bias_buffer(0x7F);
+        let mut coder = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
+        let out = read_ref_frames(
+            &mut coder,
+            false,
+            0,
+            ReferenceMode::ReferenceModeSelect,
+            cfg_altref_fixed(),
+            0,
+            RefFrameNeighbours::default(),
+            &[255; COMP_MODE_CONTEXTS],
+            &[[128; 2]; REF_CONTEXTS],
+            &[1; REF_CONTEXTS],
+        )
+        .unwrap();
+        // comp_ref (prob 1) stays 0 after the comp_mode flip consumed
+        // the one bit of "1" capacity → CompVarRef[0] = LAST_FRAME.
+        assert!(out.is_compound);
+        assert_eq!(out.ref_frame_0, ALTREF_FRAME);
+        assert_eq!(out.ref_frame_1, LAST_FRAME);
     }
 
     #[test]

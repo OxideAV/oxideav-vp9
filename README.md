@@ -35,16 +35,18 @@ A substantial portion of the inter-frame motion-vector machinery is
 also present as standalone, tested primitives: §6.4.19 / §6.4.20
 `read_mv` / `read_mv_component`, the §6.5 motion-vector reference
 geometry (`find_best_ref_mvs`, `find_mv_refs`, `append_sub8x8_mvs`,
-`clamp_mv_*`), §6.4.18 `assign_mv`, and the §9.3.2 reference-frame
-probability-context derivations feeding §6.4.17 `read_ref_frames`
-(`comp_mode_context`).
+`clamp_mv_*`), §6.4.18 `assign_mv`, and the §6.4.17 `read_ref_frames`
+driver itself — resolving `ref_frame[ 0 ]` / `ref_frame[ 1 ]` for the
+single-, compound-, and segment-override paths atop the §9.3.2
+`comp_mode` / `comp_ref` / `single_ref_p1` / `single_ref_p2`
+probability-context derivations.
 
 ### Not yet supported
 
 * Inter frames end-to-end: reference-buffer state, the §6.4.16
-  `inter_block_mode_info` / §6.4.17 `read_ref_frames` driver that
-  threads the MV primitives against the frame-wide per-MI arrays, and
-  §8.5.2 inter prediction (motion compensation).
+  `inter_block_mode_info` driver that threads `read_ref_frames` and the
+  MV primitives against the frame-wide per-MI arrays, and §8.5.2 inter
+  prediction (motion compensation).
 * `show_existing_frame` (returns `Error::Unsupported`).
 * §8.4 probability adaptation / §6.1.2 frame-context refresh
   (single-frame decode does not persist contexts).
@@ -53,7 +55,7 @@ probability-context derivations feeding §6.4.17 `read_ref_frames`
 
 ## Testing
 
-The crate carries 648 lib unit tests plus integration suites in
+The crate carries 684 lib unit tests plus integration suites in
 `tests/`. Tests construct their inputs bit-by-bit; §9.2 golden buffers
 are hand-derived by stepping the decoder, not borrowed from any
 third-party VP9 implementation. A `cargo-fuzz` harness lives in

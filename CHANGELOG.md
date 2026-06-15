@@ -4,6 +4,38 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.11...v0.0.12) - 2026-06-15
+
+### Other
+
+- §6.4.18 assign_mv( ) per-reference-list motion-vector resolver
+- §6.5.14 append_sub8x8_mvs — sub-8x8 inter motion-vector predictor builder (round 305)
+- §6.5.1 find_mv_refs candidate scan + §6.5.6-6.5.11 helpers
+- §6.5.2/§6.5.3/§6.5.4/§6.5.5/§6.5.12 motion-vector reference geometry — clamp + find_best_ref_mvs primitives (round 293)
+- §6.4.19/§6.4.20 motion-vector residual syntax — read_mv + read_mv_component leaf primitives (round 288)
+- §6.4/§6.4.4/§8.8 top-level intra decode wiring — decode_vp9 decodes keyframes end-to-end
+- stand cargo-fuzz back up — frame_header + compressed_header panic-surface targets + tracked seed corpus (round 282)
+- §8.8 loop filter process — frame-level raster driver + 3-plane CurrFrame (round 281)
+- §8.8.2 superblock loop filter — full per-plane per-pass driver (steps 1-17)
+- §8.8.2 superblock loop filter per-edge predicate derivation (steps 1-14)
+- §8.8.5 sample_filtering outer driver (round 267)
+- Round 259: §8.8.5.3 wide_filter( ) — per-edge low-pass leaf primitive
+- Round 255: §8.8.5.2 narrow_filter( ) — per-edge sample-mutation leaf primitive
+- Round 253: §8.8.5.1 filter_mask( ) — per-edge filter-mask leaf primitive
+- Round 250: §8.8.4 adaptive_filter_strength( ) — per-edge filter-strength leaf primitive
+- drop release-plz.toml — use release-plz defaults across the workspace
+- Round 244: §8.8.3 filter_size( ) — per-edge filter-size leaf primitive
+- Round 37: §8.8.1 loop_filter_frame_init( ) — public LvlLookup builder
+- Round 36: §6.4 lines 2306-2311 byte-walk lifted to a public primitive — tile_payload_sizes
+- Round 35: §6.3 parse_compressed_header_inter integration-test coverage
+- Round 34: §6.3 if (FrameIsIntra == 0) outer dispatch — parse_compressed_header_inter entry point
+- Round 33: §6.4 decode_tiles( ) outer driver — frame-level tile walk
+- Round 32: §6.4.1 get_tile_offset + §6.4.2 decode_tile — tile-driver primitive layer
+- Round 31: §6.4.4 decode_block( ) driver — pure-state fan-out primitive
+- Round 30: §6.3.16 mv_probs() compressed-header outer sweep
+- Round 29: §6.3.12 frame_reference_mode() compressed-header outer driver
+- Round 28: §6.3.18 setup_compound_reference_mode() pure-compute leaf
+
 ### Added
 
 * **Round 309: §6.4.18 `assign_mv( isCompound )` — the per-reference-list

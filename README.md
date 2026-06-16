@@ -31,22 +31,30 @@ The decode path composes:
   `to_planar_bytes` packing (8-bit bytes; little-endian pairs for
   10/12-bit).
 
-A substantial portion of the inter-frame motion-vector machinery is
-also present as standalone, tested primitives: §6.4.19 / §6.4.20
-`read_mv` / `read_mv_component`, the §6.5 motion-vector reference
-geometry (`find_best_ref_mvs`, `find_mv_refs`, `append_sub8x8_mvs`,
-`clamp_mv_*`), §6.4.18 `assign_mv`, and the §6.4.17 `read_ref_frames`
-driver itself — resolving `ref_frame[ 0 ]` / `ref_frame[ 1 ]` for the
-single-, compound-, and segment-override paths atop the §9.3.2
-`comp_mode` / `comp_ref` / `single_ref_p1` / `single_ref_p2`
-probability-context derivations.
+The inter-frame mode-info decode is assembled through the §6.4.16
+`inter_block_mode_info` driver, which ties the previously-standalone
+motion-vector primitives into one per-block pass: §6.4.17
+`read_ref_frames` resolves `ref_frame[ 0 ]` / `ref_frame[ 1 ]` (single,
+compound, segment-override) atop the §9.3.2 `comp_mode` / `comp_ref` /
+`single_ref_p1` / `single_ref_p2` contexts; the §6.5 reference geometry
+(`find_mv_refs`, `find_best_ref_mvs`, `append_sub8x8_mvs`, `clamp_mv_*`)
+supplies the `NearestMv` / `NearMv` / `BestMv` predictors; the §9.3.1
+`inter_mode_tree` / `interp_filter_tree` read the per-block `inter_mode`
+(via `ModeContext[ ref_frame[ 0 ] ]`) and switchable `interp_filter`;
+and §6.4.18 `assign_mv` plus §6.4.19 / §6.4.20 `read_mv` /
+`read_mv_component` fill `BlockMvs[ refList ][ block ]` for both the
+`MiSize >= BLOCK_8X8` single-mode and sub-8x8 `(idy, idx)` partition
+walks.
 
 ### Not yet supported
 
-* Inter frames end-to-end: reference-buffer state, the §6.4.16
-  `inter_block_mode_info` driver that threads `read_ref_frames` and the
-  MV primitives against the frame-wide per-MI arrays, and §8.5.2 inter
-  prediction (motion compensation).
+* Inter frames end-to-end: the §6.4.11 `inter_frame_mode_info` prelude
+  that dispatches into §6.4.16 against the frame-wide per-MI arrays,
+  reference-buffer state, and §8.5.2 inter prediction (motion
+  compensation). The §6.4.16 `inter_block_mode_info` driver itself —
+  threading `read_ref_frames`, the §6.5 MV-reference primitives, and
+  §6.4.18 `assign_mv` into `ref_frame[ ]` / `y_mode` / `interp_filter` /
+  `BlockMvs[ ][ ]` — is now present and tested.
 * `show_existing_frame` (returns `Error::Unsupported`).
 * §8.4 probability adaptation / §6.1.2 frame-context refresh
   (single-frame decode does not persist contexts).
@@ -55,7 +63,7 @@ probability-context derivations.
 
 ## Testing
 
-The crate carries 684 lib unit tests plus integration suites in
+The crate carries 693 lib unit tests plus integration suites in
 `tests/`. Tests construct their inputs bit-by-bit; §9.2 golden buffers
 are hand-derived by stepping the decoder, not borrowed from any
 third-party VP9 implementation. A `cargo-fuzz` harness lives in

@@ -2566,6 +2566,429 @@ pub(crate) fn read_is_inter(
     Ok(value != 0)
 }
 
+// ----- §6.4.16 inter_block_mode_info -----
+
+/// `inter_mode_tree[ 6 ]` per §9.3.1 (`vp9-spec.txt` lines 6162-6166):
+///
+/// ```text
+/// inter_mode_tree[ 6 ] = {
+///     -(ZEROMV - NEARESTMV), 2,
+///     -(NEARESTMV - NEARESTMV), 4,
+///     -(NEARMV - NEARESTMV), -(NEWMV - NEARESTMV)
+/// }
+/// ```
+///
+/// The leaves are the four §7.4.11 inter modes expressed as the offset
+/// `inter_mode = y_mode - NEARESTMV` (`NEARESTMV = 10`, so the offsets
+/// resolve to `ZEROMV - NEARESTMV = 2`, `NEARESTMV - NEARESTMV = 0`,
+/// `NEARMV - NEARESTMV = 1`, `NEWMV - NEARESTMV = 3`). The §6.4.16 caller
+/// recovers `y_mode = NEARESTMV + inter_mode`.
+pub(crate) const INTER_MODE_TREE: [i32; 6] = [
+    -(ZEROMV as i32 - NEARESTMV as i32),
+    2,
+    // -(NEARESTMV - NEARESTMV) == 0 per the §9.3.1 listing.
+    0,
+    4,
+    -(NEARMV as i32 - NEARESTMV as i32),
+    -(NEWMV as i32 - NEARESTMV as i32),
+];
+
+/// `interp_filter_tree[ 4 ]` per §9.3.1 (`vp9-spec.txt` lines 6177-6180):
+///
+/// ```text
+/// interp_filter_tree[ 4 ] = {
+///     -EIGHTTAP, 2,
+///     -EIGHTTAP_SMOOTH, -EIGHTTAP_SHARP
+/// }
+/// ```
+///
+/// The switchable per-block `interp_filter` syntax element picks among
+/// `EIGHTTAP` (0) / `EIGHTTAP_SMOOTH` (1) / `EIGHTTAP_SHARP` (2) per the
+/// §3 filter-type enumeration (`BILINIEAR` / `SWITCHABLE` are not
+/// reachable through this tree — the switchable path never selects them).
+pub(crate) const INTERP_FILTER_TREE: [i32; 4] = [
+    -(EIGHTTAP as i32),
+    2,
+    -(EIGHTTAP_SMOOTH as i32),
+    -(EIGHTTAP_SHARP as i32),
+];
+
+/// `EIGHTTAP = 0` per §3 (`vp9-spec.txt` line 3633) — the default
+/// interpolation-filter type and the first [`INTERP_FILTER_TREE`] leaf.
+pub(crate) const EIGHTTAP: u8 = 0;
+
+/// `EIGHTTAP_SMOOTH = 1` per §3 (`vp9-spec.txt` line 3634).
+pub(crate) const EIGHTTAP_SMOOTH: u8 = 1;
+
+/// `EIGHTTAP_SHARP = 2` per §3 (`vp9-spec.txt` line 3635).
+pub(crate) const EIGHTTAP_SHARP: u8 = 2;
+
+/// `SWITCHABLE = 4` per §3 (`vp9-spec.txt` line 3637) — the frame-level
+/// `interpolation_filter` sentinel that, when set, makes §6.4.16 read a
+/// per-block `interp_filter` syntax element rather than reusing the
+/// frame value.
+pub(crate) const SWITCHABLE: u8 = 4;
+
+/// `ZEROMV = 12` per §7.4.11 — the §6.4.16 `SEG_LVL_SKIP` forced luma
+/// mode and the [`INTER_MODE_TREE`] `inter_mode = 2` leaf.
+pub(crate) const ZEROMV: u8 = 12;
+
+/// `NEARESTMV = 10` per §7.4.11 — the base `y_mode` the §6.4.16
+/// `inter_mode` offset is added onto.
+pub(crate) const NEARESTMV: u8 = 10;
+
+/// `NEARMV = 11` per §7.4.11.
+pub(crate) const NEARMV: u8 = 11;
+
+/// `NEWMV = 13` per §7.4.11.
+pub(crate) const NEWMV: u8 = 13;
+
+/// Per-block `InterpFilters[ ][ ]` neighbour state §9.3.2 reads to
+/// derive the switchable `interp_filter` context.
+///
+/// The §9.3.2 listing reads `InterpFilters[ MiRow ][ MiCol - 1 ]` /
+/// `InterpFilters[ MiRow - 1 ][ MiCol ]`, but only when that neighbour
+/// is both available (`AvailL` / `AvailU`) and inter-coded
+/// (`LeftRefFrame[ 0 ] > INTRA_FRAME` / `AboveRefFrame[ 0 ] >
+/// INTRA_FRAME`). When either test fails the listing substitutes the
+/// sentinel `3`. A tile driver materialises this struct from those
+/// frame-wide arrays; an `None` field already folds the availability +
+/// intra gate into "use the `3` sentinel".
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct InterpFilterNeighbours {
+    /// `InterpFilters[ MiRow ][ MiCol - 1 ]` when `AvailL` and the left
+    /// neighbour is inter; else `None` (the §9.3.2 `3` sentinel).
+    pub left: Option<u8>,
+    /// `InterpFilters[ MiRow - 1 ][ MiCol ]` when `AvailU` and the above
+    /// neighbour is inter; else `None` (the §9.3.2 `3` sentinel).
+    pub above: Option<u8>,
+}
+
+/// `interp_filter` context per §9.3.2 (`vp9-spec.txt` lines 6617-6629).
+///
+/// ```text
+/// leftInterp  = (AvailL && LeftRefFrame[0] > INTRA_FRAME)  ? InterpFilters[MiRow][MiCol-1] : 3
+/// aboveInterp = (AvailU && AboveRefFrame[0] > INTRA_FRAME) ? InterpFilters[MiRow-1][MiCol] : 3
+/// if ( leftInterp == aboveInterp )            ctx = leftInterp
+/// else if ( leftInterp == 3 && aboveInterp != 3 )  ctx = aboveInterp
+/// else if ( leftInterp != 3 && aboveInterp == 3 )  ctx = leftInterp
+/// else                                        ctx = 3
+/// ```
+///
+/// The availability + `> INTRA_FRAME` gates are pre-folded into the
+/// `Option` fields of [`InterpFilterNeighbours`] (`None` ⇒ the `3`
+/// sentinel). Returns one of `0..=3` indexing
+/// `interp_filter_probs[ ctx ]`.
+pub(crate) fn interp_filter_context(nb: InterpFilterNeighbours) -> usize {
+    let left = nb.left.unwrap_or(3);
+    let above = nb.above.unwrap_or(3);
+    let ctx = if left == above {
+        left
+    } else if left == 3 && above != 3 {
+        above
+    } else if left != 3 && above == 3 {
+        left
+    } else {
+        3
+    };
+    usize::from(ctx)
+}
+
+/// The decoded products of §6.4.16 `inter_block_mode_info( )`.
+///
+/// The §6.4.16 driver resolves the per-block reference frames, the luma
+/// `y_mode`, the interpolation filter, and the §6.4.18 `BlockMvs[ ][ ]`
+/// motion vectors. This struct surfaces them for the §6.4.4 `decode_block`
+/// fan-out to write into the frame-wide per-MI arrays (`RefFrames`,
+/// `YModes`, `InterpFilters`, `Mvs` / `SubMvs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Vp9InterBlockModeInfo {
+    /// `ref_frame[ 0 ]` per §6.4.17 — `LAST_FRAME` / `GOLDEN_FRAME` /
+    /// `ALTREF_FRAME` (an inter reference; `> INTRA_FRAME`).
+    pub ref_frame_0: i32,
+    /// `ref_frame[ 1 ]` per §6.4.17 — the compound second reference, or
+    /// [`NONE_REF_FRAME`] for a single-reference block.
+    pub ref_frame_1: i32,
+    /// `isCompound = ref_frame[ 1 ] > INTRA_FRAME` per §6.4.16.
+    pub is_compound: bool,
+    /// `y_mode` per §7.4.11 — the §6.4.16 block-level luma mode (one of
+    /// `NEARESTMV` / `NEARMV` / `ZEROMV` / `NEWMV`). For a sub-8x8 block
+    /// this holds the §6.4.16 *last*-decoded sub-block `inter_mode`.
+    pub y_mode: u8,
+    /// `interp_filter` per §7.4.12 — the per-block (switchable) or
+    /// frame-level interpolation filter type.
+    pub interp_filter: u8,
+    /// `BlockMvs[ refList ][ block ]` per §6.4.16 / §6.4.18 — the four
+    /// 4x4 sub-block motion vectors per reference list, in eighth-pel
+    /// `[row, col]` units. For a `MiSize >= BLOCK_8X8` block every
+    /// `block` slot holds the same `Mv[ refList ]`.
+    pub block_mvs: [[[i32; 2]; 4]; 2],
+}
+
+/// `inter_block_mode_info( )` per §6.4.16 (`vp9-spec.txt` lines
+/// 2656-2710).
+///
+/// ```text
+/// inter_block_mode_info( ) {
+///   read_ref_frames( )
+///   for ( j = 0; j < 2; j++ )
+///     if ( ref_frame[ j ] > INTRA_FRAME ) {
+///       find_mv_refs( ref_frame[ j ], -1 )
+///       find_best_ref_mvs( j )
+///     }
+///   isCompound = ref_frame[ 1 ] > INTRA_FRAME
+///   if ( seg_feature_active( SEG_LVL_SKIP ) )      y_mode = ZEROMV
+///   else if ( MiSize >= BLOCK_8X8 )                inter_mode; y_mode = NEARESTMV + inter_mode
+///   if ( interpolation_filter == SWITCHABLE )      interp_filter
+///   else                                           interp_filter = interpolation_filter
+///   if ( MiSize < BLOCK_8X8 ) {
+///     for ( idy = 0; idy < 2; idy += num4x4h )
+///       for ( idx = 0; idx < 2; idx += num4x4w ) {
+///         inter_mode; y_mode = NEARESTMV + inter_mode
+///         if ( y_mode == NEARESTMV || y_mode == NEARMV )
+///           for ( j = 0; j < 1 + isCompound; j++ ) append_sub8x8_mvs( idy*2+idx, j )
+///         assign_mv( isCompound )
+///         for ( y2 .. ) for ( x2 .. ) for ( refList .. )
+///           BlockMvs[ refList ][ (idy+y2)*2 + idx+x2 ] = Mv[ refList ]
+///       }
+///   } else {
+///     assign_mv( isCompound )
+///     for ( refList .. ) for ( block = 0..4 ) BlockMvs[ refList ][ block ] = Mv[ refList ]
+///   }
+/// }
+/// ```
+///
+/// Inputs:
+/// * `geom` / `src` — the §6.5 [`MvRefGeometry`] block geometry and the
+///   [`MvCandidateSource`] neighbour accessor the MV-reference scan reads.
+/// * `mv_probs` — the §6.5 `mv_*_probs` bundle a `NEWMV` `read_mv( )`
+///   decode consumes.
+/// * `ref_frame_args` — everything §6.4.17 `read_ref_frames( )` needs
+///   (segment override, reference mode, compound config, neighbour ref
+///   frames, and the three `comp_mode` / `single_ref` / `comp_ref`
+///   probability rows).
+/// * `inter_mode_probs` / `interp_filter_probs` — the §10.5 running
+///   probability tables for the two tree-coded syntax elements.
+/// * `interp_nb` — the [`InterpFilterNeighbours`] §9.3.2 context input.
+/// * `interpolation_filter` — the §6.2.7 frame-level filter (`SWITCHABLE`
+///   ⇒ read a per-block `interp_filter`; otherwise reuse this value).
+/// * `allow_high_precision_mv` / `use_prev_frame_mvs` / `sign_bias` —
+///   the §6.2 frame-level MV-prediction flags forwarded to the §6.5
+///   primitives.
+/// * `seg_feature_skip_active` — `seg_feature_active( SEG_LVL_SKIP )`,
+///   forcing `y_mode = ZEROMV` without a tree read.
+///
+/// Returns the [`Vp9InterBlockModeInfo`] products. The bool coder is
+/// advanced past exactly the §6.4.16 syntax elements (`read_ref_frames`,
+/// the optional block-level / per-sub-block `inter_mode`, the optional
+/// `interp_filter`, and each §6.4.18 `assign_mv( )`'s `NEWMV` reads).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn inter_block_mode_info<S: crate::mv_ref::MvCandidateSource>(
+    coder: &mut BoolCoder<'_>,
+    geom: &crate::mv_ref::MvRefGeometry,
+    src: &S,
+    mv_probs: &crate::compressed::MvProbs,
+    ref_frame_args: InterRefFrameArgs<'_>,
+    inter_mode_probs: &[[u8; INTER_MODES - 1]; INTER_MODE_CONTEXTS],
+    interp_filter_probs: &[[u8; SWITCHABLE_FILTERS - 1]; INTERP_FILTER_CONTEXTS],
+    interp_nb: InterpFilterNeighbours,
+    interpolation_filter: u8,
+    allow_high_precision_mv: bool,
+    use_prev_frame_mvs: bool,
+    sign_bias: &[bool; 4],
+    seg_feature_skip_active: bool,
+) -> Result<Vp9InterBlockModeInfo, Error> {
+    use crate::mv::{assign_mv, MvPredictors};
+
+    let mi_size = geom.mi_size as u8;
+
+    // read_ref_frames( ) — §6.4.17.
+    let refs = read_ref_frames(
+        coder,
+        ref_frame_args.seg_feature_ref_frame_active,
+        ref_frame_args.segment_ref_frame_data,
+        ref_frame_args.reference_mode,
+        ref_frame_args.comp_config,
+        ref_frame_args.fix_ref_idx,
+        ref_frame_args.nb,
+        ref_frame_args.comp_mode_prob,
+        ref_frame_args.single_ref_prob,
+        ref_frame_args.comp_ref_prob,
+    )?;
+    let ref_frame = [refs.ref_frame_0, refs.ref_frame_1];
+    let is_compound = refs.ref_frame_1 > INTRA_FRAME;
+
+    // For each in-use reference list j, run find_mv_refs( ref_frame[j], -1 )
+    // then find_best_ref_mvs( j ) to derive NearestMv/NearMv/BestMv and the
+    // ModeContext used to index inter_mode_probs.
+    let mut preds = [MvPredictors::default(); 2];
+    // ModeContext[ ref_frame[ 0 ] ] — only list 0's context selects the
+    // inter_mode probability row (§9.3.2: ctx = ModeContext[ ref_frame[0] ]).
+    let mut mode_context = 0u8;
+    for j in 0..2 {
+        if ref_frame[j] > INTRA_FRAME {
+            let mv_refs = geom.find_mv_refs(src, ref_frame[j], -1, sign_bias, use_prev_frame_mvs);
+            if j == 0 {
+                mode_context = mv_refs.mode_context;
+            }
+            let best = geom.find_best_ref_mvs(mv_refs.ref_list_mv, allow_high_precision_mv);
+            // §6.5.12: NearestMv = RefListMv[0], NearMv = RefListMv[1],
+            // BestMv = RefListMv[0].
+            preds[j] = MvPredictors {
+                nearest: best[0],
+                near: best[1],
+                best: best[0],
+            };
+        }
+    }
+
+    // Block-level y_mode: forced ZEROMV under SEG_LVL_SKIP, a decoded
+    // inter_mode for >= BLOCK_8X8, and (for sub-8x8) re-decoded per
+    // sub-block below.
+    let mode_ctx = usize::from(mode_context);
+    let mut y_mode = if seg_feature_skip_active {
+        ZEROMV
+    } else if mi_size >= BLOCK_8X8 {
+        let inter_mode = tree_decode(coder, &INTER_MODE_TREE, |node| {
+            inter_mode_probs[mode_ctx][node]
+        })?;
+        NEARESTMV + inter_mode as u8
+    } else {
+        // Placeholder; the sub-8x8 walk overwrites this with the last
+        // decoded sub-block inter_mode.
+        NEARESTMV
+    };
+
+    // interp_filter: switchable ⇒ tree read; else the frame-level value.
+    let interp_filter = if interpolation_filter == SWITCHABLE {
+        let ctx = interp_filter_context(interp_nb);
+        tree_decode(coder, &INTERP_FILTER_TREE, |node| {
+            interp_filter_probs[ctx][node]
+        })? as u8
+    } else {
+        interpolation_filter
+    };
+
+    let mut block_mvs = [[[0i32; 2]; 4]; 2];
+
+    if mi_size < BLOCK_8X8 {
+        let num4x4w = NUM_4X4_BLOCKS_WIDE_LOOKUP[mi_size as usize] as usize;
+        let num4x4h = NUM_4X4_BLOCKS_HIGH_LOOKUP[mi_size as usize] as usize;
+        let ref_count = 1 + usize::from(is_compound);
+
+        let mut idy = 0usize;
+        while idy < 2 {
+            let mut idx = 0usize;
+            while idx < 2 {
+                let block = idy * 2 + idx;
+
+                // Per-sub-block inter_mode (SEG_LVL_SKIP never reaches the
+                // sub-8x8 path: it forces a single ZEROMV block above; the
+                // spec still reads inter_mode here only when not skipped,
+                // but a SEG_LVL_SKIP block is by construction a single
+                // partition >= BLOCK_8X8, so the sub-8x8 loop is inter_mode
+                // -driven).
+                let inter_mode = tree_decode(coder, &INTER_MODE_TREE, |node| {
+                    inter_mode_probs[mode_ctx][node]
+                })?;
+                y_mode = NEARESTMV + inter_mode as u8;
+
+                // append_sub8x8_mvs for NEARESTMV / NEARMV, per reference
+                // list, replacing this sub-block's NearestMv / NearMv.
+                let mut sub_preds = preds;
+                if y_mode == NEARESTMV || y_mode == NEARMV {
+                    for (ref_list, sub_pred) in sub_preds.iter_mut().enumerate().take(ref_count) {
+                        let pair = geom.append_sub8x8_mvs(
+                            src,
+                            block,
+                            ref_frame[ref_list],
+                            &block_mvs[ref_list],
+                            sign_bias,
+                            use_prev_frame_mvs,
+                        );
+                        sub_pred.nearest = pair[0];
+                        sub_pred.near = pair[1];
+                    }
+                }
+
+                let mv = assign_mv(
+                    coder,
+                    mv_probs,
+                    y_mode,
+                    is_compound,
+                    &sub_preds,
+                    allow_high_precision_mv,
+                )?;
+
+                for y2 in 0..num4x4h {
+                    for x2 in 0..num4x4w {
+                        let b = (idy + y2) * 2 + idx + x2;
+                        for ref_list in 0..ref_count {
+                            block_mvs[ref_list][b] = mv[ref_list];
+                        }
+                    }
+                }
+
+                idx += num4x4w;
+            }
+            idy += num4x4h;
+        }
+    } else {
+        let mv = assign_mv(
+            coder,
+            mv_probs,
+            y_mode,
+            is_compound,
+            &preds,
+            allow_high_precision_mv,
+        )?;
+        let ref_count = 1 + usize::from(is_compound);
+        for (ref_list, mv_ref) in mv.iter().enumerate().take(ref_count) {
+            for slot in &mut block_mvs[ref_list] {
+                *slot = *mv_ref;
+            }
+        }
+    }
+
+    Ok(Vp9InterBlockModeInfo {
+        ref_frame_0: ref_frame[0],
+        ref_frame_1: ref_frame[1],
+        is_compound,
+        y_mode,
+        interp_filter,
+        block_mvs,
+    })
+}
+
+/// The §6.4.17 `read_ref_frames( )` inputs bundled for the §6.4.16
+/// driver, mirroring the standalone [`read_ref_frames`] parameter list.
+///
+/// Grouping them keeps [`inter_block_mode_info`]'s own signature focused
+/// on the §6.4.16-specific arguments (geometry, MV state, the two
+/// tree-coded probability tables) while still threading the complete
+/// reference-frame derivation through unchanged.
+#[derive(Clone, Copy)]
+pub(crate) struct InterRefFrameArgs<'a> {
+    /// `seg_feature_active( SEG_LVL_REF_FRAME )`.
+    pub seg_feature_ref_frame_active: bool,
+    /// `FeatureData[ segment_id ][ SEG_LVL_REF_FRAME ]`.
+    pub segment_ref_frame_data: i16,
+    /// §6.2.7 frame-level `reference_mode`.
+    pub reference_mode: ReferenceMode,
+    /// §6.2.7 `CompFixedRef` / `CompVarRef` configuration.
+    pub comp_config: CompoundReferenceConfig,
+    /// `ref_frame_sign_bias[ CompFixedRef ]`.
+    pub fix_ref_idx: u8,
+    /// Neighbour reference-frame state for the §9.3.2 contexts.
+    pub nb: RefFrameNeighbours,
+    /// `comp_mode_prob[ COMP_MODE_CONTEXTS ]`.
+    pub comp_mode_prob: &'a [u8; COMP_MODE_CONTEXTS],
+    /// `single_ref_prob[ REF_CONTEXTS ][ 2 ]`.
+    pub single_ref_prob: &'a [[u8; 2]; REF_CONTEXTS],
+    /// `comp_ref_prob[ REF_CONTEXTS ]`.
+    pub comp_ref_prob: &'a [u8; REF_CONTEXTS],
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5345,5 +5768,282 @@ mod tests {
             .unwrap();
             assert!(is_inter);
         }
+    }
+
+    // ----- §6.4.16 inter_block_mode_info -----
+
+    use crate::compressed::{CompoundReferenceConfig, MvProbs, ReferenceMode};
+    use crate::mv_ref::{MvCandidateSource, MvRefGeometry};
+
+    /// A neighbourhood with no in-frame candidates: every accessor returns
+    /// the §6.5.1 intra default. With it, `find_mv_refs( )` yields
+    /// `ZeroMv` predictors and `find_best_ref_mvs( )` leaves them zero —
+    /// so `NEARESTMV` / `NEARMV` / `ZEROMV` all resolve to `[0, 0]` and a
+    /// `NEWMV` block reads its difference onto a zero `BestMv`.
+    struct EmptySource;
+
+    impl MvCandidateSource for EmptySource {
+        fn y_mode(&self, _r: i32, _c: i32) -> u8 {
+            DC_PRED
+        }
+        fn ref_frame(&self, _r: i32, _c: i32, _ref_list: usize) -> i32 {
+            INTRA_FRAME
+        }
+        fn mv(&self, _r: i32, _c: i32, _ref_list: usize) -> [i32; 2] {
+            [0, 0]
+        }
+        fn sub_mv(&self, _r: i32, _c: i32, _ref_list: usize, _idx: usize) -> [i32; 2] {
+            [0, 0]
+        }
+        fn prev_ref_frame(&self, _r: i32, _c: i32, _ref_list: usize) -> i32 {
+            INTRA_FRAME
+        }
+        fn prev_mv(&self, _r: i32, _c: i32, _ref_list: usize) -> [i32; 2] {
+            [0, 0]
+        }
+    }
+
+    /// Interior geometry away from every frame edge, so the §6.5 clamps
+    /// pass small predictors through unchanged.
+    fn inter_geom(mi_size: u8) -> MvRefGeometry {
+        MvRefGeometry {
+            mi_row: 8,
+            mi_col: 8,
+            mi_rows: 64,
+            mi_cols: 64,
+            mi_size: mi_size as usize,
+            mi_col_start: 0,
+            mi_col_end: 64,
+        }
+    }
+
+    fn single_ref_args<'a>(
+        comp_mode_prob: &'a [u8; COMP_MODE_CONTEXTS],
+        single_ref_prob: &'a [[u8; 2]; REF_CONTEXTS],
+        comp_ref_prob: &'a [u8; REF_CONTEXTS],
+    ) -> InterRefFrameArgs<'a> {
+        InterRefFrameArgs {
+            seg_feature_ref_frame_active: false,
+            segment_ref_frame_data: 0,
+            reference_mode: ReferenceMode::SingleReference,
+            comp_config: CompoundReferenceConfig {
+                fixed_ref: ALTREF_FRAME,
+                var_ref: [LAST_FRAME, GOLDEN_FRAME],
+            },
+            fix_ref_idx: 0,
+            nb: RefFrameNeighbours {
+                above: None,
+                left: None,
+            },
+            comp_mode_prob,
+            single_ref_prob,
+            comp_ref_prob,
+        }
+    }
+
+    #[test]
+    fn inter_mode_tree_matches_spec_listing() {
+        // §9.3.1: inter_mode_tree[6] = {
+        //   -(ZEROMV-NEARESTMV), 2, -(NEARESTMV-NEARESTMV), 4,
+        //   -(NEARMV-NEARESTMV), -(NEWMV-NEARESTMV) }
+        // = { -2, 2, 0, 4, -1, -3 }.
+        assert_eq!(INTER_MODE_TREE, [-2, 2, 0, 4, -1, -3]);
+    }
+
+    #[test]
+    fn interp_filter_tree_matches_spec_listing() {
+        // §9.3.1: interp_filter_tree[4] = {
+        //   -EIGHTTAP, 2, -EIGHTTAP_SMOOTH, -EIGHTTAP_SHARP } = { 0, 2, -1, -2 }.
+        assert_eq!(INTERP_FILTER_TREE, [0, 2, -1, -2]);
+    }
+
+    #[test]
+    fn interp_filter_context_both_sentinel_returns_three() {
+        // Both neighbours unavailable/intra -> both sentinel 3 -> equal -> 3.
+        let ctx = interp_filter_context(InterpFilterNeighbours {
+            left: None,
+            above: None,
+        });
+        assert_eq!(ctx, 3);
+    }
+
+    #[test]
+    fn interp_filter_context_one_sentinel_uses_other() {
+        // left=3 sentinel, above=1 real -> ctx = above = 1.
+        assert_eq!(
+            interp_filter_context(InterpFilterNeighbours {
+                left: None,
+                above: Some(1),
+            }),
+            1
+        );
+        // left=2 real, above=3 sentinel -> ctx = left = 2.
+        assert_eq!(
+            interp_filter_context(InterpFilterNeighbours {
+                left: Some(2),
+                above: None,
+            }),
+            2
+        );
+    }
+
+    #[test]
+    fn interp_filter_context_equal_reals_returns_value_else_three() {
+        // Equal reals -> that value.
+        assert_eq!(
+            interp_filter_context(InterpFilterNeighbours {
+                left: Some(1),
+                above: Some(1),
+            }),
+            1
+        );
+        // Two distinct reals -> 3.
+        assert_eq!(
+            interp_filter_context(InterpFilterNeighbours {
+                left: Some(0),
+                above: Some(2),
+            }),
+            3
+        );
+    }
+
+    /// On the zero coder every tree read selects the first leaf.
+    /// `single_ref_p1 = 0` -> `ref_frame[0] = LAST_FRAME`,
+    /// `inter_mode = INTER_MODE_TREE[0] = -2 -> 2` -> `y_mode = ZEROMV`,
+    /// and a non-switchable filter is reused verbatim.
+    #[test]
+    fn inter_block_mode_info_zero_coder_single_last_zeromv() {
+        let mut coder = zero_coder();
+        let geom = inter_geom(BLOCK_8X8);
+        let src = EmptySource;
+        let mv_probs = MvProbs::defaults();
+        let comp_mode_prob = DEFAULT_COMP_MODE_PROB;
+        let single_ref_prob = DEFAULT_SINGLE_REF_PROB;
+        let comp_ref_prob = DEFAULT_COMP_REF_PROB;
+        let out = inter_block_mode_info(
+            &mut coder,
+            &geom,
+            &src,
+            &mv_probs,
+            single_ref_args(&comp_mode_prob, &single_ref_prob, &comp_ref_prob),
+            &DEFAULT_INTER_MODE_PROBS,
+            &DEFAULT_INTERP_FILTER_PROBS,
+            InterpFilterNeighbours::default(),
+            EIGHTTAP, // non-switchable frame filter, reused verbatim.
+            false,
+            false,
+            &[false; 4],
+            false,
+        )
+        .unwrap();
+        assert_eq!(out.ref_frame_0, LAST_FRAME);
+        assert_eq!(out.ref_frame_1, NONE_REF_FRAME);
+        assert!(!out.is_compound);
+        // inter_mode 0-bit path -> INTER_MODE_TREE first leaf = ZEROMV.
+        assert_eq!(out.y_mode, ZEROMV);
+        assert_eq!(out.interp_filter, EIGHTTAP);
+        // ZEROMV -> every BlockMvs entry is the zero vector.
+        assert_eq!(out.block_mvs[0], [[0, 0]; 4]);
+        // Single reference: list 1 stays zero.
+        assert_eq!(out.block_mvs[1], [[0, 0]; 4]);
+    }
+
+    /// `seg_feature_active( SEG_LVL_SKIP )` forces `y_mode = ZEROMV`
+    /// without reading any `inter_mode` token, and (with a non-switchable
+    /// filter) the only bool-coder reads are `read_ref_frames( )`'s.
+    #[test]
+    fn inter_block_mode_info_seg_skip_forces_zeromv_no_inter_mode_read() {
+        let mut coder = zero_coder();
+        let geom = inter_geom(BLOCK_8X8);
+        let src = EmptySource;
+        let mv_probs = MvProbs::defaults();
+        let comp_mode_prob = DEFAULT_COMP_MODE_PROB;
+        let single_ref_prob = DEFAULT_SINGLE_REF_PROB;
+        let comp_ref_prob = DEFAULT_COMP_REF_PROB;
+        let out = inter_block_mode_info(
+            &mut coder,
+            &geom,
+            &src,
+            &mv_probs,
+            single_ref_args(&comp_mode_prob, &single_ref_prob, &comp_ref_prob),
+            &DEFAULT_INTER_MODE_PROBS,
+            &DEFAULT_INTERP_FILTER_PROBS,
+            InterpFilterNeighbours::default(),
+            EIGHTTAP_SHARP,
+            false,
+            false,
+            &[false; 4],
+            true, // SEG_LVL_SKIP active.
+        )
+        .unwrap();
+        assert_eq!(out.y_mode, ZEROMV);
+        assert_eq!(out.interp_filter, EIGHTTAP_SHARP);
+        assert_eq!(out.block_mvs[0], [[0, 0]; 4]);
+    }
+
+    /// A switchable frame filter makes §6.4.16 read a per-block
+    /// `interp_filter`. On the zero coder the tree's first leaf is
+    /// `EIGHTTAP`.
+    #[test]
+    fn inter_block_mode_info_switchable_reads_interp_filter() {
+        let mut coder = zero_coder();
+        let geom = inter_geom(BLOCK_8X8);
+        let src = EmptySource;
+        let mv_probs = MvProbs::defaults();
+        let comp_mode_prob = DEFAULT_COMP_MODE_PROB;
+        let single_ref_prob = DEFAULT_SINGLE_REF_PROB;
+        let comp_ref_prob = DEFAULT_COMP_REF_PROB;
+        let out = inter_block_mode_info(
+            &mut coder,
+            &geom,
+            &src,
+            &mv_probs,
+            single_ref_args(&comp_mode_prob, &single_ref_prob, &comp_ref_prob),
+            &DEFAULT_INTER_MODE_PROBS,
+            &DEFAULT_INTERP_FILTER_PROBS,
+            InterpFilterNeighbours::default(),
+            SWITCHABLE,
+            false,
+            false,
+            &[false; 4],
+            false,
+        )
+        .unwrap();
+        // Switchable -> per-block read -> zero coder picks EIGHTTAP.
+        assert_eq!(out.interp_filter, EIGHTTAP);
+    }
+
+    /// A sub-8x8 block (`BLOCK_4X4`) walks the 2x2 `(idy, idx)` grid,
+    /// reading four per-sub-block `inter_mode` tokens. On the zero coder
+    /// each resolves to `ZEROMV`, so every `BlockMvs[ 0 ][ b ]` is zero
+    /// and the four-cell grid is fully written.
+    #[test]
+    fn inter_block_mode_info_sub8x8_walks_four_subblocks() {
+        let mut coder = zero_coder();
+        let geom = inter_geom(BLOCK_4X4);
+        let src = EmptySource;
+        let mv_probs = MvProbs::defaults();
+        let comp_mode_prob = DEFAULT_COMP_MODE_PROB;
+        let single_ref_prob = DEFAULT_SINGLE_REF_PROB;
+        let comp_ref_prob = DEFAULT_COMP_REF_PROB;
+        let out = inter_block_mode_info(
+            &mut coder,
+            &geom,
+            &src,
+            &mv_probs,
+            single_ref_args(&comp_mode_prob, &single_ref_prob, &comp_ref_prob),
+            &DEFAULT_INTER_MODE_PROBS,
+            &DEFAULT_INTERP_FILTER_PROBS,
+            InterpFilterNeighbours::default(),
+            EIGHTTAP,
+            false,
+            false,
+            &[false; 4],
+            false,
+        )
+        .unwrap();
+        assert_eq!(out.y_mode, ZEROMV);
+        // All four 4x4 cells written with the zero ZEROMV vector.
+        assert_eq!(out.block_mvs[0], [[0, 0]; 4]);
     }
 }

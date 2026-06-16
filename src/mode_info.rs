@@ -2989,6 +2989,282 @@ pub(crate) struct InterRefFrameArgs<'a> {
     pub comp_ref_prob: &'a [u8; REF_CONTEXTS],
 }
 
+// ----- §6.4.11 inter_frame_mode_info -----
+
+/// A borrowed view of the §6.2.10 per-segment feature tables the §6.4.11
+/// driver consults after decoding `segment_id`.
+///
+/// The §6.4.9 `seg_feature_active( feature )` predicate is
+/// `segmentation_enabled && FeatureEnabled[ segment_id ][ feature ]`.
+/// The §6.4.11 driver decodes `segment_id` first (via §6.4.12
+/// `inter_segment_id( )`) and only *then* knows which segment's feature
+/// row to consult — so it cannot accept the pre-resolved `*_active`
+/// booleans the standalone [`read_skip`] / [`read_is_inter`] /
+/// [`read_ref_frames`] leaves take. Instead it takes this two-table view
+/// and resolves the predicates itself once `segment_id` is in hand.
+///
+/// `enabled` is `segmentation_enabled`. `feature_enabled[ s ][ f ]` and
+/// `feature_data[ s ][ f ]` are the §6.2.10 `FeatureEnabled[ ][ ]` /
+/// `FeatureData[ ][ ]` planes indexed by segment `s ∈ 0..MAX_SEGMENTS`
+/// and feature `f ∈ 0..SEG_LVL_MAX` (the §3 `SEG_LVL_*` constants).
+#[derive(Clone, Copy)]
+pub(crate) struct SegFeatureTables<'a> {
+    /// `segmentation_enabled` per §6.2.10.
+    pub enabled: bool,
+    /// `FeatureEnabled[ MAX_SEGMENTS ][ SEG_LVL_MAX ]` per §6.2.10.
+    pub feature_enabled: &'a [[bool; crate::header::SEG_LVL_MAX]; crate::header::MAX_SEGMENTS],
+    /// `FeatureData[ MAX_SEGMENTS ][ SEG_LVL_MAX ]` per §6.2.10.
+    pub feature_data: &'a [[i16; crate::header::SEG_LVL_MAX]; crate::header::MAX_SEGMENTS],
+}
+
+impl SegFeatureTables<'_> {
+    /// `seg_feature_active( feature )` per §6.4.9 for a known `segment_id`.
+    fn active(&self, segment_id: u8, feature: usize) -> bool {
+        self.enabled && self.feature_enabled[segment_id as usize][feature]
+    }
+
+    /// `FeatureData[ segment_id ][ feature ]` per §6.2.10.
+    fn data(&self, segment_id: u8, feature: usize) -> i16 {
+        self.feature_data[segment_id as usize][feature]
+    }
+}
+
+/// The §6.4.12 `inter_segment_id( )` inputs bundled for the §6.4.11
+/// driver, mirroring the standalone [`inter_segment_id`] parameter list
+/// (minus the bool coder + `mi_row` / `mi_col` / `mi_size`, which the
+/// §6.4.11 driver already carries).
+pub(crate) struct InterSegmentIdArgs<'a> {
+    /// `segmentation_update_map` per §6.2.10.
+    pub update_map: bool,
+    /// `segmentation_temporal_update` per §6.2.10.
+    pub temporal_update: bool,
+    /// `segmentation_tree_probs[ 7 ]` — `None` when `update_map == 0`.
+    pub tree_probs: Option<&'a [u8; 7]>,
+    /// `segmentation_pred_prob[ 3 ]` — `None` when `update_map == 0`.
+    pub pred_prob: Option<&'a [u8; 3]>,
+    /// `PrevSegmentIds[ ][ ]` spatial-prediction plane (§6.4.14).
+    pub prev: PrevSegmentIds<'a>,
+}
+
+/// The per-syntax-element probability/neighbour inputs the §6.4.11 driver
+/// threads into [`read_skip`], [`read_is_inter`], [`read_tx_size`], and
+/// the two §6.4.5 dispatch arms ([`inter_block_mode_info`] /
+/// [`intra_block_mode_info`]).
+///
+/// Grouped to keep [`inter_frame_mode_info`]'s own signature focused on
+/// the per-block state (`coder`, geometry, the segmentation context the
+/// §6.4.12 write-back mutates) while still threading every §6.4.11
+/// argument through unchanged.
+#[allow(clippy::type_complexity)]
+pub(crate) struct InterFrameModeArgs<'a, S: crate::mv_ref::MvCandidateSource> {
+    /// The §6.5 block geometry + neighbour accessor the MV-reference
+    /// scan reads (shared by the §6.4.16 inter arm).
+    pub geom: &'a crate::mv_ref::MvRefGeometry,
+    /// The §6.5 candidate source for the inter arm's MV-reference scan.
+    pub src: &'a S,
+    /// The §6.2.10 per-segment feature tables (resolved per `segment_id`).
+    pub seg: SegFeatureTables<'a>,
+    /// `inter_segment_id( )` inputs (§6.4.12).
+    pub seg_id: InterSegmentIdArgs<'a>,
+    /// `skip_prob[ 3 ]` (§9.3.2 `read_skip` probabilities).
+    pub skip_prob: &'a [u8; 3],
+    /// `NeighbourSkips` for the §9.3.2 `skip` context.
+    pub skip_nb: NeighbourSkips,
+    /// `is_inter_prob[ IS_INTER_CONTEXTS ]` (§9.3.2).
+    pub is_inter_prob: &'a [u8; IS_INTER_CONTEXTS],
+    /// `IsInterNeighbours` for the §9.3.2 `is_inter` context.
+    pub is_inter_nb: IsInterNeighbours,
+    /// `tx_mode` per §6.2.9.
+    pub tx_mode: TxMode,
+    /// `tx_probs[ 4 ][ 2 ][ 3 ]` (§9.3.2 `tx_size`).
+    pub tx_probs: &'a [[[u8; 3]; 2]; 4],
+    /// `NeighbourTxSizes` for the §9.3.2 `tx_size` context.
+    pub tx_nb: NeighbourTxSizes,
+    /// The §6.4.17 `read_ref_frames( )` inputs (inter arm).
+    pub ref_frame: InterRefFrameArgs<'a>,
+    /// The §6.5 `mv_*_probs` bundle (inter arm `NEWMV` reads).
+    pub mv_probs: &'a crate::compressed::MvProbs,
+    /// `inter_mode_probs[ INTER_MODE_CONTEXTS ][ INTER_MODES - 1 ]`.
+    pub inter_mode_probs: &'a [[u8; INTER_MODES - 1]; INTER_MODE_CONTEXTS],
+    /// `interp_filter_probs[ INTERP_FILTER_CONTEXTS ][ … ]`.
+    pub interp_filter_probs: &'a [[u8; SWITCHABLE_FILTERS - 1]; INTERP_FILTER_CONTEXTS],
+    /// `InterpFilterNeighbours` for the §9.3.2 `interp_filter` context.
+    pub interp_nb: InterpFilterNeighbours,
+    /// `interpolation_filter` per §6.2.7.
+    pub interpolation_filter: u8,
+    /// `allow_high_precision_mv` per §6.2.
+    pub allow_high_precision_mv: bool,
+    /// `use_prev_frame_mvs` per §6.5.
+    pub use_prev_frame_mvs: bool,
+    /// `ref_frame_sign_bias[ 4 ]` per §6.2.7.
+    pub sign_bias: &'a [bool; 4],
+    /// `y_mode_probs[ BLOCK_SIZE_GROUPS ][ INTRA_MODES - 1 ]` (intra arm).
+    pub y_mode_probs: &'a [[u8; INTRA_MODES - 1]; BLOCK_SIZE_GROUPS],
+    /// `uv_mode_probs[ INTRA_MODES ][ INTRA_MODES - 1 ]` (intra arm).
+    pub uv_mode_probs: &'a [[u8; INTRA_MODES - 1]; INTRA_MODES],
+}
+
+/// The decoded products of §6.4.11 `inter_frame_mode_info( )`.
+///
+/// The §6.4.11 driver decodes the shared prelude (`segment_id`, `skip`,
+/// `is_inter`, `tx_size`) common to both §6.4.5 inter-frame arms, then
+/// dispatches to the §6.4.16 inter-block reader or the §6.4.15
+/// intra-block reader. This struct carries the prelude products plus the
+/// arm-specific block products for the §6.4.4 `decode_block` fan-out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Vp9InterFrameModeInfo {
+    /// `segment_id` per §6.4.12 (`0..=7`).
+    pub segment_id: u8,
+    /// `skip` per §6.4.8.
+    pub skip: bool,
+    /// `is_inter` per §6.4.13.
+    pub is_inter: bool,
+    /// `tx_size` per §6.4.10 (a `TX_*` integer `0..=3`).
+    pub tx_size: u32,
+    /// The arm-specific block products.
+    pub block: Vp9InterFrameBlock,
+}
+
+/// The §6.4.5 arm-specific products of [`inter_frame_mode_info`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Vp9InterFrameBlock {
+    /// `is_inter == 1` arm — §6.4.16 `inter_block_mode_info( )`.
+    Inter(Vp9InterBlockModeInfo),
+    /// `is_inter == 0` arm — §6.4.15 `intra_block_mode_info( )`.
+    Intra(Vp9IntraBlockModeInfo),
+}
+
+/// `inter_frame_mode_info( )` per §6.4.11 (`vp9-spec.txt` lines
+/// 2532-2559).
+///
+/// ```text
+/// inter_frame_mode_info( ) {
+///   LeftRefFrame[ 0 ]  = AvailL ? RefFrames[ MiRow ][ MiCol-1 ][ 0 ] : INTRA_FRAME
+///   AboveRefFrame[ 0 ] = AvailU ? RefFrames[ MiRow-1 ][ MiCol ][ 0 ] : INTRA_FRAME
+///   LeftRefFrame[ 1 ]  = AvailL ? RefFrames[ MiRow ][ MiCol-1 ][ 1 ] : NONE
+///   AboveRefFrame[ 1 ] = AvailU ? RefFrames[ MiRow-1 ][ MiCol ][ 1 ] : NONE
+///   LeftIntra   = LeftRefFrame[ 0 ]  <= INTRA_FRAME
+///   AboveIntra  = AboveRefFrame[ 0 ] <= INTRA_FRAME
+///   LeftSingle  = LeftRefFrame[ 1 ]  <= NONE
+///   AboveSingle = AboveRefFrame[ 1 ] <= NONE
+///   inter_segment_id( )
+///   read_skip( )
+///   read_is_inter( )
+///   read_tx_size( !skip || !is_inter )
+///   if ( is_inter ) inter_block_mode_info( )
+///   else            intra_block_mode_info( )
+/// }
+/// ```
+///
+/// The §6.4.11 prelude's `Left*` / `Above*` derivations are *not* decoded
+/// here — they are already folded into the [`IsInterNeighbours`],
+/// [`CompModeNeighbours`] (via [`InterRefFrameArgs::nb`]), and
+/// [`InterpFilterNeighbours`] context inputs the caller assembles from
+/// the frame-wide `RefFrames[ ][ ][ ]` / `InterpFilters[ ][ ]` arrays.
+/// This driver therefore covers the four syntax-element reads plus the
+/// §6.4.5 dispatch.
+///
+/// Decode order — and thus the bool-coder advance — is exactly the
+/// §6.4.11 listing: `inter_segment_id` (§6.4.12), `read_skip` (§6.4.8),
+/// `read_is_inter` (§6.4.13), `read_tx_size( !skip || !is_inter )`
+/// (§6.4.10), then the §6.4.16 / §6.4.15 arm.
+///
+/// `seg_feature_active( )` predicates (§6.4.9) are resolved against the
+/// just-decoded `segment_id`: `SEG_LVL_SKIP` forces `read_skip( )` to
+/// `1` and (in the inter arm) `y_mode = ZEROMV`; `SEG_LVL_REF_FRAME`
+/// forces `read_is_inter( )` and `read_ref_frames( )` without consuming
+/// bits.
+pub(crate) fn inter_frame_mode_info<S: crate::mv_ref::MvCandidateSource>(
+    coder: &mut BoolCoder<'_>,
+    args: InterFrameModeArgs<'_, S>,
+    seg_pred_ctx: &mut SegPredContextState,
+    mi_row: u32,
+    mi_col: u32,
+) -> Result<Vp9InterFrameModeInfo, Error> {
+    let mi_size = args.geom.mi_size as u8;
+
+    // inter_segment_id( ) — §6.4.12.
+    let segment_id = inter_segment_id(
+        coder,
+        args.seg.enabled,
+        args.seg_id.update_map,
+        args.seg_id.temporal_update,
+        args.seg_id.tree_probs,
+        args.seg_id.pred_prob,
+        &args.seg_id.prev,
+        seg_pred_ctx,
+        mi_row,
+        mi_col,
+        mi_size,
+    )?;
+
+    // seg_feature_active( ) predicates for the just-decoded segment_id.
+    let seg_skip_active = args.seg.active(segment_id, SEG_LVL_SKIP);
+    let seg_ref_frame_active = args.seg.active(segment_id, SEG_LVL_REF_FRAME);
+    let segment_ref_frame_data = args.seg.data(segment_id, SEG_LVL_REF_FRAME);
+
+    // read_skip( ) — §6.4.8.
+    let skip = read_skip(coder, seg_skip_active, args.skip_prob, args.skip_nb)?;
+
+    // read_is_inter( ) — §6.4.13.
+    let is_inter = read_is_inter(
+        coder,
+        seg_ref_frame_active,
+        segment_ref_frame_data,
+        args.is_inter_prob,
+        args.is_inter_nb,
+    )?;
+
+    // read_tx_size( !skip || !is_inter ) — §6.4.10.
+    let tx_size = read_tx_size(
+        coder,
+        !skip || !is_inter,
+        args.tx_mode,
+        mi_size,
+        args.tx_probs,
+        args.tx_nb,
+    )?;
+
+    // §6.4.5 dispatch: inter_block_mode_info( ) vs intra_block_mode_info( ).
+    let block = if is_inter {
+        // §6.4.17 read_ref_frames inherits the just-resolved segment
+        // SEG_LVL_REF_FRAME override (the caller's InterRefFrameArgs is
+        // built for the keyframe-free default; refresh the two
+        // segment-override fields against this block's segment_id so the
+        // §6.4.17 driver sees the same active/data the §6.4.13 read did).
+        let mut ref_args = args.ref_frame;
+        ref_args.seg_feature_ref_frame_active = seg_ref_frame_active;
+        ref_args.segment_ref_frame_data = segment_ref_frame_data;
+        let inter = inter_block_mode_info(
+            coder,
+            args.geom,
+            args.src,
+            args.mv_probs,
+            ref_args,
+            args.inter_mode_probs,
+            args.interp_filter_probs,
+            args.interp_nb,
+            args.interpolation_filter,
+            args.allow_high_precision_mv,
+            args.use_prev_frame_mvs,
+            args.sign_bias,
+            seg_skip_active,
+        )?;
+        Vp9InterFrameBlock::Inter(inter)
+    } else {
+        let intra = intra_block_mode_info(coder, mi_size, args.y_mode_probs, args.uv_mode_probs)?;
+        Vp9InterFrameBlock::Intra(intra)
+    };
+
+    Ok(Vp9InterFrameModeInfo {
+        segment_id,
+        skip,
+        is_inter,
+        tx_size,
+        block,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6045,5 +6321,232 @@ mod tests {
         assert_eq!(out.y_mode, ZEROMV);
         // All four 4x4 cells written with the zero ZEROMV vector.
         assert_eq!(out.block_mvs[0], [[0, 0]; 4]);
+    }
+
+    // ----- §6.4.11 inter_frame_mode_info -----
+
+    use crate::compressed::{DEFAULT_SKIP_PROB, DEFAULT_TX_PROBS};
+    use crate::header::{MAX_SEGMENTS, SEG_LVL_MAX};
+
+    /// `segmentation_enabled == 0` feature tables: every
+    /// `seg_feature_active( )` resolves false, so the §6.4.11 driver
+    /// reads `skip` / `is_inter` / `tx_size` straight from the coder.
+    fn seg_disabled_tables<'a>(
+        feature_enabled: &'a [[bool; SEG_LVL_MAX]; MAX_SEGMENTS],
+        feature_data: &'a [[i16; SEG_LVL_MAX]; MAX_SEGMENTS],
+    ) -> SegFeatureTables<'a> {
+        SegFeatureTables {
+            enabled: false,
+            feature_enabled,
+            feature_data,
+        }
+    }
+
+    /// Assemble the §6.4.11 arg bundle for the common single-reference,
+    /// segmentation-disabled case.
+    #[allow(clippy::too_many_arguments)]
+    fn inter_frame_args<'a>(
+        geom: &'a MvRefGeometry,
+        src: &'a EmptySource,
+        seg: SegFeatureTables<'a>,
+        prev_data: &'a [u8],
+        mv_probs: &'a MvProbs,
+        comp_mode_prob: &'a [u8; COMP_MODE_CONTEXTS],
+        single_ref_prob: &'a [[u8; 2]; REF_CONTEXTS],
+        comp_ref_prob: &'a [u8; REF_CONTEXTS],
+    ) -> InterFrameModeArgs<'a, EmptySource> {
+        InterFrameModeArgs {
+            geom,
+            src,
+            seg,
+            seg_id: InterSegmentIdArgs {
+                update_map: false,
+                temporal_update: false,
+                tree_probs: None,
+                pred_prob: None,
+                prev: PrevSegmentIds {
+                    mi_rows: geom.mi_rows as u32,
+                    mi_cols: geom.mi_cols as u32,
+                    data: prev_data,
+                },
+            },
+            skip_prob: &DEFAULT_SKIP_PROB,
+            skip_nb: NeighbourSkips::default(),
+            is_inter_prob: &DEFAULT_IS_INTER_PROB,
+            is_inter_nb: IsInterNeighbours::default(),
+            tx_mode: TxMode::Only4x4,
+            tx_probs: &DEFAULT_TX_PROBS,
+            tx_nb: NeighbourTxSizes::default(),
+            ref_frame: single_ref_args(comp_mode_prob, single_ref_prob, comp_ref_prob),
+            mv_probs,
+            inter_mode_probs: &DEFAULT_INTER_MODE_PROBS,
+            interp_filter_probs: &DEFAULT_INTERP_FILTER_PROBS,
+            interp_nb: InterpFilterNeighbours::default(),
+            interpolation_filter: EIGHTTAP,
+            allow_high_precision_mv: false,
+            use_prev_frame_mvs: false,
+            sign_bias: &[false; 4],
+            y_mode_probs: &DEFAULT_Y_MODE_PROBS,
+            uv_mode_probs: &DEFAULT_UV_MODE_PROBS,
+        }
+    }
+
+    /// On the zero coder, `read_is_inter( )` decodes the [`BINARY_TREE`]
+    /// first leaf (0) ⇒ `is_inter == 0`, so §6.4.11 dispatches to the
+    /// §6.4.15 intra arm. With segmentation disabled the prelude reads
+    /// `segment_id = 0`, `skip = 0`, and `tx_size` from the §6.4.10
+    /// `else` branch (`tx_mode = ONLY_4X4` ⇒ `tx_size = TX_4X4`).
+    #[test]
+    fn inter_frame_mode_info_zero_coder_dispatches_intra() {
+        let mut coder = zero_coder();
+        let geom = inter_geom(BLOCK_8X8);
+        let src = EmptySource;
+        let fe = [[false; SEG_LVL_MAX]; MAX_SEGMENTS];
+        let fd = [[0i16; SEG_LVL_MAX]; MAX_SEGMENTS];
+        let prev = vec![0u8; (geom.mi_rows * geom.mi_cols) as usize];
+        let mv_probs = MvProbs::defaults();
+        let comp_mode_prob = DEFAULT_COMP_MODE_PROB;
+        let single_ref_prob = DEFAULT_SINGLE_REF_PROB;
+        let comp_ref_prob = DEFAULT_COMP_REF_PROB;
+        let args = inter_frame_args(
+            &geom,
+            &src,
+            seg_disabled_tables(&fe, &fd),
+            &prev,
+            &mv_probs,
+            &comp_mode_prob,
+            &single_ref_prob,
+            &comp_ref_prob,
+        );
+        let mut seg_ctx = SegPredContextState::new(geom.mi_cols as u32, geom.mi_rows as u32);
+        let out = inter_frame_mode_info(&mut coder, args, &mut seg_ctx, 8, 8).unwrap();
+
+        assert_eq!(out.segment_id, 0);
+        assert!(!out.skip);
+        assert!(!out.is_inter);
+        // ONLY_4X4 -> read_tx_size else-branch -> TX_4X4 (0).
+        assert_eq!(out.tx_size, 0);
+        match out.block {
+            Vp9InterFrameBlock::Intra(intra) => {
+                assert_eq!(intra.ref_frame_0, INTRA_FRAME);
+                assert_eq!(intra.ref_frame_1, NONE_REF_FRAME);
+                // Zero coder -> every intra-mode tree read picks DC_PRED.
+                assert_eq!(intra.y_mode, DC_PRED);
+                assert_eq!(intra.sub_modes, [DC_PRED; 4]);
+            }
+            Vp9InterFrameBlock::Inter(_) => panic!("expected intra arm"),
+        }
+    }
+
+    /// A `SEG_LVL_REF_FRAME` segment override forces `is_inter == 1`
+    /// (and `read_ref_frames( )`'s `ref_frame[0]`) without consuming any
+    /// bits, so §6.4.11 dispatches to the §6.4.16 inter arm. The
+    /// remaining reads come from the zero coder: `inter_mode` picks the
+    /// first leaf (`ZEROMV`), giving a zero-vector single-reference block.
+    #[test]
+    fn inter_frame_mode_info_seg_ref_override_dispatches_inter() {
+        let mut coder = zero_coder();
+        let geom = inter_geom(BLOCK_8X8);
+        let src = EmptySource;
+        let mut fe = [[false; SEG_LVL_MAX]; MAX_SEGMENTS];
+        let mut fd = [[0i16; SEG_LVL_MAX]; MAX_SEGMENTS];
+        // segment 0: SEG_LVL_REF_FRAME active, data = LAST_FRAME.
+        fe[0][SEG_LVL_REF_FRAME] = true;
+        fd[0][SEG_LVL_REF_FRAME] = LAST_FRAME as i16;
+        let seg = SegFeatureTables {
+            enabled: true,
+            feature_enabled: &fe,
+            feature_data: &fd,
+        };
+        let prev = vec![0u8; (geom.mi_rows * geom.mi_cols) as usize];
+        let mv_probs = MvProbs::defaults();
+        let comp_mode_prob = DEFAULT_COMP_MODE_PROB;
+        let single_ref_prob = DEFAULT_SINGLE_REF_PROB;
+        let comp_ref_prob = DEFAULT_COMP_REF_PROB;
+        // segmentation enabled but update_map = 0 (so inter_segment_id
+        // falls through to get_segment_id over the all-zero prev plane
+        // -> predicted segment_id = 0).
+        let args = inter_frame_args(
+            &geom,
+            &src,
+            seg,
+            &prev,
+            &mv_probs,
+            &comp_mode_prob,
+            &single_ref_prob,
+            &comp_ref_prob,
+        );
+        let mut seg_ctx = SegPredContextState::new(geom.mi_cols as u32, geom.mi_rows as u32);
+        let out = inter_frame_mode_info(&mut coder, args, &mut seg_ctx, 8, 8).unwrap();
+
+        assert_eq!(out.segment_id, 0);
+        // read_skip: seg SKIP not active -> zero coder -> false.
+        assert!(!out.skip);
+        // read_is_inter: SEG_LVL_REF_FRAME data (LAST_FRAME) != INTRA.
+        assert!(out.is_inter);
+        match out.block {
+            Vp9InterFrameBlock::Inter(inter) => {
+                // read_ref_frames inherits the segment override.
+                assert_eq!(inter.ref_frame_0, LAST_FRAME);
+                assert_eq!(inter.ref_frame_1, NONE_REF_FRAME);
+                assert!(!inter.is_compound);
+                // inter_mode zero-coder first leaf -> ZEROMV.
+                assert_eq!(inter.y_mode, ZEROMV);
+                assert_eq!(inter.block_mvs[0], [[0, 0]; 4]);
+            }
+            Vp9InterFrameBlock::Intra(_) => panic!("expected inter arm"),
+        }
+    }
+
+    /// A `SEG_LVL_SKIP` segment override forces `skip = 1` without a bit,
+    /// and (in the inter arm) `y_mode = ZEROMV` with no `inter_mode`
+    /// read. Combined with a `SEG_LVL_REF_FRAME` override the whole
+    /// §6.4.11 prelude is bit-free; only `read_ref_frames( )`'s MV-ref
+    /// scan touches the coder, and `read_tx_size( !skip || !is_inter )`
+    /// uses the §6.4.10 else-branch since `allowSelect == 0`.
+    #[test]
+    fn inter_frame_mode_info_seg_skip_forces_skip_and_zeromv() {
+        let mut coder = zero_coder();
+        let geom = inter_geom(BLOCK_8X8);
+        let src = EmptySource;
+        let mut fe = [[false; SEG_LVL_MAX]; MAX_SEGMENTS];
+        let mut fd = [[0i16; SEG_LVL_MAX]; MAX_SEGMENTS];
+        fe[0][SEG_LVL_REF_FRAME] = true;
+        fd[0][SEG_LVL_REF_FRAME] = LAST_FRAME as i16;
+        fe[0][SEG_LVL_SKIP] = true;
+        let seg = SegFeatureTables {
+            enabled: true,
+            feature_enabled: &fe,
+            feature_data: &fd,
+        };
+        let prev = vec![0u8; (geom.mi_rows * geom.mi_cols) as usize];
+        let mv_probs = MvProbs::defaults();
+        let comp_mode_prob = DEFAULT_COMP_MODE_PROB;
+        let single_ref_prob = DEFAULT_SINGLE_REF_PROB;
+        let comp_ref_prob = DEFAULT_COMP_REF_PROB;
+        let args = inter_frame_args(
+            &geom,
+            &src,
+            seg,
+            &prev,
+            &mv_probs,
+            &comp_mode_prob,
+            &single_ref_prob,
+            &comp_ref_prob,
+        );
+        let mut seg_ctx = SegPredContextState::new(geom.mi_cols as u32, geom.mi_rows as u32);
+        let out = inter_frame_mode_info(&mut coder, args, &mut seg_ctx, 8, 8).unwrap();
+
+        assert!(out.skip);
+        assert!(out.is_inter);
+        match out.block {
+            Vp9InterFrameBlock::Inter(inter) => {
+                assert_eq!(inter.ref_frame_0, LAST_FRAME);
+                // SEG_LVL_SKIP forces ZEROMV without an inter_mode read.
+                assert_eq!(inter.y_mode, ZEROMV);
+                assert_eq!(inter.block_mvs[0], [[0, 0]; 4]);
+            }
+            Vp9InterFrameBlock::Intra(_) => panic!("expected inter arm"),
+        }
     }
 }

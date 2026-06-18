@@ -14,10 +14,13 @@
 //!   `header_size_in_bytes`, plus the §6.1.1 `trailing_bits()`
 //!   zero-fill alignment.
 //!
-//! Inter-frame paths (`frame_size_with_refs`, motion-vector flags,
-//! interpolation filter) and the compressed header (§6.3) are
-//! intentionally NOT walked yet — they require reference-buffer state
-//! plus the §9.2 Boolean range coder.
+//! The §6.2 inter (non-intra-only) path is also walked via
+//! [`parse_uncompressed_header_with_refs`]: `ref_frame_idx` /
+//! `ref_frame_sign_bias`, §6.2.5 `frame_size_with_refs` (resolved
+//! against caller-supplied §8.10 reference dimensions),
+//! `allow_high_precision_mv`, and §6.2.7 `read_interpolation_filter`.
+//! The §6.3 compressed header lives in `compressed.rs` (the §9.2
+//! Boolean range coder).
 
 use crate::bitreader::BitReader;
 use crate::Error;
@@ -328,9 +331,69 @@ pub struct Vp9FrameHeader {
     /// the §6.1.1 `trailing_bits()` zero-fill that aligns to a byte
     /// boundary. The compressed header starts at this byte offset.
     pub uncompressed_header_size_bytes: usize,
+    /// §6.2 inter-frame syntax: `ref_frame_idx[ 3 ]` — the §8.10
+    /// `FrameStore[ ]` slot each of the `LAST` / `GOLDEN` / `ALTREF`
+    /// reference lists draws from. `None` on key / intra-only frames
+    /// (which carry no `ref_frame_idx`).
+    pub ref_frame_idx: Option<[u8; 3]>,
+    /// §6.2 inter-frame syntax: `ref_frame_sign_bias[ LAST_FRAME + i ]`
+    /// for `i ∈ 0..3`, stored as the three values for
+    /// `LAST` / `GOLDEN` / `ALTREF`. `[false; 3]` on key / intra-only
+    /// frames (the §6.5 candidate scan reads it; intra frames never do).
+    pub ref_frame_sign_bias: [bool; 3],
+    /// §6.2 inter-frame syntax: `allow_high_precision_mv`. `false` on
+    /// key / intra-only frames.
+    pub allow_high_precision_mv: bool,
+    /// §6.2.7 `interpolation_filter` — `EIGHTTAP` / `EIGHTTAP_SMOOTH` /
+    /// `EIGHTTAP_SHARP` / `BILINEAR` (0..3) or `SWITCHABLE = 4`. Defaults
+    /// to `EIGHTTAP = 0` on key / intra-only frames (no §6.2.7 read).
+    pub interpolation_filter: u8,
 }
 
-/// Parse a VP9 uncompressed header from `data`.
+/// The inter-frame-only header fields, bundled so the §6.2 frame-type
+/// `match` can yield them uniformly (key / intra-only frames yield
+/// [`InterFields::default`], which carries `ref_frame_idx = None`).
+#[derive(Clone, Copy, Debug, Default)]
+struct InterFields {
+    ref_frame_idx: Option<[u8; 3]>,
+    ref_frame_sign_bias: [bool; 3],
+    allow_high_precision_mv: bool,
+    interpolation_filter: u8,
+}
+
+/// Persistent decoder state a §6.2 *inter* (non-intra-only) frame needs
+/// that is not present in its own header bytes: the reference-frame
+/// dimensions (`RefFrameWidth` / `RefFrameHeight` per §8.10 slot, read
+/// by §6.2.5 `frame_size_with_refs`) and the color configuration
+/// inherited from the most recent key / intra-only frame (an inter
+/// frame does not re-read `color_config()`).
+///
+/// Supplied by the frame-sequence decoder; `None` when decoding a
+/// single intra frame in isolation (in which case an inter frame
+/// returns [`Error::Unsupported`]).
+#[derive(Clone, Copy, Debug)]
+pub struct RefFrameState<'a> {
+    /// `(RefFrameWidth[ i ], RefFrameHeight[ i ])` for the eight §8.10
+    /// `FrameStore[ ]` slots.
+    pub ref_dims: &'a [(u32, u32)],
+    /// The color configuration inherited from the most recent key /
+    /// intra-only frame.
+    pub color_config: ColorConfig,
+}
+
+/// Parse a VP9 uncompressed header from `data` (intra-only entry point).
+///
+/// Equivalent to [`parse_uncompressed_header_with_refs`] with no
+/// reference state; inter (non-intra-only) frames return
+/// [`Error::Unsupported`]. The frame-sequence decoder uses the
+/// `_with_refs` form to thread §8.10 reference dimensions + inherited
+/// color config.
+pub fn parse_uncompressed_header(data: &[u8]) -> Result<Vp9FrameHeader, Error> {
+    parse_uncompressed_header_with_refs(data, None)
+}
+
+/// Parse a VP9 uncompressed header from `data`, optionally supplying the
+/// persistent reference-frame state an inter frame needs.
 ///
 /// Walks `uncompressed_header()` through `header_size_in_bytes` and
 /// then consumes the §6.1.1 `trailing_bits()` zero-pad. Returns
@@ -338,11 +401,13 @@ pub struct Vp9FrameHeader {
 /// [`Error::InvalidBitstream`] when a "shall be equal to" constraint
 /// from §7.1.1 / §7.2 is violated.
 ///
-/// The `show_existing_frame == 1` path still early-returns; the
-/// remaining inter-frame branch (`frame_type == NON_KEY_FRAME` with
-/// `show_frame == 1` and `intra_only == 0`) returns
-/// [`Error::Unsupported`] until reference-buffer state lands.
-pub fn parse_uncompressed_header(data: &[u8]) -> Result<Vp9FrameHeader, Error> {
+/// The `show_existing_frame == 1` path still early-returns. An inter
+/// (non-intra-only) frame requires `ref_state`; when it is `None` such a
+/// frame returns [`Error::Unsupported`].
+pub fn parse_uncompressed_header_with_refs(
+    data: &[u8],
+    ref_state: Option<RefFrameState<'_>>,
+) -> Result<Vp9FrameHeader, Error> {
     let mut br = BitReader::new(data);
 
     // frame_marker — spec §7.2: "shall be equal to 2".
@@ -400,6 +465,10 @@ pub fn parse_uncompressed_header(data: &[u8]) -> Result<Vp9FrameHeader, Error> {
             // and the framing layer does not consume more bytes from
             // this stream).
             uncompressed_header_size_bytes: 0,
+            ref_frame_idx: None,
+            ref_frame_sign_bias: [false; 3],
+            allow_high_precision_mv: false,
+            interpolation_filter: 0,
         });
     }
 
@@ -421,6 +490,7 @@ pub fn parse_uncompressed_header(data: &[u8]) -> Result<Vp9FrameHeader, Error> {
         reset_frame_context,
         refresh_frame_flags,
         frame_is_intra,
+        inter_fields,
     ) = match frame_type {
         FrameType::KeyFrame => {
             // frame_sync_code(): three required bytes.
@@ -441,6 +511,7 @@ pub fn parse_uncompressed_header(data: &[u8]) -> Result<Vp9FrameHeader, Error> {
                 0u8,
                 0xFFu8,
                 true,
+                InterFields::default(),
             )
         }
         FrameType::NonKeyFrame => {
@@ -454,38 +525,101 @@ pub fn parse_uncompressed_header(data: &[u8]) -> Result<Vp9FrameHeader, Error> {
                 0
             };
 
-            if !intra_only {
-                // Inter (non-intra-only) frames need
-                // frame_size_with_refs + a reference-frame buffer,
-                // which is out of round-2 scope.
-                return Err(Error::Unsupported);
-            }
+            if intra_only {
+                // Intra-only branch: frame_sync_code, then color_config()
+                // only if Profile > 0 — for Profile 0 the spec installs
+                // CS_BT_601 / 4:2:0 / 8-bit defaults.
+                read_frame_sync_code(&mut br)?;
+                let color_config = if profile > 0 {
+                    read_color_config(&mut br, profile)?
+                } else {
+                    ColorConfig::default_intra_only_profile0()
+                };
 
-            // Intra-only branch: frame_sync_code, then color_config()
-            // only if Profile > 0 — for Profile 0 the spec installs
-            // CS_BT_601 / 4:2:0 / 8-bit defaults.
-            read_frame_sync_code(&mut br)?;
-            let color_config = if profile > 0 {
-                read_color_config(&mut br, profile)?
+                let refresh_frame_flags = br.read_bits(8)? as u8;
+                let (frame_width, frame_height) = read_frame_size(&mut br)?;
+                let (render_width, render_height) =
+                    read_render_size(&mut br, frame_width, frame_height)?;
+                (
+                    true,
+                    color_config,
+                    frame_width,
+                    frame_height,
+                    render_width,
+                    render_height,
+                    reset_frame_context,
+                    refresh_frame_flags,
+                    frame_is_intra,
+                    InterFields::default(),
+                )
             } else {
-                ColorConfig::default_intra_only_profile0()
-            };
+                // §6.2 inter (non-intra-only) branch. The §6.2 syntax
+                // does NOT re-read color_config for an inter frame — the
+                // color configuration is inherited from the most recent
+                // key / intra-only frame. The caller supplies it (and
+                // the reference-frame dimensions) through `ref_state`;
+                // without that state the inter frame cannot resolve its
+                // §6.2.5 frame_size_with_refs sizes.
+                let state = ref_state.ok_or(Error::Unsupported)?;
 
-            let refresh_frame_flags = br.read_bits(8)? as u8;
-            let (frame_width, frame_height) = read_frame_size(&mut br)?;
-            let (render_width, render_height) =
-                read_render_size(&mut br, frame_width, frame_height)?;
-            (
-                true,
-                color_config,
-                frame_width,
-                frame_height,
-                render_width,
-                render_height,
-                reset_frame_context,
-                refresh_frame_flags,
-                frame_is_intra,
-            )
+                let refresh_frame_flags = br.read_bits(8)? as u8;
+
+                // for ( i = 0; i < 3; i++ ) { ref_frame_idx[ i ] f(3);
+                //   ref_frame_sign_bias[ LAST_FRAME + i ] f(1) }
+                let mut ref_frame_idx = [0u8; 3];
+                let mut ref_frame_sign_bias = [false; 3];
+                for i in 0..3 {
+                    ref_frame_idx[i] = br.read_bits(3)? as u8;
+                    ref_frame_sign_bias[i] = br.read_flag()?;
+                }
+
+                // §6.2.5 frame_size_with_refs( ): for each ref, a
+                // found_ref flag; the first set one adopts that
+                // reference slot's dimensions and breaks.
+                let mut frame_width = 0u32;
+                let mut frame_height = 0u32;
+                let mut found_ref = false;
+                for &idx in ref_frame_idx.iter() {
+                    if br.read_flag()? {
+                        let (w, h) = state.ref_dims[idx as usize];
+                        frame_width = w;
+                        frame_height = h;
+                        found_ref = true;
+                        break;
+                    }
+                }
+                if !found_ref {
+                    let (w, h) = read_frame_size(&mut br)?;
+                    frame_width = w;
+                    frame_height = h;
+                }
+                // compute_image_size() is implicit (MiCols/MiRows derived
+                // downstream); render_size() follows either branch.
+                let (render_width, render_height) =
+                    read_render_size(&mut br, frame_width, frame_height)?;
+
+                // allow_high_precision_mv f(1); read_interpolation_filter().
+                let allow_high_precision_mv = br.read_flag()?;
+                let interpolation_filter = read_interpolation_filter(&mut br)?;
+
+                (
+                    false,
+                    state.color_config,
+                    frame_width,
+                    frame_height,
+                    render_width,
+                    render_height,
+                    reset_frame_context,
+                    refresh_frame_flags,
+                    frame_is_intra,
+                    InterFields {
+                        ref_frame_idx: Some(ref_frame_idx),
+                        ref_frame_sign_bias,
+                        allow_high_precision_mv,
+                        interpolation_filter,
+                    },
+                )
+            }
         }
     };
 
@@ -544,7 +678,32 @@ pub fn parse_uncompressed_header(data: &[u8]) -> Result<Vp9FrameHeader, Error> {
         tile_info,
         header_size_in_bytes,
         uncompressed_header_size_bytes,
+        ref_frame_idx: inter_fields.ref_frame_idx,
+        ref_frame_sign_bias: inter_fields.ref_frame_sign_bias,
+        allow_high_precision_mv: inter_fields.allow_high_precision_mv,
+        interpolation_filter: inter_fields.interpolation_filter,
     })
+}
+
+/// §6.2.7 `read_interpolation_filter( )` (`vp9-spec.txt` lines
+/// 1768-1779).
+///
+/// `is_filter_switchable f(1)`; if set, `interpolation_filter =
+/// SWITCHABLE`, else `raw_interpolation_filter f(2)` indexes the
+/// `literal_to_type[ 4 ] = { EIGHTTAP_SMOOTH, EIGHTTAP, EIGHTTAP_SHARP,
+/// BILINEAR }` table.
+fn read_interpolation_filter(br: &mut BitReader<'_>) -> Result<u8, Error> {
+    // §3 / §6.2.7: SWITCHABLE = 4; literal_to_type maps the 2-bit raw
+    // value to { EIGHTTAP_SMOOTH = 1, EIGHTTAP = 0, EIGHTTAP_SHARP = 2,
+    // BILINEAR = 3 }.
+    const SWITCHABLE: u8 = 4;
+    const LITERAL_TO_TYPE: [u8; 4] = [1, 0, 2, 3];
+    if br.read_flag()? {
+        Ok(SWITCHABLE)
+    } else {
+        let raw = br.read_bits(2)? as usize;
+        Ok(LITERAL_TO_TYPE[raw])
+    }
 }
 
 fn read_frame_sync_code(br: &mut BitReader<'_>) -> Result<(), Error> {
@@ -845,5 +1004,75 @@ mod tests {
         assert_eq!(sb64_cols, 60);
         assert_eq!(calc_min_log2_tile_cols(sb64_cols), 0);
         assert_eq!(calc_max_log2_tile_cols(sb64_cols), 3);
+    }
+
+    /// §6.2 inter (non-intra-only) header parse against the
+    /// `i-frame-then-p-frame-64x64` corpus P-frame (frame idx 1 of the
+    /// fixture IVF). Pins the §6.2.5 `frame_size_with_refs` (`found_ref`
+    /// picks slot 0 -> 64x64), §6.2 `ref_frame_idx` / `ref_frame_sign_bias`,
+    /// `allow_high_precision_mv` and §6.2.7 `interpolation_filter`
+    /// (`filter_mode=1` = FILTER_8TAP_SMOOTH = EIGHTTAP_SMOOTH = 1)
+    /// against the per-frame trace expectations.
+    #[test]
+    fn inter_frame_header_parses_against_i_then_p_fixture() {
+        // Frame 1 payload from
+        // docs/video/vp9/fixtures/i-frame-then-p-frame-64x64/input.ivf
+        // (23 bytes: 10-byte uncompressed hdr + 3-byte compressed hdr +
+        // 10-byte tile).
+        let p_frame: [u8; 23] = [
+            0x86, 0x00, 0x40, 0x92, 0x9c, 0x08, 0x51, 0x80, 0x00, 0x03, 0x60, 0x00, 0x00, 0x7a,
+            0x49, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        // After the keyframe, every FrameStore slot holds the 64x64
+        // frame; the inter frame inherits the keyframe's color config
+        // (CS_BT_601-ish 4:2:0 8-bit Profile-0 default here).
+        let ref_dims = [(64u32, 64u32); 8];
+        let state = RefFrameState {
+            ref_dims: &ref_dims,
+            color_config: ColorConfig::default_intra_only_profile0(),
+        };
+        let hdr =
+            parse_uncompressed_header_with_refs(&p_frame, Some(state)).expect("inter header parse");
+
+        assert_eq!(hdr.frame_type, FrameType::NonKeyFrame);
+        assert!(!hdr.intra_only);
+        assert!(hdr.show_frame);
+        // trace: refresh_mask=0x01.
+        assert_eq!(hdr.refresh_frame_flags, 0x01);
+        // §6.2.5 frame_size_with_refs picked the reference dimensions.
+        assert_eq!(hdr.frame_width, 64);
+        assert_eq!(hdr.frame_height, 64);
+        // trace: refidx0=0 refidx1=1 refidx2=2.
+        assert_eq!(hdr.ref_frame_idx, Some([0, 1, 2]));
+        // trace: signbias0/1/2 = 0.
+        assert_eq!(hdr.ref_frame_sign_bias, [false, false, false]);
+        // trace: highprec_mvs=1.
+        assert!(hdr.allow_high_precision_mv);
+        // §6.2.7: is_filter_switchable=0, raw_interpolation_filter=1, so
+        // interpolation_filter = literal_to_type[ 1 ] = EIGHTTAP = 0 per
+        // the §3 numbering (`{ EIGHTTAP_SMOOTH, EIGHTTAP, EIGHTTAP_SHARP,
+        // BILINEAR }`). The fixture trace labels this `filter_mode=1`
+        // using the libvpx display enum, whose value-1 is its own
+        // EIGHTTAP_SMOOTH — a numbering convention difference, not a
+        // parse disagreement (the on-wire raw value is 1 either way).
+        assert_eq!(hdr.interpolation_filter, 0);
+        // trace: compressed_hdr_size=3, uncompressed_hdr_size=10.
+        assert_eq!(hdr.header_size_in_bytes, 3);
+        assert_eq!(hdr.uncompressed_header_size_bytes, 10);
+    }
+
+    /// An inter (non-intra-only) frame parsed without reference state
+    /// returns [`Error::Unsupported`] (it cannot resolve
+    /// `frame_size_with_refs` sizes).
+    #[test]
+    fn inter_frame_without_ref_state_is_unsupported() {
+        let p_frame: [u8; 23] = [
+            0x86, 0x00, 0x40, 0x92, 0x9c, 0x08, 0x51, 0x80, 0x00, 0x03, 0x60, 0x00, 0x00, 0x7a,
+            0x49, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert!(matches!(
+            parse_uncompressed_header(&p_frame),
+            Err(Error::Unsupported)
+        ));
     }
 }

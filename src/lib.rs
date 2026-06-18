@@ -534,9 +534,10 @@ pub use filter_size::{
 };
 pub use frame_loop_filter::{frame_loop_filter, CurrFrame};
 pub use header::{
-    parse_uncompressed_header, ColorConfig, ColorSpace, FrameType, LoopFilterParams,
-    QuantizationParams, SegmentationParams, TileInfo, Vp9FrameHeader, MAX_SEGMENTS,
-    SEGMENTATION_FEATURE_BITS, SEGMENTATION_FEATURE_SIGNED, SEG_LVL_MAX,
+    parse_uncompressed_header, parse_uncompressed_header_with_refs, ColorConfig, ColorSpace,
+    FrameType, LoopFilterParams, QuantizationParams, RefFrameState, SegmentationParams, TileInfo,
+    Vp9FrameHeader, MAX_SEGMENTS, SEGMENTATION_FEATURE_BITS, SEGMENTATION_FEATURE_SIGNED,
+    SEG_LVL_MAX,
 };
 pub use loop_filter::{loop_filter_frame_init, LvlLookup, MAX_LOOP_FILTER, MAX_MODE_LF_DELTAS};
 pub use narrow_filter::{narrow_filter, NarrowFilterOutput, NarrowFilterSamples};

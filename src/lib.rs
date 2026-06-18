@@ -499,6 +499,7 @@ mod filter_size;
 mod frame_loop_filter;
 mod header;
 mod idct;
+mod inter_decode;
 mod inter_mv;
 mod inter_pred;
 mod intra;

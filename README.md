@@ -59,8 +59,14 @@ walks. The intra arm is the §6.4.15 `intra_block_mode_info` reader.
   `decode_block` fan-out against the frame-wide per-MI arrays
   (`RefFrames` / `YModes` / `InterpFilters` / `Mvs`), the multi-frame
   reference-buffer state the §6.5 MV-reference scan reads from
-  `RefFrames` of decoded references, or §8.5.2 inter prediction (motion
-  compensation). Those are the remaining steps for an end-to-end
+  `RefFrames` of decoded references. The §8.5.2 inter prediction
+  (motion compensation) is partially landed: its §8.5.2.4 block inter
+  prediction leaf — the two-pass 8-tap sub-pixel convolution over the
+  `subpel_filters[4][16][8]` kernels — is present and tested, but the
+  §8.5.2.1 motion-vector selection / §8.5.2.2 clamping / §8.5.2.3
+  scaling steps that feed it `startX` / `startY` / `xStep` / `yStep`,
+  and the §8.5.2 driver that writes the result into `CurrFrame`, are
+  not yet wired. Those are the remaining steps for an end-to-end
   inter-frame decode.
 * `show_existing_frame` (returns `Error::Unsupported`).
 * §8.4 probability adaptation / §6.1.2 frame-context refresh
@@ -70,7 +76,7 @@ walks. The intra arm is the §6.4.15 `intra_block_mode_info` reader.
 
 ## Testing
 
-The crate carries 696 lib unit tests plus integration suites in
+The crate carries 704 lib unit tests plus integration suites in
 `tests/`. Tests construct their inputs bit-by-bit; §9.2 golden buffers
 are hand-derived by stepping the decoder, not borrowed from any
 third-party VP9 implementation. A `cargo-fuzz` harness lives in

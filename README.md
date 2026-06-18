@@ -52,27 +52,35 @@ and §6.4.18 `assign_mv` plus §6.4.19 / §6.4.20 `read_mv` /
 `MiSize >= BLOCK_8X8` single-mode and sub-8x8 `(idy, idx)` partition
 walks. The intra arm is the §6.4.15 `intra_block_mode_info` reader.
 
+The §8.5.2 inter prediction (motion-compensation) process is now
+complete: the §8.5.2.4 block inter prediction leaf (two-pass 8-tap
+sub-pixel convolution over the `subpel_filters[4][16][8]` kernels), the
+three preceding steps that feed it (§8.5.2.1 `select_mv` with the
+`round_mv_comp_q2` / `round_mv_comp_q4` chroma averaging, §8.5.2.2
+`clamp_mv`, §8.5.2.3 `scale_mv`), and the §8.5.2 driver
+(`predict_inter`) that chains them per plane / reference-list, samples
+the reference planes, and writes the single or compound-averaged
+(`Round2( p0 + p1, 1 )`) result into `CurrFrame`. The §8.10 reference
+frame-buffer state (`RefBuffers` — the eight `FrameStore[ ]` slots, the
+`refresh_frame_flags` update, and the §8.5.2.3 `ref_frame_idx[ ]` slot
+resolution) and the §6.2 inter (non-intra-only) uncompressed-header
+parse (`frame_size_with_refs`, `ref_frame_idx` / `ref_frame_sign_bias`,
+`allow_high_precision_mv`, §6.2.7 `read_interpolation_filter`) are also
+landed — the latter pinned byte-exact against the
+`i-frame-then-p-frame-64x64` corpus P-frame. The `FrameStateMvSource` /
+`build_ref_planes` adapters bridge the frame-wide §6.4.4 arrays +
+`RefBuffers` to the §6.5 MV-reference scan and the §8.5.2 driver.
+
 ### Not yet supported
 
-* Inter frames end-to-end: the §6.4.11 `inter_frame_mode_info` driver
-  is present and tested, but it is not yet wired into the §6.4.4
-  `decode_block` fan-out against the frame-wide per-MI arrays
-  (`RefFrames` / `YModes` / `InterpFilters` / `Mvs`), the multi-frame
-  reference-buffer state the §6.5 MV-reference scan reads from
-  `RefFrames` of decoded references. The §8.5.2 inter prediction
-  (motion compensation) is partially landed: its §8.5.2.4 block inter
-  prediction leaf — the two-pass 8-tap sub-pixel convolution over the
-  `subpel_filters[4][16][8]` kernels — and the three preceding steps
-  that feed it (§8.5.2.1 `select_mv` motion-vector selection with the
-  `round_mv_comp_q2` / `round_mv_comp_q4` chroma averaging, §8.5.2.2
-  `clamp_mv` precision-conversion + edge clamping, §8.5.2.3 `scale_mv`
-  reference-size scaling that produces `startX` / `startY` / `stepX` /
-  `stepY`) are present and tested. What remains is the §8.5.2 driver
-  that chains those four steps per plane/refList, reads the reference
-  planes from `FrameStore[ ]`, and writes the (compound-averaged)
-  result into `CurrFrame`. That driver plus the frame-wide per-MI
-  array wiring are the remaining steps for an end-to-end inter-frame
-  decode.
+* Inter frames end-to-end: every §8.5.2 / §8.10 / §6.2-inter building
+  block above is present and tested, but the §6.4.4 `decode_block`
+  inter arm that drives the §6.4.11 `inter_frame_mode_info` decode +
+  §6.4.21 `residual( )` inter `predict_inter( )` call across the
+  partition walk — and the multi-frame sequence driver that threads
+  `RefBuffers` + the inherited color config + the §8.10 update between
+  frames — are the remaining composition steps. `decode_intra_frame`
+  still returns `Error::Unsupported` for inter frames.
 * `show_existing_frame` (returns `Error::Unsupported`).
 * §8.4 probability adaptation / §6.1.2 frame-context refresh
   (single-frame decode does not persist contexts).
@@ -81,7 +89,7 @@ walks. The intra arm is the §6.4.15 `intra_block_mode_info` reader.
 
 ## Testing
 
-The crate carries 704 lib unit tests plus integration suites in
+The crate carries 738 lib unit tests plus integration suites in
 `tests/`. Tests construct their inputs bit-by-bit; §9.2 golden buffers
 are hand-derived by stepping the decoder, not borrowed from any
 third-party VP9 implementation. A `cargo-fuzz` harness lives in

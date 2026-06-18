@@ -500,6 +500,7 @@ mod frame_loop_filter;
 mod header;
 mod idct;
 mod inter_mv;
+mod inter_pred;
 mod intra;
 mod loop_filter;
 mod mode_info;

@@ -1051,10 +1051,10 @@ mod tests {
         // §6.2.7: is_filter_switchable=0, raw_interpolation_filter=1, so
         // interpolation_filter = literal_to_type[ 1 ] = EIGHTTAP = 0 per
         // the §3 numbering (`{ EIGHTTAP_SMOOTH, EIGHTTAP, EIGHTTAP_SHARP,
-        // BILINEAR }`). The fixture trace labels this `filter_mode=1`
-        // using the libvpx display enum, whose value-1 is its own
-        // EIGHTTAP_SMOOTH — a numbering convention difference, not a
-        // parse disagreement (the on-wire raw value is 1 either way).
+        // BILINEAR }`). The fixture trace's `filter_mode=1` label uses a
+        // different (display-order) filter enumeration; the on-wire raw
+        // value is 1 either way, so this is a numbering convention
+        // difference in the label, not a parse disagreement.
         assert_eq!(hdr.interpolation_filter, 0);
         // trace: compressed_hdr_size=3, uncompressed_hdr_size=10.
         assert_eq!(hdr.header_size_in_bytes, 3);

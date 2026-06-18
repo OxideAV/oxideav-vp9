@@ -62,12 +62,17 @@ walks. The intra arm is the §6.4.15 `intra_block_mode_info` reader.
   `RefFrames` of decoded references. The §8.5.2 inter prediction
   (motion compensation) is partially landed: its §8.5.2.4 block inter
   prediction leaf — the two-pass 8-tap sub-pixel convolution over the
-  `subpel_filters[4][16][8]` kernels — is present and tested, but the
-  §8.5.2.1 motion-vector selection / §8.5.2.2 clamping / §8.5.2.3
-  scaling steps that feed it `startX` / `startY` / `xStep` / `yStep`,
-  and the §8.5.2 driver that writes the result into `CurrFrame`, are
-  not yet wired. Those are the remaining steps for an end-to-end
-  inter-frame decode.
+  `subpel_filters[4][16][8]` kernels — and the three preceding steps
+  that feed it (§8.5.2.1 `select_mv` motion-vector selection with the
+  `round_mv_comp_q2` / `round_mv_comp_q4` chroma averaging, §8.5.2.2
+  `clamp_mv` precision-conversion + edge clamping, §8.5.2.3 `scale_mv`
+  reference-size scaling that produces `startX` / `startY` / `stepX` /
+  `stepY`) are present and tested. What remains is the §8.5.2 driver
+  that chains those four steps per plane/refList, reads the reference
+  planes from `FrameStore[ ]`, and writes the (compound-averaged)
+  result into `CurrFrame`. That driver plus the frame-wide per-MI
+  array wiring are the remaining steps for an end-to-end inter-frame
+  decode.
 * `show_existing_frame` (returns `Error::Unsupported`).
 * §8.4 probability adaptation / §6.1.2 frame-context refresh
   (single-frame decode does not persist contexts).

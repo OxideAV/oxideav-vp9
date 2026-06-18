@@ -509,6 +509,7 @@ mod mv_ref;
 mod narrow_filter;
 mod partition;
 mod reconstruct;
+mod ref_buffer;
 mod residual;
 mod sample_filtering;
 mod scan;

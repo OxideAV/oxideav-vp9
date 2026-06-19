@@ -519,6 +519,7 @@ mod sample_filtering;
 mod scan;
 mod superblock_filter;
 mod superblock_loop_filter;
+mod superframe;
 mod tokens;
 mod wide_filter;
 
@@ -554,6 +555,7 @@ pub use superblock_filter::{
 pub use superblock_loop_filter::{
     superblock_loop_filter, SuperblockFilterFrame, SuperblockFilterPlane,
 };
+pub use superframe::split_superframe;
 pub use wide_filter::{wide_filter, WideFilterOutput, WideFilterSamples};
 
 /// Crate-local error type.

@@ -14,7 +14,7 @@
 //! independent decoder run over the same bitstream (see the fixture
 //! `notes.md`): 2 x (64x64 Y + 32x32 U + 32x32 V).
 
-use oxideav_vp9::decode_vp9_sequence;
+use oxideav_vp9::{decode_vp9_sequence, split_superframe};
 
 fn from_hex_lines(lines: &[&str]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -530,4 +530,98 @@ fn docs_corpus_inter_fixture_decodes_byte_exact() {
         .filter(|(a, b)| a != b)
         .count();
     assert_eq!(diffs, 0, "{diffs} differing bytes vs expected.yuv");
+}
+
+/// Split an IVF stream into its per-frame VP9 chunks (32-byte file header,
+/// then per-frame 12-byte headers whose first 4 bytes are the little-endian
+/// payload size). IVF carriage is a test-fixture convenience here, not a
+/// codec responsibility — the codec consumes the raw VP9 chunks.
+fn ivf_chunks(ivf: &[u8]) -> Vec<Vec<u8>> {
+    let mut payloads: Vec<Vec<u8>> = Vec::new();
+    let hdr_len = u16::from_le_bytes([ivf[6], ivf[7]]) as usize;
+    let mut off = hdr_len;
+    while off + 12 <= ivf.len() {
+        let size =
+            u32::from_le_bytes([ivf[off], ivf[off + 1], ivf[off + 2], ivf[off + 3]]) as usize;
+        let start = off + 12;
+        if start + size > ivf.len() {
+            break;
+        }
+        payloads.push(ivf[start..start + size].to_vec());
+        off = start + size;
+    }
+    payloads
+}
+
+/// §6.4.11 / §6.5 / §8.5.2 / §8.10: the four-frame `frame-parallel-mode`
+/// fixture (`error_resilient=1`, `parallel_mode=1`, `refresh_ctx=0` on every
+/// frame — i.e. no inter-frame entropy adaptation, which is exactly the
+/// crate's per-frame-reset context model) decodes byte-exact. This is a
+/// keyframe followed by *three* consecutive P-frames at 64x64, exercising
+/// the §8.10 reference threading across more than the single P-frame the
+/// embedded pin covers. The §7.2.5 error-resilient + frame-parallel header
+/// path is validated end-to-end against real pixels here.
+#[test]
+fn frame_parallel_mode_four_frame_sequence_byte_exact() {
+    let base = std::path::Path::new("../../docs/video/vp9/fixtures/frame-parallel-mode");
+    if !base.is_dir() {
+        eprintln!("docs corpus not present; frame-parallel-mode is docs-gated");
+        return;
+    }
+    let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");
+    let expected = std::fs::read(base.join("expected.yuv")).expect("expected.yuv");
+
+    let payloads = ivf_chunks(&ivf);
+    assert_eq!(payloads.len(), 4, "four IVF frames");
+    let refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+    let frames = decode_vp9_sequence(&refs).expect("decode frame-parallel sequence");
+    assert_eq!(frames.len(), 4, "four shown frames");
+
+    let mut got = Vec::new();
+    for f in &frames {
+        got.extend(f.to_planar_bytes());
+    }
+    assert_eq!(got.len(), expected.len(), "planar length");
+    let diffs = got
+        .iter()
+        .zip(expected.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(
+        diffs, 0,
+        "{diffs} differing bytes vs frame-parallel-mode expected.yuv"
+    );
+}
+
+/// Annex B: the `frame-parallel-mode` IVF chunks carry no superframe index,
+/// so [`split_superframe`] passes each chunk through unchanged — the §B.4
+/// single-frame fallback. Confirms the split is transparent on
+/// non-superframe content and the decode is identical when routed through
+/// it (the canonical demux order: IVF chunk -> superframe split -> decode).
+#[test]
+fn superframe_split_is_transparent_on_plain_chunks() {
+    let base = std::path::Path::new("../../docs/video/vp9/fixtures/frame-parallel-mode");
+    if !base.is_dir() {
+        eprintln!("docs corpus not present; docs-gated");
+        return;
+    }
+    let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");
+    let expected = std::fs::read(base.join("expected.yuv")).expect("expected.yuv");
+
+    let payloads = ivf_chunks(&ivf);
+    // Route each IVF chunk through the Annex B split before decode.
+    let mut split: Vec<Vec<u8>> = Vec::new();
+    for p in &payloads {
+        for f in split_superframe(p) {
+            split.push(f.to_vec());
+        }
+    }
+    assert_eq!(split.len(), 4, "no superframes -> one frame per chunk");
+    let refs: Vec<&[u8]> = split.iter().map(|p| p.as_slice()).collect();
+    let frames = decode_vp9_sequence(&refs).expect("decode");
+    let mut got = Vec::new();
+    for f in &frames {
+        got.extend(f.to_planar_bytes());
+    }
+    assert_eq!(got, expected, "split-then-decode byte-exact");
 }

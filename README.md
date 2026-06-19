@@ -14,9 +14,20 @@ planar samples, byte-exact against a 13-fixture staged corpus covering
 segmentation AQ, lossless, and both quantizer extremes.
 [`decode_vp9_sequence`] decodes a multi-frame stream (keyframe followed
 by P-frames), threading the §8.10 reference buffers + §6.5 previous-frame
-motion field across frames; the `i-frame-then-p-frame-64x64` fixture
+motion field across frames. Two corpus fixtures reconstruct byte-exact
+against their `expected.yuv`: the `i-frame-then-p-frame-64x64` fixture
 (keyframe + single-reference LAST P-frame, high-precision MVs, 8-tap-smooth
-filter) reconstructs both frames byte-exact against its `expected.yuv`.
+filter) and the `frame-parallel-mode` fixture (keyframe + **three**
+consecutive single-reference P-frames at 64x64, `error_resilient=1` /
+`parallel_mode=1` / `refresh_ctx=0`, so no inter-frame entropy adaptation —
+the §8.10 reference threading is validated across a longer P-frame run).
+
+[`split_superframe`] implements the Annex B superframe split: it parses
+the §B.2.1 superframe index and returns the enclosed coded-frame slices in
+decode order, with the §B.4 single-frame fallback when no valid index is
+present. This is VP9-intrinsic framing (Annex B of the bitstream spec) —
+the split must precede the §6.2 per-frame header walk for any chunk that
+might carry hidden alt-ref frames.
 
 The decode path composes:
 
@@ -91,8 +102,12 @@ map between frames.
 ### Not yet supported
 
 * Compound + scaled-reference inter prediction are wired but not yet
-  fixture-validated (the staged inter fixture is single-reference,
+  fixture-validated (the validated inter fixtures are single-reference,
   same-size LAST); broader inter fixtures land in later rounds.
+* Hidden alt-ref superframes (`superframe-2`) and the
+  `show-existing-frame` corpus decode their keyframe + early frames but
+  hit a divergence on a later hidden-ARF P-frame; the Annex B split is
+  in place but the full hidden-ARF inter path is not yet byte-exact.
 * §8.4 probability adaptation / §6.1.2 frame-context refresh
   (contexts are reset per frame; running adaptation is deferred).
 * §9.2.4 multi-coder tile parallelism (tiles decode sequentially).

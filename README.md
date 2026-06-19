@@ -7,11 +7,16 @@ v0.7.
 
 ## Status
 
-Intra (key / intra-only) frame decode works end-to-end. [`decode_vp9`]
+Intra **and inter (P-frame)** decode work end-to-end. [`decode_vp9`]
 and [`decode_intra_frame`] decode a complete VP9 keyframe to packed
 planar samples, byte-exact against a 13-fixture staged corpus covering
 4:2:0 and 4:4:4 chroma, 8/10/12-bit depth, RGB, multiple tile columns,
 segmentation AQ, lossless, and both quantizer extremes.
+[`decode_vp9_sequence`] decodes a multi-frame stream (keyframe followed
+by P-frames), threading the §8.10 reference buffers + §6.5 previous-frame
+motion field across frames; the `i-frame-then-p-frame-64x64` fixture
+(keyframe + single-reference LAST P-frame, high-precision MVs, 8-tap-smooth
+filter) reconstructs both frames byte-exact against its `expected.yuv`.
 
 The decode path composes:
 
@@ -71,19 +76,25 @@ landed — the latter pinned byte-exact against the
 `build_ref_planes` adapters bridge the frame-wide §6.4.4 arrays +
 `RefBuffers` to the §6.5 MV-reference scan and the §8.5.2 driver.
 
+The §6.4.4 `decode_block` inter arm is now wired into the partition
+walk: the §6.4.11 `inter_frame_mode_info` decode (segment id / skip /
+is_inter / tx size prelude → §6.4.16 `inter_block_mode_info` or §6.4.15
+`intra_block_mode_info`), the §6.4.21 `residual( )` inter arm that runs
+§8.5.2 `predict_inter( )` per plane (single + compound) before the token
+loop, and the §6.4.4 fan-out of the per-block `RefFrames` / `Mvs` /
+`SubMvs` / `InterpFilters` into the frame-wide arrays. The multi-frame
+sequence driver ([`decode_vp9_sequence`]) threads the §8.10 `RefBuffers`
+update, the inherited color config, the §6.5 previous-frame motion field,
+the §7.2.6 `UsePrevFrameMvs` derivation, and the §6.4.14 previous-segment
+map between frames.
+
 ### Not yet supported
 
-* Inter frames end-to-end: every §8.5.2 / §8.10 / §6.2-inter building
-  block above is present and tested, but the §6.4.4 `decode_block`
-  inter arm that drives the §6.4.11 `inter_frame_mode_info` decode +
-  §6.4.21 `residual( )` inter `predict_inter( )` call across the
-  partition walk — and the multi-frame sequence driver that threads
-  `RefBuffers` + the inherited color config + the §8.10 update between
-  frames — are the remaining composition steps. `decode_intra_frame`
-  still returns `Error::Unsupported` for inter frames.
-* `show_existing_frame` (returns `Error::Unsupported`).
+* Compound + scaled-reference inter prediction are wired but not yet
+  fixture-validated (the staged inter fixture is single-reference,
+  same-size LAST); broader inter fixtures land in later rounds.
 * §8.4 probability adaptation / §6.1.2 frame-context refresh
-  (single-frame decode does not persist contexts).
+  (contexts are reset per frame; running adaptation is deferred).
 * §9.2.4 multi-coder tile parallelism (tiles decode sequentially).
 * Encoder paths.
 

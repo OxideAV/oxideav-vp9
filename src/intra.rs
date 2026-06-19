@@ -148,6 +148,13 @@ impl Plane {
     pub(crate) fn samples_mut(&mut self) -> &mut [i32] {
         &mut self.samples
     }
+
+    /// Row-major immutable sample slice (stride = `width`). Used by the
+    /// §8.10 reference-buffer update, which copies the reconstructed +
+    /// loop-filtered working plane into a `FrameStore[ ]` slot.
+    pub(crate) fn samples(&self) -> &[i32] {
+        &self.samples
+    }
 }
 
 /// `Round2( x, n ) = ( x + (1 << (n - 1)) ) >> n` per §3.

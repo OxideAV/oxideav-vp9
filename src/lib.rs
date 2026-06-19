@@ -5,8 +5,11 @@
 //! [`decode_intra_frame`] decode intra (key / intra-only) frames
 //! end-to-end — §6.2 / §6.3 headers, the §6.4 tile + partition +
 //! block walk, §8.5.1 intra prediction, §8.6 dequantization, §8.7
-//! inverse transforms and the §8.8 loop filter. Inter frames need
-//! reference-buffer state and land in later rounds.
+//! inverse transforms and the §8.8 loop filter. [`decode_vp9_sequence`]
+//! decodes a multi-frame stream (keyframe + inter / P-frames) end-to-end,
+//! adding the §6.4.11 inter mode-info decode, the §6.5 motion-vector
+//! reference search, the §8.5.2 inter prediction process, and the §8.10
+//! reference-buffer update threaded across frames.
 //!
 //! ## Cumulative scope (rounds 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 + 11 + 12 + 13 + 14 + 15 + 16 + 17 + 18 + 19 + 20 + 21 + 22 + 37 + 244 + 250 + 253 + 255 + 259 + … + 284)
 //!
@@ -528,7 +531,7 @@ pub use compressed::{
     RefFrameSignBias, ReferenceMode, TxMode, Vp9CompressedHeader, Vp9CompressedHeaderInter,
     Vp9CompressedHeaderInterInputs,
 };
-pub use decode_frame::{decode_intra_frame, Vp9DecodedFrame};
+pub use decode_frame::{decode_intra_frame, decode_vp9_sequence, Vp9DecodedFrame};
 pub use filter_mask::{filter_mask, FilterMask, FilterMaskSamples};
 pub use filter_size::{
     filter_size, PASS_HORIZONTAL, PASS_VERTICAL, TX_16X16, TX_32X32, TX_4X4, TX_8X8,
@@ -555,9 +558,11 @@ pub use wide_filter::{wide_filter, WideFilterOutput, WideFilterSamples};
 
 /// Crate-local error type.
 ///
-/// [`decode_vp9`] decodes intra (key / intra-only) frames end-to-end;
-/// inter frames return [`Error::Unsupported`] until reference-buffer
-/// state lands. [`encode_vp9`] still returns
+/// [`decode_vp9`] / [`decode_intra_frame`] decode a single intra (key /
+/// intra-only) frame; an inter frame fed to them returns
+/// [`Error::Unsupported`] because it needs reference-buffer state — use
+/// [`decode_vp9_sequence`] to decode a multi-frame stream (keyframe +
+/// P-frames) end-to-end. [`encode_vp9`] still returns
 /// [`Error::NotImplemented`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -605,8 +610,9 @@ impl std::error::Error for Error {}
 /// §6.2 uncompressed header + §6.3 compressed header + §6.4 tile
 /// data. Key frames and intra-only frames decode end-to-end (mode
 /// info → intra prediction → coefficient decode → dequant → inverse
-/// transform → reconstruction → §8.8 loop filter); inter frames
-/// return [`Error::Unsupported`] until reference-buffer state lands.
+/// transform → reconstruction → §8.8 loop filter); a standalone inter
+/// frame returns [`Error::Unsupported`] (it needs reference-buffer
+/// state — use [`decode_vp9_sequence`] for a keyframe + P-frame stream).
 ///
 /// The output is planar Y then U then V at the §8.10 cropped extents
 /// — one byte per sample for 8-bit content, little-endian `u16` pairs

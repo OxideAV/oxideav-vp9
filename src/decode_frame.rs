@@ -41,24 +41,37 @@
 //! §8.7, §8.8, §8.10).
 
 use crate::bool_coder::BoolCoder;
-use crate::compressed::{parse_compressed_header, Vp9CompressedHeader};
+use crate::compressed::{
+    parse_compressed_header, parse_compressed_header_inter, CompoundReferenceConfig,
+    RefFrameSignBias, Vp9CompressedHeader, Vp9CompressedHeaderInter,
+    Vp9CompressedHeaderInterInputs,
+};
 use crate::decode_block::{decode_block_apply, DecodedBlockResult, Vp9FrameState};
 use crate::dequant::{get_ac_quant, get_dc_quant, seg_feature_active};
 use crate::frame_loop_filter::{frame_loop_filter, CurrFrame};
 use crate::header::{
-    parse_uncompressed_header, FrameType, QuantizationParams, SegmentationParams, Vp9FrameHeader,
+    parse_uncompressed_header, parse_uncompressed_header_with_refs, ColorConfig, FrameType,
+    QuantizationParams, RefFrameState, SegmentationParams, Vp9FrameHeader,
 };
+use crate::inter_decode::{build_ref_planes, FrameStateMvSource, PrevFrameMvs};
+use crate::inter_mv::{BlockGrid, ScaleGeom};
+use crate::inter_pred::{predict_inter, InterPredArgs};
 use crate::intra::{predict_intra, Plane, PredMode};
 use crate::loop_filter::loop_filter_frame_init;
 use crate::mode_info::{
-    intra_frame_mode_info, intra_segment_id, IntraFrameNeighbours, NeighbourSkips,
-    NeighbourTxSizes, Vp9IntraMiBlock, DC_PRED, INTRA_FRAME, NONE_REF_FRAME, SEG_LVL_SKIP,
+    inter_frame_mode_info, intra_frame_mode_info, intra_segment_id, InterFrameModeArgs,
+    InterRefFrameArgs, InterSegmentIdArgs, InterpFilterNeighbours, IntraFrameNeighbours,
+    IsInterNeighbours, NeighbourSkips, NeighbourTxSizes, PrevSegmentIds, RefFrameNeighbours,
+    SegFeatureTables, SegPredContextState, Vp9InterFrameBlock, Vp9IntraMiBlock, ALTREF_FRAME,
+    DC_PRED, GOLDEN_FRAME, INTRA_FRAME, LAST_FRAME, NONE_REF_FRAME, SEG_LVL_SKIP,
 };
+use crate::mv_ref::MvRefGeometry;
 use crate::partition::{
     decode_partition, get_tile_offset, tile_payload_sizes, LeafSink, PartitionContextState,
     PartitionProbsKind,
 };
 use crate::reconstruct::{reconstruct_block, tx_type_for_intra};
+use crate::ref_buffer::{CurrFramePlanes, RefBuffers, REFS_PER_FRAME};
 use crate::residual::{
     get_plane_block_size, get_uv_tx_size, BLOCK_64X64, BLOCK_8X8, BLOCK_INVALID,
     NUM_4X4_BLOCKS_HIGH_LOOKUP, NUM_4X4_BLOCKS_WIDE_LOOKUP,
@@ -120,6 +133,7 @@ struct BlockDecoder<'a> {
     mi_rows: u32,
     mi_cols: u32,
     mi_col_start: u32,
+    mi_col_end: u32,
     subsampling_x: bool,
     subsampling_y: bool,
     bit_depth: u32,
@@ -131,6 +145,52 @@ struct BlockDecoder<'a> {
     nz: &'a mut [NonzeroContext; 3],
     token_cache: &'a mut [u8; 1024],
     tok_buf: &'a mut [i64; 1024],
+    /// `Some(_)` on inter (non-intra-only) frames; `None` on keyframes /
+    /// intra-only frames. Carries the §6.3 inter compressed-header tail,
+    /// the §8.10 reference buffers, the §6.2 inter header flags, the
+    /// §6.4.11 segmentation-prediction context, and the previous frame's
+    /// motion field. The §6.4.11 inter mode-info decode + §8.5.2
+    /// `predict_inter( )` residual arm only run when this is `Some(_)`.
+    inter: Option<InterCtx<'a>>,
+}
+
+/// The inter-frame decode context the §6.4.11 `inter_frame_mode_info( )`
+/// driver and the §8.5.2 `predict_inter( )` residual arm need on a
+/// non-intra-only frame.
+struct InterCtx<'a> {
+    /// The §6.3 inter compressed-header tail (probability tables +
+    /// `reference_mode` + compound config + `mv_probs`).
+    chdr: &'a Vp9CompressedHeaderInter,
+    /// §8.10 reference-frame slots resolved through `ref_frame_idx`.
+    refs: &'a RefBuffers,
+    /// §6.2 `ref_frame_idx[ 3 ]` slot map.
+    ref_frame_idx: [u8; REFS_PER_FRAME],
+    /// §6.2.5 `ref_frame_sign_bias[ 4 ]` (indexed by §3 ref-frame value).
+    sign_bias: [bool; 4],
+    /// §6.2.7 `interpolation_filter` frame-level value (`SWITCHABLE = 4`
+    /// ⇒ per-block tree read).
+    interpolation_filter: u8,
+    /// §6.2 `allow_high_precision_mv`.
+    allow_high_precision_mv: bool,
+    /// §7.2.6 `UsePrevFrameMvs`.
+    use_prev_frame_mvs: bool,
+    /// §6.3.18 compound-reference config (`SingleReference` frames carry
+    /// a placeholder; `read_ref_frames( )` only reads it on the compound
+    /// arms).
+    comp_config: CompoundReferenceConfig,
+    /// §8.10 `FrameWidth` / `FrameHeight` of the frame being decoded (for
+    /// the §8.5.2.3 scale geometry).
+    frame_width: u32,
+    frame_height: u32,
+    /// Previous decoded frame's `RefFrames[ ][ ][ 0 ]` (`[mi*2+list]`),
+    /// read by the §6.5.10 candidate scan when `use_prev_frame_mvs`.
+    prev_ref_frames: &'a [i32],
+    /// Previous decoded frame's `Mvs[ ][ ][ ]` (`[mi*2+list]`).
+    prev_mvs: &'a [(i16, i16)],
+    /// Previous decoded frame's `SegmentId[ ][ ]` plane (§6.4.14).
+    prev_segment_ids: &'a [u8],
+    /// §6.4.11 segmentation-prediction context strips.
+    seg_pred_ctx: &'a mut SegPredContextState,
 }
 
 impl LeafSink for BlockDecoder<'_> {
@@ -146,8 +206,25 @@ impl LeafSink for BlockDecoder<'_> {
 }
 
 impl BlockDecoder<'_> {
-    /// §6.4.4 `decode_block( r, c, subsize )` — the intra arm.
+    /// §6.4.4 `decode_block( r, c, subsize )` — dispatches the §6.4.5
+    /// intra-frame (keyframe) arm or the §6.4.11 inter-frame arm.
     fn decode_block(
+        &mut self,
+        coder: &mut BoolCoder<'_>,
+        r: u32,
+        c: u32,
+        subsize: u8,
+    ) -> Result<(), Error> {
+        if self.inter.is_some() {
+            self.decode_block_inter(coder, r, c, subsize)
+        } else {
+            self.decode_block_intra(coder, r, c, subsize)
+        }
+    }
+
+    /// §6.4.4 `decode_block( r, c, subsize )` — the keyframe / intra-only
+    /// arm (§6.4.6 `intra_frame_mode_info( )`).
+    fn decode_block_intra(
         &mut self,
         coder: &mut BoolCoder<'_>,
         r: u32,
@@ -448,14 +525,608 @@ impl BlockDecoder<'_> {
 
         Ok(eob_total)
     }
+
+    /// §6.4.4 `decode_block( r, c, subsize )` — the §6.4.11 inter-frame
+    /// arm. Decodes the per-block §6.4.11 `inter_frame_mode_info( )`
+    /// (which dispatches §6.4.16 inter / §6.4.15 intra), runs the
+    /// §6.4.21 residual (with the §8.5.2 `predict_inter( )` arm for inter
+    /// blocks), and fans the products into the frame-wide arrays.
+    fn decode_block_inter(
+        &mut self,
+        coder: &mut BoolCoder<'_>,
+        r: u32,
+        c: u32,
+        subsize: u8,
+    ) -> Result<(), Error> {
+        let avail_u = r > 0;
+        let avail_l = c > self.mi_col_start;
+
+        // §6.4.11 prelude neighbour bundles — derived from the frame-wide
+        // arrays earlier blocks' §6.4.4 fan-outs populated.
+        let above_rf = |rl: usize| -> Option<i32> {
+            if avail_u {
+                self.state.get_ref_frame(r - 1, c, rl)
+            } else {
+                None
+            }
+        };
+        let left_rf = |rl: usize| -> Option<i32> {
+            if avail_l {
+                self.state.get_ref_frame(r, c - 1, rl)
+            } else {
+                None
+            }
+        };
+        let above_pair = above_rf(0).map(|rf0| (rf0, above_rf(1).unwrap_or(NONE_REF_FRAME)));
+        let left_pair = left_rf(0).map(|rf0| (rf0, left_rf(1).unwrap_or(NONE_REF_FRAME)));
+
+        let nb_skip = NeighbourSkips {
+            above: if avail_u {
+                self.state.get_skip(r - 1, c)
+            } else {
+                None
+            },
+            left: if avail_l {
+                self.state.get_skip(r, c - 1)
+            } else {
+                None
+            },
+        };
+        let nb_tx = NeighbourTxSizes {
+            avail_u,
+            avail_l,
+            skip_above: nb_skip.above.unwrap_or(0),
+            skip_left: nb_skip.left.unwrap_or(0),
+            tx_above: if avail_u {
+                self.state.get_tx_size(r - 1, c).unwrap_or(0) as u32
+            } else {
+                0
+            },
+            tx_left: if avail_l {
+                self.state.get_tx_size(r, c - 1).unwrap_or(0) as u32
+            } else {
+                0
+            },
+        };
+        let is_inter_nb = IsInterNeighbours {
+            above: above_rf(0),
+            left: left_rf(0),
+        };
+        // §9.3.2 interp_filter neighbours: the InterpFilters cell is only
+        // meaningful when that neighbour is inter (RefFrame[0] > INTRA).
+        let interp_nb = InterpFilterNeighbours {
+            above: above_rf(0).and_then(|rf0| {
+                if rf0 > INTRA_FRAME {
+                    self.state.get_interp_filter(r - 1, c)
+                } else {
+                    None
+                }
+            }),
+            left: left_rf(0).and_then(|rf0| {
+                if rf0 > INTRA_FRAME {
+                    self.state.get_interp_filter(r, c - 1)
+                } else {
+                    None
+                }
+            }),
+        };
+        let ref_nb = RefFrameNeighbours {
+            above: above_pair,
+            left: left_pair,
+        };
+
+        // Snapshot the inter-context scalars the decode reads (avoid
+        // holding a borrow of `self.inter` across the `&mut self`
+        // mode-info call which also touches `self.state` / planes).
+        let inter = self.inter.as_ref().expect("inter ctx on inter frame");
+        let interpolation_filter = inter.interpolation_filter;
+        let allow_hp_mv = inter.allow_high_precision_mv;
+        let use_prev = inter.use_prev_frame_mvs;
+        let comp_config = inter.comp_config;
+        let reference_mode = inter.chdr.reference_mode;
+        let sign_bias = inter.sign_bias;
+        let fix_ref_idx = sign_bias[comp_config.fixed_ref as usize] as u8;
+
+        let geom = MvRefGeometry {
+            mi_row: r as i32,
+            mi_col: c as i32,
+            mi_rows: self.mi_rows as i32,
+            mi_cols: self.mi_cols as i32,
+            mi_size: subsize as usize,
+            mi_col_start: self.mi_col_start as i32,
+            mi_col_end: self.mi_col_end as i32,
+        };
+
+        let prev = if use_prev {
+            Some(PrevFrameMvs {
+                prev_ref_frames: inter.prev_ref_frames,
+                prev_mvs: inter.prev_mvs,
+            })
+        } else {
+            None
+        };
+        let src = FrameStateMvSource::new(self.state, prev);
+
+        let prev_seg = PrevSegmentIds {
+            mi_rows: self.mi_rows,
+            mi_cols: self.mi_cols,
+            data: inter.prev_segment_ids,
+        };
+        let seg = SegFeatureTables {
+            enabled: self.seg.enabled,
+            feature_enabled: &self.seg.feature_enabled,
+            feature_data: &self.seg.feature_data,
+        };
+        let chdr_inter = inter.chdr;
+
+        let args = InterFrameModeArgs {
+            geom: &geom,
+            src: &src,
+            seg,
+            seg_id: InterSegmentIdArgs {
+                update_map: self.seg.update_map,
+                temporal_update: self.seg.temporal_update,
+                tree_probs: self.seg.tree_probs.as_ref(),
+                pred_prob: self.seg.pred_prob.as_ref(),
+                prev: prev_seg,
+            },
+            skip_prob: &chdr_inter.intra.skip_prob,
+            skip_nb: nb_skip,
+            is_inter_prob: &chdr_inter.is_inter_prob,
+            is_inter_nb,
+            tx_mode: chdr_inter.intra.tx_mode,
+            tx_probs: &chdr_inter.intra.tx_probs,
+            tx_nb: nb_tx,
+            ref_frame: InterRefFrameArgs {
+                // The §6.4.11 driver re-resolves the SEG_LVL_REF_FRAME
+                // override against the just-decoded segment_id; these two
+                // fields are placeholders it overwrites.
+                seg_feature_ref_frame_active: false,
+                segment_ref_frame_data: 0,
+                reference_mode,
+                comp_config,
+                fix_ref_idx,
+                nb: ref_nb,
+                comp_mode_prob: &chdr_inter.comp_mode_prob,
+                single_ref_prob: &chdr_inter.single_ref_prob,
+                comp_ref_prob: &chdr_inter.comp_ref_prob,
+            },
+            mv_probs: &chdr_inter.mv_probs,
+            inter_mode_probs: &chdr_inter.inter_mode_probs,
+            interp_filter_probs: &chdr_inter.interp_filter_probs,
+            interp_nb,
+            interpolation_filter,
+            allow_high_precision_mv: allow_hp_mv,
+            use_prev_frame_mvs: use_prev,
+            sign_bias: &sign_bias,
+            y_mode_probs: &chdr_inter.y_mode_probs,
+            uv_mode_probs: &crate::mode_info::DEFAULT_UV_MODE_PROBS,
+        };
+
+        let seg_pred_ctx = &mut self.inter.as_mut().unwrap().seg_pred_ctx;
+        let mi = inter_frame_mode_info(coder, args, seg_pred_ctx, r, c)?;
+
+        // Map the §6.4.11 products into the §6.4.4 fan-out + residual.
+        let (ref_frame, is_inter, y_mode, interp_filter, block_mvs, sub_modes, uv_mode) =
+            match mi.block {
+                Vp9InterFrameBlock::Inter(b) => (
+                    [b.ref_frame_0, b.ref_frame_1],
+                    true,
+                    b.y_mode,
+                    b.interp_filter,
+                    b.block_mvs,
+                    [DC_PRED; 4],
+                    DC_PRED,
+                ),
+                Vp9InterFrameBlock::Intra(b) => (
+                    [b.ref_frame_0, b.ref_frame_1],
+                    false,
+                    b.y_mode,
+                    0u8,
+                    [[[0i32; 2]; 4]; 2],
+                    b.sub_modes,
+                    b.uv_mode,
+                ),
+            };
+
+        // §6.4.21 residual + (inter) §8.5.2 predict_inter.
+        let tx_size = mi.tx_size as u8;
+        let eob_total = self.residual_inter(
+            coder,
+            r,
+            c,
+            subsize,
+            tx_size,
+            mi.segment_id,
+            mi.skip,
+            is_inter,
+            y_mode,
+            uv_mode,
+            &sub_modes,
+            ref_frame,
+            interp_filter,
+            &block_mvs,
+            avail_u,
+            avail_l,
+        )?;
+
+        // §6.4.4 line 2405-2407 skip rewrite + fan-out.
+        let block_mvs_i16: [[(i16, i16); 4]; 2] = {
+            let mut out = [[(0i16, 0i16); 4]; 2];
+            for (rl, row) in block_mvs.iter().enumerate() {
+                for (b, mv) in row.iter().enumerate() {
+                    out[rl][b] = (mv[0] as i16, mv[1] as i16);
+                }
+            }
+            out
+        };
+        let result = DecodedBlockResult {
+            skip: mi.skip,
+            tx_size: mi.tx_size as u8,
+            y_mode,
+            segment_id: mi.segment_id,
+            ref_frame,
+            is_inter,
+            eob_total,
+            interp_filter,
+            block_mvs: block_mvs_i16,
+            sub_modes,
+        };
+        decode_block_apply(self.state, r, c, subsize, &result);
+        Ok(())
+    }
+
+    /// §6.4.21 `residual( )` — the inter-capable arm. Runs §8.5.2
+    /// `predict_inter( )` for inter blocks (before the token loop, per
+    /// the §6.4.21 listing) and §8.5.1 `predict_intra( )` for intra
+    /// blocks, then the shared §6.4.24 token + §8.6.2 reconstruct loop.
+    /// Returns the §6.4.24 `EobTotal` accumulator.
+    #[allow(clippy::too_many_arguments)]
+    fn residual_inter(
+        &mut self,
+        coder: &mut BoolCoder<'_>,
+        r: u32,
+        c: u32,
+        mi_size: u8,
+        tx_size: u8,
+        segment_id: u8,
+        skip: bool,
+        is_inter: bool,
+        y_mode: u8,
+        uv_mode: u8,
+        sub_modes: &[u8; 4],
+        ref_frame: [i32; 2],
+        interp_filter: u8,
+        block_mvs: &[[[i32; 2]; 4]; 2],
+        avail_u: bool,
+        avail_l: bool,
+    ) -> Result<u32, Error> {
+        let bsize = mi_size.max(BLOCK_8X8);
+        let mut eob_total = 0u32;
+        let segment_id = segment_id as usize;
+        let is_compound = ref_frame[1] > INTRA_FRAME;
+        let tx_size = tx_size as u32;
+
+        for plane in 0..3usize {
+            let tx_sz = if plane == 0 {
+                tx_size
+            } else {
+                get_uv_tx_size(tx_size, mi_size, self.subsampling_x, self.subsampling_y)
+            };
+            let step = 1u32 << tx_sz;
+
+            let plane_sz =
+                get_plane_block_size(bsize, plane, self.subsampling_x, self.subsampling_y);
+            if plane_sz == BLOCK_INVALID {
+                return Err(Error::InvalidBitstream);
+            }
+            let num4x4w = NUM_4X4_BLOCKS_WIDE_LOOKUP[plane_sz as usize];
+            let num4x4h = NUM_4X4_BLOCKS_HIGH_LOOKUP[plane_sz as usize];
+
+            let sub_x = plane > 0 && self.subsampling_x;
+            let sub_y = plane > 0 && self.subsampling_y;
+            let base_x = (c * 8) >> u32::from(sub_x);
+            let base_y = (r * 8) >> u32::from(sub_y);
+            let maxx = (self.mi_cols * 8) >> u32::from(sub_x);
+            let maxy = (self.mi_rows * 8) >> u32::from(sub_y);
+
+            // §6.4.21: for inter blocks, predict the whole plane region
+            // BEFORE the token/reconstruct loop. Sub-8x8 blocks predict
+            // each 4x4 sub-block; >= BLOCK_8X8 predicts the whole plane.
+            if is_inter {
+                if mi_size < BLOCK_8X8 {
+                    for y in 0..num4x4h {
+                        for x in 0..num4x4w {
+                            self.predict_inter_region(
+                                plane,
+                                (base_x + 4 * x) as i32,
+                                (base_y + 4 * y) as i32,
+                                4,
+                                4,
+                                (y * num4x4w + x) as usize,
+                                r,
+                                c,
+                                mi_size,
+                                ref_frame,
+                                interp_filter,
+                                is_compound,
+                                block_mvs,
+                            );
+                        }
+                    }
+                } else {
+                    self.predict_inter_region(
+                        plane,
+                        base_x as i32,
+                        base_y as i32,
+                        (num4x4w * 4) as usize,
+                        (num4x4h * 4) as usize,
+                        0,
+                        r,
+                        c,
+                        mi_size,
+                        ref_frame,
+                        interp_filter,
+                        is_compound,
+                        block_mvs,
+                    );
+                }
+            }
+
+            let dc_quant = get_dc_quant(
+                plane,
+                self.seg,
+                self.quant,
+                segment_id,
+                self.bit_depth as u8,
+            );
+            let ac_quant = get_ac_quant(
+                plane,
+                self.seg,
+                self.quant,
+                segment_id,
+                self.bit_depth as u8,
+            );
+
+            let mut block_idx = 0usize;
+            let mut y = 0u32;
+            while y < num4x4h {
+                let mut x = 0u32;
+                while x < num4x4w {
+                    let start_x = base_x + 4 * x;
+                    let start_y = base_y + 4 * y;
+                    let mut nonzero = false;
+
+                    if start_x < maxx && start_y < maxy {
+                        let plane_buf: &mut Plane = match plane {
+                            0 => self.y,
+                            1 => self.u,
+                            _ => self.v,
+                        };
+
+                        if !is_inter {
+                            let mode_raw = if plane > 0 {
+                                uv_mode
+                            } else if mi_size >= BLOCK_8X8 {
+                                y_mode
+                            } else {
+                                sub_modes[block_idx & 3]
+                            };
+                            let mode =
+                                PredMode::from_raw(mode_raw).ok_or(Error::InvalidBitstream)?;
+                            predict_intra(
+                                plane_buf,
+                                start_x as usize,
+                                start_y as usize,
+                                avail_l || x > 0,
+                                avail_u || y > 0,
+                                x + step < num4x4w,
+                                tx_sz,
+                                mode,
+                                (maxx - 1) as usize,
+                                (maxy - 1) as usize,
+                                self.bit_depth,
+                            );
+                        }
+
+                        if !skip {
+                            // §6.4.25 TxType: inter blocks always DCT_DCT;
+                            // chroma / TX_32X32 / lossless force DCT_DCT;
+                            // other intra luma blocks follow the §6.4.25 map.
+                            let tx_type = if is_inter || plane > 0 || tx_sz == 3 || self.lossless {
+                                crate::idct::DCT_DCT
+                            } else {
+                                let mode_raw = if mi_size >= BLOCK_8X8 {
+                                    y_mode
+                                } else {
+                                    sub_modes[block_idx & 3]
+                                };
+                                let mode =
+                                    PredMode::from_raw(mode_raw).ok_or(Error::InvalidBitstream)?;
+                                tx_type_for_intra(mode)
+                            };
+                            let scan = get_scan(plane, tx_sz, tx_type);
+                            let n0 = 1usize << (tx_sz + 2);
+                            let seg_eob = n0 * n0;
+
+                            let tbc = TokenBlockCtx {
+                                plane,
+                                is_inter,
+                                tx_type,
+                                bit_depth: self.bit_depth,
+                                x4: (start_x >> 2) as usize,
+                                y4: (start_y >> 2) as usize,
+                                max_x: ((2 * self.mi_cols) >> u32::from(sub_x)) as usize,
+                                max_y: ((2 * self.mi_rows) >> u32::from(sub_y)) as usize,
+                            };
+                            self.token_cache[..seg_eob].fill(0);
+                            nonzero = tokens(
+                                coder,
+                                &tbc,
+                                tx_sz,
+                                scan,
+                                &self.chdr.coef_probs,
+                                &self.nz[plane],
+                                &mut self.token_cache[..],
+                                &mut self.tok_buf[..seg_eob],
+                            )?;
+                            eob_total += u32::from(nonzero);
+
+                            reconstruct_block(
+                                plane_buf,
+                                start_x as usize,
+                                start_y as usize,
+                                tx_sz,
+                                &self.tok_buf[..seg_eob],
+                                dc_quant,
+                                ac_quant,
+                                tx_type,
+                                self.lossless,
+                                self.bit_depth,
+                            );
+                        }
+                    }
+
+                    let x4 = (start_x >> 2) as usize;
+                    let y4 = (start_y >> 2) as usize;
+                    for i in 0..step as usize {
+                        if x4 + i < self.nz[plane].above.len() {
+                            self.nz[plane].above[x4 + i] = u8::from(nonzero);
+                        }
+                        if y4 + i < self.nz[plane].left.len() {
+                            self.nz[plane].left[y4 + i] = u8::from(nonzero);
+                        }
+                    }
+
+                    block_idx += 1;
+                    x += step;
+                }
+                y += step;
+            }
+        }
+
+        Ok(eob_total)
+    }
+
+    /// §8.5.2 `predict_inter( plane, x, y, w, h, blockIdx )` for one
+    /// region — resolves the §8.10 reference planes and runs the
+    /// [`predict_inter`] driver, writing into the working plane.
+    #[allow(clippy::too_many_arguments)]
+    fn predict_inter_region(
+        &mut self,
+        plane: usize,
+        x: i32,
+        y: i32,
+        w: usize,
+        h: usize,
+        block_idx: usize,
+        r: u32,
+        c: u32,
+        mi_size: u8,
+        ref_frame: [i32; 2],
+        interp_filter: u8,
+        is_compound: bool,
+        block_mvs: &[[[i32; 2]; 4]; 2],
+    ) {
+        let inter = self.inter.as_ref().expect("inter ctx");
+        let refs = build_ref_planes(inter.refs, ref_frame, &inter.ref_frame_idx, plane);
+        let grid = BlockGrid {
+            mi_row: r as i32,
+            mi_col: c as i32,
+            mi_rows: self.mi_rows as i32,
+            mi_cols: self.mi_cols as i32,
+            mi_size,
+        };
+        let geom = ScaleGeom {
+            // ref_frame_width/height are per-list and overridden inside
+            // the driver from each RefPlane; these frame-level dims feed
+            // the §8.5.2.3 scale ratio numerator.
+            ref_frame_width: inter.frame_width as i32,
+            ref_frame_height: inter.frame_height as i32,
+            frame_width: inter.frame_width as i32,
+            frame_height: inter.frame_height as i32,
+            subsampling_x: self.subsampling_x,
+            subsampling_y: self.subsampling_y,
+        };
+        let args = InterPredArgs {
+            plane,
+            x,
+            y,
+            w,
+            h,
+            block_idx,
+            interp_filter: interp_filter as usize,
+            bit_depth: self.bit_depth,
+            is_compound,
+        };
+        let dst: &mut Plane = match plane {
+            0 => self.y,
+            1 => self.u,
+            _ => self.v,
+        };
+        predict_inter(
+            dst,
+            &args,
+            &grid,
+            &geom,
+            block_mvs,
+            &refs,
+            self.subsampling_x,
+            self.subsampling_y,
+        );
+    }
+}
+
+/// One frame's reconstruction products: the cropped output plus the
+/// MI-aligned working planes and §6.4.4 state the §8.10 reference update
+/// + the next frame's §6.5 prev-MV scan read.
+struct FrameDecodeProducts {
+    out: Vp9DecodedFrame,
+    /// MI-aligned working luma plane (stride `mi_cols * 8`).
+    plane_y: Plane,
+    plane_u: Plane,
+    plane_v: Plane,
+    /// `MiCols * 8` luma stride.
+    y_w: usize,
+    uv_w: usize,
+    /// The §6.4.4 frame-wide state (carries `Mvs` / `RefFrames` /
+    /// `SegmentIds` for the next frame's §6.5 / §6.4.14 reads).
+    state: Vp9FrameState,
+}
+
+/// The §6.3 compressed-header product threaded into [`decode_single_frame`]:
+/// either the intra-only header or the full inter header.
+enum ChdrKind {
+    Intra(Box<Vp9CompressedHeader>),
+    Inter(Box<Vp9CompressedHeaderInter>),
+}
+
+impl ChdrKind {
+    fn intra(&self) -> &Vp9CompressedHeader {
+        match self {
+            ChdrKind::Intra(c) => c,
+            ChdrKind::Inter(c) => &c.intra,
+        }
+    }
+}
+
+/// The previous-frame state an inter frame's §6.5 / §6.4.14 reads need.
+struct PrevFrameState<'a> {
+    /// `RefFrames[ ][ ][ ]` stored `[mi * 2 + list]` (both ref lists).
+    ref_frames: &'a [i32],
+    /// `Mvs[ ][ ][ ]` stored `[mi * 2 + list]`.
+    mvs: &'a [(i16, i16)],
+    /// `SegmentId[ ][ ]` stored `[mi]`.
+    segment_ids: &'a [u8],
 }
 
 /// Decode one intra (key or intra-only) VP9 frame to planar samples.
 ///
 /// `data` is a single frame's byte payload (uncompressed header +
 /// compressed header + tile data) — e.g. one IVF frame body. Inter
-/// frames and `show_existing_frame` short frames return
-/// [`Error::Unsupported`] (they need reference-buffer state).
+/// frames need reference-buffer state; use [`decode_vp9_sequence`] to
+/// decode a multi-frame stream that includes P-frames.
+/// `show_existing_frame` short frames return [`Error::Unsupported`].
 pub fn decode_intra_frame(data: &[u8]) -> Result<Vp9DecodedFrame, Error> {
     // §6.2 uncompressed header.
     let hdr: Vp9FrameHeader = parse_uncompressed_header(data)?;
@@ -482,7 +1153,28 @@ pub fn decode_intra_frame(data: &[u8]) -> Result<Vp9DecodedFrame, Error> {
     if data.len() < ch_end {
         return Err(Error::UnexpectedEof);
     }
-    let chdr = parse_compressed_header(&data[ch_start..ch_end], lossless)?;
+    let chdr = ChdrKind::Intra(Box::new(parse_compressed_header(
+        &data[ch_start..ch_end],
+        lossless,
+    )?));
+    let products = decode_single_frame(data, &hdr, ch_end, chdr, None, None)?;
+    Ok(products.out)
+}
+
+/// Decode one frame (intra or inter) given the parsed header, the
+/// compressed header, the optional §8.10 reference buffers, and the
+/// optional previous-frame motion field. Returns the reconstruction
+/// products (cropped output + working planes + §6.4.4 state).
+fn decode_single_frame(
+    data: &[u8],
+    hdr: &Vp9FrameHeader,
+    ch_end: usize,
+    chdr_kind: ChdrKind,
+    refs: Option<&RefBuffers>,
+    prev: Option<PrevFrameState<'_>>,
+) -> Result<FrameDecodeProducts, Error> {
+    let lossless = hdr.quantization.lossless;
+    let chdr = chdr_kind.intra().clone();
 
     // §7.2.6: MiCols / MiRows; §7.2 Sb64 extents for the §7.4.1 strip
     // spans (AbovePartitionContext is read beyond MiCols).
@@ -526,6 +1218,39 @@ pub fn decode_intra_frame(data: &[u8]) -> Result<Vp9DecodedFrame, Error> {
     let mut token_cache = [0u8; 1024];
     let mut tok_buf = [0i64; 1024];
 
+    // Inter-frame scaffolding: the §6.4.11 segmentation-prediction
+    // context, the §6.5 prev-MV / §6.4.14 prev-segment snapshots, and the
+    // §6.3 inter-only compressed-header tail.
+    let chdr_inter_ref: Option<&Vp9CompressedHeaderInter> = match &chdr_kind {
+        ChdrKind::Inter(c) => Some(c),
+        ChdrKind::Intra(_) => None,
+    };
+    let is_inter_frame = chdr_inter_ref.is_some();
+    let mut seg_pred_ctx = SegPredContextState::new(mi_cols, mi_rows);
+    let zero_prev_ref = vec![INTRA_FRAME; (mi_rows * mi_cols * 2) as usize];
+    let zero_prev_mvs = vec![(0i16, 0i16); (mi_rows * mi_cols * 2) as usize];
+    let zero_prev_seg = vec![0u8; (mi_rows * mi_cols) as usize];
+    let (prev_ref_frames, prev_mvs, prev_segment_ids): (&[i32], &[(i16, i16)], &[u8]) = match &prev
+    {
+        Some(p)
+            if p.ref_frames.len() == zero_prev_ref.len()
+                && p.mvs.len() == zero_prev_mvs.len()
+                && p.segment_ids.len() == zero_prev_seg.len() =>
+        {
+            (p.ref_frames, p.mvs, p.segment_ids)
+        }
+        // Dimension change or no prev frame: §7.2.6 UsePrevFrameMvs is 0
+        // and §6.4.14 PrevSegmentIds is cleared to zero.
+        _ => (&zero_prev_ref, &zero_prev_mvs, &zero_prev_seg),
+    };
+
+    // §7.2.6 UsePrevFrameMvs: requires a same-dimension prev frame that
+    // was shown, error_resilient_mode == 0, and FrameIsIntra == 0.
+    let use_prev_frame_mvs = is_inter_frame
+        && prev.is_some()
+        && prev_mvs.len() == zero_prev_mvs.len()
+        && !hdr.error_resilient_mode;
+
     // §6.4 decode_tiles( sz ): per-tile byte budget walk, then the
     // per-tile bool-coder bracket around §6.4.2 decode_tile( ).
     let tile_data = &data[ch_end..];
@@ -561,6 +1286,43 @@ pub fn decode_intra_frame(data: &[u8]) -> Result<Vp9DecodedFrame, Error> {
             let tile_slice = &tile_data[byte_cursor..byte_cursor + tile_size];
             let mut coder = BoolCoder::init_bool(tile_slice, tile_size)?;
 
+            // Build the per-tile inter context (re-borrowing the shared
+            // per-frame `seg_pred_ctx`). On keyframes / intra-only frames
+            // this is `None` and the §6.4.6 intra arm runs.
+            let inter_ctx = match (chdr_inter_ref, refs) {
+                (Some(ci), Some(rb)) => {
+                    let comp_config =
+                        ci.compound_reference_config
+                            .unwrap_or(CompoundReferenceConfig {
+                                fixed_ref: LAST_FRAME,
+                                var_ref: [GOLDEN_FRAME, ALTREF_FRAME],
+                            });
+                    // §6.2.5 ref_frame_sign_bias[ 4 ] indexed by §3 value.
+                    let mut sb = [false; 4];
+                    let hdr_sb = hdr.ref_frame_sign_bias;
+                    sb[LAST_FRAME as usize] = hdr_sb[0];
+                    sb[GOLDEN_FRAME as usize] = hdr_sb[1];
+                    sb[ALTREF_FRAME as usize] = hdr_sb[2];
+                    Some(InterCtx {
+                        chdr: ci,
+                        refs: rb,
+                        ref_frame_idx: hdr.ref_frame_idx.unwrap_or([0, 1, 2]),
+                        sign_bias: sb,
+                        interpolation_filter: hdr.interpolation_filter,
+                        allow_high_precision_mv: hdr.allow_high_precision_mv,
+                        use_prev_frame_mvs,
+                        comp_config,
+                        frame_width: hdr.frame_width,
+                        frame_height: hdr.frame_height,
+                        prev_ref_frames,
+                        prev_mvs,
+                        prev_segment_ids,
+                        seg_pred_ctx: &mut seg_pred_ctx,
+                    })
+                }
+                _ => None,
+            };
+
             let mut block_decoder = BlockDecoder {
                 seg: &hdr.segmentation,
                 quant: &hdr.quantization,
@@ -568,6 +1330,7 @@ pub fn decode_intra_frame(data: &[u8]) -> Result<Vp9DecodedFrame, Error> {
                 mi_rows,
                 mi_cols,
                 mi_col_start,
+                mi_col_end,
                 subsampling_x: ssx,
                 subsampling_y: ssy,
                 bit_depth,
@@ -579,6 +1342,14 @@ pub fn decode_intra_frame(data: &[u8]) -> Result<Vp9DecodedFrame, Error> {
                 nz: &mut nz,
                 token_cache: &mut token_cache,
                 tok_buf: &mut tok_buf,
+                inter: inter_ctx,
+            };
+
+            // §6.4.3 partition probs: keyframe fixed table or the inter
+            // running `partition_probs[ ]`.
+            let part_kind = match chdr_inter_ref {
+                Some(ci) => PartitionProbsKind::Inter(&ci.partition_probs),
+                None => PartitionProbsKind::Keyframe,
             };
 
             // §6.4.2 decode_tile( ): superblock raster with the
@@ -587,6 +1358,9 @@ pub fn decode_intra_frame(data: &[u8]) -> Result<Vp9DecodedFrame, Error> {
             let mut r = mi_row_start;
             while r < mi_row_end {
                 pctx.clear_left();
+                if let Some(ic) = block_decoder.inter.as_mut() {
+                    ic.seg_pred_ctx.clear_left();
+                }
                 for plane_nz in block_decoder.nz.iter_mut() {
                     plane_nz.left.fill(0);
                 }
@@ -600,7 +1374,7 @@ pub fn decode_intra_frame(data: &[u8]) -> Result<Vp9DecodedFrame, Error> {
                         mi_rows,
                         mi_cols,
                         &mut pctx,
-                        PartitionProbsKind::Keyframe,
+                        part_kind,
                         &mut block_decoder,
                     )?;
                     c += 8;
@@ -694,7 +1468,7 @@ pub fn decode_intra_frame(data: &[u8]) -> Result<Vp9DecodedFrame, Error> {
         out
     };
 
-    Ok(Vp9DecodedFrame {
+    let out = Vp9DecodedFrame {
         width: hdr.frame_width,
         height: hdr.frame_height,
         bit_depth: hdr.color_config.bit_depth,
@@ -703,8 +1477,163 @@ pub fn decode_intra_frame(data: &[u8]) -> Result<Vp9DecodedFrame, Error> {
         y: crop(&plane_y, crop_w, crop_h),
         u: crop(&plane_u, uv_crop_w, uv_crop_h),
         v: crop(&plane_v, uv_crop_w, uv_crop_h),
+    };
+
+    Ok(FrameDecodeProducts {
+        out,
+        plane_y,
+        plane_u,
+        plane_v,
+        y_w,
+        uv_w,
+        state,
     })
 }
+
+/// Decode a multi-frame VP9 stream (keyframe followed by inter / P-frames)
+/// from a slice of per-frame payloads, threading the §8.10 reference
+/// buffers + §6.5 previous-frame motion field across frames.
+///
+/// `frames` is a list of frame payloads in decode order (each: §6.2
+/// uncompressed header + §6.3 compressed header + §6.4 tile data — e.g.
+/// the body of one IVF packet). The first frame must be a key frame.
+/// Returns one [`Vp9DecodedFrame`] per *shown* frame (frames with
+/// `show_frame == 0` are decoded as references but not emitted; a
+/// `show_existing_frame` packet re-emits a stored frame).
+///
+/// Inter frames reconstruct end-to-end via the §8.5.2 inter prediction
+/// process; single + compound prediction, segmentation, and the §8.10
+/// reference-buffer update are all wired.
+pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Error> {
+    let mut bufs = RefBuffers::new();
+    let mut out = Vec::new();
+    // The most-recently-decoded color config + frame dims (for the §6.2
+    // inter header's inherited color config + §8.10 ref dims).
+    let mut last_color: Option<ColorConfig> = None;
+    // The previous decoded frame's §6.4.4 state + show/size for the §6.5
+    // prev-MV scan + §7.2.6 UsePrevFrameMvs derivation.
+    let mut prev_state: Option<(Vp9FrameState, u32, u32, bool)> = None;
+    // The eight stored shown frames (for show_existing_frame).
+    let mut stored_shown: [Option<Vp9DecodedFrame>; 8] = Default::default();
+
+    for &frame in frames {
+        // Peek the uncompressed header (with inherited ref state so inter
+        // frames parse).
+        let ref_dims: Vec<(u32, u32)> = (0..8)
+            .map(|i| (bufs.ref_frame_width(i), bufs.ref_frame_height(i)))
+            .collect();
+        let ref_state = last_color.map(|cc| RefFrameState {
+            ref_dims: &ref_dims,
+            color_config: cc,
+        });
+        let hdr = parse_uncompressed_header_with_refs(frame, ref_state)?;
+
+        if hdr.show_existing_frame {
+            let idx = hdr.frame_to_show_map_idx.ok_or(Error::InvalidBitstream)? as usize;
+            let f = stored_shown
+                .get(idx)
+                .and_then(|s| s.clone())
+                .ok_or(Error::Unsupported)?;
+            out.push(f);
+            continue;
+        }
+
+        let frame_is_intra = matches!(hdr.frame_type, FrameType::KeyFrame) || hdr.intra_only;
+        let lossless = hdr.quantization.lossless;
+        let ch_start = hdr.uncompressed_header_size_bytes;
+        let ch_size = hdr.header_size_in_bytes as usize;
+        if ch_size == 0 {
+            return Err(Error::InvalidBitstream);
+        }
+        let ch_end = ch_start
+            .checked_add(ch_size)
+            .ok_or(Error::InvalidBitstream)?;
+        if frame.len() < ch_end {
+            return Err(Error::UnexpectedEof);
+        }
+
+        // §6.5 / §6.4.14 previous-frame snapshot (same-dimension only).
+        let prev = prev_state.as_ref().and_then(|(ps, pw, ph, shown)| {
+            if *pw == hdr.frame_width && *ph == hdr.frame_height && *shown {
+                Some(PrevFrameState {
+                    ref_frames: &ps.ref_frames,
+                    mvs: &ps.mvs,
+                    segment_ids: &ps.segment_ids,
+                })
+            } else {
+                None
+            }
+        });
+
+        let products = if frame_is_intra {
+            let chdr = ChdrKind::Intra(Box::new(parse_compressed_header(
+                &frame[ch_start..ch_end],
+                lossless,
+            )?));
+            decode_single_frame(frame, &hdr, ch_end, chdr, Some(&bufs), prev)?
+        } else {
+            let inputs = Vp9CompressedHeaderInterInputs {
+                interpolation_filter_is_switchable: hdr.interpolation_filter == SWITCHABLE_FILTER,
+                ref_frame_sign_bias: RefFrameSignBias::from_inter_biases(
+                    hdr.ref_frame_sign_bias[0] as u8,
+                    hdr.ref_frame_sign_bias[1] as u8,
+                    hdr.ref_frame_sign_bias[2] as u8,
+                ),
+                allow_high_precision_mv: hdr.allow_high_precision_mv,
+            };
+            let chdr = ChdrKind::Inter(Box::new(parse_compressed_header_inter(
+                &frame[ch_start..ch_end],
+                lossless,
+                inputs,
+            )?));
+            decode_single_frame(frame, &hdr, ch_end, chdr, Some(&bufs), prev)?
+        };
+
+        // §8.10 reference frame update: store the (loop-filtered) working
+        // planes into the slots `refresh_frame_flags` names.
+        let curr = CurrFramePlanes {
+            y: products.plane_y.samples(),
+            y_stride: products.y_w,
+            u: products.plane_u.samples(),
+            v: products.plane_v.samples(),
+            uv_stride: products.uv_w,
+            frame_width: hdr.frame_width,
+            frame_height: hdr.frame_height,
+            subsampling_x: hdr.color_config.subsampling_x,
+            subsampling_y: hdr.color_config.subsampling_y,
+            bit_depth: hdr.color_config.bit_depth,
+        };
+        bufs.update(hdr.refresh_frame_flags, &curr);
+
+        // Carry inherited color config (§6.2: an intra frame establishes
+        // it; an inter frame before any intra frame is malformed but we
+        // tolerate it by adopting its own config) + the prev-frame motion
+        // field.
+        if frame_is_intra || last_color.is_none() {
+            last_color = Some(hdr.color_config);
+        }
+        let shown = hdr.show_frame;
+        prev_state = Some((products.state, hdr.frame_width, hdr.frame_height, shown));
+
+        if shown {
+            // Store into the shown-frame slots refresh_frame_flags names,
+            // for a later show_existing_frame.
+            for (i, slot) in stored_shown.iter_mut().enumerate() {
+                if (hdr.refresh_frame_flags >> i) & 1 == 1 {
+                    *slot = Some(products.out.clone());
+                }
+            }
+            out.push(products.out);
+        }
+    }
+
+    Ok(out)
+}
+
+/// `SWITCHABLE = 4` per §7.4.10 — the frame-level interpolation-filter
+/// sentinel that gates the §6.4.16 per-block `interp_filter` tree read
+/// and the §6.3.10 `read_interp_filter_probs( )` sweep.
+const SWITCHABLE_FILTER: u8 = 4;
 
 impl Vp9DecodedFrame {
     /// Pack the frame as planar bytes (Y then U then V): one byte per

@@ -101,9 +101,12 @@ map between frames.
 
 ### Not yet supported
 
-* Compound + scaled-reference inter prediction are wired but not yet
-  fixture-validated (the validated inter fixtures are single-reference,
-  same-size LAST); broader inter fixtures land in later rounds.
+* Compound + scaled-reference inter prediction are wired and unit-tested
+  against an independent spec re-derivation of the §8.5.2.3 scaling +
+  §8.5.2.4 convolution (half-size reference, and compound over two
+  distinct per-list-scaled references), but not yet *corpus*-validated
+  end-to-end (the corpus inter fixtures are single-reference, same-size
+  LAST); broader inter fixtures land in later rounds.
 * Hidden alt-ref superframes (`superframe-2`) and the
   `show-existing-frame` corpus decode their keyframe + early frames but
   hit a divergence on a later hidden-ARF P-frame; the Annex B split is

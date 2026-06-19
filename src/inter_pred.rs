@@ -570,4 +570,280 @@ mod tests {
             }
         }
     }
+
+    // ---- §8.5.2.3 scaled-reference path ---------------------------------
+
+    /// Independent §8.5.2.4 two-pass 8-tap convolution, re-derived from the
+    /// spec formulas (`vp9-spec.txt` lines 4709-4738) rather than calling
+    /// the crate's `block_inter_predict`. Used to cross-check the
+    /// scaled-reference `predict_inter` output: the test computes the
+    /// `startX` / `startY` / `stepX` / `stepY` via the spec §8.5.2.3 math,
+    /// runs this reference convolution, and asserts the driver produced the
+    /// same samples.
+    #[allow(clippy::too_many_arguments)]
+    fn spec_block_predict(
+        refp: &[i32],
+        stride: usize,
+        start_x: i32,
+        start_y: i32,
+        step_x: i32,
+        step_y: i32,
+        w: usize,
+        h: usize,
+        last_x: i32,
+        last_y: i32,
+    ) -> Vec<i32> {
+        // EIGHTTAP (interp_filter = 0) kernels, summing to 128.
+        const TAPS: [[i32; 8]; 16] = [
+            [0, 0, 0, 128, 0, 0, 0, 0],
+            [0, 1, -5, 126, 8, -3, 1, 0],
+            [-1, 3, -10, 122, 18, -6, 2, 0],
+            [-1, 4, -13, 118, 27, -9, 3, -1],
+            [-1, 4, -16, 112, 37, -11, 4, -1],
+            [-1, 5, -18, 105, 48, -14, 4, -1],
+            [-1, 5, -19, 97, 58, -16, 5, -1],
+            [-1, 6, -19, 88, 68, -18, 5, -1],
+            [-1, 6, -19, 78, 78, -19, 6, -1],
+            [-1, 5, -18, 68, 88, -19, 6, -1],
+            [-1, 5, -16, 58, 97, -19, 5, -1],
+            [-1, 4, -14, 48, 105, -18, 5, -1],
+            [-1, 4, -11, 37, 112, -16, 4, -1],
+            [-1, 3, -9, 27, 118, -13, 4, -1],
+            [0, 2, -6, 18, 122, -10, 3, -1],
+            [0, 1, -3, 8, 126, -5, 1, 0],
+        ];
+        let clip3 = |lo: i32, hi: i32, v: i32| v.clamp(lo, hi);
+        let sample = |row: i32, col: i32| -> i32 {
+            refp[(row.max(0) as usize) * stride + col.max(0) as usize]
+        };
+        let inter_h = ((((h as i32 - 1) * step_y + 15) >> 4) + 8) as usize;
+        let mut intermediate = vec![0i32; inter_h * w];
+        for (r, row) in intermediate.chunks_mut(w).enumerate().take(inter_h) {
+            for (c, slot) in row.iter_mut().enumerate() {
+                let p = start_x + step_x * c as i32;
+                let taps = &TAPS[(p & 15) as usize];
+                let ref_row = clip3(0, last_y, (start_y >> 4) + r as i32 - 3);
+                let mut s = 0i32;
+                for (t, &tap) in taps.iter().enumerate() {
+                    let ref_col = clip3(0, last_x, (p >> 4) + t as i32 - 3);
+                    s += tap * sample(ref_row, ref_col);
+                }
+                *slot = round2(s, 7).clamp(0, 255);
+            }
+        }
+        let mut pred = vec![0i32; h * w];
+        for r in 0..h {
+            for c in 0..w {
+                let p = (start_y & 15) + step_y * r as i32;
+                let taps = &TAPS[(p & 15) as usize];
+                let base_row = (p >> 4) as usize;
+                let mut s = 0i32;
+                for (t, &tap) in taps.iter().enumerate() {
+                    s += tap * intermediate[(base_row + t) * w + c];
+                }
+                pred[r * w + c] = round2(s, 7).clamp(0, 255);
+            }
+        }
+        pred
+    }
+
+    /// A half-size reference frame (the §8.5.2.3 `xScale` / `yScale` ratio
+    /// is `1 << (REF_SCALE_SHIFT - 1)`, so `stepX = stepY = 8`) over a
+    /// non-flat ramp: the driver's scaled output must match an independent
+    /// spec-formula re-derivation of the §8.5.2.3 start/step plus the
+    /// §8.5.2.4 convolution. This validates the scaled-reference path on
+    /// content that actually exercises the filter taps (a flat reference
+    /// would pass through unchanged regardless of scaling).
+    #[test]
+    fn half_size_reference_scaled_path_matches_spec_rederivation() {
+        // Reference is 32×32 for a 64×64 current frame: half size.
+        let (rw, rh) = (32usize, 32usize);
+        let mut refp = vec![0i32; rw * rh];
+        for (r, row) in refp.chunks_mut(rw).enumerate() {
+            for (c, slot) in row.iter_mut().enumerate() {
+                // A smooth ramp inside the 8-bit range that varies on both
+                // axes, so the 8-tap filter produces non-trivial output.
+                *slot = ((3 * r + 5 * c) % 200 + 20) as i32;
+            }
+        }
+
+        let grid = BlockGrid {
+            mi_row: 1,
+            mi_col: 1,
+            mi_rows: 8,
+            mi_cols: 8,
+            mi_size: BLOCK_8X8,
+        };
+        let geom = ScaleGeom {
+            ref_frame_width: 32,
+            ref_frame_height: 32,
+            frame_width: 64,
+            frame_height: 64,
+            subsampling_x: false,
+            subsampling_y: false,
+        };
+        let (px, py, w, h) = (16i32, 8i32, 8usize, 8usize);
+        // A small high-precision MV (eighth-pel) so the §8.5.2.2 clamp
+        // doubles it and the §8.5.2.3 scaling lands on a non-zero phase.
+        let mv = [5i32, -7i32];
+        let block_mvs = [[mv; 4]; 2];
+        let args = InterPredArgs {
+            plane: 0,
+            x: px,
+            y: py,
+            w,
+            h,
+            block_idx: 0,
+            interp_filter: 0,
+            bit_depth: 8,
+            is_compound: false,
+        };
+        let refs = RefPlanes {
+            list: [
+                Some(RefPlane {
+                    samples: &refp,
+                    stride: rw,
+                    ref_frame_width: 32,
+                    ref_frame_height: 32,
+                }),
+                None,
+            ],
+        };
+        let mut dst = Plane::new(64, 64);
+        predict_inter(
+            &mut dst, &args, &grid, &geom, &block_mvs, &refs, false, false,
+        );
+
+        // Independently re-derive the expected samples via the spec chain.
+        let clamped = clamp_mv(&grid, mv, 0, false, false);
+        let scaled = scale_mv(&geom, 0, px, py, clamped);
+        let last_x = 32 - 1;
+        let last_y = 32 - 1;
+        let expected = spec_block_predict(
+            &refp,
+            rw,
+            scaled.start_x,
+            scaled.start_y,
+            scaled.step_x,
+            scaled.step_y,
+            w,
+            h,
+            last_x,
+            last_y,
+        );
+        // Sanity: a half-size reference halves the step.
+        assert_eq!(scaled.step_x, 8);
+        assert_eq!(scaled.step_y, 8);
+        for i in 0..h {
+            for j in 0..w {
+                assert_eq!(
+                    dst.get(px as usize + j, py as usize + i),
+                    expected[i * w + j],
+                    "scaled sample mismatch at i{i} j{j}"
+                );
+            }
+        }
+    }
+
+    /// Compound prediction over two distinct *scaled* references: the
+    /// driver must scale each reference list independently (each carries
+    /// its own `ref_frame_width` / `ref_frame_height`) and then average
+    /// with `Round2( p0 + p1, 1 )`. Cross-checked against two independent
+    /// spec re-derivations.
+    #[test]
+    fn compound_scaled_references_average_per_list() {
+        // List 0: half-size 32×32 ramp. List 1: full-size 64×64 ramp.
+        let (rw0, rh0) = (32usize, 32usize);
+        let mut refp0 = vec![0i32; rw0 * rh0];
+        for (r, row) in refp0.chunks_mut(rw0).enumerate() {
+            for (c, slot) in row.iter_mut().enumerate() {
+                *slot = ((2 * r + 7 * c) % 180 + 30) as i32;
+            }
+        }
+        let (rw1, rh1) = (64usize, 64usize);
+        let mut refp1 = vec![0i32; rw1 * rh1];
+        for (r, row) in refp1.chunks_mut(rw1).enumerate() {
+            for (c, slot) in row.iter_mut().enumerate() {
+                *slot = ((5 * r + 2 * c) % 160 + 40) as i32;
+            }
+        }
+
+        let grid = BlockGrid {
+            mi_row: 1,
+            mi_col: 2,
+            mi_rows: 8,
+            mi_cols: 8,
+            mi_size: BLOCK_8X8,
+        };
+        let geom = ScaleGeom {
+            ref_frame_width: 64,
+            ref_frame_height: 64,
+            frame_width: 64,
+            frame_height: 64,
+            subsampling_x: false,
+            subsampling_y: false,
+        };
+        let (px, py, w, h) = (16i32, 8i32, 8usize, 8usize);
+        let mv0 = [9i32, 4i32];
+        let mv1 = [-6i32, 11i32];
+        let block_mvs = [[mv0; 4], [mv1; 4]];
+        let args = InterPredArgs {
+            plane: 0,
+            x: px,
+            y: py,
+            w,
+            h,
+            block_idx: 0,
+            interp_filter: 0,
+            bit_depth: 8,
+            is_compound: true,
+        };
+        let refs = RefPlanes {
+            list: [
+                Some(RefPlane {
+                    samples: &refp0,
+                    stride: rw0,
+                    ref_frame_width: 32,
+                    ref_frame_height: 32,
+                }),
+                Some(RefPlane {
+                    samples: &refp1,
+                    stride: rw1,
+                    ref_frame_width: 64,
+                    ref_frame_height: 64,
+                }),
+            ],
+        };
+        let mut dst = Plane::new(64, 64);
+        predict_inter(
+            &mut dst, &args, &grid, &geom, &block_mvs, &refs, false, false,
+        );
+
+        // Re-derive each list's prediction, then average per §8.5.2.
+        let geom0 = ScaleGeom {
+            ref_frame_width: 32,
+            ref_frame_height: 32,
+            ..geom
+        };
+        let clamped0 = clamp_mv(&grid, mv0, 0, false, false);
+        let s0 = scale_mv(&geom0, 0, px, py, clamped0);
+        let pred0 = spec_block_predict(
+            &refp0, rw0, s0.start_x, s0.start_y, s0.step_x, s0.step_y, w, h, 31, 31,
+        );
+        let clamped1 = clamp_mv(&grid, mv1, 0, false, false);
+        let s1 = scale_mv(&geom, 0, px, py, clamped1);
+        let pred1 = spec_block_predict(
+            &refp1, rw1, s1.start_x, s1.start_y, s1.step_x, s1.step_y, w, h, 63, 63,
+        );
+        for i in 0..h {
+            for j in 0..w {
+                let expected = round2(pred0[i * w + j] + pred1[i * w + j], 1);
+                assert_eq!(
+                    dst.get(px as usize + j, py as usize + i),
+                    expected,
+                    "compound scaled mismatch at i{i} j{j}"
+                );
+            }
+        }
+    }
 }

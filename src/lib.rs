@@ -512,6 +512,7 @@ mod mv;
 mod mv_ref;
 mod narrow_filter;
 mod partition;
+mod prob_adapt;
 mod reconstruct;
 mod ref_buffer;
 mod residual;

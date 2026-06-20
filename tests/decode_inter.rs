@@ -491,6 +491,105 @@ fn keyframe_only_sequence_matches_prefix() {
     assert_eq!(got, expected[..got.len()], "keyframe prefix byte-exact");
 }
 
+/// A `show_existing_frame` short packet (§6.2 / §8.9). The byte encodes,
+/// MSB-first: `frame_marker` f(2) = 2, `profile_low_bit` f(1) = 0,
+/// `profile_high_bit` f(1) = 0, `show_existing_frame` f(1) = 1, then
+/// `frame_to_show_map_idx` f(3). For profile 0 this is
+/// `0b10_0_0_1_iii = 0x88 | idx`.
+fn show_existing_packet(idx: u8) -> Vec<u8> {
+    assert!(idx < 8, "frame_to_show_map_idx is f(3)");
+    vec![0x88 | idx]
+}
+
+/// §8.9 output process: a `show_existing_frame` packet re-displays
+/// `FrameStore[ frame_to_show_map_idx ]` — the §8.10 reference slot — with
+/// that stored frame's own dimensions and bit depth. The keyframe refreshes
+/// all eight slots (`refresh_frame_flags = 0xFF`), so a `show_existing` of
+/// any slot must re-emit the keyframe verbatim.
+#[test]
+fn show_existing_frame_redisplays_keyframe_slot() {
+    let keyframe = from_hex_lines(KEYFRAME);
+    let expected = from_hex_lines(EXPECTED);
+
+    let kf_only = decode_vp9_sequence(&[&keyframe]).expect("decode keyframe");
+    let kf_bytes = kf_only[0].to_planar_bytes();
+
+    // The keyframe is slot-refreshed into all eight slots; re-display a few
+    // distinct indices and confirm each re-emits the keyframe.
+    for idx in [0u8, 3, 7] {
+        let se = show_existing_packet(idx);
+        let frames = decode_vp9_sequence(&[&keyframe, &se]).expect("kf + show_existing");
+        assert_eq!(frames.len(), 2, "keyframe shown + the re-displayed frame");
+        assert_eq!(
+            frames[1].to_planar_bytes(),
+            kf_bytes,
+            "show_existing(idx={idx}) re-emits the keyframe"
+        );
+        assert_eq!(frames[1].width, 64);
+        assert_eq!(frames[1].height, 64);
+        assert_eq!(frames[1].bit_depth, 8);
+        // The keyframe-sized prefix of the corpus output is reproduced.
+        assert_eq!(frames[1].to_planar_bytes(), expected[..kf_bytes.len()]);
+    }
+}
+
+/// §8.9 / §8.10 step 1: `show_existing_frame` resolves the *per-slot*
+/// `FrameStore[ ]`, so re-displaying a slot the P-frame refreshed surfaces
+/// the P-frame, while re-displaying a slot only the keyframe refreshed
+/// surfaces the keyframe. The corpus P-frame has `refresh_frame_flags =
+/// 0x01` (slot 0 only), so after `[keyframe, P-frame]` slot 0 holds the
+/// P-frame and slots 1..7 still hold the keyframe. This distinguishes the
+/// slot indexing from a single "last shown frame" fallback.
+#[test]
+fn show_existing_frame_resolves_per_slot_after_pframe() {
+    let keyframe = from_hex_lines(KEYFRAME);
+    let pframe = from_hex_lines(PFRAME);
+
+    let shown = decode_vp9_sequence(&[&keyframe, &pframe]).expect("decode shown sequence");
+    assert_eq!(shown.len(), 2, "keyframe + P-frame both shown");
+    let keyframe_bytes = shown[0].to_planar_bytes();
+    let pframe_bytes = shown[1].to_planar_bytes();
+    // The fixture is a genuine inter frame: the P-frame differs from the
+    // keyframe, so the per-slot distinction below is observable.
+    assert_ne!(
+        keyframe_bytes, pframe_bytes,
+        "P-frame reconstruction differs"
+    );
+
+    // show_existing(0): slot 0 was refreshed by the P-frame (refresh_mask
+    // 0x01), so it must re-emit the P-frame.
+    let se0 = show_existing_packet(0);
+    let r0 = decode_vp9_sequence(&[&keyframe, &pframe, &se0]).expect("show_existing(0)");
+    assert_eq!(r0.len(), 3, "keyframe + P-frame + re-displayed P-frame");
+    assert_eq!(
+        r0[2].to_planar_bytes(),
+        pframe_bytes,
+        "slot 0 (P-frame refresh) re-emits the P-frame"
+    );
+
+    // show_existing(1): slot 1 was last written by the keyframe (the
+    // P-frame did not refresh it), so it must re-emit the keyframe.
+    let se1 = show_existing_packet(1);
+    let r1 = decode_vp9_sequence(&[&keyframe, &pframe, &se1]).expect("show_existing(1)");
+    assert_eq!(r1.len(), 3);
+    assert_eq!(
+        r1[2].to_planar_bytes(),
+        keyframe_bytes,
+        "slot 1 (keyframe refresh, untouched by P-frame) re-emits the keyframe"
+    );
+}
+
+/// A `show_existing_frame` packet pointing at a never-written slot is an
+/// invalid bitstream (`FrameStore[ idx ]` is undefined). Decoding a lone
+/// `show_existing_frame` before any frame populates the store must reject
+/// rather than panic or silently emit nothing.
+#[test]
+fn show_existing_frame_unwritten_slot_is_invalid() {
+    let se = show_existing_packet(5);
+    let r = decode_vp9_sequence(&[&se]);
+    assert!(r.is_err(), "show_existing of an unwritten slot must error");
+}
+
 /// Workspace-checkout cross-check: when the docs corpus is reachable,
 /// re-parse the `i-frame-then-p-frame-64x64` IVF directly and confirm the
 /// full two-frame sequence decodes byte-exact. Standalone CI (no docs

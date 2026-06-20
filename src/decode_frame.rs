@@ -1513,8 +1513,15 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
     // The previous decoded frame's §6.4.4 state + show/size for the §6.5
     // prev-MV scan + §7.2.6 UsePrevFrameMvs derivation.
     let mut prev_state: Option<(Vp9FrameState, u32, u32, bool)> = None;
-    // The eight stored shown frames (for show_existing_frame).
-    let mut stored_shown: [Option<Vp9DecodedFrame>; 8] = Default::default();
+    // §8.10 `FrameStore[ ]`: the eight reference slots as displayable
+    // frames, for a later §8.9 `show_existing_frame` output. Per §8.10
+    // step 1, EVERY decoded frame writes the slots `refresh_frame_flags`
+    // names — including hidden (`show_frame == 0`) alt-ref frames — and a
+    // `show_existing_frame` packet re-displays `FrameStore[ idx ]` with
+    // that stored frame's own §8.9 dimensions / bit depth. `RefBuffers`
+    // already tracks the sample planes; this parallel array keeps the
+    // crop + packing metadata needed to re-emit the frame verbatim.
+    let mut frame_store: [Option<Vp9DecodedFrame>; 8] = Default::default();
 
     for &frame in frames {
         // Peek the uncompressed header (with inherited ref state so inter
@@ -1529,12 +1536,19 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
         let hdr = parse_uncompressed_header_with_refs(frame, ref_state)?;
 
         if hdr.show_existing_frame {
+            // §8.9: output `FrameStore[ frame_to_show_map_idx ]` verbatim.
+            // The slot may have been written by a hidden alt-ref frame, so
+            // it is sourced from `frame_store` (updated for every decoded
+            // frame) rather than only the shown ones.
             let idx = hdr.frame_to_show_map_idx.ok_or(Error::InvalidBitstream)? as usize;
-            let f = stored_shown
+            let f = frame_store
                 .get(idx)
                 .and_then(|s| s.clone())
-                .ok_or(Error::Unsupported)?;
+                .ok_or(Error::InvalidBitstream)?;
             out.push(f);
+            // §7.2.6 NOTE: compute_image_size is not invoked for a
+            // show_existing_frame packet, so it leaves `prev_state` (the
+            // §7.2.6 "previous invocation" record) untouched.
             continue;
         }
 
@@ -1615,14 +1629,20 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
         let shown = hdr.show_frame;
         prev_state = Some((products.state, hdr.frame_width, hdr.frame_height, shown));
 
-        if shown {
-            // Store into the shown-frame slots refresh_frame_flags names,
-            // for a later show_existing_frame.
-            for (i, slot) in stored_shown.iter_mut().enumerate() {
-                if (hdr.refresh_frame_flags >> i) & 1 == 1 {
-                    *slot = Some(products.out.clone());
-                }
+        // §8.10 step 1: store the decoded frame into the `FrameStore[ ]`
+        // slots `refresh_frame_flags` names. This happens for every decoded
+        // frame, including hidden (`show_frame == 0`) alt-ref frames, so a
+        // later `show_existing_frame` can re-display whatever a hidden ARF
+        // wrote into a slot.
+        for (i, slot) in frame_store.iter_mut().enumerate() {
+            if (hdr.refresh_frame_flags >> i) & 1 == 1 {
+                *slot = Some(products.out.clone());
             }
+        }
+
+        // §8.9: a hidden (`show_frame == 0`) frame is decoded as a reference
+        // but not emitted; only shown frames are output here.
+        if shown {
             out.push(products.out);
         }
     }

@@ -111,8 +111,14 @@ map between frames.
   `show-existing-frame` corpus decode their keyframe + early frames but
   hit a divergence on a later hidden-ARF P-frame; the Annex B split is
   in place but the full hidden-ARF inter path is not yet byte-exact.
-* §8.4 probability adaptation / §6.1.2 frame-context refresh
-  (contexts are reset per frame; running adaptation is deferred).
+* §8.4 probability adaptation / §6.1.2 frame-context refresh — the
+  §8.4.1/§8.4.2 `merge_prob` / `merge_probs` primitives and the §8.4.3
+  `adapt_coef_probs` coefficient-adaption transform are implemented and
+  unit-tested (`prob_adapt`), but are not yet wired into the decode loop:
+  count-collection is blocked on a v0.7 docs gap — the §9.3.4 "special
+  case (for more_coefs)" the spec references is absent from the PDF
+  (page 126 ends at the `more_coefs` table row; the promised paragraph
+  is blank). Contexts are reset to §10 defaults per frame meanwhile.
 * §9.2.4 multi-coder tile parallelism (tiles decode sequentially).
 * Encoder paths.
 

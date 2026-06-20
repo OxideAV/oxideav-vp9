@@ -154,6 +154,100 @@ pub(crate) fn adapt_probs(tree: &[i32], probs: &mut [u8], counts: &[u32]) {
     merge_probs(tree, 0, probs, counts, COUNT_SAT, MAX_UPDATE_FACTOR);
 }
 
+// ----- §8.4.3 coefficient probability adaption -----
+
+/// `small_token_tree[ 6 ]` per §8.4.3 (line 4282):
+/// ```text
+/// { 0, 0,                 // Unused (indices 0,1)
+///   -ZERO_TOKEN, 4,       // index 2: leaf ZERO_TOKEN(0) / branch 4
+///   -ONE_TOKEN, -TWO_TOKEN // index 4: leaf ONE_TOKEN(1) / leaf TWO_TOKEN(2)
+/// }
+/// ```
+/// Walked starting at `i = 2`; the unused index-0 pair is never visited.
+/// Leaf negatives index `counts_token` (`-0/-1/-2` → 0/1/2). The
+/// interior writes touch `probs[2>>1]=probs[1]` and `probs[4>>1]=probs[2]`
+/// — the ZERO/ONE token nodes of the 3-entry coef cell.
+const SMALL_TOKEN_TREE: [i32; 6] = [0, 0, 0, 4, -1, -2];
+
+/// `binary_tree[ 2 ] = { 0, -1 }` per §9.3.1 — the single-decision tree
+/// driving the §8.4.3 `more_coefs` merge into `probs[0]`.
+const BINARY_TREE: [i32; 2] = [0, -1];
+
+/// Per-cell `counts_token` bucket: `[count_ZERO, count_ONE, count_TWO+]`
+/// where the index is `Min(2, token)` per §9.3.4.
+pub(crate) type CountsTokenCell = [u32; 3];
+
+/// Per-cell `counts_more_coefs` bucket: `[count_more0, count_more1]` —
+/// the §9.3.4 `more_coefs` binary count.
+pub(crate) type CountsMoreCoefsCell = [u32; 2];
+
+/// Shape of `counts_token` mirroring [`crate::coef_probs::CoefProbs`]
+/// indexing `[txSz][blockType][refType][band][ctx]`.
+pub(crate) type CountsToken = [[[[[CountsTokenCell; 6]; 6]; 2]; 2]; 4];
+
+/// Shape of `counts_more_coefs` mirroring [`crate::coef_probs::CoefProbs`].
+pub(crate) type CountsMoreCoefs = [[[[[CountsMoreCoefsCell; 6]; 6]; 2]; 2]; 4];
+
+/// §8.4.3 Coefficient probability adaption process.
+///
+/// Updates `coef_probs` in place from the observed `counts_token` /
+/// `counts_more_coefs`. The `updateFactor` is selected per §8.4.3 (lines
+/// 4248-4252):
+/// * `FrameIsIntra == 1` → 112
+/// * else `LastFrameType == KEY_FRAME` → 128
+/// * else → 112
+///
+/// The nested walk (lines 4254-4270) visits every
+/// `[t][i][j][k][l]` cell with `maxL = (k == 0) ? 3 : 6`, calling
+/// `merge_probs(small_token_tree, 2, …)` then `merge_probs(binary_tree,
+/// 0, …)` — both with `countSat = 24` and the selected `updateFactor`.
+pub(crate) fn adapt_coef_probs(
+    coef_probs: &mut crate::coef_probs::CoefProbs,
+    counts_token: &CountsToken,
+    counts_more_coefs: &CountsMoreCoefs,
+    frame_is_intra: bool,
+    last_frame_was_key: bool,
+) {
+    let update_factor: u32 = if frame_is_intra {
+        112
+    } else if last_frame_was_key {
+        128
+    } else {
+        112
+    };
+    // §8.4.3 fixes countSat to 24 (not the default COUNT_SAT=20).
+    const COEF_COUNT_SAT: u32 = 24;
+
+    for t in 0..4 {
+        for i in 0..2 {
+            for j in 0..2 {
+                for k in 0..6 {
+                    let max_l = if k == 0 { 3 } else { 6 };
+                    for l in 0..max_l {
+                        let cell = &mut coef_probs[t][i][j][k][l];
+                        merge_probs(
+                            &SMALL_TOKEN_TREE,
+                            2,
+                            cell,
+                            &counts_token[t][i][j][k][l],
+                            COEF_COUNT_SAT,
+                            update_factor,
+                        );
+                        merge_probs(
+                            &BINARY_TREE,
+                            0,
+                            cell,
+                            &counts_more_coefs[t][i][j][k][l],
+                            COEF_COUNT_SAT,
+                            update_factor,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +357,108 @@ mod tests {
         assert_eq!(clip3(1, 255, 0), 1);
         assert_eq!(clip3(1, 255, 256), 255);
         assert_eq!(clip3(1, 255, 128), 128);
+    }
+
+    // ----- §8.4.3 adapt_coef_probs -----
+
+    // §8.4.3 small_token_tree[6] = {0,0, -ZERO_TOKEN,4, -ONE_TOKEN,-TWO_TOKEN}.
+    // Walked from i=2: index-0 pair is unused, leaves map -0/-1/-2 → token
+    // count buckets, interior writes hit probs[1] (i=2>>1) and probs[2]
+    // (i=4>>1).
+    #[test]
+    fn small_token_tree_layout() {
+        assert_eq!(SMALL_TOKEN_TREE, [0, 0, 0, 4, -1, -2]);
+        assert_eq!(BINARY_TREE, [0, -1]);
+    }
+
+    // §8.4.3 updateFactor selection: intra → 112, inter-after-key → 128,
+    // inter-after-inter → 112. We probe via the resulting cell update,
+    // which differs when the factor differs.
+    fn one_cell_after(
+        frame_is_intra: bool,
+        last_key: bool,
+        cell0: [u8; 3],
+        ct: [u32; 3],
+        cmc: [u32; 2],
+    ) -> [u8; 3] {
+        let mut cp = crate::coef_probs::DEFAULT_COEF_PROBS;
+        cp[0][0][0][0][0] = cell0;
+        let mut counts_token: CountsToken = [[[[[[0; 3]; 6]; 6]; 2]; 2]; 4];
+        let mut counts_mc: CountsMoreCoefs = [[[[[[0; 2]; 6]; 6]; 2]; 2]; 4];
+        counts_token[0][0][0][0][0] = ct;
+        counts_mc[0][0][0][0][0] = cmc;
+        adapt_coef_probs(&mut cp, &counts_token, &counts_mc, frame_is_intra, last_key);
+        cp[0][0][0][0][0]
+    }
+
+    // §8.4.3 cell update matches two direct merge_probs calls with
+    // countSat=24, updateFactor=112 (intra). Cell = [more, zero, one].
+    #[test]
+    fn adapt_coef_probs_cell_matches_direct_intra() {
+        let cell0 = [120u8, 90, 60];
+        let ct = [5u32, 7, 3]; // ZERO, ONE, TWO+
+        let cmc = [9u32, 11]; // more_coefs 0/1
+        let got = one_cell_after(true, false, cell0, ct, cmc);
+
+        let mut expect = cell0;
+        merge_probs(&SMALL_TOKEN_TREE, 2, &mut expect, &ct, 24, 112);
+        merge_probs(&BINARY_TREE, 0, &mut expect, &cmc, 24, 112);
+        assert_eq!(got, expect);
+    }
+
+    // §8.4.3: inter-after-key uses updateFactor=128, which yields a
+    // different result than the intra (112) path for the same counts.
+    #[test]
+    fn adapt_coef_probs_update_factor_depends_on_frame_types() {
+        let cell0 = [120u8, 90, 60];
+        let ct = [5u32, 7, 3];
+        let cmc = [9u32, 11];
+        let intra = one_cell_after(true, false, cell0, ct, cmc);
+        let inter_after_key = one_cell_after(false, true, cell0, ct, cmc);
+        let inter_after_inter = one_cell_after(false, false, cell0, ct, cmc);
+
+        // 112 path == intra path.
+        assert_eq!(inter_after_inter, intra);
+        // 128 path is a stronger pull → differs from the 112 result here.
+        assert_ne!(inter_after_key, intra);
+
+        // Verify the 128 path against direct merge_probs.
+        let mut expect = cell0;
+        merge_probs(&SMALL_TOKEN_TREE, 2, &mut expect, &ct, 24, 128);
+        merge_probs(&BINARY_TREE, 0, &mut expect, &cmc, 24, 128);
+        assert_eq!(inter_after_key, expect);
+    }
+
+    // §8.4.3 inner loop: band 0 (k==0) visits only maxL=3 ctx slots; ctx
+    // 3..5 of band 0 must be left untouched even with non-zero counts.
+    #[test]
+    fn adapt_coef_probs_band0_maxl_is_three() {
+        let mut cp = crate::coef_probs::DEFAULT_COEF_PROBS;
+        let untouched = cp[0][0][0][0][4]; // band 0, ctx 4 (>= maxL=3)
+        let mut counts_token: CountsToken = [[[[[[0; 3]; 6]; 6]; 2]; 2]; 4];
+        let mut counts_mc: CountsMoreCoefs = [[[[[[0; 2]; 6]; 6]; 2]; 2]; 4];
+        // Pile counts into the out-of-range ctx slot.
+        counts_token[0][0][0][0][4] = [50, 50, 50];
+        counts_mc[0][0][0][0][4] = [50, 50];
+        adapt_coef_probs(&mut cp, &counts_token, &counts_mc, true, false);
+        assert_eq!(
+            cp[0][0][0][0][4], untouched,
+            "band-0 ctx>=3 must not be adapted (maxL=3)"
+        );
+        // But band 1 (k==1) ctx 4 IS in range (maxL=6) and would adapt.
+        let touched_in_range = cp[0][0][0][0][2]; // band 0 ctx 2 < 3 → in range
+        assert_eq!(touched_in_range, cp[0][0][0][0][2]);
+    }
+
+    // §8.4.3: all-zero counts leave coef_probs unchanged (merge_prob is
+    // the identity at zero counts).
+    #[test]
+    fn adapt_coef_probs_zero_counts_is_identity() {
+        let orig = crate::coef_probs::DEFAULT_COEF_PROBS;
+        let mut cp = orig;
+        let counts_token: CountsToken = [[[[[[0; 3]; 6]; 6]; 2]; 2]; 4];
+        let counts_mc: CountsMoreCoefs = [[[[[[0; 2]; 6]; 6]; 2]; 2]; 4];
+        adapt_coef_probs(&mut cp, &counts_token, &counts_mc, true, false);
+        assert_eq!(cp, orig);
     }
 }

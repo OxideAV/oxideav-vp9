@@ -724,3 +724,62 @@ fn superframe_split_is_transparent_on_plain_chunks() {
     }
     assert_eq!(got, expected, "split-then-decode byte-exact");
 }
+
+/// §8.9 `show_existing_frame` corpus: the `show-existing-frame` fixture is a
+/// 24-frame `auto-alt-ref=2` stream whose visible frames at ARF-release time
+/// are `show_existing_frame=1` packets re-displaying a reference slot. Its
+/// keyframe (the first sub-frame) decodes byte-exact against the leading
+/// 64x64 4:2:0 frame of `expected.yuv`, exercising the §8.10 reference store
+/// + §8.9 output wiring up to the inter boundary.
+///
+/// The stream's first inter frame currently diverges (the §9.2.3 `exit_bool`
+/// padding check rejects it — the tile decode consumes the wrong number of
+/// bits because the `auto-alt-ref` inter path is not yet bit-exact), so the
+/// full sequence is not decodable end-to-end here. This pin locks the
+/// keyframe boundary that *is* correct and is the precise reproduction for
+/// the follow-up inter-decode work; the inter divergence is gated behind the
+/// §9.3.4 `more_coefs` count-collection docs gap that also blocks entropy
+/// adaptation.
+#[test]
+fn show_existing_corpus_keyframe_decodes_byte_exact() {
+    let base = std::path::Path::new("../../docs/video/vp9/fixtures/show-existing-frame");
+    if !base.is_dir() {
+        eprintln!("docs corpus not present; docs-gated");
+        return;
+    }
+    let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");
+    let expected = std::fs::read(base.join("expected.yuv")).expect("expected.yuv");
+
+    // Demux: IVF chunk -> Annex B superframe split -> sub-frames.
+    let mut sub: Vec<Vec<u8>> = Vec::new();
+    for p in &ivf_chunks(&ivf) {
+        for f in split_superframe(p) {
+            sub.push(f.to_vec());
+        }
+    }
+    assert!(sub.len() > 1, "fixture has a keyframe plus inter frames");
+
+    // The keyframe (first sub-frame) decodes byte-exact against frame 0.
+    let kf = decode_vp9_sequence(&[&sub[0]]).expect("decode keyframe");
+    assert_eq!(kf.len(), 1);
+    let kf_bytes = kf[0].to_planar_bytes();
+    assert_eq!(kf[0].width, 64);
+    assert_eq!(kf[0].height, 64);
+    assert_eq!(kf_bytes.len(), 64 * 64 * 3 / 2, "64x64 4:2:0 frame size");
+    assert_eq!(
+        kf_bytes,
+        expected[..kf_bytes.len()],
+        "show-existing-frame keyframe byte-exact vs expected.yuv frame 0"
+    );
+
+    // Documented divergence boundary: decoding through the first inter frame
+    // currently fails (it is not yet bit-exact). This guards the boundary —
+    // when the inter path is fixed, this assertion flips and the test is
+    // upgraded to a full-sequence byte-exact pin.
+    let through_inter = decode_vp9_sequence(&[&sub[0], &sub[1]]);
+    assert!(
+        through_inter.is_err(),
+        "first inter frame is the known divergence boundary; \
+         upgrade this pin to full-sequence when the inter path is bit-exact"
+    );
+}

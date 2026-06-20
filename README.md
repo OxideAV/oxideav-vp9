@@ -108,9 +108,16 @@ map between frames.
   end-to-end (the corpus inter fixtures are single-reference, same-size
   LAST); broader inter fixtures land in later rounds.
 * Hidden alt-ref superframes (`superframe-2`) and the
-  `show-existing-frame` corpus decode their keyframe + early frames but
-  hit a divergence on a later hidden-ARF P-frame; the Annex B split is
-  in place but the full hidden-ARF inter path is not yet byte-exact.
+  `show-existing-frame` corpus decode their keyframe byte-exact (the
+  latter pinned against `expected.yuv` frame 0) but hit a divergence on
+  the first inter frame: the §9.2.3 `exit_bool` padding check rejects it
+  because the `auto-alt-ref` inter tile decode consumes the wrong number
+  of bits, so the full hidden-ARF inter path is not yet byte-exact. The
+  §8.9 / §8.10 `show_existing_frame` output process itself is correct —
+  it re-displays the per-slot §8.10 `FrameStore[ ]` (updated by every
+  decoded frame, including hidden `show_frame=0` alt-ref frames) with the
+  stored frame's own dimensions, so a slot written by a hidden ARF can be
+  re-emitted; per-slot resolution is pinned end-to-end.
 * §8.4 probability adaptation / §6.1.2 frame-context refresh — the
   §8.4.1/§8.4.2 `merge_prob` / `merge_probs` primitives and the §8.4.3
   `adapt_coef_probs` coefficient-adaption transform are implemented and
@@ -124,7 +131,7 @@ map between frames.
 
 ## Testing
 
-The crate carries 738 lib unit tests plus integration suites in
+The crate carries 762 lib unit tests plus integration suites in
 `tests/`. Tests construct their inputs bit-by-bit; §9.2 golden buffers
 are hand-derived by stepping the decoder, not borrowed from any
 third-party VP9 implementation. A `cargo-fuzz` harness lives in

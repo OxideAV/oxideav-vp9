@@ -42,9 +42,9 @@
 
 use crate::bool_coder::BoolCoder;
 use crate::compressed::{
-    parse_compressed_header, parse_compressed_header_inter, CompoundReferenceConfig,
-    RefFrameSignBias, Vp9CompressedHeader, Vp9CompressedHeaderInter,
-    Vp9CompressedHeaderInterInputs,
+    parse_compressed_header, parse_compressed_header_inter_with_ctx,
+    parse_compressed_header_with_ctx, CompoundReferenceConfig, FrameContext, RefFrameSignBias,
+    Vp9CompressedHeader, Vp9CompressedHeaderInter, Vp9CompressedHeaderInterInputs,
 };
 use crate::decode_block::{decode_block_apply, DecodedBlockResult, Vp9FrameState};
 use crate::dequant::{get_ac_quant, get_dc_quant, seg_feature_active};
@@ -1523,6 +1523,14 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
     // crop + packing metadata needed to re-emit the frame verbatim.
     let mut frame_store: [Option<Vp9DecodedFrame>; 8] = Default::default();
 
+    // §6.1.2 / §7.2 `FrameContext[ 4 ]` — the persistent entropy
+    // probability banks `load_probs( )` / `save_probs( )` thread across
+    // frames. Initialised to the §10.5 defaults; a key / intra-only /
+    // error-resilient frame's §7.2 `setup_past_independence( )` resets
+    // the bank(s) again before the frame folds its own compressed-header
+    // forward updates on top.
+    let mut frame_contexts: [FrameContext; 4] = Default::default();
+
     for &frame in frames {
         // Peek the uncompressed header (with inherited ref state so inter
         // frames parse).
@@ -1579,11 +1587,42 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
             }
         });
 
+        // §6.2 setup_past_independence + reset_frame_context: a key /
+        // intra-only / error-resilient frame decodes free of prior-frame
+        // entropy state. §7.2 resets the working probability tables to the
+        // §10.5 defaults, then §6.2 saves those defaults into the frame
+        // context(s) named by `reset_frame_context` (all four on a
+        // keyframe / error-resilient frame), and finally forces
+        // `frame_context_idx = 0`.
+        let frame_context_idx = if frame_is_intra || hdr.error_resilient_mode {
+            let reset_all = matches!(hdr.frame_type, FrameType::KeyFrame)
+                || hdr.error_resilient_mode
+                || hdr.reset_frame_context == 3;
+            if reset_all {
+                frame_contexts = Default::default();
+            } else if hdr.reset_frame_context == 2 {
+                frame_contexts[hdr.frame_context_idx as usize] = FrameContext::default();
+            }
+            0usize
+        } else {
+            hdr.frame_context_idx as usize
+        };
+
+        // §6.1.2 load_probs( frame_context_idx ): the compressed-header
+        // forward updates fold onto the loaded bank, not the static
+        // defaults.
+        let base_ctx = frame_contexts[frame_context_idx].clone();
+
         let products = if frame_is_intra {
-            let chdr = ChdrKind::Intra(Box::new(parse_compressed_header(
-                &frame[ch_start..ch_end],
-                lossless,
-            )?));
+            let chdr_parsed =
+                parse_compressed_header_with_ctx(&frame[ch_start..ch_end], lossless, &base_ctx)?;
+            // §6.1.2 save_probs( frame_context_idx ) (parallel-mode path:
+            // no backward adaptation, just persist the forward-updated
+            // tables).
+            if hdr.refresh_frame_context {
+                frame_contexts[frame_context_idx].apply_intra(&chdr_parsed);
+            }
+            let chdr = ChdrKind::Intra(Box::new(chdr_parsed));
             decode_single_frame(frame, &hdr, ch_end, chdr, Some(&bufs), prev)?
         } else {
             let inputs = Vp9CompressedHeaderInterInputs {
@@ -1595,11 +1634,16 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
                 ),
                 allow_high_precision_mv: hdr.allow_high_precision_mv,
             };
-            let chdr = ChdrKind::Inter(Box::new(parse_compressed_header_inter(
+            let chdr_parsed = parse_compressed_header_inter_with_ctx(
                 &frame[ch_start..ch_end],
                 lossless,
                 inputs,
-            )?));
+                &base_ctx,
+            )?;
+            if hdr.refresh_frame_context {
+                frame_contexts[frame_context_idx].apply_inter(&chdr_parsed);
+            }
+            let chdr = ChdrKind::Inter(Box::new(chdr_parsed));
             decode_single_frame(frame, &hdr, ch_end, chdr, Some(&bufs), prev)?
         };
 

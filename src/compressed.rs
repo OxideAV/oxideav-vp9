@@ -235,6 +235,111 @@ pub struct Vp9CompressedHeader {
     pub skip_prob: [u8; 3],
 }
 
+/// §7.2 / §6.1.2 frame-context probability bank — the persistent
+/// entropy state `load_probs( frame_context_idx )` restores at the start
+/// of a frame's compressed-header parse and `save_probs(
+/// frame_context_idx )` writes back at frame end.
+///
+/// VP9 keeps `FRAME_CONTEXTS = 4` independent banks. Each holds every
+/// probability table that the §6.3 compressed header forward-updates
+/// (`diff_update_prob` / `update_mv_prob`) on top of: the §6.3.1-§6.3.8
+/// intra-shared tables (`tx_probs`, `coef_probs`, `skip_prob`) and the
+/// §6.3.9-§6.3.16 inter tail (`inter_mode_probs`, `interp_filter_probs`,
+/// `is_inter_prob`, `comp_mode_prob`, `single_ref_prob`, `comp_ref_prob`,
+/// `y_mode_probs`, `partition_probs`, `mv_probs`).
+///
+/// On a key / intra-only frame (or any `error_resilient_mode` frame)
+/// §7.2 `setup_past_independence( )` resets every bank to the §10.5
+/// defaults via [`FrameContext::default`] before the frame's own
+/// compressed header forward-updates the loaded copy. A subsequent inter
+/// frame then `load_probs`-es the bank the prior frame saved — so the
+/// inter frame's `diff_update_prob` deltas compound onto the *previous*
+/// frame's tables, not the static defaults. Decoding multi-superblock
+/// inter frames with `frame_parallel_decoding_mode == 1` and
+/// `refresh_frame_context == 1` requires this threading: the encoder's
+/// arithmetic coder was driven by the loaded-and-updated tables, so a
+/// decoder that always reloads defaults desynchronises partway through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameContext {
+    /// `tx_probs[ TX_SIZES ][ TX_SIZE_CONTEXTS ][ TX_SIZES - 1 ]`.
+    pub tx_probs: [[[u8; 3]; 2]; 4],
+    /// `coef_probs[ … ]` — the §6.3.7 coefficient probability bank.
+    pub coef_probs: CoefProbs,
+    /// `skip_prob[ SKIP_CONTEXTS ]`.
+    pub skip_prob: [u8; 3],
+    /// `inter_mode_probs[ INTER_MODE_CONTEXTS ][ INTER_MODES - 1 ]`.
+    pub inter_mode_probs: [[u8; INTER_MODES - 1]; INTER_MODE_CONTEXTS],
+    /// `interp_filter_probs[ INTERP_FILTER_CONTEXTS ][ SWITCHABLE_FILTERS - 1 ]`.
+    pub interp_filter_probs: [[u8; SWITCHABLE_FILTERS - 1]; INTERP_FILTER_CONTEXTS],
+    /// `is_inter_prob[ IS_INTER_CONTEXTS ]`.
+    pub is_inter_prob: [u8; IS_INTER_CONTEXTS],
+    /// `comp_mode_prob[ COMP_MODE_CONTEXTS ]`.
+    pub comp_mode_prob: [u8; COMP_MODE_CONTEXTS],
+    /// `single_ref_prob[ REF_CONTEXTS ][ 2 ]`.
+    pub single_ref_prob: [[u8; 2]; REF_CONTEXTS],
+    /// `comp_ref_prob[ REF_CONTEXTS ]`.
+    pub comp_ref_prob: [u8; REF_CONTEXTS],
+    /// `y_mode_probs[ BLOCK_SIZE_GROUPS ][ INTRA_MODES - 1 ]`.
+    pub y_mode_probs: [[u8; INTRA_MODES - 1]; BLOCK_SIZE_GROUPS],
+    /// `partition_probs[ PARTITION_CONTEXTS ][ PARTITION_TYPES - 1 ]`.
+    pub partition_probs: [[u8; PARTITION_TYPES - 1]; PARTITION_CONTEXTS],
+    /// The §6.3.16 MV probability bundle.
+    pub mv_probs: MvProbs,
+}
+
+impl Default for FrameContext {
+    /// The §10.5 default probability bank — the state every frame
+    /// context is reset to by §7.2 `setup_past_independence( )`.
+    fn default() -> Self {
+        Self {
+            tx_probs: DEFAULT_TX_PROBS,
+            coef_probs: DEFAULT_COEF_PROBS,
+            skip_prob: DEFAULT_SKIP_PROB,
+            inter_mode_probs: DEFAULT_INTER_MODE_PROBS_TABLE,
+            interp_filter_probs: DEFAULT_INTERP_FILTER_PROBS_TABLE,
+            is_inter_prob: DEFAULT_IS_INTER_PROB_TABLE,
+            comp_mode_prob: DEFAULT_COMP_MODE_PROB_TABLE,
+            single_ref_prob: DEFAULT_SINGLE_REF_PROB_TABLE,
+            comp_ref_prob: DEFAULT_COMP_REF_PROB_TABLE,
+            y_mode_probs: DEFAULT_Y_MODE_PROBS_TABLE,
+            partition_probs: DEFAULT_PARTITION_PROBS_TABLE,
+            mv_probs: MvProbs::defaults(),
+        }
+    }
+}
+
+impl FrameContext {
+    /// `save_probs( frame_context_idx )` source — fold a just-parsed
+    /// keyframe / intra-only compressed header into this bank. Only the
+    /// §6.3.1-§6.3.8 intra-shared tables are touched by an intra frame's
+    /// compressed header; the inter-tail tables keep whatever this bank
+    /// already held (which, after a §7.2 reset, is the §10.5 default).
+    pub fn apply_intra(&mut self, chdr: &Vp9CompressedHeader) {
+        self.tx_probs = chdr.tx_probs;
+        self.coef_probs = chdr.coef_probs;
+        self.skip_prob = chdr.skip_prob;
+    }
+
+    /// `save_probs( frame_context_idx )` source — fold a just-parsed
+    /// inter compressed header into this bank. An inter frame's
+    /// compressed header forward-updates every table, so the whole bank
+    /// is overwritten with the parsed result.
+    pub fn apply_inter(&mut self, chdr: &Vp9CompressedHeaderInter) {
+        self.tx_probs = chdr.intra.tx_probs;
+        self.coef_probs = chdr.intra.coef_probs;
+        self.skip_prob = chdr.intra.skip_prob;
+        self.inter_mode_probs = chdr.inter_mode_probs;
+        self.interp_filter_probs = chdr.interp_filter_probs;
+        self.is_inter_prob = chdr.is_inter_prob;
+        self.comp_mode_prob = chdr.comp_mode_prob;
+        self.single_ref_prob = chdr.single_ref_prob;
+        self.comp_ref_prob = chdr.comp_ref_prob;
+        self.y_mode_probs = chdr.y_mode_probs;
+        self.partition_probs = chdr.partition_probs;
+        self.mv_probs = chdr.mv_probs.clone();
+    }
+}
+
 /// Parse the §6.3 compressed header from `data`.
 ///
 /// `data` must be the byte slice of length `header_size_in_bytes`
@@ -254,9 +359,25 @@ pub struct Vp9CompressedHeader {
 /// bit is nonzero, if `read_bool` underruns `BoolMaxBits`, or if a
 /// decoded value falls outside its spec-defined range.
 pub fn parse_compressed_header(data: &[u8], lossless: bool) -> Result<Vp9CompressedHeader, Error> {
+    parse_compressed_header_with_ctx(data, lossless, &FrameContext::default())
+}
+
+/// [`parse_compressed_header`] with an explicit §6.1.2
+/// `load_probs( frame_context_idx )` base bank.
+///
+/// The §6.3 `diff_update_prob` sweeps fold their decoded deltas onto the
+/// `base` tables rather than the static §10.5 defaults. On a key /
+/// intra-only frame following §7.2 `setup_past_independence( )`, `base`
+/// is the reset (default) bank and this is identical to
+/// [`parse_compressed_header`].
+pub fn parse_compressed_header_with_ctx(
+    data: &[u8],
+    lossless: bool,
+    base: &FrameContext,
+) -> Result<Vp9CompressedHeader, Error> {
     let sz = data.len();
     let mut coder = BoolCoder::init_bool(data, sz)?;
-    parse_compressed_header_intra_prefix(&mut coder, lossless)
+    parse_compressed_header_intra_prefix(&mut coder, lossless, base)
 }
 
 /// Shared helper that walks the §6.3 outer-listing prefix that runs
@@ -269,15 +390,16 @@ pub fn parse_compressed_header(data: &[u8], lossless: bool) -> Result<Vp9Compres
 fn parse_compressed_header_intra_prefix(
     coder: &mut BoolCoder<'_>,
     lossless: bool,
+    base: &FrameContext,
 ) -> Result<Vp9CompressedHeader, Error> {
     let tx_mode = read_tx_mode(coder, lossless)?;
-    let mut tx_probs = DEFAULT_TX_PROBS;
+    let mut tx_probs = base.tx_probs;
     if tx_mode == TxMode::TxModeSelect {
         read_tx_mode_probs(coder, &mut tx_probs)?;
     }
-    let mut coef_probs = DEFAULT_COEF_PROBS;
+    let mut coef_probs = base.coef_probs;
     read_coef_probs(coder, tx_mode, &mut coef_probs)?;
-    let mut skip_prob = DEFAULT_SKIP_PROB;
+    let mut skip_prob = base.skip_prob;
     read_skip_prob(coder, &mut skip_prob)?;
     Ok(Vp9CompressedHeader {
         tx_mode,
@@ -444,27 +566,44 @@ pub fn parse_compressed_header_inter(
     lossless: bool,
     inputs: Vp9CompressedHeaderInterInputs,
 ) -> Result<Vp9CompressedHeaderInter, Error> {
+    parse_compressed_header_inter_with_ctx(data, lossless, inputs, &FrameContext::default())
+}
+
+/// [`parse_compressed_header_inter`] with an explicit §6.1.2
+/// `load_probs( frame_context_idx )` base bank.
+///
+/// Every §6.3.1-§6.3.16 forward-update sweep folds its `diff_update_prob`
+/// / `update_mv_prob` deltas onto the matching `base` table rather than
+/// the static §10.5 defaults. Threading the bank a prior frame saved is
+/// what lets a P-frame's entropy decode stay synchronised with the
+/// encoder past the first superblock.
+pub fn parse_compressed_header_inter_with_ctx(
+    data: &[u8],
+    lossless: bool,
+    inputs: Vp9CompressedHeaderInterInputs,
+    base: &FrameContext,
+) -> Result<Vp9CompressedHeaderInter, Error> {
     let sz = data.len();
     let mut coder = BoolCoder::init_bool(data, sz)?;
 
     // §6.3 lines 1958-1963: the intra-shared prefix.
-    let intra = parse_compressed_header_intra_prefix(&mut coder, lossless)?;
+    let intra = parse_compressed_header_intra_prefix(&mut coder, lossless, base)?;
 
     // §6.3 lines 1965-1973: the `FrameIsIntra == 0` inter-only tail.
 
     // §6.3.9 read_inter_mode_probs( ).
-    let mut inter_mode_probs = DEFAULT_INTER_MODE_PROBS_TABLE;
+    let mut inter_mode_probs = base.inter_mode_probs;
     read_inter_mode_probs(&mut coder, &mut inter_mode_probs)?;
 
     // §6.3.10 read_interp_filter_probs( ) — gated on
     // `interpolation_filter == SWITCHABLE`.
-    let mut interp_filter_probs = DEFAULT_INTERP_FILTER_PROBS_TABLE;
+    let mut interp_filter_probs = base.interp_filter_probs;
     if inputs.interpolation_filter_is_switchable {
         read_interp_filter_probs(&mut coder, &mut interp_filter_probs)?;
     }
 
     // §6.3.11 read_is_inter_probs( ).
-    let mut is_inter_prob = DEFAULT_IS_INTER_PROB_TABLE;
+    let mut is_inter_prob = base.is_inter_prob;
     read_is_inter_probs(&mut coder, &mut is_inter_prob)?;
 
     // §6.3.12 frame_reference_mode( ) — also invokes §6.3.18
@@ -474,9 +613,9 @@ pub fn parse_compressed_header_inter(
         frame_reference_mode(&mut coder, &inputs.ref_frame_sign_bias)?;
 
     // §6.3.13 frame_reference_mode_probs( ).
-    let mut comp_mode_prob = DEFAULT_COMP_MODE_PROB_TABLE;
-    let mut single_ref_prob = DEFAULT_SINGLE_REF_PROB_TABLE;
-    let mut comp_ref_prob = DEFAULT_COMP_REF_PROB_TABLE;
+    let mut comp_mode_prob = base.comp_mode_prob;
+    let mut single_ref_prob = base.single_ref_prob;
+    let mut comp_ref_prob = base.comp_ref_prob;
     read_frame_reference_mode_probs(
         &mut coder,
         reference_mode,
@@ -486,16 +625,16 @@ pub fn parse_compressed_header_inter(
     )?;
 
     // §6.3.14 read_y_mode_probs( ).
-    let mut y_mode_probs = DEFAULT_Y_MODE_PROBS_TABLE;
+    let mut y_mode_probs = base.y_mode_probs;
     read_y_mode_probs(&mut coder, &mut y_mode_probs)?;
 
     // §6.3.15 read_partition_probs( ).
-    let mut partition_probs = DEFAULT_PARTITION_PROBS_TABLE;
+    let mut partition_probs = base.partition_probs;
     read_partition_probs(&mut coder, &mut partition_probs)?;
 
     // §6.3.16 mv_probs( ) — also invokes §6.3.17
     // `update_mv_prob( )` per cell via the inner walker.
-    let mut mv_probs_table = MvProbs::defaults();
+    let mut mv_probs_table = base.mv_probs.clone();
     mv_probs(
         &mut coder,
         &mut mv_probs_table,
@@ -1380,6 +1519,45 @@ pub(crate) fn mv_probs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----- §6.1.2 / §7.2 FrameContext -----
+
+    #[test]
+    fn frame_context_default_is_the_section_10_5_default_bank() {
+        // §7.2 setup_past_independence resets every bank to the §10.5
+        // defaults; FrameContext::default() must equal them slot for slot.
+        let ctx = FrameContext::default();
+        assert_eq!(ctx.tx_probs, DEFAULT_TX_PROBS);
+        assert_eq!(ctx.coef_probs, DEFAULT_COEF_PROBS);
+        assert_eq!(ctx.skip_prob, DEFAULT_SKIP_PROB);
+        assert_eq!(ctx.inter_mode_probs, DEFAULT_INTER_MODE_PROBS_TABLE);
+        assert_eq!(ctx.is_inter_prob, DEFAULT_IS_INTER_PROB_TABLE);
+        assert_eq!(ctx.y_mode_probs, DEFAULT_Y_MODE_PROBS_TABLE);
+        assert_eq!(ctx.partition_probs, DEFAULT_PARTITION_PROBS_TABLE);
+        assert_eq!(ctx.mv_probs, MvProbs::defaults());
+    }
+
+    #[test]
+    fn frame_context_apply_intra_overwrites_only_intra_shared_tables() {
+        // save_probs( ) after a key / intra-only frame folds in the
+        // §6.3.1-§6.3.8 intra-shared tables; the inter-tail tables keep
+        // whatever the bank already held (a §10.5 default after reset).
+        let mut ctx = FrameContext::default();
+        let mut chdr = Vp9CompressedHeader {
+            tx_mode: TxMode::TxModeSelect,
+            tx_probs: DEFAULT_TX_PROBS,
+            coef_probs: DEFAULT_COEF_PROBS,
+            skip_prob: DEFAULT_SKIP_PROB,
+        };
+        chdr.skip_prob = [1, 2, 3];
+        chdr.tx_probs[1][0][0] = 200;
+        ctx.apply_intra(&chdr);
+        assert_eq!(ctx.skip_prob, [1, 2, 3]);
+        assert_eq!(ctx.tx_probs[1][0][0], 200);
+        // Inter-tail tables untouched.
+        assert_eq!(ctx.y_mode_probs, DEFAULT_Y_MODE_PROBS_TABLE);
+        assert_eq!(ctx.is_inter_prob, DEFAULT_IS_INTER_PROB_TABLE);
+    }
 
     // Golden test vectors below were derived by stepping the §9.2
     // Boolean decoder by hand (see `src/bool_coder.rs` tests for the

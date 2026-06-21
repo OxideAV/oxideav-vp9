@@ -692,6 +692,48 @@ fn frame_parallel_mode_four_frame_sequence_byte_exact() {
     );
 }
 
+/// §6.1.2 entropy-context threading end-to-end: the `profile-0-yuv420-8bit`
+/// "common path" fixture is a keyframe + three P-frames at 128x128 (a 2x2
+/// superblock grid) with `tx_mode=TX_MODE_SELECT`, deep partitions down to
+/// 4x4, sub-8x8 inter blocks, and — critically — `error_resilient_mode=0` +
+/// `refresh_frame_context=1`. Unlike the error-resilient `frame-parallel-mode`
+/// fixture, each P-frame here `load_probs( )`-es the bank the *previous* frame
+/// `save_probs( )`-ed, so the compressed-header forward updates compound onto
+/// the prior frame's tables rather than the §10.5 defaults. Without that
+/// threading the arithmetic decoder desynchronises partway through the second
+/// superblock; with it the whole four-frame sequence reconstructs byte-exact.
+#[test]
+fn profile0_common_path_inter_sequence_byte_exact() {
+    let base = std::path::Path::new("../../docs/video/vp9/fixtures/profile-0-yuv420-8bit");
+    if !base.is_dir() {
+        eprintln!("docs corpus not present; profile-0 is docs-gated");
+        return;
+    }
+    let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");
+    let expected = std::fs::read(base.join("expected.yuv")).expect("expected.yuv");
+
+    let payloads = ivf_chunks(&ivf);
+    assert_eq!(payloads.len(), 4, "four IVF frames");
+    let refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+    let frames = decode_vp9_sequence(&refs).expect("decode profile-0 sequence");
+    assert_eq!(frames.len(), 4, "four shown frames");
+
+    let mut got = Vec::new();
+    for f in &frames {
+        got.extend(f.to_planar_bytes());
+    }
+    assert_eq!(got.len(), expected.len(), "planar length");
+    let diffs = got
+        .iter()
+        .zip(expected.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(
+        diffs, 0,
+        "{diffs} differing bytes vs profile-0 expected.yuv"
+    );
+}
+
 /// Annex B: the `frame-parallel-mode` IVF chunks carry no superframe index,
 /// so [`split_superframe`] passes each chunk through unchanged — the §B.4
 /// single-frame fallback. Confirms the split is transparent on
@@ -727,21 +769,15 @@ fn superframe_split_is_transparent_on_plain_chunks() {
 
 /// §8.9 `show_existing_frame` corpus: the `show-existing-frame` fixture is a
 /// 24-frame `auto-alt-ref=2` stream whose visible frames at ARF-release time
-/// are `show_existing_frame=1` packets re-displaying a reference slot. Its
-/// keyframe (the first sub-frame) decodes byte-exact against the leading
-/// 64x64 4:2:0 frame of `expected.yuv`, exercising the §8.10 reference store
-/// + §8.9 output wiring up to the inter boundary.
-///
-/// The stream's first inter frame currently diverges (the §9.2.3 `exit_bool`
-/// padding check rejects it — the tile decode consumes the wrong number of
-/// bits because the `auto-alt-ref` inter path is not yet bit-exact), so the
-/// full sequence is not decodable end-to-end here. This pin locks the
-/// keyframe boundary that *is* correct and is the precise reproduction for
-/// the follow-up inter-decode work; the inter divergence is gated behind the
-/// §9.3.4 `more_coefs` count-collection docs gap that also blocks entropy
-/// adaptation.
+/// are `show_existing_frame=1` packets re-displaying a reference slot. The
+/// stream uses `error_resilient_mode=0` + `refresh_frame_context=1`, so it
+/// requires §6.1.2 `load_probs( ) / save_probs( )` entropy-context threading:
+/// each inter frame's compressed-header forward updates fold onto the prior
+/// frame's saved tables. With that threading the full 24-frame sequence —
+/// keyframe, the hidden alt-ref frames, the `show_existing_frame` re-displays,
+/// and every visible P-frame — decodes byte-exact against `expected.yuv`.
 #[test]
-fn show_existing_corpus_keyframe_decodes_byte_exact() {
+fn show_existing_corpus_decodes_byte_exact() {
     let base = std::path::Path::new("../../docs/video/vp9/fixtures/show-existing-frame");
     if !base.is_dir() {
         eprintln!("docs corpus not present; docs-gated");
@@ -759,27 +795,17 @@ fn show_existing_corpus_keyframe_decodes_byte_exact() {
     }
     assert!(sub.len() > 1, "fixture has a keyframe plus inter frames");
 
-    // The keyframe (first sub-frame) decodes byte-exact against frame 0.
-    let kf = decode_vp9_sequence(&[&sub[0]]).expect("decode keyframe");
-    assert_eq!(kf.len(), 1);
-    let kf_bytes = kf[0].to_planar_bytes();
-    assert_eq!(kf[0].width, 64);
-    assert_eq!(kf[0].height, 64);
-    assert_eq!(kf_bytes.len(), 64 * 64 * 3 / 2, "64x64 4:2:0 frame size");
-    assert_eq!(
-        kf_bytes,
-        expected[..kf_bytes.len()],
-        "show-existing-frame keyframe byte-exact vs expected.yuv frame 0"
-    );
-
-    // Documented divergence boundary: decoding through the first inter frame
-    // currently fails (it is not yet bit-exact). This guards the boundary —
-    // when the inter path is fixed, this assertion flips and the test is
-    // upgraded to a full-sequence byte-exact pin.
-    let through_inter = decode_vp9_sequence(&[&sub[0], &sub[1]]);
-    assert!(
-        through_inter.is_err(),
-        "first inter frame is the known divergence boundary; \
-         upgrade this pin to full-sequence when the inter path is bit-exact"
-    );
+    let refs: Vec<&[u8]> = sub.iter().map(|p| p.as_slice()).collect();
+    let frames = decode_vp9_sequence(&refs).expect("decode full sequence");
+    let mut got = Vec::new();
+    for f in &frames {
+        got.extend(f.to_planar_bytes());
+    }
+    assert_eq!(got.len(), expected.len(), "24 visible frames planar length");
+    let diffs = got
+        .iter()
+        .zip(expected.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(diffs, 0, "{diffs} differing bytes vs expected.yuv");
 }

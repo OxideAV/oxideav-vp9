@@ -1531,6 +1531,16 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
     // forward updates on top.
     let mut frame_contexts: [FrameContext; 4] = Default::default();
 
+    // §6.4.14 `PrevSegmentIds[ ][ ]` — the persistent segmentation map a
+    // §6.4.12 `temporal_update` / `update_map == 0` frame predicts from.
+    // §8.1 step 3 only refreshes it after a frame with
+    // `segmentation_update_map == 1`; a frame that reuses the map
+    // (`update_map == 0`) leaves it pointing at the *last map-bearing*
+    // frame, NOT its own (possibly Min-collapsed) `SegmentIds`. Tracking
+    // it separately from the per-frame `prev_state` snapshot is what keeps
+    // a run of `update_map == 0` inter frames reading the original map.
+    let mut prev_segment_ids_map: Option<(Vec<u8>, u32, u32)> = None;
+
     for &frame in frames {
         // Peek the uncompressed header (with inherited ref state so inter
         // frames parse).
@@ -1574,13 +1584,28 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
             return Err(Error::UnexpectedEof);
         }
 
+        // §6.4.14 PrevSegmentIds: the last map-bearing frame's
+        // `SegmentIds`, if it matches the current dimensions. A run of
+        // `update_map == 0` frames keeps predicting from this same map.
+        let prev_seg_slice: Option<&[u8]> =
+            prev_segment_ids_map.as_ref().and_then(|(map, mw, mh)| {
+                if *mw == hdr.frame_width && *mh == hdr.frame_height {
+                    Some(map.as_slice())
+                } else {
+                    None
+                }
+            });
+
         // §6.5 / §6.4.14 previous-frame snapshot (same-dimension only).
+        // §6.5 MV/ref prediction reads the immediately-preceding decoded
+        // frame; §6.4.14 segment prediction reads the separately-tracked
+        // `prev_segment_ids_map` (last `update_map == 1` frame).
         let prev = prev_state.as_ref().and_then(|(ps, pw, ph, shown)| {
             if *pw == hdr.frame_width && *ph == hdr.frame_height && *shown {
                 Some(PrevFrameState {
                     ref_frames: &ps.ref_frames,
                     mvs: &ps.mvs,
-                    segment_ids: &ps.segment_ids,
+                    segment_ids: prev_seg_slice.unwrap_or(&ps.segment_ids),
                 })
             } else {
                 None
@@ -1670,6 +1695,18 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
         if frame_is_intra || last_color.is_none() {
             last_color = Some(hdr.color_config);
         }
+        // §8.1 step 3: refresh PrevSegmentIds only after a frame that
+        // built a fresh map (`segmentation_enabled && update_map`). A
+        // frame reusing the map leaves the persistent copy untouched so
+        // the *next* frame still predicts from the original.
+        if hdr.segmentation.enabled && hdr.segmentation.update_map {
+            prev_segment_ids_map = Some((
+                products.state.segment_ids.clone(),
+                hdr.frame_width,
+                hdr.frame_height,
+            ));
+        }
+
         let shown = hdr.show_frame;
         prev_state = Some((products.state, hdr.frame_width, hdr.frame_height, shown));
 

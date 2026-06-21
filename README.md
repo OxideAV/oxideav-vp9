@@ -13,14 +13,22 @@ planar samples, byte-exact against a 13-fixture staged corpus covering
 4:2:0 and 4:4:4 chroma, 8/10/12-bit depth, RGB, multiple tile columns,
 segmentation AQ, lossless, and both quantizer extremes.
 [`decode_vp9_sequence`] decodes a multi-frame stream (keyframe followed
-by P-frames), threading the §8.10 reference buffers + §6.5 previous-frame
-motion field across frames. Two corpus fixtures reconstruct byte-exact
-against their `expected.yuv`: the `i-frame-then-p-frame-64x64` fixture
-(keyframe + single-reference LAST P-frame, high-precision MVs, 8-tap-smooth
-filter) and the `frame-parallel-mode` fixture (keyframe + **three**
-consecutive single-reference P-frames at 64x64, `error_resilient=1` /
-`parallel_mode=1` / `refresh_ctx=0`, so no inter-frame entropy adaptation —
-the §8.10 reference threading is validated across a longer P-frame run).
+by P-frames), threading the §8.10 reference buffers, the §6.5 previous-frame
+motion field, the §6.1.2 / §7.2 `FrameContext[ 4 ]` entropy probability
+banks (`load_probs( )` / `save_probs( )`), and the §6.4.14 PrevSegmentIds
+map across frames. Four corpus fixtures reconstruct byte-exact against
+their `expected.yuv`: `i-frame-then-p-frame-64x64` (keyframe +
+single-reference LAST P-frame, high-precision MVs, 8-tap-smooth filter),
+`frame-parallel-mode` (keyframe + three single-reference P-frames at 64x64,
+`error_resilient=1` so no entropy threading), `profile-0-yuv420-8bit` (the
+common path: keyframe + three P-frames at **128x128** — a 2x2 superblock
+grid — with `tx_mode_select`, deep partitions to 4x4, sub-8x8 inter blocks,
+and `refresh_frame_context=1` so the per-frame `load_probs( ) / save_probs(
+)` entropy threading is exercised), and the 24-frame `show-existing-frame`
+`auto-alt-ref=2` stream (hidden ARFs + `show_existing_frame` re-displays).
+The `segments-aq-mode` (per-segment AQ) and `superframe-2` (hidden-ARF
+superframes) fixtures decode end-to-end but diverge in later frames (a
+remaining entropy / reconstruction discrepancy — see CHANGELOG).
 
 [`split_superframe`] implements the Annex B superframe split: it parses
 the §B.2.1 superframe index and returns the enclosed coded-frame slices in

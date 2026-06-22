@@ -27,8 +27,15 @@ and `refresh_frame_context=1` so the per-frame `load_probs( ) / save_probs(
 )` entropy threading is exercised), and the 24-frame `show-existing-frame`
 `auto-alt-ref=2` stream (hidden ARFs + `show_existing_frame` re-displays).
 The `segments-aq-mode` (per-segment AQ) and `superframe-2` (hidden-ARF
-superframes) fixtures decode end-to-end but diverge in later frames (a
-remaining entropy / reconstruction discrepancy — see CHANGELOG).
+superframes) fixtures decode end-to-end but still diverge from their
+`expected.yuv`: `segments-aq-mode` is exact through frame 1 and diverges
+from frame 2 (where the P-frame switches to `tx_mode=ALLOW_32X32`);
+`superframe-2` diverges by ±1 in a handful of samples from the keyframe
+onward (a `TX_MODE_SELECT` small-transform / ADST reconstruction
+precision discrepancy at very low quantizer). Both are reconstruction —
+not entropy-adaptation — discrepancies (the corpus is entirely
+`frame_parallel_decoding_mode=1`, so §8.4 adaptation never runs); see the
+"Not yet supported" section for the localised next-round targets.
 
 [`split_superframe`] implements the Annex B superframe split: it parses
 the §B.2.1 superframe index and returns the enclosed coded-frame slices in
@@ -115,25 +122,43 @@ map between frames.
   distinct per-list-scaled references), but not yet *corpus*-validated
   end-to-end (the corpus inter fixtures are single-reference, same-size
   LAST); broader inter fixtures land in later rounds.
-* Hidden alt-ref superframes (`superframe-2`) and the
-  `show-existing-frame` corpus decode their keyframe byte-exact (the
-  latter pinned against `expected.yuv` frame 0) but hit a divergence on
-  the first inter frame: the §9.2.3 `exit_bool` padding check rejects it
-  because the `auto-alt-ref` inter tile decode consumes the wrong number
-  of bits, so the full hidden-ARF inter path is not yet byte-exact. The
-  §8.9 / §8.10 `show_existing_frame` output process itself is correct —
-  it re-displays the per-slot §8.10 `FrameStore[ ]` (updated by every
-  decoded frame, including hidden `show_frame=0` alt-ref frames) with the
-  stored frame's own dimensions, so a slot written by a hidden ARF can be
-  re-emitted; per-slot resolution is pinned end-to-end.
-* §8.4 probability adaptation / §6.1.2 frame-context refresh — the
-  §8.4.1/§8.4.2 `merge_prob` / `merge_probs` primitives and the §8.4.3
-  `adapt_coef_probs` coefficient-adaption transform are implemented and
-  unit-tested (`prob_adapt`), but are not yet wired into the decode loop:
-  count-collection is blocked on a v0.7 docs gap — the §9.3.4 "special
-  case (for more_coefs)" the spec references is absent from the PDF
-  (page 126 ends at the `more_coefs` table row; the promised paragraph
-  is blank). Contexts are reset to §10 defaults per frame meanwhile.
+* Two corpus fixtures still diverge from `expected.yuv`, and the
+  per-frame byte diff localises the remaining work precisely:
+  * `superframe-2` (hidden-ARF superframes, 64x64, `yac_qi=4`) diverges
+    by ~13-23 bytes **per frame, starting at the keyframe** (frame 0,
+    23/6144 bytes). The keyframe runs with loop-filter `level=0`, so the
+    error is in the §8.6.2 reconstruction itself, not §8.8 deblocking. It
+    is `TX_MODE_SELECT`-specific: the otherwise-identical `q-low` fixture
+    (also 64x64, `yac_qi=4`, lossy) forces `tx_mode=ALLOW_32X32` and is
+    byte-exact, while `superframe-2`'s keyframe uses `TX_MODE_SELECT` and
+    mixes the smaller (4x4/8x8/16x16, ADST-eligible) transforms. The
+    errors are all ±1 — a rounding/precision discrepancy in the small-tx
+    or ADST reconstruct path at very low quantizer.
+  * `segments-aq-mode` (per-segment AQ, 128x128) is byte-exact for
+    frames 0-1 (keyframe + a `tx_mode=ONLY_4X4` P-frame) and diverges
+    only from frame 2 onward, where the P-frame switches to
+    `tx_mode=ALLOW_32X32`. The frame-2 errors are *localised* to a
+    handful of 8x8 cells in the bottom-right superblock (sb_x=1, sb_y=1)
+    rather than spread frame-wide, so it is a specific inter-block
+    configuration (a larger-transform inter block), not a global
+    segment-quantizer mismatch.
+* §8.4 probability adaptation / §6.1.2 `refresh_probs( )` — the
+  §8.4.1/§8.4.2 `merge_prob` / `merge_probs` primitives, the §8.4.3
+  `adapt_coef_probs` coefficient-adaption transform, and the
+  `CountsToken` / `CountsMoreCoefs` accumulator types are implemented and
+  unit-tested (`prob_adapt`), but are not yet wired into the decode loop.
+  Note that **every fixture in the staged corpus carries
+  `frame_parallel_decoding_mode = 1`**, for which §6.1.2 `refresh_probs( )`
+  skips the entire adaptation branch (`adapt_coef_probs` /
+  `adapt_noncoef_probs`) and only runs `save_probs`; the current
+  forward-updated-bank `save_probs` path is therefore already correct for
+  the corpus, and the two divergences above are *not* attributable to
+  missing backward adaptation. Wiring §8.4 fully (for non-parallel
+  streams) is additionally blocked on a v0.7 docs gap: the §9.3.4
+  "special case (for more_coefs)" the spec references is absent from the
+  PDF (page 126 ends at the `more_coefs` counting-table row; the promised
+  end-of-section paragraph is blank). Contexts are reset to §10 defaults
+  per frame meanwhile, which is exact for the all-parallel-mode corpus.
 * §9.2.4 multi-coder tile parallelism (tiles decode sequentially).
 * Encoder paths.
 

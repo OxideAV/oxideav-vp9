@@ -809,3 +809,54 @@ fn show_existing_corpus_decodes_byte_exact() {
         .count();
     assert_eq!(diffs, 0, "{diffs} differing bytes vs expected.yuv");
 }
+
+/// §6.4.14 / §8.1 segment-map threading + the `tx_mode=ONLY_4X4` inter
+/// residual path: the `segments-aq-mode` fixture (per-segment AQ, 4 frames
+/// at 128x128, `frame_parallel_decoding_mode=1` throughout) reconstructs its
+/// keyframe (frame 0) and its first P-frame (frame 1, `tx_mode=ONLY_4X4`,
+/// `segmentation_update_map=0` so the segment IDs are predicted from the
+/// keyframe's map) **byte-exact** against `expected.yuv`. This pins the
+/// segment-map persistence (the §8.1 step-3 `PrevSegmentIds` refresh-only-on-
+/// update-map rule) and the per-segment quantizer selection on a real inter
+/// frame. Frames 2-3 — which switch to `tx_mode=ALLOW_32X32` — still diverge
+/// (a localised larger-transform inter-block reconstruction discrepancy; see
+/// the crate README "Not yet supported" section), so this test asserts only
+/// the byte-exact prefix that the current decoder reaches.
+#[test]
+fn segments_aq_first_two_frames_byte_exact() {
+    let base = std::path::Path::new("../../docs/video/vp9/fixtures/segments-aq-mode");
+    if !base.is_dir() {
+        eprintln!("docs corpus not present; docs-gated");
+        return;
+    }
+    let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");
+    let expected = std::fs::read(base.join("expected.yuv")).expect("expected.yuv");
+
+    let mut sub: Vec<Vec<u8>> = Vec::new();
+    for p in &ivf_chunks(&ivf) {
+        for f in split_superframe(p) {
+            sub.push(f.to_vec());
+        }
+    }
+    let refs: Vec<&[u8]> = sub.iter().map(|p| p.as_slice()).collect();
+    let frames = decode_vp9_sequence(&refs).expect("decode segments-aq sequence");
+    assert_eq!(frames.len(), 4, "four shown frames");
+
+    // 128x128 4:2:0 => Y 16384 + U 4096 + V 4096 = 24576 bytes/frame.
+    let frame_bytes = 128 * 128 * 3 / 2;
+    let mut got = Vec::new();
+    for f in &frames {
+        got.extend(f.to_planar_bytes());
+    }
+    assert_eq!(got.len(), expected.len(), "four-frame planar length");
+
+    // Frames 0 (keyframe) and 1 (the ONLY_4X4 P-frame predicting segment IDs
+    // from the keyframe map) are byte-exact.
+    let prefix = 2 * frame_bytes;
+    let diffs = got[..prefix]
+        .iter()
+        .zip(&expected[..prefix])
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(diffs, 0, "{diffs} differing bytes in frames 0-1");
+}

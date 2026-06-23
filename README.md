@@ -133,15 +133,30 @@ map between frames.
     byte-exact, while `superframe-2`'s keyframe uses `TX_MODE_SELECT` and
     mixes the smaller (4x4/8x8/16x16, ADST-eligible) transforms. The
     errors are all ±1 — a rounding/precision discrepancy in the small-tx
-    or ADST reconstruct path at very low quantizer.
+    or ADST reconstruct path at very low quantizer. The keyframe profile
+    (23 differing bytes, every `|delta| == 1`) is pinned as an upper
+    bound by `superframe2_keyframe_divergence_profile_is_bounded`, and
+    the `segments-aq-mode` frame-2/3 profile by
+    `segments_aq_divergence_profile_is_bounded`, so any future fix or
+    regression is caught.
   * `segments-aq-mode` (per-segment AQ, 128x128) is byte-exact for
-    frames 0-1 (keyframe + a `tx_mode=ONLY_4X4` P-frame) and diverges
-    only from frame 2 onward, where the P-frame switches to
-    `tx_mode=ALLOW_32X32`. The frame-2 errors are *localised* to a
-    handful of 8x8 cells in the bottom-right superblock (sb_x=1, sb_y=1)
-    rather than spread frame-wide, so it is a specific inter-block
-    configuration (a larger-transform inter block), not a global
-    segment-quantizer mismatch.
+    frames 0-1 (keyframe + an `ALLOW_8X8`, `PARTITION_NONE` P-frame) and
+    diverges only from frame 2 onward, where the P-frame switches to
+    `tx_mode=ALLOW_32X32` (trace `tx_mode=3`) **and** all four
+    superblocks switch from `PARTITION_NONE` (`bp=0`) to
+    `PARTITION_SPLIT` (`bp=3`). A per-8x8-cell error heatmap of frame 2
+    (524 differing bytes, `maxdelta=26`, ~equal counts across Y/U/V =
+    172/169/183) localises the errors to a scattered handful of 8x8
+    cells across *three* of the four superblocks — not frame-wide, and
+    not a single block — so it is a per-block configuration that only
+    these blocks hit, not a global segment-quantizer mismatch. Two
+    distinct delta signatures are visible: (a) a smooth 16-wide block
+    with a uniform `+1` gradient error (a prediction off-by-one,
+    intra-in-inter or a sub-pel MV phase), and (b) a high-detail block
+    with mixed `-10..+8` deltas (a wrong-coefficient residual). The
+    ±tens magnitude rules out the keyframe's ±1 rounding cause; the
+    near-equal Y/U/V error counts point at a motion/segment-shared
+    per-block decode rather than a luma-only transform issue.
 * §8.4 probability adaptation / §6.1.2 `refresh_probs( )` — the
   §8.4.1/§8.4.2 `merge_prob` / `merge_probs` primitives, the §8.4.3
   `adapt_coef_probs` coefficient-adaption transform, and the

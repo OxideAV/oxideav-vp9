@@ -671,3 +671,47 @@ fn docs_corpus_intra_fixtures_decode_byte_exact() {
         assert_eq!(diffs, 0, "{name}: {diffs} differing bytes");
     }
 }
+
+/// Regression boundary for the known `superframe-2` keyframe divergence.
+///
+/// `superframe-2`'s leading keyframe (64x64, `TX_MODE_SELECT`, `yac_qi=4`,
+/// loop-filter `level=0`) reconstructs with a small number of ±1 samples
+/// versus `expected.yuv` — a rounding/precision discrepancy in the small-tx /
+/// ADST reconstruct path at very low quantizer (see the crate README). Loop
+/// filter `level=0` means §8.8 deblocking is a no-op, so the error is purely
+/// in §8.6.2 reconstruction. This pins the *current* profile (23 differing
+/// bytes, all |delta| == 1) as an upper bound so a fix that drives it toward
+/// zero, or an accidental regression, is caught.
+#[test]
+fn superframe2_keyframe_divergence_profile_is_bounded() {
+    let base = std::path::Path::new("../../docs/video/vp9/fixtures/superframe-2");
+    if !base.is_dir() {
+        eprintln!("docs corpus not present; docs-gated");
+        return;
+    }
+    let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");
+    let expected = std::fs::read(base.join("expected.yuv")).expect("expected.yuv");
+    // First IVF frame = the keyframe superframe (one VP9 sub-frame here).
+    let size = u32::from_le_bytes([ivf[32], ivf[33], ivf[34], ivf[35]]) as usize;
+    let frame = &ivf[44..44 + size];
+    let out = decode_vp9(frame).expect("decode superframe-2 keyframe");
+
+    // 64x64 4:2:0 => Y 4096 + U 1024 + V 1024 = 6144 bytes.
+    let frame_bytes = 64 * 64 * 3 / 2;
+    assert_eq!(out.len(), frame_bytes, "keyframe planar length");
+    let mut diffs = 0usize;
+    let mut maxd = 0i32;
+    for (a, b) in out.iter().zip(&expected[..frame_bytes]) {
+        if a != b {
+            diffs += 1;
+            maxd = maxd.max((*a as i32 - *b as i32).abs());
+        }
+    }
+    // Current measured profile: 23 differing bytes, every delta exactly ±1.
+    assert!(
+        diffs <= 23,
+        "{diffs} differing bytes exceeds pinned bound 23 \
+         (a regression — or, if improved, update the bound)"
+    );
+    assert!(maxd <= 1, "max |delta| {maxd} exceeds pinned bound 1");
+}

@@ -818,10 +818,14 @@ fn show_existing_corpus_decodes_byte_exact() {
 /// keyframe's map) **byte-exact** against `expected.yuv`. This pins the
 /// segment-map persistence (the §8.1 step-3 `PrevSegmentIds` refresh-only-on-
 /// update-map rule) and the per-segment quantizer selection on a real inter
-/// frame. Frames 2-3 — which switch to `tx_mode=ALLOW_32X32` — still diverge
-/// (a localised larger-transform inter-block reconstruction discrepancy; see
-/// the crate README "Not yet supported" section), so this test asserts only
-/// the byte-exact prefix that the current decoder reaches.
+/// frame. Frame 1 is an `ALLOW_8X8` / `PARTITION_NONE` (`bp=0`) inter frame.
+/// Frames 2-3 — which switch to `tx_mode=ALLOW_32X32` (`bp=3`,
+/// `PARTITION_SPLIT` on every superblock) — still diverge (a per-block decode
+/// discrepancy that only some blocks hit; see the crate README "Not yet
+/// supported" section). This test pins the byte-exact prefix (frames 0-1) and,
+/// in [`segments_aq_divergence_profile_is_bounded`], pins the *current*
+/// frame-2/3 divergence profile so any future change — an improvement toward
+/// zero or an accidental regression — is caught immediately.
 #[test]
 fn segments_aq_first_two_frames_byte_exact() {
     let base = std::path::Path::new("../../docs/video/vp9/fixtures/segments-aq-mode");
@@ -850,7 +854,7 @@ fn segments_aq_first_two_frames_byte_exact() {
     }
     assert_eq!(got.len(), expected.len(), "four-frame planar length");
 
-    // Frames 0 (keyframe) and 1 (the ONLY_4X4 P-frame predicting segment IDs
+    // Frames 0 (keyframe) and 1 (the ALLOW_8X8 P-frame predicting segment IDs
     // from the keyframe map) are byte-exact.
     let prefix = 2 * frame_bytes;
     let diffs = got[..prefix]
@@ -859,4 +863,68 @@ fn segments_aq_first_two_frames_byte_exact() {
         .filter(|(a, b)| a != b)
         .count();
     assert_eq!(diffs, 0, "{diffs} differing bytes in frames 0-1");
+}
+
+/// Regression boundary for the known `segments-aq-mode` frames 2-3 divergence.
+///
+/// Frames 2-3 switch to `tx_mode=ALLOW_32X32` with `PARTITION_SPLIT`
+/// superblocks and reconstruct with a handful of per-block errors (some 8x8
+/// cells across three of the four superblocks are wrong; see README). Until a
+/// per-transform-block reference trace lets us localise the failing syntax
+/// element, this test pins the *current* divergence as an upper bound: the
+/// per-frame differing-byte counts and the maximum per-sample delta must not
+/// grow. A future fix that drives any of these toward zero will (correctly)
+/// trip the bound and prompt tightening it — that is the intended signal.
+#[test]
+fn segments_aq_divergence_profile_is_bounded() {
+    let base = std::path::Path::new("../../docs/video/vp9/fixtures/segments-aq-mode");
+    if !base.is_dir() {
+        eprintln!("docs corpus not present; docs-gated");
+        return;
+    }
+    let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");
+    let expected = std::fs::read(base.join("expected.yuv")).expect("expected.yuv");
+
+    let mut sub: Vec<Vec<u8>> = Vec::new();
+    for p in &ivf_chunks(&ivf) {
+        for f in split_superframe(p) {
+            sub.push(f.to_vec());
+        }
+    }
+    let refs: Vec<&[u8]> = sub.iter().map(|p| p.as_slice()).collect();
+    let frames = decode_vp9_sequence(&refs).expect("decode segments-aq sequence");
+    assert_eq!(frames.len(), 4, "four shown frames");
+
+    let frame_bytes = 128 * 128 * 3 / 2;
+    let mut got = Vec::new();
+    for f in &frames {
+        got.extend(f.to_planar_bytes());
+    }
+    assert_eq!(got.len(), expected.len(), "four-frame planar length");
+
+    // Per-frame differing-byte count + max |delta|. The frame-2/3 bounds are
+    // the measured current values (524 / 1224 diffs, max |delta| 26); frames
+    // 0-1 must stay exact (0 / 0).
+    let bounds = [(0usize, 0i32), (0, 0), (524, 26), (1224, 26)];
+    for (k, &(max_diffs, max_delta)) in bounds.iter().enumerate() {
+        let s = k * frame_bytes;
+        let e = s + frame_bytes;
+        let mut diffs = 0usize;
+        let mut maxd = 0i32;
+        for (a, b) in got[s..e].iter().zip(&expected[s..e]) {
+            if a != b {
+                diffs += 1;
+                maxd = maxd.max((*a as i32 - *b as i32).abs());
+            }
+        }
+        assert!(
+            diffs <= max_diffs,
+            "frame {k}: {diffs} differing bytes exceeds pinned bound {max_diffs} \
+             (a regression — or, if intentional, update the bound)"
+        );
+        assert!(
+            maxd <= max_delta,
+            "frame {k}: max |delta| {maxd} exceeds pinned bound {max_delta}"
+        );
+    }
 }

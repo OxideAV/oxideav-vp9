@@ -157,11 +157,16 @@ map between frames.
     ±tens magnitude rules out the keyframe's ±1 rounding cause; the
     near-equal Y/U/V error counts point at a motion/segment-shared
     per-block decode rather than a luma-only transform issue.
-* §8.4 probability adaptation / §6.1.2 `refresh_probs( )` — the
-  §8.4.1/§8.4.2 `merge_prob` / `merge_probs` primitives, the §8.4.3
-  `adapt_coef_probs` coefficient-adaption transform, and the
-  `CountsToken` / `CountsMoreCoefs` accumulator types are implemented and
-  unit-tested (`prob_adapt`), but are not yet wired into the decode loop.
+* §8.4 probability adaptation / §6.1.2 `refresh_probs( )` — the complete
+  §8.4 backward-adaptation transform set is implemented and unit-tested in
+  the `prob_adapt` module: the §8.4.1/§8.4.2 `merge_prob` / `merge_probs`
+  primitives, the §8.4.3 `adapt_coef_probs` coefficient-adaption transform
+  (with `CountsToken` / `CountsMoreCoefs` accumulators), and the §8.4.4
+  `adapt_noncoef_probs` non-coefficient-adaption transform (with the
+  `CountsNonCoef` / `CountsMvComponent` accumulators mirroring the §9.3.4
+  counting table, and the three §8.4.4 conditional gates on
+  `SWITCHABLE` interp-filter / `TX_MODE_SELECT` / `allow_high_precision_mv`).
+  None are yet wired into the decode loop's `refresh_probs( )`.
   Note that **every fixture in the staged corpus carries
   `frame_parallel_decoding_mode = 1`**, for which §6.1.2 `refresh_probs( )`
   skips the entire adaptation branch (`adapt_coef_probs` /
@@ -179,7 +184,7 @@ map between frames.
 
 ## Testing
 
-The crate carries 762 lib unit tests plus integration suites in
+The crate carries 771 lib unit tests plus integration suites in
 `tests/`. Tests construct their inputs bit-by-bit; §9.2 golden buffers
 are hand-derived by stepping the decoder, not borrowed from any
 third-party VP9 implementation. A `cargo-fuzz` harness lives in

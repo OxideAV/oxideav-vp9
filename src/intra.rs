@@ -942,4 +942,121 @@ mod tests {
         //  = Round2(3 + 8 + 5, 2) = Round2(16, 2) = 4.
         assert_eq!(p.get(1 + 3, 1), 4);
     }
+
+    /// Every §8.5.1 predictor — *all ten* modes, not just the six
+    /// directionals already pinned — must reproduce a uniform value when
+    /// the entire above row, left column, and corner are that same value:
+    /// each mode is an affine combination of edge samples whose
+    /// coefficients sum to one (the `Round2` averages, the `V`/`H`/`D*`
+    /// copies, the DC mean, and the `TM = left + above - corner` formula
+    /// which collapses to the corner). Pins flat-preservation across every
+    /// mode and transform size in one sweep.
+    #[test]
+    fn every_mode_preserves_a_flat_neighbourhood() {
+        let modes = [
+            PredMode::DcPred,
+            PredMode::VPred,
+            PredMode::HPred,
+            PredMode::D45Pred,
+            PredMode::D135Pred,
+            PredMode::D117Pred,
+            PredMode::D153Pred,
+            PredMode::D207Pred,
+            PredMode::D63Pred,
+            PredMode::TmPred,
+        ];
+        const C: i32 = 100;
+        for &mode in &modes {
+            for tx in 0..=3u32 {
+                let size = 1usize << (tx + 2);
+                let w = 2 + 2 * size + 2;
+                let h = 2 + size + 2;
+                let mut p = plane(w, h);
+                for x in 0..w {
+                    p.set(x, 0, C);
+                }
+                for yy in 0..h {
+                    p.set(0, yy, C);
+                }
+                let (max_x, max_y) = (w - 1, h - 1);
+                predict_intra(&mut p, 1, 1, true, true, true, tx, mode, max_x, max_y, BD);
+                for i in 0..size {
+                    for j in 0..size {
+                        assert_eq!(p.get(1 + j, 1 + i), C, "mode={mode:?} tx={tx} i={i} j={j}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every §8.5.1 predictor output sample is `Clip1`-bounded into
+    /// `[0, (1 << BitDepth) - 1]` regardless of the neighbour values. Only
+    /// `TM_PRED` (`left + above - corner`) and the DC-with-no-neighbour
+    /// fills can leave the source range, but the spec clips them; the
+    /// directional / DC-average modes are convex combinations and stay in
+    /// range by construction. This drives every mode with deterministic
+    /// pseudo-random in-range neighbours (and the saturating extremes that
+    /// would make `TM` overshoot) and asserts no out-of-range write — a
+    /// missing `Clip1` would surface here rather than as a corrupt
+    /// reconstructed sample downstream.
+    #[test]
+    fn every_mode_output_is_clip1_bounded() {
+        let modes = [
+            PredMode::DcPred,
+            PredMode::VPred,
+            PredMode::HPred,
+            PredMode::D45Pred,
+            PredMode::D135Pred,
+            PredMode::D117Pred,
+            PredMode::D153Pred,
+            PredMode::D207Pred,
+            PredMode::D63Pred,
+            PredMode::TmPred,
+        ];
+        let max_val = (1i32 << BD) - 1;
+        let mut state: u64 = 0xBADC_0FFE_E0DD_F00D;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as i32
+        };
+        for &mode in &modes {
+            for tx in 0..=3u32 {
+                let size = 1usize << (tx + 2);
+                let w = 2 + 2 * size + 2;
+                let h = 2 + size + 2;
+                for trial in 0..40 {
+                    let mut p = plane(w, h);
+                    // Bias the neighbours toward the range extremes on
+                    // some trials so TM_PRED's left+above-corner overshoots
+                    // both ends and the clip is actually exercised.
+                    let fill = |n: &mut dyn FnMut() -> i32, trial: usize| -> i32 {
+                        match trial % 3 {
+                            0 => n() % (max_val + 1),
+                            1 => max_val,
+                            _ => 0,
+                        }
+                    };
+                    for x in 0..w {
+                        p.set(x, 0, fill(&mut next, trial));
+                    }
+                    for yy in 0..h {
+                        p.set(0, yy, fill(&mut next, trial + 1));
+                    }
+                    let (max_x, max_y) = (w - 1, h - 1);
+                    predict_intra(&mut p, 1, 1, true, true, true, tx, mode, max_x, max_y, BD);
+                    for i in 0..size {
+                        for j in 0..size {
+                            let v = p.get(1 + j, 1 + i);
+                            assert!(
+                                (0..=max_val).contains(&v),
+                                "mode={mode:?} tx={tx} trial={trial} i={i} j={j}: {v} out of [0,{max_val}]"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

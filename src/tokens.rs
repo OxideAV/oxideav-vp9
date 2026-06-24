@@ -1284,6 +1284,58 @@ mod tests {
         assert_eq!(token_cache_neighbours(1, 9, 1, DCT_DCT), (1, 8));
     }
 
+    /// The §9.3.2 coefficient context for the token at scan index `c`
+    /// reads `token_cache[ nb0 ]` / `token_cache[ nb1 ]`. For the decode
+    /// to be causal — the context may only depend on coefficients already
+    /// decoded — both neighbour *positions* must appear at an **earlier**
+    /// scan index than the position at `c`. This walks every scan table
+    /// (default / col / row, all four sizes) for every `tx_type` and pins
+    /// that causality invariant across all ~3.5k (c, pos) pairs, so a
+    /// neighbour-derivation bug that reaches forward into not-yet-decoded
+    /// coefficients is caught structurally rather than only as a corpus
+    /// desync. (The bound is checked against the *scan-index* of each
+    /// neighbour, recovered via an inverse-permutation of the scan.)
+    #[test]
+    fn token_cache_neighbours_are_strictly_causal_over_every_scan() {
+        use crate::scan;
+        let scans: &[(&[u16], u32)] = &[
+            (&scan::DEFAULT_SCAN_4X4, 0),
+            (&scan::COL_SCAN_4X4, 0),
+            (&scan::ROW_SCAN_4X4, 0),
+            (&scan::DEFAULT_SCAN_8X8, 1),
+            (&scan::COL_SCAN_8X8, 1),
+            (&scan::ROW_SCAN_8X8, 1),
+            (&scan::DEFAULT_SCAN_16X16, 2),
+            (&scan::COL_SCAN_16X16, 2),
+            (&scan::ROW_SCAN_16X16, 2),
+            (&scan::DEFAULT_SCAN_32X32, 3),
+        ];
+        // The §9.3.2 neighbour pick branches on tx_type, but the col/row
+        // scans pair with their own ADST/DCT orientations; exercise every
+        // tx_type against every scan so the invariant holds regardless of
+        // which orientation the dispatcher selects.
+        for &(scan_tab, tx_sz) in scans {
+            // Inverse permutation: scan_index[ position ] = c.
+            let mut scan_index = vec![usize::MAX; scan_tab.len()];
+            for (c, &pos) in scan_tab.iter().enumerate() {
+                scan_index[pos as usize] = c;
+            }
+            for tx_type in [DCT_DCT, ADST_DCT, DCT_ADST, ADST_ADST] {
+                for (c, &posu) in scan_tab.iter().enumerate().skip(1) {
+                    let pos = posu as usize;
+                    let (nb0, nb1) = token_cache_neighbours(c, pos, tx_sz, tx_type);
+                    let c0 = scan_index[nb0];
+                    let c1 = scan_index[nb1];
+                    assert!(
+                        c0 < c && c1 < c,
+                        "non-causal neighbour: tx_sz={tx_sz} tx_type={tx_type} c={c} \
+                         pos={pos} -> nb=({nb0},{nb1}) at scan idx ({c0},{c1})"
+                    );
+                }
+            }
+        }
+    }
+
     // ----- build_token_probs -----
 
     #[test]

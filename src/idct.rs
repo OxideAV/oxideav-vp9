@@ -848,4 +848,203 @@ mod tests {
         let exp = [round2(x, 14), round2(y, 14)];
         assert_eq!(t_fast, exp);
     }
+
+    /// A from-spec closed-form reference for the VP9 inverse DCT, derived
+    /// independently of the butterfly network from the transform
+    /// definition the §8.7.1.1 `cos64` note encodes
+    /// (`cos64( angle ) == round( 16384 * cos( angle * pi / 64 ) )`).
+    ///
+    /// Probing the integer [`inverse_dct`] with a single non-zero input
+    /// coefficient `T[ k ] = c` (after the §8.7.1.2 bit-reversal permute)
+    /// reproduces the closed form
+    ///
+    /// ```text
+    ///   x[ n ] = ( k == 0 ? 1/sqrt(2) : 1 ) * c * cos( (2n+1) k pi / (2N) )
+    /// ```
+    ///
+    /// i.e. the orthonormal inverse-DCT-III basis with the DC term scaled
+    /// by `1/sqrt(2)` and *no* `2/N` normalization (the butterfly network
+    /// folds that scaling into its `Round2( ., 14 )` rotations — recovered
+    /// empirically as the 0.70703125 DC ratio). By linearity the response
+    /// to an arbitrary input is the superposition of the per-coefficient
+    /// basis rows. This shares no code with the network it validates.
+    fn idct_reference(input: &[f64]) -> Vec<f64> {
+        let n0 = input.len();
+        let nf = n0 as f64;
+        (0..n0)
+            .map(|n| {
+                (0..n0)
+                    .map(|k| {
+                        let scale = if k == 0 {
+                            std::f64::consts::FRAC_1_SQRT_2
+                        } else {
+                            1.0
+                        };
+                        scale
+                            * input[k]
+                            * ((2 * n + 1) as f64 * k as f64 * std::f64::consts::PI / (2.0 * nf))
+                                .cos()
+                    })
+                    .sum()
+            })
+            .collect()
+    }
+
+    /// The closed-form reference reproduces the single-impulse integer
+    /// response within the accumulated fixed-point error of the butterfly
+    /// network for every size and every basis index. This pins the oracle
+    /// itself before it validates arbitrary vectors below.
+    #[test]
+    fn idct_reference_matches_single_impulse_response() {
+        for n in 2..=5u32 {
+            let n0 = 1usize << n;
+            for k in 0..n0 {
+                let mut t = vec![0i64; n0];
+                t[k] = 4096;
+                idct_permute(&mut t, n);
+                inverse_dct(&mut t, n);
+                let mut r_in = vec![0.0f64; n0];
+                r_in[k] = 4096.0;
+                let r = idct_reference(&r_in);
+                for (i, (&ti, &ri)) in t.iter().zip(&r).enumerate() {
+                    let d = (ti as f64 - ri).abs();
+                    assert!(d <= 2.0, "N={n0} k={k} i={i}: int={ti} ref={ri} d={d}");
+                }
+            }
+        }
+    }
+
+    /// Cross-validate the full integer inverse DCT against the
+    /// independent closed form over many deterministic pseudo-random
+    /// coefficient vectors, for every transform size. The error bound
+    /// scales with the number of butterfly stages (`log2(N)`, each adding
+    /// at most ~1 from its `Round2`) plus a small constant for the 14-bit
+    /// `cos64` quantization accumulated across the basis sum.
+    #[test]
+    fn inverse_dct_matches_closed_form_reference_random() {
+        let mut state: u64 = 0xD1B5_4A32_D192_ED03;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as i64
+        };
+        for n in 2..=5u32 {
+            let n0 = 1usize << n;
+            // |coef| <= 2048 keeps the conformance 8+BitDepth range; a
+            // transposed butterfly or dropped Round2 diverges by hundreds,
+            // far past this `log2(N)+3` bound.
+            let bound = (n + 3) as f64;
+            for _ in 0..400 {
+                let mut t = vec![0i64; n0];
+                let mut r_in = vec![0.0f64; n0];
+                for j in 0..n0 {
+                    let c = (next() % 4097) - 2048;
+                    t[j] = c;
+                    r_in[j] = c as f64;
+                }
+                idct_permute(&mut t, n);
+                inverse_dct(&mut t, n);
+                let r = idct_reference(&r_in);
+                for (i, (&ti, &ri)) in t.iter().zip(&r).enumerate() {
+                    let d = (ti as f64 - ri).abs();
+                    assert!(
+                        d <= bound,
+                        "N={n0} i={i}: int={ti} ref={ri:.2} d={d:.2} > bound {bound}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The inverse DCT is a linear operator: the (rounded) response to a
+    /// summed input equals the summed responses, up to the per-stage
+    /// rounding (`log2(N)` stages). Pinned directly on the integer network
+    /// with no floating reference.
+    #[test]
+    fn inverse_dct_is_linear() {
+        for n in 2..=5u32 {
+            let n0 = 1usize << n;
+            let mut a: Vec<i64> = (0..n0)
+                .map(|j| ((j * 37 + 11) % 901) as i64 - 450)
+                .collect();
+            let mut b: Vec<i64> = (0..n0).map(|j| ((j * 53 + 7) % 701) as i64 - 350).collect();
+            let mut sum: Vec<i64> = a.iter().zip(&b).map(|(x, y)| x + y).collect();
+            for v in [&mut a, &mut b, &mut sum] {
+                idct_permute(v, n);
+                inverse_dct(v, n);
+            }
+            for i in 0..n0 {
+                let lhs = a[i] + b[i];
+                let d = (lhs - sum[i]).abs();
+                assert!(
+                    d <= n as i64,
+                    "N={n0} i={i}: a+b={lhs} sum={} d={d}",
+                    sum[i]
+                );
+            }
+        }
+    }
+
+    /// The §8.7.1.10 inverse WHT realises the orthogonal matrix
+    ///
+    /// ```text
+    ///   M = 1/2 * [[ 1,  1,  1,  1],
+    ///              [ 1,  1, -1, -1],
+    ///              [ 1, -1, -1,  1],
+    ///              [ 1, -1,  1, -1]]
+    /// ```
+    ///
+    /// recovered here by probing each unit impulse (input pre-scaled so
+    /// the `>> shift` is exact). The matrix is its own inverse up to the
+    /// `2x` integer scaling the transform carries, so this independently
+    /// certifies the butterfly sequence without re-deriving it.
+    #[test]
+    fn inverse_wht_realises_the_orthogonal_matrix() {
+        // Rows of 2*M (so the entries are the integer ±1 pattern).
+        let expected_2m: [[i64; 4]; 4] =
+            [[1, 1, 1, 1], [1, 1, -1, -1], [1, -1, -1, 1], [1, -1, 1, -1]];
+        for shift in [0u32, 2] {
+            for (k, row) in expected_2m.iter().enumerate() {
+                let mut t = [0i64; 4];
+                // input = 2 << shift at position k -> output entries are
+                // (2 << shift) * M[n][k] = (row entry) since 2*M is ±1 and
+                // the >> shift cancels the << shift exactly.
+                t[k] = 2 << shift;
+                inverse_wht(&mut t, shift);
+                for (n, exp) in row.iter().enumerate() {
+                    assert_eq!(t[n], *exp, "shift={shift} e{k} out[{n}]");
+                }
+            }
+        }
+    }
+
+    /// The §8.7.1.10 inverse WHT is a perfect involution at `shift == 0`:
+    /// the interior `e = (a - d) >> 1` exactly halves the matrix's `2x`
+    /// scaling, so applying the transform twice returns the input
+    /// bit-exactly (no rounding loss, as befits the lossless path). This
+    /// round-trips the whole butterfly sequence with no floating
+    /// reference and certifies it is bijective over the integers.
+    #[test]
+    fn inverse_wht_applied_twice_is_identity() {
+        let mut state: u64 = 0x91E1_0DA5_DF55_1015;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as i64
+        };
+        for _ in 0..500 {
+            let input: [i64; 4] = [
+                (next() % 2001) - 1000,
+                (next() % 2001) - 1000,
+                (next() % 2001) - 1000,
+                (next() % 2001) - 1000,
+            ];
+            let mut t = input;
+            inverse_wht(&mut t, 0);
+            inverse_wht(&mut t, 0);
+            assert_eq!(t, input, "WHT is not an involution at shift 0");
+        }
+    }
 }

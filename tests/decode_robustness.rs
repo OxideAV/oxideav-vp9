@@ -127,7 +127,7 @@ fn pseudo_random_input_never_panics() {
     std::panic::set_hook(Box::new(|_| {}));
     let mut panics = Vec::new();
 
-    // SplitMix64-style deterministic generator for reproducibility.
+    // Deterministic linear-congruential generator for reproducibility.
     let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut next = move || {
         state = state

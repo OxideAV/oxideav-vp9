@@ -701,6 +701,90 @@ mod tests {
         assert!(t.iter().any(|&v| v != 0));
     }
 
+    /// Independent closed-form reference for the §8.7.1.6 ADST4: probing
+    /// the integer [`inverse_adst4`] with a single non-zero input
+    /// coefficient `T[ k ] = c` reproduces the inverse-DST-VII basis row
+    ///
+    /// ```text
+    ///   x[ n ] = A * c * sin( (n+1)(2k+1) pi / 9 )
+    /// ```
+    ///
+    /// where `9 == 2N+1` for `N == 4` and the amplitude `A` is the
+    /// constant the four `SINPI_*_9` scalings collapse to (recovered
+    /// below from the largest-magnitude basis entry so the test shares no
+    /// constant with the implementation). By linearity an arbitrary input
+    /// is the superposition of these rows; the random cross-check uses
+    /// that. Derived from the transform definition, not from the
+    /// butterfly listing — an independent oracle.
+    #[test]
+    fn inverse_adst4_matches_dst_vii_closed_form_random() {
+        let basis = |n: usize, k: usize| {
+            ((n + 1) as f64 * (2 * k + 1) as f64 * std::f64::consts::PI / 9.0).sin()
+        };
+        // Recover the amplitude from a single impulse at k=0, n=3 (the
+        // largest |basis| entry) so no SINPI constant is hard-coded here.
+        let amp = {
+            let mut t = [4096i64, 0, 0, 0];
+            inverse_adst4(&mut t);
+            t[3] as f64 / (4096.0 * basis(3, 0))
+        };
+
+        let mut state: u64 = 0x4F6C_2A11_9B3D_77E5;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as i64
+        };
+        for _ in 0..400 {
+            let mut t = [0i64; 4];
+            let mut r_in = [0.0f64; 4];
+            for j in 0..4 {
+                let c = (next() % 4097) - 2048;
+                t[j] = c;
+                r_in[j] = c as f64;
+            }
+            inverse_adst4(&mut t);
+            for (n, &tn) in t.iter().enumerate() {
+                let r: f64 = (0..4).map(|k| amp * r_in[k] * basis(n, k)).sum();
+                let d = (tn as f64 - r).abs();
+                assert!(d <= 3.0, "n={n}: int={tn} ref={r:.2} d={d:.2}");
+            }
+        }
+    }
+
+    /// The inverse ADST is linear: `IADST(a) + IADST(b)` equals
+    /// `IADST(a + b)` up to the per-stage `Round2` rounding (bounded by
+    /// the stage count). Pinned directly on the integer network for all
+    /// three sizes — no floating reference, so it certifies ADST8 / ADST16
+    /// (whose size-specific butterfly structure has no single clean
+    /// closed form) too.
+    #[test]
+    fn inverse_adst_is_linear() {
+        for n in 2..=4u32 {
+            let n0 = 1usize << n;
+            let mut a: Vec<i64> = (0..n0)
+                .map(|j| ((j * 41 + 13) % 811) as i64 - 405)
+                .collect();
+            let mut b: Vec<i64> = (0..n0).map(|j| ((j * 59 + 5) % 611) as i64 - 305).collect();
+            let mut sum: Vec<i64> = a.iter().zip(&b).map(|(x, y)| x + y).collect();
+            for v in [&mut a, &mut b, &mut sum] {
+                inverse_adst(v, n);
+            }
+            // ADST8/16 use a higher-precision S array with two rounding
+            // layers; bound the per-element drift by 2*n.
+            for i in 0..n0 {
+                let lhs = a[i] + b[i];
+                let d = (lhs - sum[i]).abs();
+                assert!(
+                    d <= 2 * n as i64,
+                    "N={n0} i={i}: a+b={lhs} sum={} d={d}",
+                    sum[i]
+                );
+            }
+        }
+    }
+
     #[test]
     fn adst_output_permute_n3_is_involution_on_identity() {
         // §8.7.1.5 n=3 permutation maps copyT[ 4*(c^b)+2*(b^a)+a ].

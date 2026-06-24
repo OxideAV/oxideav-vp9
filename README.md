@@ -184,12 +184,21 @@ map between frames.
 
 ## Testing
 
-The crate carries 771 lib unit tests plus integration suites in
+The crate carries 780+ lib unit tests plus integration suites in
 `tests/`. Tests construct their inputs bit-by-bit; §9.2 golden buffers
 are hand-derived by stepping the decoder, not borrowed from any
-third-party VP9 implementation. A `cargo-fuzz` harness lives in
-`fuzz/` with panic-surface targets over the header parsers and the
-Boolean-decoder walkers.
+third-party VP9 implementation. Several precision-critical primitives
+also carry *independent* oracles that share no code with the
+implementation they check: the §8.7 inverse DCT / ADST4 against
+from-spec closed-form transform bases (and the §8.7.1.10 WHT against its
+orthogonal matrix + involution property), the §9.3.2 coefficient-context
+neighbour derivation against a strict scan-order causality invariant, and
+every §8.5.1 intra mode against flat-preservation + `Clip1`-bound
+properties. A `cargo-fuzz` harness lives in `fuzz/` with panic-surface
+targets over the header parsers, the Boolean-decoder walkers, and the
+whole `decode_frame` pipeline (single-frame, Annex B split, and the
+multi-frame sequence driver); the `decode_robustness` integration suite
+pins the same garbage-in-no-panic contract in standard CI.
 
 ## Provenance
 

@@ -248,8 +248,247 @@ pub(crate) fn adapt_coef_probs(
     }
 }
 
+// ----- §8.4.4 non-coefficient probability adaption -----
+
+use crate::compressed::FrameContext;
+use crate::mode_info::{
+    BLOCK_SIZE_GROUPS, CLASS0_SIZE, COMP_MODE_CONTEXTS, INTERP_FILTER_CONTEXTS, INTERP_FILTER_TREE,
+    INTER_MODES, INTER_MODE_CONTEXTS, INTER_MODE_TREE, INTRA_MODES, INTRA_MODE_TREE,
+    IS_INTER_CONTEXTS, MV_CLASSES, MV_FR_SIZE, MV_JOINTS, MV_OFFSET_BITS, REF_CONTEXTS,
+    SWITCHABLE_FILTERS, TX_SIZE_16_TREE, TX_SIZE_32_TREE, TX_SIZE_8_TREE,
+};
+use crate::mv::{MV_CLASS_TREE, MV_FR_TREE, MV_JOINT_TREE};
+use crate::partition::{PARTITION_CONTEXTS, PARTITION_TREE, PARTITION_TYPES};
+
+/// `TX_SIZE_CONTEXTS = 2` per §3 — the per-`maxTxSize` context count of
+/// the `tx_probs[ TX_SIZES ][ TX_SIZE_CONTEXTS ][ TX_SIZES - 1 ]` table
+/// the §8.4.4 `tx_size` adaptation walks.
+const TX_SIZE_CONTEXTS: usize = 2;
+
+/// `SKIP_CONTEXTS = 3` per §3 — the context count of the `skip_prob[ ]`
+/// table the §8.4.4 `skip` adaptation walks.
+const SKIP_CONTEXTS: usize = 3;
+
+/// Per-component MV count accumulators per §9.3.4 — one block of these
+/// per motion-vector component (`comp = 0..1`).
+///
+/// Each field mirrors a `counts_mv_*[ comp ]` array from the §9.3.4
+/// counting table (`vp9-spec.txt` lines 6792-6814); the `class0_hp` /
+/// `hp` fields are only adapted when `allow_high_precision_mv == 1`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CountsMvComponent {
+    /// `counts_mv_sign[ comp ][ syntax ]`.
+    pub sign: [u32; 2],
+    /// `counts_mv_class[ comp ][ syntax ]` over [`MV_CLASS_TREE`].
+    pub class: [u32; MV_CLASSES],
+    /// `counts_mv_class0_bit[ comp ][ syntax ]`.
+    pub class0_bit: [u32; 2],
+    /// `counts_mv_bits[ comp ][ i ][ syntax ]`.
+    pub bits: [[u32; 2]; MV_OFFSET_BITS],
+    /// `counts_mv_class0_fr[ comp ][ mv_class0_bit ][ syntax ]` over
+    /// [`MV_FR_TREE`].
+    pub class0_fr: [[u32; MV_FR_SIZE]; CLASS0_SIZE],
+    /// `counts_mv_fr[ comp ][ syntax ]` over [`MV_FR_TREE`].
+    pub fr: [u32; MV_FR_SIZE],
+    /// `counts_mv_class0_hp[ comp ][ syntax ]`.
+    pub class0_hp: [u32; 2],
+    /// `counts_mv_hp[ comp ][ syntax ]`.
+    pub hp: [u32; 2],
+}
+
+/// The full bank of non-coefficient syntax-element counts collected over
+/// a frame per §9.3.4, consumed by [`adapt_noncoef_probs`].
+///
+/// Every field mirrors a `counts_*` array from the §9.3.4 counting table
+/// (`vp9-spec.txt` lines 6755-6818) using the same context / syntax
+/// indexing as the corresponding probability table in [`FrameContext`].
+/// Tree-decoded elements (`inter_mode`, `intra_mode` / `uv_mode`,
+/// `partition`, `interp_filter`, `tx_size`, `mv_joint`, `mv_class`,
+/// `mv_fr`) carry one count slot per leaf value; binary elements
+/// (`is_inter`, `comp_mode`, `comp_ref`, `single_ref`, `skip`,
+/// `mv_sign` / `mv_class0_bit` / `mv_bits` / `mv_class0_hp` / `mv_hp`)
+/// carry the `[count0, count1]` pair `adapt_prob` consumes directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CountsNonCoef {
+    /// `counts_is_inter[ ctx ][ syntax ]`.
+    pub is_inter: [[u32; 2]; IS_INTER_CONTEXTS],
+    /// `counts_comp_mode[ ctx ][ syntax ]`.
+    pub comp_mode: [[u32; 2]; COMP_MODE_CONTEXTS],
+    /// `counts_comp_ref[ ctx ][ syntax ]`.
+    pub comp_ref: [[u32; 2]; REF_CONTEXTS],
+    /// `counts_single_ref[ ctx ][ 0/1 ][ syntax ]`.
+    pub single_ref: [[[u32; 2]; 2]; REF_CONTEXTS],
+    /// `counts_inter_mode[ ctx ][ syntax ]` over [`INTER_MODE_TREE`].
+    pub inter_mode: [[u32; INTER_MODES]; INTER_MODE_CONTEXTS],
+    /// `counts_intra_mode[ ctx ][ syntax ]` over [`INTRA_MODE_TREE`] —
+    /// the `y_mode` adaptation source (per `BLOCK_SIZE_GROUPS`).
+    pub y_mode: [[u32; INTRA_MODES]; BLOCK_SIZE_GROUPS],
+    /// `counts_uv_mode[ ctx ][ syntax ]` over [`INTRA_MODE_TREE`] (per
+    /// `INTRA_MODES`).
+    pub uv_mode: [[u32; INTRA_MODES]; INTRA_MODES],
+    /// `counts_partition[ ctx ][ syntax ]` over [`PARTITION_TREE`].
+    pub partition: [[u32; PARTITION_TYPES]; PARTITION_CONTEXTS],
+    /// `counts_skip[ ctx ][ syntax ]`.
+    pub skip: [[u32; 2]; SKIP_CONTEXTS],
+    /// `counts_interp_filter[ ctx ][ syntax ]` over [`INTERP_FILTER_TREE`].
+    pub interp_filter: [[u32; SWITCHABLE_FILTERS]; INTERP_FILTER_CONTEXTS],
+    /// `counts_tx_size[ maxTxSize ][ ctx ][ syntax ]`. The §8.4.4 walk
+    /// adapts the `TX_8X8` / `TX_16X16` / `TX_32X32` rows; index 0
+    /// (`TX_4X4`) is never tree-adapted, so a 4-syntax slot per row holds
+    /// every adapted leaf.
+    pub tx_size: [[[u32; 4]; TX_SIZE_CONTEXTS]; 4],
+    /// `counts_mv_joint[ syntax ]` over [`MV_JOINT_TREE`].
+    pub mv_joint: [u32; MV_JOINTS],
+    /// Per-component MV counts.
+    pub mv_comp: [CountsMvComponent; 2],
+}
+
+impl Default for CountsNonCoef {
+    fn default() -> Self {
+        Self {
+            is_inter: [[0; 2]; IS_INTER_CONTEXTS],
+            comp_mode: [[0; 2]; COMP_MODE_CONTEXTS],
+            comp_ref: [[0; 2]; REF_CONTEXTS],
+            single_ref: [[[0; 2]; 2]; REF_CONTEXTS],
+            inter_mode: [[0; INTER_MODES]; INTER_MODE_CONTEXTS],
+            y_mode: [[0; INTRA_MODES]; BLOCK_SIZE_GROUPS],
+            uv_mode: [[0; INTRA_MODES]; INTRA_MODES],
+            partition: [[0; PARTITION_TYPES]; PARTITION_CONTEXTS],
+            skip: [[0; 2]; SKIP_CONTEXTS],
+            interp_filter: [[0; SWITCHABLE_FILTERS]; INTERP_FILTER_CONTEXTS],
+            tx_size: [[[0; 4]; TX_SIZE_CONTEXTS]; 4],
+            mv_joint: [0; MV_JOINTS],
+            mv_comp: [CountsMvComponent::default(), CountsMvComponent::default()],
+        }
+    }
+}
+
+/// §8.4.4 Non coefficient probability adaption process
+/// (`vp9-spec.txt` lines 4289-4344).
+///
+/// Folds the per-frame `counts` into the probability bank `fc` in place,
+/// using the default `COUNT_SAT = 20` / `MAX_UPDATE_FACTOR = 128` (via
+/// [`adapt_prob`] / [`adapt_probs`]). The two conditional blocks fire on
+/// the same uncompressed-header flags the §6.3 inter sweeps used:
+///
+/// * the `interp_filter` adaptation runs only when
+///   `interpolation_filter == SWITCHABLE` (`interp_filter_switchable`);
+/// * the `tx_size` adaptation runs only when `tx_mode == TX_MODE_SELECT`
+///   (`tx_mode_select`);
+/// * the per-component `mv_class0_hp` / `mv_hp` adaptation runs only when
+///   `allow_high_precision_mv == 1`.
+pub(crate) fn adapt_noncoef_probs(
+    fc: &mut FrameContext,
+    counts: &CountsNonCoef,
+    interp_filter_switchable: bool,
+    tx_mode_select: bool,
+    allow_high_precision_mv: bool,
+) {
+    for i in 0..IS_INTER_CONTEXTS {
+        fc.is_inter_prob[i] = adapt_prob(fc.is_inter_prob[i], counts.is_inter[i]);
+    }
+    for i in 0..COMP_MODE_CONTEXTS {
+        fc.comp_mode_prob[i] = adapt_prob(fc.comp_mode_prob[i], counts.comp_mode[i]);
+    }
+    for i in 0..REF_CONTEXTS {
+        fc.comp_ref_prob[i] = adapt_prob(fc.comp_ref_prob[i], counts.comp_ref[i]);
+    }
+    for i in 0..REF_CONTEXTS {
+        for j in 0..2 {
+            fc.single_ref_prob[i][j] =
+                adapt_prob(fc.single_ref_prob[i][j], counts.single_ref[i][j]);
+        }
+    }
+    for i in 0..INTER_MODE_CONTEXTS {
+        adapt_probs(
+            &INTER_MODE_TREE,
+            &mut fc.inter_mode_probs[i],
+            &counts.inter_mode[i],
+        );
+    }
+    for i in 0..BLOCK_SIZE_GROUPS {
+        adapt_probs(&INTRA_MODE_TREE, &mut fc.y_mode_probs[i], &counts.y_mode[i]);
+    }
+    // §8.4.4 adapts the inter-frame `uv_mode_probs` table. It is not part
+    // of the persisted `FrameContext` bank (the inter decode uses the
+    // static §10.5 `DEFAULT_UV_MODE_PROBS`), so the spec's per-frame
+    // `uv_mode` adaptation has no persisted destination here; the counts
+    // are still accepted so a future wiring that threads a per-frame
+    // `uv_mode_probs` table can consume them.
+    for i in 0..PARTITION_CONTEXTS {
+        adapt_probs(
+            &PARTITION_TREE,
+            &mut fc.partition_probs[i],
+            &counts.partition[i],
+        );
+    }
+    for i in 0..SKIP_CONTEXTS {
+        fc.skip_prob[i] = adapt_prob(fc.skip_prob[i], counts.skip[i]);
+    }
+    if interp_filter_switchable {
+        for i in 0..INTERP_FILTER_CONTEXTS {
+            adapt_probs(
+                &INTERP_FILTER_TREE,
+                &mut fc.interp_filter_probs[i],
+                &counts.interp_filter[i],
+            );
+        }
+    }
+    if tx_mode_select {
+        for i in 0..TX_SIZE_CONTEXTS {
+            adapt_probs(
+                &TX_SIZE_8_TREE,
+                &mut fc.tx_probs[1][i],
+                &counts.tx_size[1][i],
+            );
+            adapt_probs(
+                &TX_SIZE_16_TREE,
+                &mut fc.tx_probs[2][i],
+                &counts.tx_size[2][i],
+            );
+            adapt_probs(
+                &TX_SIZE_32_TREE,
+                &mut fc.tx_probs[3][i],
+                &counts.tx_size[3][i],
+            );
+        }
+    }
+    adapt_probs(
+        &MV_JOINT_TREE,
+        &mut fc.mv_probs.joint_probs,
+        &counts.mv_joint,
+    );
+    for i in 0..2 {
+        let mc = &counts.mv_comp[i];
+        fc.mv_probs.sign_prob[i] = adapt_prob(fc.mv_probs.sign_prob[i], mc.sign);
+        adapt_probs(&MV_CLASS_TREE, &mut fc.mv_probs.class_probs[i], &mc.class);
+        fc.mv_probs.class0_bit_prob[i] = adapt_prob(fc.mv_probs.class0_bit_prob[i], mc.class0_bit);
+        for j in 0..MV_OFFSET_BITS {
+            fc.mv_probs.bits_prob[i][j] = adapt_prob(fc.mv_probs.bits_prob[i][j], mc.bits[j]);
+        }
+        for j in 0..CLASS0_SIZE {
+            adapt_probs(
+                &MV_FR_TREE,
+                &mut fc.mv_probs.class0_fr_probs[i][j],
+                &mc.class0_fr[j],
+            );
+        }
+        adapt_probs(&MV_FR_TREE, &mut fc.mv_probs.fr_probs[i], &mc.fr);
+        if allow_high_precision_mv {
+            fc.mv_probs.class0_hp_prob[i] = adapt_prob(fc.mv_probs.class0_hp_prob[i], mc.class0_hp);
+            fc.mv_probs.hp_prob[i] = adapt_prob(fc.mv_probs.hp_prob[i], mc.hp);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    // Several §8.4.4 tests build a zeroed `CountsNonCoef::default()` and
+    // poke a single field to isolate one adaptation path; that pattern
+    // trips clippy's field_reassign_with_default, which is noise for this
+    // single-cell-isolation test style.
+    #![allow(clippy::field_reassign_with_default)]
+
     use super::*;
 
     // §8.4.1: with zero counts, prob defaults to 128 but factor is 0, so
@@ -460,5 +699,165 @@ mod tests {
         let counts_mc: CountsMoreCoefs = [[[[[[0; 2]; 6]; 6]; 2]; 2]; 4];
         adapt_coef_probs(&mut cp, &counts_token, &counts_mc, true, false);
         assert_eq!(cp, orig);
+    }
+
+    // ----- §8.4.4 adapt_noncoef_probs -----
+
+    // §8.4.4 zero counts: the whole non-coefficient bank is unchanged
+    // (merge_prob is the identity at zero counts, for both the binary
+    // adapt_prob and the tree-walking adapt_probs).
+    #[test]
+    fn adapt_noncoef_probs_zero_counts_is_identity() {
+        let orig = FrameContext::default();
+        let mut fc = orig.clone();
+        let counts = CountsNonCoef::default();
+        adapt_noncoef_probs(&mut fc, &counts, true, true, true);
+        assert_eq!(fc, orig);
+    }
+
+    // §8.4.4: a single binary element (is_inter ctx 1) adapts to exactly
+    // adapt_prob(prob, counts) and nothing else moves.
+    #[test]
+    fn adapt_noncoef_probs_single_is_inter_cell() {
+        let orig = FrameContext::default();
+        let mut fc = orig.clone();
+        let mut counts = CountsNonCoef::default();
+        counts.is_inter[1] = [7, 13];
+        adapt_noncoef_probs(&mut fc, &counts, false, false, false);
+
+        let mut expect = orig.clone();
+        expect.is_inter_prob[1] = adapt_prob(orig.is_inter_prob[1], [7, 13]);
+        assert_eq!(fc, expect);
+    }
+
+    // §8.4.4 inter_mode is tree-adapted via INTER_MODE_TREE: a populated
+    // context cell matches a direct adapt_probs call on the same row.
+    #[test]
+    fn adapt_noncoef_probs_inter_mode_tree() {
+        let orig = FrameContext::default();
+        let mut fc = orig.clone();
+        let mut counts = CountsNonCoef::default();
+        counts.inter_mode[2] = [3, 5, 2, 9];
+        adapt_noncoef_probs(&mut fc, &counts, false, false, false);
+
+        let mut expect_row = orig.inter_mode_probs[2];
+        adapt_probs(&INTER_MODE_TREE, &mut expect_row, &[3, 5, 2, 9]);
+        assert_eq!(fc.inter_mode_probs[2], expect_row);
+        // No other inter_mode context moved.
+        for i in 0..INTER_MODE_CONTEXTS {
+            if i != 2 {
+                assert_eq!(fc.inter_mode_probs[i], orig.inter_mode_probs[i]);
+            }
+        }
+    }
+
+    // §8.4.4 conditional gates: interp_filter only adapts when
+    // interpolation_filter == SWITCHABLE; tx_size only when
+    // tx_mode == TX_MODE_SELECT; mv hp tails only when
+    // allow_high_precision_mv == 1.
+    #[test]
+    fn adapt_noncoef_probs_conditional_gates() {
+        let orig = FrameContext::default();
+
+        // interp_filter gate OFF: untouched even with counts present.
+        let mut fc = orig.clone();
+        let mut counts = CountsNonCoef::default();
+        counts.interp_filter[0] = [4, 5, 6];
+        counts.tx_size[1][0] = [3, 7, 0, 0];
+        counts.mv_comp[0].hp = [2, 9];
+        counts.mv_comp[0].class0_hp = [1, 4];
+        adapt_noncoef_probs(&mut fc, &counts, false, false, false);
+        assert_eq!(fc.interp_filter_probs, orig.interp_filter_probs);
+        assert_eq!(fc.tx_probs, orig.tx_probs);
+        assert_eq!(fc.mv_probs.hp_prob, orig.mv_probs.hp_prob);
+        assert_eq!(fc.mv_probs.class0_hp_prob, orig.mv_probs.class0_hp_prob);
+
+        // All gates ON: each now moves.
+        let mut fc = orig.clone();
+        adapt_noncoef_probs(&mut fc, &counts, true, true, true);
+        assert_ne!(fc.interp_filter_probs[0], orig.interp_filter_probs[0]);
+        assert_ne!(fc.tx_probs[1][0], orig.tx_probs[1][0]);
+        assert_ne!(fc.mv_probs.hp_prob[0], orig.mv_probs.hp_prob[0]);
+        assert_ne!(
+            fc.mv_probs.class0_hp_prob[0],
+            orig.mv_probs.class0_hp_prob[0]
+        );
+    }
+
+    // §8.4.4 tx_size adapts the three non-4x4 rows with their respective
+    // trees; TX_4X4 (row 0) is never tree-adapted.
+    #[test]
+    fn adapt_noncoef_probs_tx_size_rows() {
+        let orig = FrameContext::default();
+        let mut fc = orig.clone();
+        let mut counts = CountsNonCoef::default();
+        counts.tx_size[1][1] = [5, 9, 0, 0];
+        counts.tx_size[2][1] = [3, 4, 7, 0];
+        counts.tx_size[3][1] = [2, 3, 4, 6];
+        adapt_noncoef_probs(&mut fc, &counts, false, true, false);
+
+        let mut e8 = orig.tx_probs[1][1];
+        adapt_probs(&TX_SIZE_8_TREE, &mut e8, &[5, 9, 0, 0]);
+        let mut e16 = orig.tx_probs[2][1];
+        adapt_probs(&TX_SIZE_16_TREE, &mut e16, &[3, 4, 7, 0]);
+        let mut e32 = orig.tx_probs[3][1];
+        adapt_probs(&TX_SIZE_32_TREE, &mut e32, &[2, 3, 4, 6]);
+        assert_eq!(fc.tx_probs[1][1], e8);
+        assert_eq!(fc.tx_probs[2][1], e16);
+        assert_eq!(fc.tx_probs[3][1], e32);
+        // TX_4X4 row untouched.
+        assert_eq!(fc.tx_probs[0], orig.tx_probs[0]);
+    }
+
+    // §8.4.4 mv joint + per-component fields adapt; high-precision tails
+    // gated. Verify the mv_joint tree adaptation and a class tree cell.
+    #[test]
+    fn adapt_noncoef_probs_mv_fields() {
+        let orig = FrameContext::default();
+        let mut fc = orig.clone();
+        let mut counts = CountsNonCoef::default();
+        counts.mv_joint = [2, 3, 4, 5];
+        counts.mv_comp[1].sign = [6, 8];
+        counts.mv_comp[1].class[3] = 11;
+        counts.mv_comp[1].fr = [1, 2, 3, 4];
+        adapt_noncoef_probs(&mut fc, &counts, false, false, false);
+
+        let mut ej = orig.mv_probs.joint_probs;
+        adapt_probs(&MV_JOINT_TREE, &mut ej, &[2, 3, 4, 5]);
+        assert_eq!(fc.mv_probs.joint_probs, ej);
+        assert_eq!(
+            fc.mv_probs.sign_prob[1],
+            adapt_prob(orig.mv_probs.sign_prob[1], [6, 8])
+        );
+        let mut ecl = orig.mv_probs.class_probs[1];
+        let mut clc = [0u32; MV_CLASSES];
+        clc[3] = 11;
+        adapt_probs(&MV_CLASS_TREE, &mut ecl, &clc);
+        assert_eq!(fc.mv_probs.class_probs[1], ecl);
+        let mut efr = orig.mv_probs.fr_probs[1];
+        adapt_probs(&MV_FR_TREE, &mut efr, &[1, 2, 3, 4]);
+        assert_eq!(fc.mv_probs.fr_probs[1], efr);
+    }
+
+    // §8.4.4 partition + skip + y_mode adapt unconditionally.
+    #[test]
+    fn adapt_noncoef_probs_unconditional_block() {
+        let orig = FrameContext::default();
+        let mut fc = orig.clone();
+        let mut counts = CountsNonCoef::default();
+        counts.partition[5] = [2, 3, 4, 5];
+        counts.skip[2] = [9, 1];
+        counts.y_mode[1][0] = 12;
+        adapt_noncoef_probs(&mut fc, &counts, false, false, false);
+
+        let mut ep = orig.partition_probs[5];
+        adapt_probs(&PARTITION_TREE, &mut ep, &[2, 3, 4, 5]);
+        assert_eq!(fc.partition_probs[5], ep);
+        assert_eq!(fc.skip_prob[2], adapt_prob(orig.skip_prob[2], [9, 1]));
+        let mut ey = orig.y_mode_probs[1];
+        let mut yc = [0u32; INTRA_MODES];
+        yc[0] = 12;
+        adapt_probs(&INTRA_MODE_TREE, &mut ey, &yc);
+        assert_eq!(fc.y_mode_probs[1], ey);
     }
 }

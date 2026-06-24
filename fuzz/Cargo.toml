@@ -36,5 +36,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "decode_frame"
+path = "fuzz_targets/decode_frame.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

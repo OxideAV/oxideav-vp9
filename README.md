@@ -180,12 +180,38 @@ map between frames.
   end-of-section paragraph is blank). Contexts are reset to §10 defaults
   per frame meanwhile, which is exact for the all-parallel-mode corpus.
 * §9.2.4 multi-coder tile parallelism (tiles decode sequentially).
-* Encoder paths.
+* Full encoder frame assembly. The **encoder bootstrap** has landed its
+  bitstream-writer primitives, each derived as the exact inverse of the
+  matching decode step and validated by round-tripping back through the
+  in-crate decoder (no external encoder consulted):
+  * the §9.2 Boolean (range) **encoder** (`bool_encoder`) — `write_bool`
+    / `write_literal` / `finish`, the arithmetic-coder inverse of the
+    §9.2 decoder, with `0xff`-run carry propagation and §9.2.3
+    superframe-marker avoidance;
+  * the §6.2 uncompressed-header **writer** (`header_writer`) — the
+    key-frame branch + `show_existing_frame` sentinel across all four
+    profiles;
+  * the §6.3 compressed-header **writer** (`compressed_writer`) — the
+    intra, default-probability path (no forward updates) for every
+    `tx_mode`;
+  * the §6.4.24 coefficient-**token writer** (`token_writer`) —
+    `more_coefs` / `token` tree / `read_coef` magnitude (incl. the CAT6
+    high-bit prefix at 10/12-bit) / sign;
+  * the §6.4.6 keyframe intra **mode-info writer** (`mode_writer`) — a
+    generic §9.3.1 `tree_encode` plus `skip` / `segment_id` /
+    `default_intra_mode` / `default_uv_mode` / `tx_size`.
+
+  Still pending: the §6.4.3 partition-tree writer with its §9.3.2
+  neighbour-context bookkeeping, the §6.4.21 `residual( )` encode driver
+  (forward transform + quantization + scan → tokens), and the top-level
+  `encode_vp9` frame assembly that threads these into a complete
+  decodable keyframe. `encode_vp9` still returns `Error::NotImplemented`.
 
 ## Testing
 
-The crate carries 780+ lib unit tests plus integration suites in
-`tests/`. Tests construct their inputs bit-by-bit; §9.2 golden buffers
+The crate carries 825+ lib unit tests plus integration suites in
+`tests/` (including the encoder-bootstrap writers, each round-tripped
+back through the in-crate decoder). Tests construct their inputs bit-by-bit; §9.2 golden buffers
 are hand-derived by stepping the decoder, not borrowed from any
 third-party VP9 implementation. Several precision-critical primitives
 also carry *independent* oracles that share no code with the

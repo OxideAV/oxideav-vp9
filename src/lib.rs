@@ -525,6 +525,7 @@ mod mv;
 mod mv_ref;
 mod narrow_filter;
 mod partition;
+mod partition_writer;
 mod prob_adapt;
 mod reconstruct;
 mod ref_buffer;

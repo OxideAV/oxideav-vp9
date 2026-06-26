@@ -570,6 +570,14 @@ impl<'a> PartitionProbsKind<'a> {
             PartitionProbsKind::Inter(table) => table[ctx],
         }
     }
+
+    /// Per-context probability-row pick for the partition *writer* — the
+    /// same §9.3.2 row the decoder consumes via [`Self::row`], re-exposed
+    /// at `pub(crate)` so [`crate::partition_writer`] codes each tree
+    /// branch with the identical probability.
+    pub(crate) fn row_for_writer(&self, ctx: usize) -> [u8; PARTITION_TYPES - 1] {
+        self.row(ctx)
+    }
 }
 
 /// `AbovePartitionContext[ ]` / `LeftPartitionContext[ ]` per §6.4.3 +
@@ -697,7 +705,7 @@ impl LeafSink for Vec<LeafBlock> {
 /// has run. `subsize` is the post-`subsize_lookup` child size, NOT the
 /// parent `bsize`; per §10.2 / §3 it is always a valid `BLOCK_*` index
 /// (never `BLOCK_INVALID`) when the gate condition fires.
-fn write_back_partition_context(
+pub(crate) fn write_back_partition_context(
     above: &mut [u8],
     left: &mut [u8],
     r: usize,

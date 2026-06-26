@@ -517,6 +517,10 @@ mod inter_pred;
 mod intra;
 mod loop_filter;
 mod mode_info;
+// The keyframe intra mode-info writer is built ahead of the tile-data
+// encoder that consumes it; the allowance is removed when that lands.
+#[allow(dead_code)]
+mod mode_writer;
 mod mv;
 mod mv_ref;
 mod narrow_filter;

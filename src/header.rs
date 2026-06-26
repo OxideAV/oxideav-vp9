@@ -88,6 +88,22 @@ impl ColorSpace {
             _ => unreachable!(),
         }
     }
+
+    /// The inverse of [`ColorSpace::from_bits`] — the 3-bit `color_space`
+    /// field value the §6.2.2 walker reads back to this variant. Used by
+    /// the uncompressed-header writer.
+    pub(crate) fn to_bits(self) -> u32 {
+        match self {
+            Self::Unknown => 0,
+            Self::Bt601 => 1,
+            Self::Bt709 => 2,
+            Self::Smpte170 => 3,
+            Self::Smpte240 => 4,
+            Self::Bt2020 => 5,
+            Self::Reserved => 6,
+            Self::Rgb => 7,
+        }
+    }
 }
 
 /// Color configuration walked out of `color_config()` (spec §6.2.2 /
@@ -225,7 +241,7 @@ pub struct SegmentationParams {
 }
 
 impl SegmentationParams {
-    const fn default_disabled() -> Self {
+    pub(crate) const fn default_disabled() -> Self {
         Self {
             enabled: false,
             update_map: false,

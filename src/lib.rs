@@ -492,6 +492,7 @@ mod adaptive_filter_strength;
 mod bitreader;
 mod block_inter_pred;
 mod bool_coder;
+mod bool_encoder;
 mod coef_probs;
 mod compressed;
 mod decode_block;

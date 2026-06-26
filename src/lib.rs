@@ -495,6 +495,10 @@ mod bool_coder;
 mod bool_encoder;
 mod coef_probs;
 mod compressed;
+// The §6.3 compressed-header writer is built ahead of the keyframe
+// encoder that consumes it; the allowance is removed when that lands.
+#[allow(dead_code)]
+mod compressed_writer;
 mod decode_block;
 mod decode_frame;
 mod dequant;

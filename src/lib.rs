@@ -530,6 +530,10 @@ mod scan;
 mod superblock_filter;
 mod superblock_loop_filter;
 mod superframe;
+// The §6.4.24 token writer is built ahead of the residual encoder that
+// consumes it; the allowance is removed when that lands.
+#[allow(dead_code)]
+mod token_writer;
 mod tokens;
 mod wide_filter;
 

@@ -7,7 +7,9 @@ v0.7.
 
 ## Status
 
-Intra **and inter (P-frame)** decode work end-to-end. [`decode_vp9`]
+Intra **and inter (P-frame)** decode work end-to-end, and a **keyframe
+encoder** assembles a complete decoder-reconstructible frame (see the
+"Encoder" section). [`decode_vp9`]
 and [`decode_intra_frame`] decode a complete VP9 keyframe to packed
 planar samples, byte-exact against a 13-fixture staged corpus covering
 4:2:0 and 4:4:4 chroma, 8/10/12-bit depth, RGB, multiple tile columns,
@@ -114,6 +116,60 @@ update, the inherited color config, the §6.5 previous-frame motion field,
 the §7.2.6 `UsePrevFrameMvs` derivation, and the §6.4.14 previous-segment
 map between frames.
 
+### Encoder
+
+[`encode_vp9`] assembles a **complete, decoder-reconstructible VP9
+keyframe** end-to-end. The encode path composes the bitstream-writer
+primitives — each derived as the exact inverse of the matching decode step
+and validated by round-tripping back through the in-crate decoder (no
+external encoder consulted):
+
+* the §9.2 Boolean (range) **encoder** (`bool_encoder`) — `write_bool` /
+  `write_literal` / `finish`, the arithmetic-coder inverse of the §9.2
+  decoder, with `0xff`-run carry propagation and §9.2.3 superframe-marker
+  avoidance;
+* the §6.2 uncompressed-header **writer** (`header_writer`) — the key-frame
+  branch + `show_existing_frame` sentinel across all four profiles;
+* the §6.3 compressed-header **writer** (`compressed_writer`) — the intra,
+  default-probability path (no forward updates) for every `tx_mode`;
+* the §6.4.24 coefficient-**token writer** (`token_writer`) — `more_coefs`
+  / `token` tree / `read_coef` magnitude (incl. the CAT6 high-bit prefix at
+  10/12-bit) / sign, plus the block-level `write_tokens` driver that walks
+  the §6.4.25 scan deriving the §9.3.2 per-coefficient context exactly as
+  the decoder does;
+* the §6.4.6 keyframe intra **mode-info writer** (`mode_writer`) — a
+  generic §9.3.1 `tree_encode` plus `skip` / `segment_id` /
+  `default_intra_mode` / `default_uv_mode` / `tx_size`;
+* the §6.4.3 **partition-tree writer** (`partition_writer`) — the all-8x8
+  partition recursion with its §9.3.2 neighbour-context bookkeeping (shared
+  with the decoder so a written partition stream decodes to the identical
+  leaf set);
+* the §6.4.21 **residual encode driver** (`residual_writer`) — the inverse
+  of `BlockDecoder::residual( )`, walking the same per-plane / per-4x4 grid,
+  per-block tx-size (§6.4.22) / `TxType` (§6.4.25) / scan selection, and
+  the §6.4.21 `AboveNonzeroContext` / `LeftNonzeroContext` write-back;
+* the §6.4.4 keyframe intra **block writer** (`block_writer`) — the inverse
+  of `decode_block_intra( )`, deriving every §9.3.2 neighbour context from
+  the shared `Vp9FrameState`, writing the §6.4.7/§6.4.6/§6.4.21 syntax, and
+  fanning the per-MI values into the frame-wide arrays via
+  `decode_block_apply`;
+* the top-level **frame assembler** (`frame_writer`) — threads the
+  uncompressed + compressed headers and the single-tile §6.4 partition /
+  block walk into a complete frame, with `header_size_in_bytes` set to the
+  compressed-header length.
+
+The residual writer's coefficients are validated to reconstruct to known
+samples through the *full* decode pipeline (§8.6.1 dequant + §8.7 inverse
+transform + §8.6.2 reconstruct): a DC-only block coded on the top-left 4x4
+luma block (which predicts from no neighbours) reconstructs to `128 + r`
+where `r` is the independently-computed inverse transform of the
+dequantized DC. The assembler covers 8/10-bit (profile 0 / 2), 4:2:0,
+segmentation (per-block `segment_id` via the §6.4.7 tree), partial- and
+multi-superblock geometries (1x1 through 256x144 including degenerate
+strips), and is byte-deterministic. The emitted frame is an all-skip
+`DC_PRED` keyframe — structurally complete but a flat DC reconstruction
+rather than a pixel-accurate encode of the input (see "Not yet supported").
+
 ### Not yet supported
 
 * Compound + scaled-reference inter prediction are wired and unit-tested
@@ -180,38 +236,23 @@ map between frames.
   end-of-section paragraph is blank). Contexts are reset to §10 defaults
   per frame meanwhile, which is exact for the all-parallel-mode corpus.
 * §9.2.4 multi-coder tile parallelism (tiles decode sequentially).
-* Full encoder frame assembly. The **encoder bootstrap** has landed its
-  bitstream-writer primitives, each derived as the exact inverse of the
-  matching decode step and validated by round-tripping back through the
-  in-crate decoder (no external encoder consulted):
-  * the §9.2 Boolean (range) **encoder** (`bool_encoder`) — `write_bool`
-    / `write_literal` / `finish`, the arithmetic-coder inverse of the
-    §9.2 decoder, with `0xff`-run carry propagation and §9.2.3
-    superframe-marker avoidance;
-  * the §6.2 uncompressed-header **writer** (`header_writer`) — the
-    key-frame branch + `show_existing_frame` sentinel across all four
-    profiles;
-  * the §6.3 compressed-header **writer** (`compressed_writer`) — the
-    intra, default-probability path (no forward updates) for every
-    `tx_mode`;
-  * the §6.4.24 coefficient-**token writer** (`token_writer`) —
-    `more_coefs` / `token` tree / `read_coef` magnitude (incl. the CAT6
-    high-bit prefix at 10/12-bit) / sign;
-  * the §6.4.6 keyframe intra **mode-info writer** (`mode_writer`) — a
-    generic §9.3.1 `tree_encode` plus `skip` / `segment_id` /
-    `default_intra_mode` / `default_uv_mode` / `tx_size`.
-
-  Still pending: the §6.4.3 partition-tree writer with its §9.3.2
-  neighbour-context bookkeeping, the §6.4.21 `residual( )` encode driver
-  (forward transform + quantization + scan → tokens), and the top-level
-  `encode_vp9` frame assembly that threads these into a complete
-  decodable keyframe. `encode_vp9` still returns `Error::NotImplemented`.
+* Pixel-accurate encoding (forward transform + quantization + intra-mode
+  / partition search). `encode_vp9` now produces a **complete,
+  decoder-reconstructible keyframe** (see the "Encoder" section), but the
+  emitted frame is an all-`BLOCK_8X8`, all-skip, `DC_PRED` keyframe (a
+  flat DC reconstruction) rather than a rate-distortion-optimised encode
+  of the input samples. Choosing the residual coefficients / intra modes /
+  partition layout that reconstruct an arbitrary input frame is the next
+  encoder milestone; the residual *machinery* to carry such coefficients
+  is already landed and validated end-to-end (a chosen DC coefficient
+  reconstructs to known samples through the full decode pipeline).
 
 ## Testing
 
-The crate carries 825+ lib unit tests plus integration suites in
-`tests/` (including the encoder-bootstrap writers, each round-tripped
-back through the in-crate decoder). Tests construct their inputs bit-by-bit; §9.2 golden buffers
+The crate carries 860+ lib unit tests plus integration suites in
+`tests/` (including the encoder writers, each round-tripped back through
+the in-crate decoder, and `encode_keyframe` exercising the public
+`encode_vp9` → decode round-trip across a geometry sweep). Tests construct their inputs bit-by-bit; §9.2 golden buffers
 are hand-derived by stepping the decoder, not borrowed from any
 third-party VP9 implementation. Several precision-critical primitives
 also carry *independent* oracles that share no code with the
@@ -221,10 +262,11 @@ orthogonal matrix + involution property), the §9.3.2 coefficient-context
 neighbour derivation against a strict scan-order causality invariant, and
 every §8.5.1 intra mode against flat-preservation + `Clip1`-bound
 properties. A `cargo-fuzz` harness lives in `fuzz/` with panic-surface
-targets over the header parsers, the Boolean-decoder walkers, and the
-whole `decode_frame` pipeline (single-frame, Annex B split, and the
-multi-frame sequence driver); the `decode_robustness` integration suite
-pins the same garbage-in-no-panic contract in standard CI.
+targets over the header parsers, the Boolean-decoder walkers, the whole
+`decode_frame` pipeline (single-frame, Annex B split, and the multi-frame
+sequence driver), and the `encode_keyframe` encode → decode round-trip;
+the `decode_robustness` integration suite pins the same
+garbage-in-no-panic contract in standard CI.
 
 ## Provenance
 

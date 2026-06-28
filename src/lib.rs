@@ -530,6 +530,7 @@ mod prob_adapt;
 mod reconstruct;
 mod ref_buffer;
 mod residual;
+mod residual_writer;
 mod sample_filtering;
 mod scan;
 mod superblock_filter;

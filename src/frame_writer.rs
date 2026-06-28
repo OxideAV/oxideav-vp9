@@ -41,7 +41,7 @@ use crate::residual::{BLOCK_64X64, BLOCK_8X8};
 use crate::tokens::NonzeroContext;
 use crate::Error;
 
-/// Per-8x8-block plan: the mode / skip a leaf block codes.
+/// Per-8x8-block plan: the mode / skip / segment a leaf block codes.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BlockPlan {
     /// Luma `y_mode` (0..=9).
@@ -51,6 +51,9 @@ pub(crate) struct BlockPlan {
     /// `skip` flag (true ⇒ no residual coded; decoder reconstructs from
     /// prediction only).
     pub skip: bool,
+    /// `segment_id` (0..=7) — coded only when the frame's segmentation is
+    /// enabled with `update_map`.
+    pub segment_id: u8,
 }
 
 /// The minimal keyframe the assembler can emit: an all-8x8 partition with
@@ -75,6 +78,7 @@ impl KeyframePlan {
                     y_mode,
                     uv_mode,
                     skip: true,
+                    segment_id: 0,
                 };
                 n
             ],
@@ -196,7 +200,7 @@ fn assemble_tile(
                         mi_col_start: 0,
                         c: lc,
                         mi_size: BLOCK_8X8,
-                        segment_id: 0,
+                        segment_id: bp.segment_id,
                         skip: bp.skip,
                         tx_size: 0,
                         y_mode: bp.y_mode,
@@ -456,6 +460,7 @@ mod tests {
                     y_mode: 0,
                     uv_mode: 0,
                     skip: false,
+                    segment_id: 0,
                 };
                 n
             ],
@@ -490,5 +495,73 @@ mod tests {
                 assert_eq!(s, exp, "top-left luma ({row},{col}) != {exp}");
             }
         }
+    }
+
+    /// A segmentation-enabled keyframe: every block codes a `segment_id`
+    /// via the §6.4.7 `intra_segment_id( )` tree, and the frame decodes
+    /// without error. Pins the assembler's segment-id path
+    /// (block_writer's §6.4.7 write_segment_id) against the decoder.
+    #[test]
+    fn segmented_keyframe_decodes() {
+        let mut hdr = keyframe_header(64, 64);
+        let mut seg = SegmentationParams::default_disabled();
+        seg.enabled = true;
+        seg.update_map = true;
+        seg.tree_probs = Some([128; 7]);
+        seg.temporal_update = false;
+        seg.pred_prob = Some([255; 3]);
+        seg.update_data = true;
+        seg.abs_or_delta_update = false; // delta update.
+                                         // SEG_LVL_ALT_Q (feature 0) on segment 1: a -16 quantizer delta.
+        seg.feature_enabled[1][0] = true;
+        seg.feature_data[1][0] = -16;
+        hdr.segmentation = seg;
+
+        // Checkerboard segment ids 0 / 1 across the 8x8 grid, all skip.
+        let mut plan = KeyframePlan::all_skip(8, 8, 0, 0);
+        for (i, bp) in plan.plans.iter_mut().enumerate() {
+            bp.segment_id = (i % 2) as u8;
+        }
+        let bytes = assemble_keyframe(&hdr, &plan, &mut *no_coeffs()).expect("assemble");
+        let frame = decode_intra_frame(&bytes).expect("decode");
+        assert_eq!((frame.width, frame.height), (64, 64));
+        // All-skip DC_PRED with no residual is still flat 128 regardless
+        // of segment (the per-segment Q only affects coded residuals).
+        assert!(frame.y.iter().all(|&s| s == 128), "luma not flat 128");
+    }
+
+    /// A 10-bit profile-2 keyframe assembles + decodes; the no-neighbour
+    /// DC_PRED default is `1 << (BitDepth - 1) == 512` at 10-bit, and the
+    /// packed output carries little-endian u16 pairs.
+    #[test]
+    fn profile2_10bit_keyframe_decodes() {
+        let mut hdr = keyframe_header(64, 64);
+        hdr.profile = 2;
+        hdr.color_config = ColorConfig {
+            bit_depth: 10,
+            color_space: ColorSpace::Bt709,
+            color_range_full: false,
+            subsampling_x: true,
+            subsampling_y: true,
+        };
+        let plan = KeyframePlan::all_skip(8, 8, 0, 0);
+        let bytes = assemble_keyframe(&hdr, &plan, &mut *no_coeffs()).expect("assemble");
+        let frame = decode_intra_frame(&bytes).expect("decode");
+        assert_eq!(frame.bit_depth, 10);
+        assert!(
+            frame.y.iter().all(|&s| s == 512),
+            "10-bit luma not flat 512"
+        );
+    }
+
+    /// Re-encoding the same plan is byte-stable (the assembler is a pure
+    /// function of its inputs).
+    #[test]
+    fn assembly_is_deterministic() {
+        let hdr = keyframe_header(64, 64);
+        let plan = KeyframePlan::all_skip(8, 8, 3, 5);
+        let a = assemble_keyframe(&hdr, &plan, &mut *no_coeffs()).expect("a");
+        let b = assemble_keyframe(&hdr, &plan, &mut *no_coeffs()).expect("b");
+        assert_eq!(a, b, "assembly not byte-stable");
     }
 }

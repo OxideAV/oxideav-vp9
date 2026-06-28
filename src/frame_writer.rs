@@ -419,4 +419,76 @@ mod tests {
         assert_eq!(frame.width, 128);
         assert_eq!(frame.height, 64);
     }
+
+    /// An all-skip DC_PRED keyframe reconstructs to a flat mid-grey fill:
+    /// every plane is the §8.5.1 `DC_PRED` no-neighbour default
+    /// `1 << (BitDepth - 1) == 128` at 8-bit (no residual, loop filter
+    /// off).
+    #[test]
+    fn all_skip_dc_pred_is_flat_128() {
+        let hdr = keyframe_header(64, 64);
+        let plan = KeyframePlan::all_skip(8, 8, 0, 0); // DC_PRED luma + uv.
+        let bytes = assemble_keyframe(&hdr, &plan, &mut *no_coeffs()).expect("assemble");
+        let frame = decode_intra_frame(&bytes).expect("decode");
+        assert!(frame.y.iter().all(|&s| s == 128), "luma not flat 128");
+        assert!(frame.u.iter().all(|&s| s == 128), "U not flat 128");
+        assert!(frame.v.iter().all(|&s| s == 128), "V not flat 128");
+    }
+
+    /// A non-skip keyframe with a chosen DC coefficient: the **top-left**
+    /// 4x4 luma block predicts from no neighbours (§8.5.1 `DC_PRED`
+    /// no-neighbour default `1 << (BitDepth-1) == 128`), so its
+    /// reconstructed samples equal `128 + r` where `r` is the
+    /// independently-computed inverse transform of the dequantized DC
+    /// token. This pins the residual writer's coefficients reconstructing
+    /// to known samples through the *full* decode pipeline (dequant +
+    /// inverse transform + reconstruct), not just the token round-trip.
+    #[test]
+    fn non_skip_dc_residual_reconstructs_top_left_block() {
+        use crate::dequant::get_dc_quant;
+        use crate::idct::{inverse_transform_2d, DCT_DCT};
+
+        let hdr = keyframe_header(64, 64);
+        let n = 8 * 8usize;
+        let plan = KeyframePlan {
+            plans: vec![
+                BlockPlan {
+                    y_mode: 0,
+                    uv_mode: 0,
+                    skip: false,
+                };
+                n
+            ],
+            tx_mode: TxMode::Only4x4,
+        };
+
+        // Code DC token = 2 on every 4x4 luma + chroma block.
+        let dc_token: i64 = 2;
+        let mut coeffs: Box<FrameCoefSource> = Box::new(move |_r, _c, _p, _x, _y, _b| {
+            let mut v = vec![0i64; 16];
+            v[0] = dc_token;
+            v
+        });
+        let bytes = assemble_keyframe(&hdr, &plan, &mut *coeffs).expect("assemble");
+        let frame = decode_intra_frame(&bytes).expect("decode");
+
+        // Independent reconstruction of the top-left 4x4 luma block.
+        let seg = SegmentationParams::default_disabled();
+        let q = hdr.quantization;
+        let dcq = get_dc_quant(0, &seg, &q, 0, 8);
+        let mut probe = vec![0i64; 16];
+        probe[0] = dc_token * dcq as i64; // dqDenom = 1 for TX_4X4.
+        inverse_transform_2d(&mut probe, 2, DCT_DCT, false);
+        let r = probe[0];
+        let exp = (128i64 + r).clamp(0, 255) as i32;
+        assert_ne!(exp, 128, "DC residual should shift the block off 128");
+
+        // The top-left 4x4 luma samples (row-major, width 64).
+        for row in 0..4usize {
+            for col in 0..4usize {
+                let s = frame.y[row * 64 + col] as i32;
+                assert_eq!(s, exp, "top-left luma ({row},{col}) != {exp}");
+            }
+        }
+    }
 }

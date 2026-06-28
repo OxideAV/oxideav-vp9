@@ -43,5 +43,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "encode_keyframe"
+path = "fuzz_targets/encode_keyframe.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

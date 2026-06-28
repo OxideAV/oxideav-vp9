@@ -1736,6 +1736,103 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
 /// and the §6.3.10 `read_interp_filter_probs( )` sweep.
 const SWITCHABLE_FILTER: u8 = 4;
 
+/// Test-only helper: decode a fixed list of keyframe intra MI blocks from
+/// `coder`, mirroring `decode_block_intra( )` for each, and return the
+/// per-block recovered [`DecodedBlockResult`]-equivalent values read back
+/// from the §6.4.4 frame-wide arrays.
+///
+/// Used by the encoder block-writer round-trip tests to confirm a written
+/// block stream decodes back to the spec'd mode info + residual through
+/// the real decoder path (default §6.3 probability banks, single 4:2:0
+/// tile, segmentation disabled).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_keyframe_blocks_for_test(
+    coder: &mut BoolCoder<'_>,
+    mi_rows: u32,
+    mi_cols: u32,
+    tx_mode: crate::compressed::TxMode,
+    blocks: Vec<(u32, u32, u8)>,
+    y: &mut Plane,
+    u: &mut Plane,
+    v: &mut Plane,
+) -> Result<Vec<DecodedBlockResult>, Error> {
+    use crate::coef_probs::DEFAULT_COEF_PROBS;
+    use crate::compressed::{DEFAULT_SKIP_PROB, DEFAULT_TX_PROBS};
+
+    let chdr = Vp9CompressedHeader {
+        tx_mode,
+        tx_probs: DEFAULT_TX_PROBS,
+        coef_probs: DEFAULT_COEF_PROBS,
+        skip_prob: DEFAULT_SKIP_PROB,
+    };
+    let seg = SegmentationParams::default_disabled();
+    let quant = QuantizationParams {
+        base_q_idx: 64,
+        delta_q_y_dc: 0,
+        delta_q_uv_dc: 0,
+        delta_q_uv_ac: 0,
+        lossless: false,
+    };
+    let mut state = Vp9FrameState::new(mi_rows, mi_cols);
+    let mut nz = [
+        NonzeroContext::new((2 * mi_cols) as usize, (2 * mi_rows) as usize),
+        NonzeroContext::new((2 * mi_cols) as usize, (2 * mi_rows) as usize),
+        NonzeroContext::new((2 * mi_cols) as usize, (2 * mi_rows) as usize),
+    ];
+    let mut token_cache = [0u8; 1024];
+    let mut tok_buf = [0i64; 1024];
+
+    let mut results = Vec::with_capacity(blocks.len());
+    {
+        let mut bd = BlockDecoder {
+            seg: &seg,
+            quant: &quant,
+            chdr: &chdr,
+            mi_rows,
+            mi_cols,
+            mi_col_start: 0,
+            mi_col_end: mi_cols,
+            subsampling_x: true,
+            subsampling_y: true,
+            bit_depth: 8,
+            lossless: false,
+            state: &mut state,
+            y,
+            u,
+            v,
+            nz: &mut nz,
+            token_cache: &mut token_cache,
+            tok_buf: &mut tok_buf,
+            inter: None,
+        };
+        for &(r, c, subsize) in &blocks {
+            bd.decode_block_intra(coder, r, c, subsize)?;
+        }
+    }
+
+    for &(r, c, _subsize) in &blocks {
+        results.push(DecodedBlockResult {
+            skip: state.get_skip(r, c).unwrap_or(0) != 0,
+            tx_size: state.get_tx_size(r, c).unwrap_or(0),
+            y_mode: state.get_y_mode(r, c).unwrap_or(0),
+            segment_id: state.get_segment_id(r, c).unwrap_or(0),
+            ref_frame: [INTRA_FRAME, NONE_REF_FRAME],
+            is_inter: false,
+            eob_total: 0,
+            interp_filter: 0,
+            block_mvs: [[(0, 0); 4]; 2],
+            sub_modes: [
+                state.get_sub_mode(r, c, 0).unwrap_or(0),
+                state.get_sub_mode(r, c, 1).unwrap_or(0),
+                state.get_sub_mode(r, c, 2).unwrap_or(0),
+                state.get_sub_mode(r, c, 3).unwrap_or(0),
+            ],
+        });
+    }
+    Ok(results)
+}
+
 impl Vp9DecodedFrame {
     /// Pack the frame as planar bytes (Y then U then V): one byte per
     /// sample for `BitDepth == 8`, little-endian `u16` pairs for 10 /

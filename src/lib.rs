@@ -491,6 +491,7 @@ use oxideav_core::RuntimeContext;
 mod adaptive_filter_strength;
 mod bitreader;
 mod block_inter_pred;
+mod block_writer;
 mod bool_coder;
 mod bool_encoder;
 mod coef_probs;

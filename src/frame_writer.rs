@@ -564,4 +564,82 @@ mod tests {
         let b = assemble_keyframe(&hdr, &plan, &mut *no_coeffs()).expect("b");
         assert_eq!(a, b, "assembly not byte-stable");
     }
+
+    /// A non-skip keyframe carrying **AC** coefficients (not just DC) on
+    /// the top-left 4x4 luma block reconstructs to the independently
+    /// computed `Clip1( 128 + invtx( dequant( coeffs ) ) )` — exercising
+    /// the full §6.4.25 scan + token-tree + §8.6.1/§8.7/§8.6.2 path for a
+    /// non-flat residual through the assembler. The top-left block alone
+    /// is checked because it is the only block predicting from a known
+    /// (no-neighbour, flat 128) baseline.
+    #[test]
+    fn non_skip_ac_residual_reconstructs_top_left_block() {
+        use crate::dequant::{get_ac_quant, get_dc_quant};
+        use crate::idct::{inverse_transform_2d, DCT_DCT};
+
+        let hdr = keyframe_header(64, 64);
+        // DC_PRED everywhere so mode2txfm_map -> DCT_DCT (matches probe).
+        let n = 8 * 8usize;
+        let plan = KeyframePlan {
+            plans: vec![
+                BlockPlan {
+                    y_mode: 0,
+                    uv_mode: 0,
+                    skip: false,
+                    segment_id: 0,
+                };
+                n
+            ],
+            tx_mode: TxMode::Only4x4,
+        };
+
+        // Chosen 4x4 luma coefficients (raster order): a DC + two AC
+        // terms. Only the top-left luma block (mi 0,0; plane 0; start 0,0)
+        // gets this; every other coded block is all-zero (still non-skip,
+        // so it codes a single more_coefs == 0 at DC).
+        let tl_coeffs: [i64; 16] = {
+            let mut v = [0i64; 16];
+            v[0] = 3; // DC
+            v[1] = -2; // AC (row 0, col 1)
+            v[4] = 1; // AC (row 1, col 0)
+            v
+        };
+        let mut coeffs: Box<FrameCoefSource> = Box::new(move |r, c, plane, sx, sy, _b| {
+            let mut out = vec![0i64; 16];
+            if r == 0 && c == 0 && plane == 0 && sx == 0 && sy == 0 {
+                out.copy_from_slice(&tl_coeffs);
+            }
+            out
+        });
+        let bytes = assemble_keyframe(&hdr, &plan, &mut *coeffs).expect("assemble");
+        let frame = decode_intra_frame(&bytes).expect("decode");
+
+        // Independent reconstruction of the top-left 4x4 luma block.
+        let seg = SegmentationParams::default_disabled();
+        let q = hdr.quantization;
+        let dcq = get_dc_quant(0, &seg, &q, 0, 8) as i64;
+        let acq = get_ac_quant(0, &seg, &q, 0, 8) as i64;
+        let mut deq = vec![0i64; 16];
+        for (i, &t) in tl_coeffs.iter().enumerate() {
+            deq[i] = t * acq; // dqDenom = 1 for TX_4X4.
+        }
+        deq[0] = tl_coeffs[0] * dcq; // DC override.
+        inverse_transform_2d(&mut deq, 2, DCT_DCT, false);
+        let mut expected = [[0i32; 4]; 4];
+        for (i, exp_row) in expected.iter_mut().enumerate() {
+            for (j, slot) in exp_row.iter_mut().enumerate() {
+                *slot = (128i64 + deq[i * 4 + j]).clamp(0, 255) as i32;
+            }
+        }
+        // Residual must be non-flat (the AC terms create variation).
+        let flat = expected.iter().flatten().all(|&s| s == expected[0][0]);
+        assert!(!flat, "AC residual should produce a non-flat block");
+
+        for (i, exp_row) in expected.iter().enumerate() {
+            for (j, &exp) in exp_row.iter().enumerate() {
+                let s = frame.y[i * 64 + j] as i32;
+                assert_eq!(s, exp, "top-left luma ({i},{j})");
+            }
+        }
+    }
 }

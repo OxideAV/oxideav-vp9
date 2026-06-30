@@ -318,6 +318,251 @@ pub(crate) fn encode_keyframe_all_skip_dc(width: u32, height: u32) -> Result<Vec
     assemble_keyframe(&hdr, &plan, &mut *coeffs)
 }
 
+/// Build the §6.2 header for a minimal P-frame of `width × height`: a
+/// shown, single-tile, non-error-resilient inter frame that refreshes
+/// slot 1, references slot 0 (`LAST`/`GOLDEN`/`ALTREF` all = slot 0),
+/// EIGHTTAP filter, no high-precision MV. Pairs with
+/// [`assemble_inter_frame_all_skip_zeromv`].
+pub(crate) fn inter_pframe_header(width: u32, height: u32) -> Vp9FrameHeader {
+    use crate::header::{
+        ColorConfig, ColorSpace, LoopFilterParams, QuantizationParams, SegmentationParams, TileInfo,
+    };
+    Vp9FrameHeader {
+        profile: 0,
+        show_existing_frame: false,
+        frame_to_show_map_idx: None,
+        frame_type: FrameType::NonKeyFrame,
+        show_frame: true,
+        error_resilient_mode: false,
+        intra_only: false,
+        color_config: ColorConfig {
+            bit_depth: 8,
+            color_space: ColorSpace::Bt601,
+            color_range_full: false,
+            subsampling_x: true,
+            subsampling_y: true,
+        },
+        frame_width: width,
+        frame_height: height,
+        render_width: width,
+        render_height: height,
+        reset_frame_context: 0,
+        refresh_frame_flags: 0x02,
+        refresh_frame_context: true,
+        frame_parallel_decoding_mode: true,
+        frame_context_idx: 0,
+        loop_filter: LoopFilterParams {
+            level: 0,
+            sharpness: 0,
+            delta_enabled: true,
+            delta_update: false,
+            ref_deltas: [None; 4],
+            mode_deltas: [None; 2],
+        },
+        quantization: QuantizationParams {
+            base_q_idx: 64,
+            delta_q_y_dc: 0,
+            delta_q_uv_dc: 0,
+            delta_q_uv_ac: 0,
+            lossless: false,
+        },
+        segmentation: SegmentationParams::default_disabled(),
+        tile_info: TileInfo {
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
+        },
+        header_size_in_bytes: 0,
+        uncompressed_header_size_bytes: 0,
+        ref_frame_idx: Some([0, 0, 0]),
+        ref_frame_sign_bias: [false; 3],
+        allow_high_precision_mv: false,
+        interpolation_filter: 0,
+    }
+}
+
+/// Assemble a complete VP9 **inter** frame: an all-`BLOCK_8X8`,
+/// all-skip, single-reference-`LAST`, `ZEROMV` P-frame. Every leaf block
+/// copies its co-located samples from the `LAST` reference (zero motion,
+/// no residual), so the frame reconstructs to a verbatim copy of that
+/// reference — the minimal complete decodable inter frame.
+///
+/// `hdr` must be a non-key frame (`FrameType::NonKeyFrame`, `!intra_only`,
+/// shown, `tile_cols_log2 == tile_rows_log2 == 0`) carrying a valid
+/// `ref_frame_idx`; the `header_size_in_bytes` field is overwritten with
+/// the actual compressed-header length.
+pub(crate) fn assemble_inter_frame_all_skip_zeromv(hdr: &Vp9FrameHeader) -> Result<Vec<u8>, Error> {
+    use crate::compressed::ReferenceMode;
+    use crate::compressed_writer::write_compressed_header_inter;
+    use crate::inter_block_writer::{
+        write_inter_block, InterBlockFrameCtx, InterBlockProbs, InterBlockSpec,
+    };
+    use crate::mode_info::{LAST_FRAME, NONE_REF_FRAME, ZEROMV};
+
+    if hdr.frame_type != FrameType::NonKeyFrame || hdr.intra_only || !hdr.show_frame {
+        return Err(Error::Unsupported);
+    }
+    if hdr.tile_info.tile_cols_log2 != 0 || hdr.tile_info.tile_rows_log2 != 0 {
+        return Err(Error::Unsupported);
+    }
+    if hdr.ref_frame_idx.is_none() {
+        return Err(Error::Unsupported);
+    }
+
+    let mi_cols = (hdr.frame_width + 7) >> 3;
+    let mi_rows = (hdr.frame_height + 7) >> 3;
+    let tx_mode = TxMode::Only4x4;
+    let reference_mode = ReferenceMode::SingleReference;
+    let switchable = hdr.interpolation_filter == 4;
+    // sign_bias indexed by §3 ref value: [INTRA, LAST, GOLDEN, ALTREF].
+    let sign_bias = [
+        false,
+        hdr.ref_frame_sign_bias[0],
+        hdr.ref_frame_sign_bias[1],
+        hdr.ref_frame_sign_bias[2],
+    ];
+
+    // §6.3 compressed header (default-probability path).
+    let chdr_bytes = write_compressed_header_inter(
+        tx_mode,
+        hdr.quantization.lossless,
+        reference_mode,
+        switchable,
+        hdr.allow_high_precision_mv,
+        &sign_bias,
+    )?;
+
+    // §6.2 uncompressed header with header_size_in_bytes = compressed len.
+    let mut hdr2 = *hdr;
+    hdr2.header_size_in_bytes = u16::try_from(chdr_bytes.len()).map_err(|_| Error::Unsupported)?;
+    let uhdr_bytes = write_uncompressed_header(&hdr2)?;
+
+    // §6.4 tile data.
+    let ssx = hdr.color_config.subsampling_x;
+    let ssy = hdr.color_config.subsampling_y;
+    let bit_depth = u32::from(hdr.color_config.bit_depth);
+    let sb64_cols = ((mi_cols + 7) >> 3) * 8;
+    let sb64_rows = ((mi_rows + 7) >> 3) * 8;
+
+    let ctx = crate::compressed::FrameContext::default();
+    let comp_config = crate::compressed::CompoundReferenceConfig {
+        fixed_ref: crate::mode_info::ALTREF_FRAME,
+        var_ref: [LAST_FRAME, crate::mode_info::GOLDEN_FRAME],
+    };
+
+    let mut enc = BoolEncoder::new();
+    let mut state = Vp9FrameState::new(mi_rows, mi_cols);
+    let mut nz = [
+        NonzeroContext::new((2 * mi_cols) as usize, (2 * mi_rows) as usize),
+        NonzeroContext::new(
+            ((2 * mi_cols) >> u32::from(ssx)) as usize,
+            ((2 * mi_rows) >> u32::from(ssy)) as usize,
+        ),
+        NonzeroContext::new(
+            ((2 * mi_cols) >> u32::from(ssx)) as usize,
+            ((2 * mi_rows) >> u32::from(ssy)) as usize,
+        ),
+    ];
+    let mut pctx = PartitionContextState::new(sb64_cols as usize, sb64_rows as usize);
+    let mut token_cache = vec![0u8; 1024];
+
+    let fctx = InterBlockFrameCtx {
+        mi_cols,
+        mi_rows,
+        mi_col_end: mi_cols,
+        subsampling_x: ssx,
+        subsampling_y: ssy,
+        bit_depth,
+        lossless: hdr.quantization.lossless,
+        tx_mode,
+        seg_enabled: false,
+        seg_update_map: false,
+        reference_mode,
+        comp_config,
+        sign_bias: &sign_bias,
+        interpolation_filter: hdr.interpolation_filter,
+        allow_high_precision_mv: hdr.allow_high_precision_mv,
+        use_prev_frame_mvs: false,
+    };
+    let probs = InterBlockProbs {
+        skip_prob: &ctx.skip_prob,
+        tx_probs: &ctx.tx_probs,
+        is_inter_prob: &ctx.is_inter_prob,
+        comp_mode_prob: &ctx.comp_mode_prob,
+        single_ref_prob: &ctx.single_ref_prob,
+        comp_ref_prob: &ctx.comp_ref_prob,
+        inter_mode_probs: &ctx.inter_mode_probs,
+        interp_filter_probs: &ctx.interp_filter_probs,
+        mv_probs: &ctx.mv_probs,
+        coef_probs: &ctx.coef_probs,
+        tree_probs: None,
+    };
+
+    pctx.clear_above();
+
+    let mut r = 0u32;
+    while r < mi_rows {
+        pctx.clear_left();
+        let mut c = 0u32;
+        while c < mi_cols {
+            let mut leaf =
+                |enc: &mut BoolEncoder, lr: u32, lc: u32, _ls: u8| -> Result<(), Error> {
+                    let spec = InterBlockSpec {
+                        r: lr,
+                        mi_col_start: 0,
+                        c: lc,
+                        mi_size: BLOCK_8X8,
+                        segment_id: 0,
+                        skip: true,
+                        tx_size: 0,
+                        ref_frame: [LAST_FRAME, NONE_REF_FRAME],
+                        y_mode: ZEROMV,
+                        interp_filter: if switchable {
+                            0
+                        } else {
+                            hdr.interpolation_filter
+                        },
+                        mv: [[0, 0], [0, 0]],
+                    };
+                    let mut src = |_p: usize, tx_sz: u32, _x: u32, _y: u32, _b: usize| {
+                        let n0 = 1usize << (tx_sz + 2);
+                        vec![0i64; n0 * n0]
+                    };
+                    write_inter_block(
+                        enc,
+                        &fctx,
+                        &spec,
+                        &probs,
+                        &mut state,
+                        &mut nz,
+                        &mut token_cache,
+                        &mut src,
+                    )
+                };
+            write_partition_8x8(
+                &mut enc,
+                r,
+                c,
+                BLOCK_64X64,
+                mi_rows,
+                mi_cols,
+                &mut pctx,
+                PartitionProbsKind::Inter(&ctx.partition_probs),
+                &mut leaf,
+            )?;
+            c += 8;
+        }
+        r += 8;
+    }
+
+    let tile_bytes = enc.finish();
+
+    let mut out = Vec::with_capacity(uhdr_bytes.len() + chdr_bytes.len() + tile_bytes.len());
+    out.extend_from_slice(&uhdr_bytes);
+    out.extend_from_slice(&chdr_bytes);
+    out.extend_from_slice(&tile_bytes);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,5 +886,93 @@ mod tests {
                 assert_eq!(s, exp, "top-left luma ({i},{j})");
             }
         }
+    }
+
+    // ----- Inter-frame assembler -----
+
+    fn inter_header(width: u32, height: u32) -> Vp9FrameHeader {
+        inter_pframe_header(width, height)
+    }
+
+    /// An all-skip ZEROMV P-frame after a flat keyframe reconstructs to a
+    /// verbatim copy of the keyframe (zero motion + no residual = a copy
+    /// of the LAST reference), validated end-to-end through
+    /// `decode_vp9_sequence`.
+    #[test]
+    fn inter_all_skip_zeromv_copies_reference() {
+        use crate::decode_frame::decode_vp9_sequence;
+
+        let kf_hdr = keyframe_header(64, 64);
+        let plan = KeyframePlan::all_skip(8, 8, 0, 0); // DC_PRED -> flat 128.
+        let kf = assemble_keyframe(&kf_hdr, &plan, &mut *no_coeffs()).expect("keyframe");
+
+        let p_hdr = inter_header(64, 64);
+        let pf = assemble_inter_frame_all_skip_zeromv(&p_hdr).expect("p-frame");
+
+        let frames = decode_vp9_sequence(&[&kf, &pf]).expect("decode sequence");
+        assert_eq!(frames.len(), 2);
+        // Both frames are 64x64.
+        assert_eq!((frames[0].width, frames[0].height), (64, 64));
+        assert_eq!((frames[1].width, frames[1].height), (64, 64));
+        // The keyframe is flat 128; the P-frame copies it.
+        assert!(frames[0].y.iter().all(|&s| s == 128), "keyframe not flat");
+        assert_eq!(frames[1].y, frames[0].y, "p-frame luma != reference");
+        assert_eq!(frames[1].u, frames[0].u, "p-frame U != reference");
+        assert_eq!(frames[1].v, frames[0].v, "p-frame V != reference");
+    }
+
+    /// A two-superblock-wide P-frame (128x64) exercises the per-superblock
+    /// partition + neighbour-context threading across SB boundaries.
+    #[test]
+    fn inter_two_superblocks_copy_reference() {
+        use crate::decode_frame::decode_vp9_sequence;
+
+        let kf_hdr = keyframe_header(128, 64);
+        let plan = KeyframePlan::all_skip(8, 16, 0, 0);
+        let kf = assemble_keyframe(&kf_hdr, &plan, &mut *no_coeffs()).expect("keyframe");
+
+        let p_hdr = inter_header(128, 64);
+        let pf = assemble_inter_frame_all_skip_zeromv(&p_hdr).expect("p-frame");
+
+        let frames = decode_vp9_sequence(&[&kf, &pf]).expect("decode sequence");
+        assert_eq!((frames[1].width, frames[1].height), (128, 64));
+        assert_eq!(frames[1].y, frames[0].y, "p-frame luma != reference");
+    }
+
+    /// A non-multiple-of-64 P-frame (40x24) forces frame-edge partition
+    /// splits and still copies the reference.
+    #[test]
+    fn inter_partial_superblock_copies_reference() {
+        use crate::decode_frame::decode_vp9_sequence;
+
+        let kf_hdr = keyframe_header(40, 24);
+        let plan = KeyframePlan::all_skip(3, 5, 0, 0);
+        let kf = assemble_keyframe(&kf_hdr, &plan, &mut *no_coeffs()).expect("keyframe");
+
+        let p_hdr = inter_header(40, 24);
+        let pf = assemble_inter_frame_all_skip_zeromv(&p_hdr).expect("p-frame");
+
+        let frames = decode_vp9_sequence(&[&kf, &pf]).expect("decode sequence");
+        assert_eq!((frames[1].width, frames[1].height), (40, 24));
+        assert_eq!(frames[1].y, frames[0].y, "p-frame luma != reference");
+    }
+
+    /// The inter assembler is byte-deterministic.
+    #[test]
+    fn inter_assembly_is_deterministic() {
+        let h = inter_header(64, 64);
+        let a = assemble_inter_frame_all_skip_zeromv(&h).expect("a");
+        let b = assemble_inter_frame_all_skip_zeromv(&h).expect("b");
+        assert_eq!(a, b, "inter assembly not byte-stable");
+    }
+
+    /// A keyframe header is rejected by the inter assembler.
+    #[test]
+    fn inter_assembler_rejects_keyframe() {
+        let h = keyframe_header(64, 64);
+        assert_eq!(
+            assemble_inter_frame_all_skip_zeromv(&h).unwrap_err(),
+            Error::Unsupported
+        );
     }
 }

@@ -679,6 +679,43 @@ pub fn encode_vp9(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Err
     frame_writer::encode_keyframe_all_skip_dc(width, height)
 }
 
+/// Encode a minimal VP9 **inter (P-frame) sequence** of `width × height`:
+/// a keyframe followed by `num_pframes` all-skip, single-reference-`LAST`,
+/// `ZEROMV` P-frames.
+///
+/// Each P-frame copies its co-located samples from the `LAST` reference
+/// (zero motion, no residual), so the whole sequence reconstructs to the
+/// keyframe's flat-DC fill — a *structurally* complete decodable inter
+/// sequence rather than a pixel-accurate encode. Returns the per-frame
+/// coded byte buffers in decode order (the keyframe first), each a
+/// complete VP9 frame that [`decode_vp9_sequence`] threads through the
+/// §8.10 reference buffers.
+///
+/// This exercises the §6.2 inter uncompressed header, the §6.3 inter
+/// compressed header, and the §6.4.11 / §6.4.16 inter block writer
+/// end-to-end; the P-frame reconstruction is validated byte-exact against
+/// the keyframe through the in-crate decoder.
+///
+/// Returns [`Error::Unsupported`] for `width` / `height` outside
+/// `1..=65536`.
+pub fn encode_vp9_pframe_sequence(
+    width: u32,
+    height: u32,
+    num_pframes: usize,
+) -> Result<Vec<Vec<u8>>, Error> {
+    if width == 0 || height == 0 || width > (1 << 16) || height > (1 << 16) {
+        return Err(Error::Unsupported);
+    }
+    let keyframe = frame_writer::encode_keyframe_all_skip_dc(width, height)?;
+    let mut frames = Vec::with_capacity(1 + num_pframes);
+    frames.push(keyframe);
+    for _ in 0..num_pframes {
+        let hdr = frame_writer::inter_pframe_header(width, height);
+        frames.push(frame_writer::assemble_inter_frame_all_skip_zeromv(&hdr)?);
+    }
+    Ok(frames)
+}
+
 /// No-op codec registration — round 1 has nothing to register into the
 /// runtime context until the decode / encode paths land.
 pub fn register(_ctx: &mut RuntimeContext) {}
@@ -724,6 +761,43 @@ mod encode_roundtrip_tests {
     fn encode_rejects_short_input() {
         assert_eq!(
             encode_vp9(&[0u8; 10], 64, 64).unwrap_err(),
+            Error::Unsupported
+        );
+    }
+
+    /// `encode_vp9_pframe_sequence` produces a keyframe + P-frame stream
+    /// that `decode_vp9_sequence` reconstructs byte-exact: every P-frame
+    /// copies the keyframe's flat-DC reference.
+    #[test]
+    fn encode_pframe_sequence_decodes_byte_exact() {
+        let frames = encode_vp9_pframe_sequence(64, 64, 3).expect("encode seq");
+        assert_eq!(frames.len(), 4); // keyframe + 3 P-frames.
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        let decoded = decode_vp9_sequence(&refs).expect("decode seq");
+        assert_eq!(decoded.len(), 4);
+        let kf = &decoded[0];
+        assert!(kf.y.iter().all(|&s| s == 128), "keyframe not flat 128");
+        for (i, f) in decoded.iter().enumerate().skip(1) {
+            assert_eq!(f.y, kf.y, "p-frame {i} luma != reference");
+            assert_eq!(f.u, kf.u, "p-frame {i} U != reference");
+            assert_eq!(f.v, kf.v, "p-frame {i} V != reference");
+        }
+    }
+
+    /// A zero-pframe request yields just the keyframe.
+    #[test]
+    fn encode_pframe_sequence_zero_pframes_is_keyframe_only() {
+        let frames = encode_vp9_pframe_sequence(64, 64, 0).expect("encode seq");
+        assert_eq!(frames.len(), 1);
+        let decoded = decode_vp9_sequence(&[&frames[0]]).expect("decode");
+        assert_eq!((decoded[0].width, decoded[0].height), (64, 64));
+    }
+
+    /// Degenerate geometry is rejected.
+    #[test]
+    fn encode_pframe_sequence_rejects_zero_dim() {
+        assert_eq!(
+            encode_vp9_pframe_sequence(0, 64, 1).unwrap_err(),
             Error::Unsupported
         );
     }

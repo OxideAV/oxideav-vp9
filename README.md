@@ -119,7 +119,9 @@ map between frames.
 ### Encoder
 
 [`encode_vp9`] assembles a **complete, decoder-reconstructible VP9
-keyframe** end-to-end. The encode path composes the bitstream-writer
+keyframe**, and [`encode_vp9_pframe_sequence`] assembles a **complete,
+decoder-reconstructible inter (P-frame) sequence** (keyframe + N
+P-frames), both end-to-end. The encode path composes the bitstream-writer
 primitives — each derived as the exact inverse of the matching decode step
 and validated by round-tripping back through the in-crate decoder (no
 external encoder consulted):
@@ -129,9 +131,24 @@ external encoder consulted):
   decoder, with `0xff`-run carry propagation and §9.2.3 superframe-marker
   avoidance;
 * the §6.2 uncompressed-header **writer** (`header_writer`) — the key-frame
-  branch + `show_existing_frame` sentinel across all four profiles;
-* the §6.3 compressed-header **writer** (`compressed_writer`) — the intra,
-  default-probability path (no forward updates) for every `tx_mode`;
+  branch + `show_existing_frame` sentinel across all four profiles, **plus
+  the inter (non-intra-only, shown) branch** (`ref_frame_idx` /
+  `ref_frame_sign_bias` / explicit `frame_size` / `allow_high_precision_mv`
+  / §6.2.7 `interpolation_filter`);
+* the §6.3 compressed-header **writer** (`compressed_writer`) — the
+  default-probability path (no forward updates) for every `tx_mode`, **both
+  the intra prefix and the §6.3.9-§6.3.16 inter tail** (`inter_mode` /
+  `interp_filter` / `is_inter` / `frame_reference_mode` / reference-mode /
+  `y_mode` / `partition` / `mv` probability sweeps);
+* the §6.4.13 / §6.4.16 / §6.4.17 / §6.4.18-§6.4.20 **inter mode-info + MV
+  writers** (`inter_mode_writer` / `mv_writer`) — the inverse of
+  `read_is_inter` / `read_ref_frames` / the `inter_mode` + `interp_filter`
+  tokens and `assign_mv` / `read_mv` / `read_mv_component`, with the
+  §6.4.20 magnitude decomposition and §6.5.13 `use_mv_hp` gate;
+* the §6.4.11 / §6.4.16 **inter block writer** (`inter_block_writer`) — the
+  inverse of `decode_block_inter( )` for `MiSize >= BLOCK_8X8`, reusing the
+  **shared decode** §6.5 `find_mv_refs` / `find_best_ref_mvs` over the same
+  `Vp9FrameState` so the MV predictors and `ModeContext` are bit-identical;
 * the §6.4.24 coefficient-**token writer** (`token_writer`) — `more_coefs`
   / `token` tree / `read_coef` magnitude (incl. the CAT6 high-bit prefix at
   10/12-bit) / sign, plus the block-level `write_tokens` driver that walks
@@ -156,7 +173,15 @@ external encoder consulted):
 * the top-level **frame assembler** (`frame_writer`) — threads the
   uncompressed + compressed headers and the single-tile §6.4 partition /
   block walk into a complete frame, with `header_size_in_bytes` set to the
-  compressed-header length.
+  compressed-header length. The **inter assembler**
+  (`assemble_inter_frame_all_skip_zeromv`) emits an all-`BLOCK_8X8`,
+  all-skip, single-reference-`LAST`, `ZEROMV` P-frame; with zero motion and
+  no residual every block copies its co-located reference samples, so the
+  P-frame reconstructs to a verbatim copy of its `LAST` reference. This is
+  validated **byte-exact end-to-end through the full decoder**
+  (`decode_vp9_sequence`, including §8.5.2 motion compensation and the
+  §8.10 reference-buffer threading) across 64x64, 128x64 (two-superblock
+  partition / neighbour threading), and 40x24 (frame-edge splits).
 
 The residual writer's coefficients are validated to reconstruct to known
 samples through the *full* decode pipeline (§8.6.1 dequant + §8.7 inverse
@@ -237,22 +262,31 @@ rather than a pixel-accurate encode of the input (see "Not yet supported").
   per frame meanwhile, which is exact for the all-parallel-mode corpus.
 * §9.2.4 multi-coder tile parallelism (tiles decode sequentially).
 * Pixel-accurate encoding (forward transform + quantization + intra-mode
-  / partition search). `encode_vp9` now produces a **complete,
-  decoder-reconstructible keyframe** (see the "Encoder" section), but the
-  emitted frame is an all-`BLOCK_8X8`, all-skip, `DC_PRED` keyframe (a
-  flat DC reconstruction) rather than a rate-distortion-optimised encode
-  of the input samples. Choosing the residual coefficients / intra modes /
-  partition layout that reconstruct an arbitrary input frame is the next
-  encoder milestone; the residual *machinery* to carry such coefficients
+  / partition / motion search). `encode_vp9` /
+  [`encode_vp9_pframe_sequence`] now produce **complete,
+  decoder-reconstructible keyframes and inter (P-)frames** (see the
+  "Encoder" section), but the emitted keyframe is an all-`BLOCK_8X8`,
+  all-skip, `DC_PRED` flat-DC frame and the emitted P-frame is an
+  all-skip, `ZEROMV`, single-`LAST` frame that *copies* its reference —
+  neither is a rate-distortion-optimised encode of arbitrary input
+  samples. Choosing the residual coefficients / modes / partition layout /
+  motion vectors that reconstruct an arbitrary input frame is the next
+  encoder milestone; the residual + MV *machinery* to carry such a choice
   is already landed and validated end-to-end (a chosen DC coefficient
-  reconstructs to known samples through the full decode pipeline).
+  reconstructs to known samples through the full decode pipeline, and a
+  `NEWMV` difference round-trips through the shared decode MV-prediction
+  scan). The inter block writer covers `MiSize >= BLOCK_8X8` with
+  single / compound references; the sub-8x8 per-(idy, idx) MV walk and the
+  §6.4.12 temporal-predicted segment-id branch are later milestones.
 
 ## Testing
 
-The crate carries 860+ lib unit tests plus integration suites in
-`tests/` (including the encoder writers, each round-tripped back through
-the in-crate decoder, and `encode_keyframe` exercising the public
-`encode_vp9` → decode round-trip across a geometry sweep). Tests construct their inputs bit-by-bit; §9.2 golden buffers
+The crate carries 900+ lib unit tests plus integration suites in
+`tests/` (including the keyframe **and inter** encoder writers, each
+round-tripped back through the in-crate decoder, `encode_keyframe`
+exercising the public `encode_vp9` → decode round-trip across a geometry
+sweep, and the inter assembler's keyframe + P-frame sequence reconstructed
+byte-exact through `decode_vp9_sequence`). Tests construct their inputs bit-by-bit; §9.2 golden buffers
 are hand-derived by stepping the decoder, not borrowed from any
 third-party VP9 implementation. Several precision-critical primitives
 also carry *independent* oracles that share no code with the

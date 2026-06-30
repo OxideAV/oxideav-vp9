@@ -11,10 +11,13 @@
 //! back to an equivalent [`Vp9FrameHeader`].
 //!
 //! Scope: the **key-frame** branch (and the `show_existing_frame`
-//! sentinel), which is what the round-372 keyframe encoder bootstrap
-//! emits. The inter-frame branch (`ref_frame_idx` / `frame_size_with_refs`
-//! / `interpolation_filter`) is not yet written; an inter header passed
-//! here returns [`Error::Unsupported`].
+//! sentinel) plus the **inter** (non-intra-only, shown) branch —
+//! `reset_frame_context` / `refresh_frame_flags` / `ref_frame_idx` +
+//! `ref_frame_sign_bias`, the §6.2.5 explicit-`frame_size` path
+//! (`found_ref = 0` for all references), `allow_high_precision_mv`, and
+//! the §6.2.7 `interpolation_filter`. The intra-only inter branch
+//! (`show_frame == 0` ⇒ `intra_only` flag) is not yet written; such a
+//! header returns [`Error::Unsupported`].
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7
 //! (`docs/video/vp9/vp9-spec.txt`) §6.2; the field order mirrors the
@@ -147,6 +150,32 @@ fn write_frame_size(w: &mut BitWriter, width: u32, height: u32) -> Result<(), Er
     }
     w.write_bits(width - 1, 16);
     w.write_bits(height - 1, 16);
+    Ok(())
+}
+
+/// §6.2.7 `read_interpolation_filter( )` inverse. `is_filter_switchable
+/// f(1)` set ⇒ `SWITCHABLE`; otherwise `raw_interpolation_filter f(2)`
+/// where the §6.2.7 `literal_to_type[ ] = { SMOOTH, EIGHTTAP, SHARP,
+/// BILINEAR }` maps the raw value to the filter type — so the writer
+/// inverts that table to recover the 2-bit raw value.
+fn write_interpolation_filter(w: &mut BitWriter, interpolation_filter: u8) -> Result<(), Error> {
+    const SWITCHABLE: u8 = 4;
+    // type_to_literal: inverse of literal_to_type = {1, 0, 2, 3}.
+    // EIGHTTAP(0)->1, EIGHTTAP_SMOOTH(1)->0, EIGHTTAP_SHARP(2)->2,
+    // BILINEAR(3)->3.
+    if interpolation_filter == SWITCHABLE {
+        w.write_flag(true);
+        return Ok(());
+    }
+    w.write_flag(false);
+    let raw = match interpolation_filter {
+        0 => 1, // EIGHTTAP
+        1 => 0, // EIGHTTAP_SMOOTH
+        2 => 2, // EIGHTTAP_SHARP
+        3 => 3, // BILINEAR
+        _ => return Err(Error::Unsupported),
+    };
+    w.write_bits(raw, 2);
     Ok(())
 }
 
@@ -361,29 +390,73 @@ pub(crate) fn write_uncompressed_header(hdr: &Vp9FrameHeader) -> Result<Vec<u8>,
         return Ok(w.into_bytes());
     }
 
-    // The writer currently supports the key-frame branch only.
-    if hdr.frame_type != FrameType::KeyFrame || hdr.intra_only {
+    // Intra-only inter frames are not yet written.
+    if hdr.frame_type == FrameType::NonKeyFrame && hdr.intra_only {
         return Err(Error::Unsupported);
     }
 
-    // frame_type f(1) (0 = key), show_frame f(1), error_resilient_mode f(1).
-    w.write_bits(0, 1);
+    let frame_is_intra = hdr.frame_type == FrameType::KeyFrame;
+
+    // frame_type f(1) (0 = key / 1 = non-key), show_frame f(1),
+    // error_resilient_mode f(1).
+    w.write_bits(u32::from(!frame_is_intra), 1);
     w.write_flag(hdr.show_frame);
     w.write_flag(hdr.error_resilient_mode);
 
-    // Key-frame body: frame_sync_code, color_config, frame_size,
-    // render_size. (refresh_frame_flags = 0xFF, reset_frame_context = 0,
-    // FrameIsIntra = 1 are all implicit — not coded.)
-    write_frame_sync_code(&mut w);
-    write_color_config(&mut w, hdr.profile, &hdr.color_config)?;
-    write_frame_size(&mut w, hdr.frame_width, hdr.frame_height)?;
-    write_render_size(
-        &mut w,
-        hdr.frame_width,
-        hdr.frame_height,
-        hdr.render_width,
-        hdr.render_height,
-    )?;
+    if frame_is_intra {
+        // Key-frame body: frame_sync_code, color_config, frame_size,
+        // render_size. (refresh_frame_flags = 0xFF, reset_frame_context =
+        // 0, FrameIsIntra = 1 are all implicit — not coded.)
+        write_frame_sync_code(&mut w);
+        write_color_config(&mut w, hdr.profile, &hdr.color_config)?;
+        write_frame_size(&mut w, hdr.frame_width, hdr.frame_height)?;
+        write_render_size(
+            &mut w,
+            hdr.frame_width,
+            hdr.frame_height,
+            hdr.render_width,
+            hdr.render_height,
+        )?;
+    } else {
+        // §6.2 inter (non-intra-only) branch. show_frame == 0 would read
+        // an intra_only flag the writer doesn't support yet; require a
+        // shown inter frame so the flag is inferred 0.
+        if !hdr.show_frame {
+            return Err(Error::Unsupported);
+        }
+        // reset_frame_context f(2) — only present when not error-resilient.
+        if !hdr.error_resilient_mode {
+            w.write_bits(u32::from(hdr.reset_frame_context & 3), 2);
+        }
+        // refresh_frame_flags f(8).
+        w.write_bits(u32::from(hdr.refresh_frame_flags), 8);
+        // for i in 0..3 { ref_frame_idx[i] f(3); ref_frame_sign_bias f(1) }
+        let ref_idx = hdr.ref_frame_idx.ok_or(Error::Unsupported)?;
+        for (&idx, &bias) in ref_idx.iter().zip(hdr.ref_frame_sign_bias.iter()) {
+            if idx > 7 {
+                return Err(Error::Unsupported);
+            }
+            w.write_bits(u32::from(idx), 3);
+            w.write_flag(bias);
+        }
+        // §6.2.5 frame_size_with_refs( ): the writer always codes the
+        // explicit-size path (found_ref = 0 for all three references), so
+        // every found_ref flag is 0 followed by an explicit frame_size.
+        for _ in 0..3 {
+            w.write_flag(false);
+        }
+        write_frame_size(&mut w, hdr.frame_width, hdr.frame_height)?;
+        write_render_size(
+            &mut w,
+            hdr.frame_width,
+            hdr.frame_height,
+            hdr.render_width,
+            hdr.render_height,
+        )?;
+        // allow_high_precision_mv f(1); read_interpolation_filter().
+        w.write_flag(hdr.allow_high_precision_mv);
+        write_interpolation_filter(&mut w, hdr.interpolation_filter)?;
+    }
 
     // §6.2 tail. For a key frame error_resilient_mode gates
     // refresh_frame_context + frame_parallel_decoding_mode, and
@@ -658,10 +731,91 @@ mod tests {
         assert_eq!(parsed.frame_to_show_map_idx, Some(5));
     }
 
-    #[test]
-    fn inter_frame_is_unsupported() {
+    fn minimal_inter_header() -> Vp9FrameHeader {
         let mut h = minimal_keyframe_header();
         h.frame_type = FrameType::NonKeyFrame;
+        h.refresh_frame_flags = 0x01;
+        h.ref_frame_idx = Some([0, 1, 2]);
+        h.ref_frame_sign_bias = [false, false, true];
+        h.allow_high_precision_mv = false;
+        h.interpolation_filter = 0; // EIGHTTAP
+        h
+    }
+
+    /// Round-trip an inter header through the `_with_refs` parser. The
+    /// writer codes the explicit-frame-size path, so `ref_dims` is unused,
+    /// but the parser still requires a `ref_state` to be present.
+    fn assert_inter_roundtrips(h: &Vp9FrameHeader) {
+        use crate::header::{parse_uncompressed_header_with_refs, RefFrameState};
+        let bytes = write_uncompressed_header(h).expect("write inter");
+        let dims = [(h.frame_width, h.frame_height); 8];
+        let state = RefFrameState {
+            ref_dims: &dims,
+            color_config: h.color_config,
+        };
+        let parsed = parse_uncompressed_header_with_refs(&bytes, Some(state)).expect("parse inter");
+        assert_eq!(parsed.frame_type, FrameType::NonKeyFrame);
+        assert_eq!(parsed.frame_width, h.frame_width);
+        assert_eq!(parsed.frame_height, h.frame_height);
+        assert_eq!(parsed.refresh_frame_flags, h.refresh_frame_flags);
+        assert_eq!(parsed.ref_frame_idx, h.ref_frame_idx);
+        assert_eq!(parsed.ref_frame_sign_bias, h.ref_frame_sign_bias);
+        assert_eq!(parsed.allow_high_precision_mv, h.allow_high_precision_mv);
+        assert_eq!(parsed.interpolation_filter, h.interpolation_filter);
+        assert_eq!(parsed.reset_frame_context, h.reset_frame_context);
+        assert_eq!(parsed.frame_context_idx, h.frame_context_idx);
+    }
+
+    #[test]
+    fn inter_frame_minimal_roundtrips() {
+        assert_inter_roundtrips(&minimal_inter_header());
+    }
+
+    #[test]
+    fn inter_frame_high_precision_mv_roundtrips() {
+        let mut h = minimal_inter_header();
+        h.allow_high_precision_mv = true;
+        assert_inter_roundtrips(&h);
+    }
+
+    #[test]
+    fn inter_frame_switchable_filter_roundtrips() {
+        let mut h = minimal_inter_header();
+        h.interpolation_filter = 4; // SWITCHABLE
+        assert_inter_roundtrips(&h);
+    }
+
+    #[test]
+    fn inter_frame_all_filters_roundtrip() {
+        for filt in [0u8, 1, 2, 3, 4] {
+            let mut h = minimal_inter_header();
+            h.interpolation_filter = filt;
+            assert_inter_roundtrips(&h);
+        }
+    }
+
+    #[test]
+    fn inter_frame_reset_context_roundtrips() {
+        let mut h = minimal_inter_header();
+        h.reset_frame_context = 2;
+        h.frame_context_idx = 1;
+        assert_inter_roundtrips(&h);
+    }
+
+    #[test]
+    fn inter_frame_error_resilient_roundtrips() {
+        let mut h = minimal_inter_header();
+        h.error_resilient_mode = true;
+        // error_resilient forces frame_context_idx to 0 in the parser.
+        h.frame_context_idx = 0;
+        assert_inter_roundtrips(&h);
+    }
+
+    #[test]
+    fn inter_intra_only_is_unsupported() {
+        let mut h = minimal_inter_header();
+        h.intra_only = true;
+        h.show_frame = false;
         assert_eq!(
             write_uncompressed_header(&h).unwrap_err(),
             Error::Unsupported

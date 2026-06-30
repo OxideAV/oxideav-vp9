@@ -525,6 +525,7 @@ mod mode_info;
 mod mode_writer;
 mod mv;
 mod mv_ref;
+mod mv_writer;
 mod narrow_filter;
 mod partition;
 mod partition_writer;

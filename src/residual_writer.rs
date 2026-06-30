@@ -228,6 +228,129 @@ pub(crate) fn write_residual_intra(
     Ok(eob_total)
 }
 
+/// Write the §6.4.21 residual syntax for one **inter** MI block — the
+/// inter arm of `BlockDecoder::residual( )`.
+///
+/// Identical grid walk to [`write_residual_intra`], but the §6.4.25
+/// `TxType` is unconditionally `DCT_DCT` for an inter block (the decoder's
+/// `tx_type = if is_inter || plane > 0 || tx_sz == 3 || lossless`
+/// short-circuit), the per-block `TokenBlockCtx::is_inter` is `true`, and
+/// there is no intra-mode lookup. The §8.5.2 motion-compensated
+/// prediction the decoder runs before its token loop produces no
+/// bitstream syntax, so the writer omits it entirely — only the
+/// coefficient tokens + the §6.4.21 non-zero write-back are coded.
+///
+/// `mi_size`, `tx_size`, and `skip` come from the just-written mode info;
+/// `coords` is `(MiRow, MiCol)`. `coef_src` supplies the quantized
+/// coefficients per coded block (only called for non-skip blocks at
+/// on-visible grid positions). Returns the §6.4.24 `EobTotal`.
+#[allow(clippy::too_many_arguments)]
+// The §6.4.21 loop is keyed by `plane` and indexes the three `nz` strips
+// by that same index, mirroring the spec listing directly.
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn write_residual_inter(
+    enc: &mut BoolEncoder,
+    ctx: &ResidualWriteCtx,
+    coords: (u32, u32),
+    mi_size: u8,
+    tx_size: u32,
+    skip: bool,
+    coef_probs: &crate::coef_probs::CoefProbs,
+    nz: &mut [NonzeroContext; 3],
+    token_cache: &mut [u8],
+    coef_src: &mut CoefSource<'_>,
+) -> Result<u32, Error> {
+    let (r, c) = coords;
+    let bsize = mi_size.max(BLOCK_8X8);
+    let mut eob_total = 0u32;
+
+    for plane in 0..3usize {
+        let tx_sz = if plane == 0 {
+            tx_size
+        } else {
+            get_uv_tx_size(tx_size, mi_size, ctx.subsampling_x, ctx.subsampling_y)
+        };
+        let step = 1u32 << tx_sz;
+
+        let plane_sz = get_plane_block_size(bsize, plane, ctx.subsampling_x, ctx.subsampling_y);
+        if plane_sz == BLOCK_INVALID {
+            return Err(Error::InvalidBitstream);
+        }
+        let num4x4w = NUM_4X4_BLOCKS_WIDE_LOOKUP[plane_sz as usize];
+        let num4x4h = NUM_4X4_BLOCKS_HIGH_LOOKUP[plane_sz as usize];
+
+        let sub_x = plane > 0 && ctx.subsampling_x;
+        let sub_y = plane > 0 && ctx.subsampling_y;
+        let base_x = (c * 8) >> u32::from(sub_x);
+        let base_y = (r * 8) >> u32::from(sub_y);
+        let maxx = (ctx.mi_cols * 8) >> u32::from(sub_x);
+        let maxy = (ctx.mi_rows * 8) >> u32::from(sub_y);
+
+        let mut block_idx = 0usize;
+        let mut y = 0u32;
+        while y < num4x4h {
+            let mut x = 0u32;
+            while x < num4x4w {
+                let start_x = base_x + 4 * x;
+                let start_y = base_y + 4 * y;
+                let mut nonzero = false;
+
+                if start_x < maxx && start_y < maxy && !skip {
+                    // §6.4.25: inter blocks use DCT_DCT for every tx size.
+                    let tx_type = DCT_DCT;
+                    let scan = get_scan(plane, tx_sz, tx_type);
+                    let n0 = 1usize << (tx_sz + 2);
+                    let seg_eob = n0 * n0;
+
+                    let tbc = TokenBlockCtx {
+                        plane,
+                        is_inter: true,
+                        tx_type,
+                        bit_depth: ctx.bit_depth,
+                        x4: (start_x >> 2) as usize,
+                        y4: (start_y >> 2) as usize,
+                        max_x: ((2 * ctx.mi_cols) >> u32::from(sub_x)) as usize,
+                        max_y: ((2 * ctx.mi_rows) >> u32::from(sub_y)) as usize,
+                    };
+
+                    let coeffs = coef_src(plane, tx_sz, start_x, start_y, block_idx);
+                    debug_assert_eq!(coeffs.len(), seg_eob, "coef source length must be segEob");
+
+                    token_cache[..seg_eob].fill(0);
+                    nonzero = crate::token_writer::write_tokens(
+                        enc,
+                        &tbc,
+                        tx_sz,
+                        scan,
+                        coef_probs,
+                        &nz[plane],
+                        &coeffs,
+                        &mut token_cache[..seg_eob],
+                    )?;
+                    eob_total += u32::from(nonzero);
+                }
+
+                let x4 = (start_x >> 2) as usize;
+                let y4 = (start_y >> 2) as usize;
+                for i in 0..step as usize {
+                    if x4 + i < nz[plane].above.len() {
+                        nz[plane].above[x4 + i] = u8::from(nonzero);
+                    }
+                    if y4 + i < nz[plane].left.len() {
+                        nz[plane].left[y4 + i] = u8::from(nonzero);
+                    }
+                }
+
+                block_idx += 1;
+                x += step;
+            }
+            y += step;
+        }
+    }
+
+    Ok(eob_total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -101,30 +101,83 @@ pub(crate) fn forward_wht_2d(block: &mut [i64]) {
 /// reconstruction loop absorbs by replaying the decoder's own integer
 /// inverse.
 pub(crate) fn forward_dct_2d(block: &mut [i64], n: u32) {
+    forward_transform_2d(block, n, crate::idct::DCT_DCT);
+}
+
+/// 1D forward DCT-II with the §8.7-matching per-pass scaling:
+/// `X[k] = (k==0 ? 1/√2 : 1) · (2/N) · Σ_i x[i] cos((2i+1)kπ / 2N)`.
+fn fwd_dct_1d(src: &[f64], dst: &mut [f64]) {
+    let nf = src.len() as f64;
+    for (k, slot) in dst.iter_mut().enumerate() {
+        let scale = if k == 0 {
+            std::f64::consts::FRAC_1_SQRT_2
+        } else {
+            1.0
+        };
+        let sum: f64 = src
+            .iter()
+            .enumerate()
+            .map(|(i, &x)| {
+                x * ((2 * i + 1) as f64 * k as f64 * std::f64::consts::PI / (2.0 * nf)).cos()
+            })
+            .sum();
+        *slot = scale * (2.0 / nf) * sum;
+    }
+}
+
+/// 1D forward counterpart of the §8.7.1.6 inverse ADST4.
+///
+/// The integer inverse realises the inverse-DST-VII basis
+/// `x[n] = A · Σ_k X[k] · sin( (n+1)(2k+1)π / 9 )` with amplitude
+/// `A = 2√2 / 3` (each §8.7.1.6 `SINPI_i_9` constant equals
+/// `round( 16384 · A · sin( iπ/9 ) )`; the in-crate §8.7 oracle test
+/// recovers the same amplitude empirically from the impulse response).
+/// The DST-VII basis rows are orthogonal with squared norm
+/// `(2N+1)/4 = 9/4`, so the forward map is
+/// `X[k] = (4 / (9A)) · Σ_n x[n] · sin( (n+1)(2k+1)π / 9 )`.
+fn fwd_adst4_1d(src: &[f64], dst: &mut [f64]) {
+    debug_assert_eq!(src.len(), 4, "the ADST4 forward is 4-point only");
+    let amp = 2.0 * std::f64::consts::SQRT_2 / 3.0;
+    for (k, slot) in dst.iter_mut().enumerate() {
+        let sum: f64 = src
+            .iter()
+            .enumerate()
+            .map(|(n, &x)| {
+                x * ((n + 1) as f64 * (2 * k + 1) as f64 * std::f64::consts::PI / 9.0).sin()
+            })
+            .sum();
+        *slot = 4.0 / (9.0 * amp) * sum;
+    }
+}
+
+/// Forward 2D transform of an `n0 × n0` residual block for the §6.4.25
+/// `TxType`, scaled to the coefficient domain the §8.7 integer inverse
+/// consumes — the generalisation of [`forward_dct_2d`] over the four
+/// row/column basis combinations.
+///
+/// Mirrors the §8.7.2 pass selection exactly: the decoder inverts rows
+/// with DCT for `DCT_DCT` / `ADST_DCT` (ADST otherwise) and columns with
+/// DCT for `DCT_DCT` / `DCT_ADST`, so the forward applies the matching
+/// forward basis per pass. The ADST forward is 4-point only (this
+/// encoder codes `TX_4X4`); callers must pass `DCT_DCT` for other sizes.
+pub(crate) fn forward_transform_2d(block: &mut [i64], n: u32, tx_type: u8) {
     let n0 = 1usize << n;
     debug_assert_eq!(block.len(), n0 * n0, "block must be n0*n0");
-    let nf = n0 as f64;
+    let row_dct = tx_type == crate::idct::DCT_DCT || tx_type == crate::idct::ADST_DCT;
+    let col_dct = tx_type == crate::idct::DCT_DCT || tx_type == crate::idct::DCT_ADST;
+    debug_assert!(
+        (row_dct && col_dct) || n == 2,
+        "the ADST forward is only wired for 4x4 blocks"
+    );
 
     let mut work: Vec<f64> = block.iter().map(|&v| v as f64).collect();
     let mut t = vec![0.0f64; n0];
 
-    // 1D forward DCT-II with the §8.7-matching per-pass scaling:
-    // X[k] = (k==0 ? 1/sqrt(2) : 1) * (2/N) * sum_i x[i] cos((2i+1)k pi / 2N).
-    let fwd_1d = |src: &[f64], dst: &mut [f64]| {
-        for (k, slot) in dst.iter_mut().enumerate() {
-            let scale = if k == 0 {
-                std::f64::consts::FRAC_1_SQRT_2
-            } else {
-                1.0
-            };
-            let sum: f64 = src
-                .iter()
-                .enumerate()
-                .map(|(i, &x)| {
-                    x * ((2 * i + 1) as f64 * k as f64 * std::f64::consts::PI / (2.0 * nf)).cos()
-                })
-                .sum();
-            *slot = scale * (2.0 / nf) * sum;
+    let fwd_1d = |src: &[f64], dst: &mut [f64], use_dct: bool| {
+        if use_dct {
+            fwd_dct_1d(src, dst);
+        } else {
+            fwd_adst4_1d(src, dst);
         }
     };
 
@@ -132,7 +185,7 @@ pub(crate) fn forward_dct_2d(block: &mut [i64], n: u32) {
     let mut row_out = vec![0.0f64; n0];
     for r in 0..n0 {
         t.copy_from_slice(&work[r * n0..(r + 1) * n0]);
-        fwd_1d(&t, &mut row_out);
+        fwd_1d(&t, &mut row_out, row_dct);
         work[r * n0..(r + 1) * n0].copy_from_slice(&row_out);
     }
     // Columns.
@@ -142,7 +195,7 @@ pub(crate) fn forward_dct_2d(block: &mut [i64], n: u32) {
         for r in 0..n0 {
             col_in[r] = work[r * n0 + c];
         }
-        fwd_1d(&col_in, &mut col_out);
+        fwd_1d(&col_in, &mut col_out, col_dct);
         for r in 0..n0 {
             work[r * n0 + c] = col_out[r];
         }
@@ -295,6 +348,37 @@ mod tests {
                     assert!(
                         err <= tol,
                         "n={n} i={i}: residual={r} decoded={d} err={err} > {tol}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The generalised forward transform inverts the decoder's integer
+    /// inverse for **all four** §6.4.25 `TxType`s at 4x4 — including the
+    /// ADST rows/columns the directional intra modes select.
+    #[test]
+    fn forward_transform_all_tx_types_roundtrip_within_tolerance() {
+        use crate::idct::{ADST_ADST, ADST_DCT, DCT_ADST};
+        let mut state: u64 = 0x8E21_66C3_D905_4A7F;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as i64
+        };
+        for &tt in &[DCT_DCT, ADST_DCT, DCT_ADST, ADST_ADST] {
+            for _ in 0..200 {
+                let residual: Vec<i64> = (0..16).map(|_| (next() % 511) - 255).collect();
+                let mut coefs = residual.clone();
+                forward_transform_2d(&mut coefs, 2, tt);
+                let mut dequant = coefs.clone();
+                inverse_transform_2d(&mut dequant, 2, tt, false);
+                for (i, (&r, &d)) in residual.iter().zip(dequant.iter()).enumerate() {
+                    let err = (r - d).abs();
+                    assert!(
+                        err <= 4,
+                        "tt={tt} i={i}: residual={r} decoded={d} err={err}"
                     );
                 }
             }

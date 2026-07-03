@@ -1533,7 +1533,13 @@ pub(crate) fn encode_pframe_lossless_motion(
         },
     );
 
-    crate::frame_writer::assemble_inter_frame_planned(hdr, false, &mut *planner, &mut *coeffs)
+    crate::frame_writer::assemble_inter_frame_planned(
+        hdr,
+        crate::compressed::TxMode::Only4x4,
+        false,
+        &mut *planner,
+        &mut *coeffs,
+    )
 }
 
 /// Integer motion-search window (±luma pixels) for the P-frame
@@ -1546,6 +1552,11 @@ pub(crate) const PFRAME_SEARCH_RANGE: i32 = 8;
 /// forward-DCT residual, and the decoder's §8.6.2 reconstruction replayed
 /// in place — so the returned [`ReconState`] equals the decoder's output
 /// bit-for-bit and its visible crop is the next frame's reference.
+///
+/// The frame codes `tx_mode = Allow8x8`: every `BLOCK_8X8` block's luma
+/// residual is one §6.4.10-**inferred** `TX_8X8` DCT (no per-block tx
+/// bits; chroma stays at its §6.4.22 subsampled size), replacing the
+/// four 4x4 blocks per MI the `Only4x4` layout coded.
 ///
 /// Requires an error-resilient non-key lossy header (see
 /// [`crate::frame_writer::assemble_inter_frame_planned`]).
@@ -1645,27 +1656,41 @@ pub(crate) fn encode_pframe_lossy_motion(
             choice
         });
 
+    // §6.4.10 inferred tx under Allow8x8 at BLOCK_8X8: TX_8X8 luma; the
+    // chroma size follows §6.4.22.
+    let tx_mode = crate::compressed::TxMode::Allow8x8;
+    let luma_tx = crate::mode_writer::inferred_tx_size(
+        crate::residual::MAX_TXSIZE_LOOKUP[BLOCK_8X8 as usize],
+        tx_mode,
+    );
+
     let mut coeffs: Box<FrameCoefSource<'_>> = Box::new(
         |_mi_r: u32, _mi_c: u32, plane: usize, sx: u32, sy: u32, _b: usize| -> Vec<i64> {
             let mut work = work.borrow_mut();
-            let mut block = vec![0i64; 16];
-            for i in 0..4usize {
-                for j in 0..4usize {
+            let tx_sz = if plane == 0 {
+                luma_tx
+            } else {
+                crate::residual::get_uv_tx_size(luma_tx, BLOCK_8X8, ssx, ssy)
+            };
+            let n0 = 4usize << tx_sz;
+            let mut block = vec![0i64; n0 * n0];
+            for i in 0..n0 {
+                for j in 0..n0 {
                     let t = targets[plane].get(sx as usize + j, sy as usize + i);
                     let p = work.planes[plane].get(sx as usize + j, sy as usize + i);
-                    block[i * 4 + j] = i64::from(t) - i64::from(p);
+                    block[i * n0 + j] = i64::from(t) - i64::from(p);
                 }
             }
             let dc_q = get_dc_quant(plane, &seg, &quant, 0, bd8);
             let ac_q = get_ac_quant(plane, &seg, &quant, 0, bd8);
             // §6.4.25: inter blocks transform with DCT_DCT at every size.
-            crate::fwd_transform::forward_dct_2d(&mut block, 2);
-            crate::fwd_transform::quantize_block(&mut block, dc_q, ac_q);
+            crate::fwd_transform::forward_dct_2d(&mut block, tx_sz + 2);
+            crate::fwd_transform::quantize_block_tx(&mut block, dc_q, ac_q, tx_sz, bit_depth);
             reconstruct_block(
                 &mut work.planes[plane],
                 sx as usize,
                 sy as usize,
-                0,
+                tx_sz,
                 &block,
                 dc_q,
                 ac_q,
@@ -1677,8 +1702,13 @@ pub(crate) fn encode_pframe_lossy_motion(
         },
     );
 
-    let bytes =
-        crate::frame_writer::assemble_inter_frame_planned(hdr, false, &mut *planner, &mut *coeffs)?;
+    let bytes = crate::frame_writer::assemble_inter_frame_planned(
+        hdr,
+        tx_mode,
+        false,
+        &mut *planner,
+        &mut *coeffs,
+    )?;
     drop(planner);
     drop(coeffs);
     Ok((bytes, work.into_inner()))

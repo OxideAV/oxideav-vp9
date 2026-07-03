@@ -696,7 +696,7 @@ pub(crate) fn assemble_inter_frame_zeromv(
 ) -> Result<Vec<u8>, Error> {
     let mut planner: Box<InterBlockPlanner<'_>> =
         Box::new(|_r, _c, _state| (crate::mode_info::ZEROMV, [0, 0]));
-    assemble_inter_frame_planned(hdr, skip_all, &mut *planner, coeffs)
+    assemble_inter_frame_planned(hdr, TxMode::Only4x4, skip_all, &mut *planner, coeffs)
 }
 
 /// Per-block inter mode planner: called once per `BLOCK_8X8` leaf (in
@@ -727,8 +727,17 @@ pub(crate) type InterBlockPlanner<'f> = dyn FnMut(u32, u32, &Vp9FrameState) -> (
 /// returns a non-`ZEROMV` block (where the §6.5 candidate scan reaches
 /// the coded syntax through `BestMv`) requires an error-resilient header,
 /// and a `NEWMV` plan on a non-error-resilient header is rejected.
+///
+/// `tx_mode` selects the frame's §6.3.1 transform mode; every block
+/// codes the §6.4.10 **inferred** size
+/// `Min( maxTxSize, tx_mode_to_biggest_tx_size )` (`TX_8X8` at the
+/// all-`BLOCK_8X8` layout under `Allow8x8` and larger — no per-block tx
+/// bits), so `TxModeSelect` is rejected. A lossless header forces
+/// `Only4x4` (the §6.3.1 lossless gate never codes `tx_mode`, and the
+/// WHT path is 4x4-only).
 pub(crate) fn assemble_inter_frame_planned(
     hdr: &Vp9FrameHeader,
+    tx_mode: TxMode,
     skip_all: bool,
     planner: &mut InterBlockPlanner<'_>,
     coeffs: &mut FrameCoefSource<'_>,
@@ -750,9 +759,15 @@ pub(crate) fn assemble_inter_frame_planned(
         return Err(Error::Unsupported);
     }
 
+    if matches!(tx_mode, TxMode::TxModeSelect) {
+        return Err(Error::Unsupported); // per-block tx sizes: later step.
+    }
+    if hdr.quantization.lossless && !matches!(tx_mode, TxMode::Only4x4) {
+        return Err(Error::Unsupported);
+    }
+
     let mi_cols = (hdr.frame_width + 7) >> 3;
     let mi_rows = (hdr.frame_height + 7) >> 3;
-    let tx_mode = TxMode::Only4x4;
     let reference_mode = ReferenceMode::SingleReference;
     let switchable = hdr.interpolation_filter == 4;
     // sign_bias indexed by §3 ref value: [INTRA, LAST, GOLDEN, ALTREF].
@@ -862,7 +877,9 @@ pub(crate) fn assemble_inter_frame_planned(
                         mi_size: BLOCK_8X8,
                         segment_id: 0,
                         skip: skip_all,
-                        tx_size: 0,
+                        // §6.4.10 inferred size (tx_mode is never SELECT
+                        // here, so no tx bits are coded).
+                        tx_size: inferred_tx_size(MAX_TXSIZE_LOOKUP[BLOCK_8X8 as usize], tx_mode),
                         ref_frame: [LAST_FRAME, NONE_REF_FRAME],
                         y_mode,
                         interp_filter: if switchable {
@@ -1616,6 +1633,62 @@ mod tests {
         let h = keyframe_header(64, 64);
         assert_eq!(
             assemble_inter_frame_all_skip_zeromv(&h).unwrap_err(),
+            Error::Unsupported
+        );
+    }
+
+    /// An `Allow8x8` P-frame codes every block at the §6.4.10 inferred
+    /// `TX_8X8` (no per-block tx bits) and decodes end-to-end; the
+    /// `TxModeSelect` and lossless-with-larger-tx gates are pinned.
+    #[test]
+    fn inter_tx_mode_gates_and_allow8x8_decode() {
+        use crate::decode_frame::decode_vp9_sequence;
+        use crate::mode_info::ZEROMV;
+
+        let kf_hdr = keyframe_header(64, 64);
+        let plan = KeyframePlan::all_skip(8, 8, 0, 0);
+        let kf = assemble_keyframe(&kf_hdr, &plan, &mut *no_coeffs()).expect("keyframe");
+
+        // A DC-only residual on every luma TX_8X8 block (the src closure
+        // receives the 8x8 segEob via resize).
+        let p_hdr = inter_header(64, 64);
+        let mut planner: Box<InterBlockPlanner> = Box::new(|_r, _c, _s| (ZEROMV, [0, 0]));
+        let mut coeffs: Box<FrameCoefSource> =
+            Box::new(
+                |_r, _c, p, _sx, _sy, _b| {
+                    if p == 0 {
+                        vec![2i64]
+                    } else {
+                        Vec::new()
+                    }
+                },
+            );
+        let pf = assemble_inter_frame_planned(
+            &p_hdr,
+            TxMode::Allow8x8,
+            false,
+            &mut *planner,
+            &mut *coeffs,
+        )
+        .expect("allow8x8 p-frame");
+        let frames = decode_vp9_sequence(&[&kf, &pf]).expect("decode");
+        // The DC residual shifts the luma off the flat-128 reference.
+        assert!(frames[1].y.iter().all(|&s| s != 128));
+
+        // Gates.
+        let mut p2: Box<InterBlockPlanner> = Box::new(|_r, _c, _s| (ZEROMV, [0, 0]));
+        let mut c2: Box<FrameCoefSource> = Box::new(|_r, _c, _p, _sx, _sy, _b| Vec::new());
+        assert_eq!(
+            assemble_inter_frame_planned(&p_hdr, TxMode::TxModeSelect, true, &mut *p2, &mut *c2)
+                .unwrap_err(),
+            Error::Unsupported
+        );
+        let mut lossless_hdr = p_hdr;
+        lossless_hdr.quantization.base_q_idx = 0;
+        lossless_hdr.quantization.lossless = true;
+        assert_eq!(
+            assemble_inter_frame_planned(&lossless_hdr, TxMode::Allow8x8, true, &mut *p2, &mut *c2)
+                .unwrap_err(),
             Error::Unsupported
         );
     }

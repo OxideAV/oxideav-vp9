@@ -532,6 +532,7 @@ mod mv_writer;
 mod narrow_filter;
 mod partition;
 mod partition_writer;
+mod pixel_encoder;
 mod prob_adapt;
 mod reconstruct;
 mod ref_buffer;
@@ -650,34 +651,23 @@ pub fn decode_vp9(bytes: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(decode_intra_frame(bytes)?.to_planar_bytes())
 }
 
-/// Encode a single VP9 keyframe of size `width × height`.
+/// Encode a single VP9 keyframe of size `width × height` — **lossless**:
+/// the returned frame decodes byte-exact back to `pixels`.
 ///
-/// This is the encoder-bootstrap entry: it assembles a complete,
-/// decoder-reconstructible 8-bit 4:2:0 keyframe through the §6.2 / §6.3 /
-/// §6.4 bitstream writers — an all-`BLOCK_8X8`, all-skip, `DC_PRED`
-/// keyframe with the loop filter disabled. The result round-trips through
-/// [`decode_intra_frame`] / [`decode_vp9`].
-///
-/// The reconstruction is a flat DC fill (no residual is coded), so the
-/// output is a *structurally* complete frame rather than a pixel-accurate
-/// encode of `pixels`. The forward-transform residual path (choosing
-/// coefficients that reconstruct the input samples) and intra-mode /
-/// partition search are later milestones; `pixels` is currently used only
-/// for its length validation.
+/// `pixels` is an 8-bit 4:2:0 planar frame (`Y` then `U` then `V`, each
+/// chroma plane `ceil(w/2) × ceil(h/2)` — the [`decode_vp9`] output
+/// layout). The encoder codes a lossless (`base_q_idx == 0`) keyframe:
+/// per transform block it predicts with the decoder's own §8.5.1 intra
+/// process over the shared reconstruction state, forward-WHT-transforms
+/// the residual (the exact inverse of the §8.7.2 lossless inverse
+/// transform), and replays the decoder's §8.6.2 reconstruction — so
+/// `decode_vp9( encode_vp9( pixels ) ) == pixels` holds bit-for-bit.
 ///
 /// Returns [`Error::Unsupported`] for `width` / `height` outside
 /// `1..=65536`, or when `pixels` is too short for a `width × height`
 /// 4:2:0 frame.
 pub fn encode_vp9(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Error> {
-    // A planar 8-bit 4:2:0 frame needs Y (w*h) + U + V
-    // (each ceil(w/2)*ceil(h/2)).
-    let cw = width.div_ceil(2) as usize;
-    let ch = height.div_ceil(2) as usize;
-    let need = (width as usize) * (height as usize) + 2 * cw * ch;
-    if pixels.len() < need {
-        return Err(Error::Unsupported);
-    }
-    frame_writer::encode_keyframe_all_skip_dc(width, height)
+    pixel_encoder::encode_keyframe_lossless_420(pixels, width, height)
 }
 
 /// Encode a minimal VP9 **inter (P-frame) sequence** of `width × height`:
@@ -727,34 +717,38 @@ oxideav_core::register!("vp9", register);
 mod encode_roundtrip_tests {
     use super::*;
 
-    /// `encode_vp9` produces a stream that `decode_vp9` accepts and that
-    /// reports the requested geometry.
+    /// `encode_vp9` produces a stream that `decode_vp9` reconstructs
+    /// **byte-exact** back to the input (lossless contract).
     #[test]
     fn encode_then_decode_64x64() {
         let w = 64u32;
         let h = 64u32;
         let cw = w.div_ceil(2) as usize;
         let ch = h.div_ceil(2) as usize;
-        let pixels = vec![128u8; (w * h) as usize + 2 * cw * ch];
+        let pixels: Vec<u8> = (0..(w * h) as usize + 2 * cw * ch)
+            .map(|i| ((i * 37 + 11) % 256) as u8)
+            .collect();
         let stream = encode_vp9(&pixels, w, h).expect("encode");
         let frame = decode_intra_frame(&stream).expect("decode");
         assert_eq!(frame.width, w);
         assert_eq!(frame.height, h);
-        // Planar byte output is the full 4:2:0 size.
         let bytes = decode_vp9(&stream).expect("decode_vp9");
-        assert_eq!(bytes.len(), (w * h) as usize + 2 * cw * ch);
+        assert_eq!(bytes, pixels, "lossless round-trip not byte-exact");
     }
 
-    /// A non-square, non-multiple-of-8 frame still encodes + decodes.
+    /// A non-square, non-multiple-of-8 frame round-trips byte-exact.
     #[test]
     fn encode_then_decode_40x24() {
         let (w, h) = (40u32, 24u32);
         let cw = w.div_ceil(2) as usize;
         let ch = h.div_ceil(2) as usize;
-        let pixels = vec![16u8; (w * h) as usize + 2 * cw * ch];
+        let pixels: Vec<u8> = (0..(w * h) as usize + 2 * cw * ch)
+            .map(|i| ((i * 89 + 3) % 256) as u8)
+            .collect();
         let stream = encode_vp9(&pixels, w, h).expect("encode");
         let frame = decode_intra_frame(&stream).expect("decode");
         assert_eq!((frame.width, frame.height), (w, h));
+        assert_eq!(decode_vp9(&stream).expect("planar"), pixels);
     }
 
     /// Too-short input is rejected.

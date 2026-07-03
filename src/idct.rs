@@ -439,7 +439,12 @@ fn inverse_adst16(t: &mut [i64]) {
 
 /// §8.7.1.9 inverse ADST process over `t` of length `1<<n` for
 /// `2 <= n <= 4`, dispatching to ADST4 / ADST8 / ADST16.
-fn inverse_adst(t: &mut [i64], n: u32) {
+///
+/// `pub(crate)` so the encoder's forward-transform derivation
+/// ([`crate::fwd_transform`]) can measure this 1D inverse's response
+/// matrix and invert it numerically — the forward ADST8 / ADST16 bases
+/// are defined *as* the inverse of this §8.7.1.7 / §8.7.1.8 network.
+pub(crate) fn inverse_adst(t: &mut [i64], n: u32) {
     match n {
         2 => inverse_adst4(t),
         3 => inverse_adst8(t),

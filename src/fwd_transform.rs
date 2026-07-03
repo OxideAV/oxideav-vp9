@@ -150,6 +150,115 @@ fn fwd_adst4_1d(src: &[f64], dst: &mut [f64]) {
     }
 }
 
+/// The measured inverse-response matrix of the §8.7.1.9 1D integer
+/// inverse ADST at size `n0 = 1 << n` (`n` in `{3, 4}`), inverted — i.e.
+/// the **forward** ADST basis, row-major (`dst[k] = Σ_i F[k][i]·src[i]`).
+///
+/// The §8.7.1.7 / §8.7.1.8 inverse ADST8 / ADST16 are rotation-cascade
+/// networks whose ideal real-valued map is linear and invertible. Rather
+/// than re-deriving a closed form, the forward basis is obtained from
+/// the in-crate transcription itself: feed a scaled impulse
+/// `A · e_i` (`A = 1 << 16`, large enough that the network's `Round2`
+/// fixed-point steps contribute only ~2^-16 relative error) through
+/// [`crate::idct::inverse_adst`] to measure column `i` of the inverse
+/// matrix `M`, then Gauss-Jordan-invert `M`. This keeps the §8.7
+/// listings as the sole source of truth for the transform definition;
+/// the residual float error is absorbed by the encoder's
+/// decoder-mirrored reconstruction loop exactly like the forward DCT's.
+fn fwd_adst_matrix(n: u32) -> Vec<f64> {
+    debug_assert!(n == 3 || n == 4);
+    let n0 = 1usize << n;
+    const AMP: i64 = 1 << 16;
+
+    // Measure M: column i is the inverse network's response to e_i.
+    let mut m = vec![0.0f64; n0 * n0];
+    let mut t = vec![0i64; n0];
+    for i in 0..n0 {
+        t.fill(0);
+        t[i] = AMP;
+        crate::idct::inverse_adst(&mut t, n);
+        for (k, &v) in t.iter().enumerate() {
+            m[k * n0 + i] = v as f64 / AMP as f64;
+        }
+    }
+
+    // Gauss-Jordan inversion with partial pivoting: [M | I] -> [I | F].
+    let mut aug = vec![0.0f64; n0 * 2 * n0];
+    for r in 0..n0 {
+        aug[r * 2 * n0..r * 2 * n0 + n0].copy_from_slice(&m[r * n0..(r + 1) * n0]);
+        aug[r * 2 * n0 + n0 + r] = 1.0;
+    }
+    let w = 2 * n0;
+    for col in 0..n0 {
+        // Pivot: largest |value| in this column at or below the diagonal.
+        let pivot = (col..n0)
+            .max_by(|&a, &b| {
+                aug[a * w + col]
+                    .abs()
+                    .partial_cmp(&aug[b * w + col].abs())
+                    .unwrap()
+            })
+            .unwrap();
+        if pivot != col {
+            for j in 0..w {
+                aug.swap(col * w + j, pivot * w + j);
+            }
+        }
+        let p = aug[col * w + col];
+        debug_assert!(p.abs() > 1e-6, "inverse ADST matrix is singular?");
+        for j in 0..w {
+            aug[col * w + j] /= p;
+        }
+        for r in 0..n0 {
+            if r == col {
+                continue;
+            }
+            let f = aug[r * w + col];
+            if f != 0.0 {
+                for j in 0..w {
+                    aug[r * w + j] -= f * aug[col * w + j];
+                }
+            }
+        }
+    }
+    let mut fwd = vec![0.0f64; n0 * n0];
+    for r in 0..n0 {
+        fwd[r * n0..(r + 1) * n0].copy_from_slice(&aug[r * w + n0..r * w + 2 * n0]);
+    }
+    fwd
+}
+
+/// Cached forward ADST8 / ADST16 bases (see [`fwd_adst_matrix`]).
+fn fwd_adst_basis(n: u32) -> &'static [f64] {
+    use std::sync::OnceLock;
+    static ADST8: OnceLock<Vec<f64>> = OnceLock::new();
+    static ADST16: OnceLock<Vec<f64>> = OnceLock::new();
+    match n {
+        3 => ADST8.get_or_init(|| fwd_adst_matrix(3)),
+        4 => ADST16.get_or_init(|| fwd_adst_matrix(4)),
+        _ => unreachable!("forward ADST only defined for n in 2..=4"),
+    }
+}
+
+/// 1D forward ADST at length `1 << n` (`n` in `{2, 3, 4}`): the analytic
+/// DST-VII inverse at 4 points, the measured-basis inverse of the
+/// §8.7.1.7 / §8.7.1.8 networks at 8 / 16 points.
+fn fwd_adst_1d(src: &[f64], dst: &mut [f64], n: u32) {
+    if n == 2 {
+        fwd_adst4_1d(src, dst);
+        return;
+    }
+    let n0 = 1usize << n;
+    let f = fwd_adst_basis(n);
+    for (k, slot) in dst.iter_mut().enumerate() {
+        *slot = src
+            .iter()
+            .zip(&f[k * n0..(k + 1) * n0])
+            .map(|(&x, &b)| x * b)
+            .sum();
+    }
+}
+
 /// Forward 2D transform of an `n0 × n0` residual block for the §6.4.25
 /// `TxType`, scaled to the coefficient domain the §8.7 integer inverse
 /// consumes — the generalisation of [`forward_dct_2d`] over the four
@@ -158,16 +267,17 @@ fn fwd_adst4_1d(src: &[f64], dst: &mut [f64]) {
 /// Mirrors the §8.7.2 pass selection exactly: the decoder inverts rows
 /// with DCT for `DCT_DCT` / `ADST_DCT` (ADST otherwise) and columns with
 /// DCT for `DCT_DCT` / `DCT_ADST`, so the forward applies the matching
-/// forward basis per pass. The ADST forward is 4-point only (this
-/// encoder codes `TX_4X4`); callers must pass `DCT_DCT` for other sizes.
+/// forward basis per pass. The ADST forward covers 4/8/16 points (the
+/// §8.7.1.9 dispatch range); `TX_32X32` is `DCT_DCT`-only exactly as the
+/// decoder's §6.4.25 selection forces it.
 pub(crate) fn forward_transform_2d(block: &mut [i64], n: u32, tx_type: u8) {
     let n0 = 1usize << n;
     debug_assert_eq!(block.len(), n0 * n0, "block must be n0*n0");
     let row_dct = tx_type == crate::idct::DCT_DCT || tx_type == crate::idct::ADST_DCT;
     let col_dct = tx_type == crate::idct::DCT_DCT || tx_type == crate::idct::DCT_ADST;
     debug_assert!(
-        (row_dct && col_dct) || n == 2,
-        "the ADST forward is only wired for 4x4 blocks"
+        (row_dct && col_dct) || n <= 4,
+        "TX_32X32 is DCT_DCT-only (§6.4.25)"
     );
 
     let mut work: Vec<f64> = block.iter().map(|&v| v as f64).collect();
@@ -177,7 +287,7 @@ pub(crate) fn forward_transform_2d(block: &mut [i64], n: u32, tx_type: u8) {
         if use_dct {
             fwd_dct_1d(src, dst);
         } else {
-            fwd_adst4_1d(src, dst);
+            fwd_adst_1d(src, dst, n);
         }
     };
 
@@ -217,10 +327,39 @@ pub(crate) fn forward_transform_2d(block: &mut [i64], n: u32, tx_type: u8) {
 /// dequantized coefficient differs from the input by at most `quant / 2`
 /// per coefficient. `coefs[ 0 ]` uses `dc_quant`; the rest `ac_quant`.
 pub(crate) fn quantize_block(coefs: &mut [i64], dc_quant: i32, ac_quant: i32) {
+    quantize_block_tx(coefs, dc_quant, ac_quant, 0, 8);
+}
+
+/// The largest coefficient magnitude the §6.4.26 `read_coef` syntax can
+/// carry at `bit_depth`: the CAT6 base (67) plus the maximal extra-bits
+/// value. At 8-bit the CAT6 residual is 14 bits; each extra bit of depth
+/// prepends one §6.4.26 high bit (shift `5 + BitDepth - e`), extending
+/// the residual to `6 + BitDepth` bits total.
+pub(crate) fn max_codeable_coef(bit_depth: u32) -> i64 {
+    67 + ((1i64 << (6 + bit_depth)) - 1)
+}
+
+/// [`quantize_block`] generalised over the transform size: applies the
+/// §8.6.2 `dqDenom` (2 for `TX_32X32`, 1 otherwise), so the token is
+/// `round( coef * dqDenom / quant )` — the value minimising the
+/// decoder's `( Tokens * quant ) / dqDenom` dequantization error — and
+/// clamps every token into the §6.4.26-codeable magnitude range for
+/// `bit_depth` (the clamp only fires for extreme content at very low
+/// quantizers; the encoder's reconstruction mirror absorbs the induced
+/// error like any other quantization error).
+pub(crate) fn quantize_block_tx(
+    coefs: &mut [i64],
+    dc_quant: i32,
+    ac_quant: i32,
+    tx_sz: u32,
+    bit_depth: u32,
+) {
+    let dq_denom: i64 = if tx_sz == 3 { 2 } else { 1 };
+    let max_tok = max_codeable_coef(bit_depth);
     for (i, c) in coefs.iter_mut().enumerate() {
         let q = i64::from(if i == 0 { dc_quant } else { ac_quant });
-        let a = c.abs();
-        let t = (2 * a + q) / (2 * q);
+        let a = c.abs() * dq_denom;
+        let t = ((2 * a + q) / (2 * q)).min(max_tok);
         *c = if *c < 0 { -t } else { t };
     }
 }
@@ -379,6 +518,108 @@ mod tests {
                     assert!(
                         err <= 4,
                         "tt={tt} i={i}: residual={r} decoded={d} err={err}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The forward ADST8 / ADST16 (measured-basis inverses of the
+    /// §8.7.1.7 / §8.7.1.8 networks) invert the decoder's integer
+    /// inverse for all four `TxType`s at 8x8 and 16x16 within the same
+    /// small fixed-point tolerance the DCT path carries.
+    #[test]
+    fn forward_transform_large_adst_roundtrips_within_tolerance() {
+        use crate::idct::{ADST_ADST, ADST_DCT, DCT_ADST};
+        let mut state: u64 = 0x11E9_2CB0_57D3_86FA;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as i64
+        };
+        for n in 3..=4u32 {
+            let n0 = 1usize << n;
+            let tol = 2 + n as i64;
+            for &tt in &[DCT_DCT, ADST_DCT, DCT_ADST, ADST_ADST] {
+                for _ in 0..40 {
+                    let residual: Vec<i64> = (0..n0 * n0).map(|_| (next() % 511) - 255).collect();
+                    let mut coefs = residual.clone();
+                    forward_transform_2d(&mut coefs, n, tt);
+                    let mut dequant = coefs.clone();
+                    inverse_transform_2d(&mut dequant, n, tt, false);
+                    for (i, (&r, &d)) in residual.iter().zip(dequant.iter()).enumerate() {
+                        let err = (r - d).abs();
+                        assert!(
+                            err <= tol,
+                            "n={n} tt={tt} i={i}: residual={r} decoded={d} err={err} > {tol}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// TX_32X32 quantization (dqDenom = 2): every token minimises the
+    /// decoder's truncating `( tok * quant ) / 2` dequant against the
+    /// input coefficient, within `quant / 2`.
+    #[test]
+    fn quantize_tx32x32_dqdenom_roundtrip_bounded() {
+        let dcq = 11i32;
+        let acq = 17i32;
+        let mut coefs: Vec<i64> = (-200..200).map(|i| i * 13 + 5).collect();
+        let orig = coefs.clone();
+        quantize_block_tx(&mut coefs, dcq, acq, 3, 8);
+        for (i, (&tok, &c)) in coefs.iter().zip(orig.iter()).enumerate() {
+            let q = i64::from(if i == 0 { dcq } else { acq });
+            // The decoder's §8.6.2 step-1/2 dequant at TX_32X32.
+            let deq = (tok * q) / 2;
+            assert!(
+                (deq - c).abs() <= q / 2 + 1,
+                "i={i}: coef {c} -> token {tok} -> dequant {deq}"
+            );
+        }
+    }
+
+    /// The quantizer clamps tokens into the §6.4.26-codeable magnitude
+    /// range per bit depth; in-range tokens are untouched.
+    #[test]
+    fn quantize_clamps_to_codeable_range() {
+        assert_eq!(max_codeable_coef(8), 67 + (1 << 14) - 1);
+        assert_eq!(max_codeable_coef(10), 67 + (1 << 16) - 1);
+        assert_eq!(max_codeable_coef(12), 67 + (1 << 18) - 1);
+
+        // A huge coefficient at quant 1 would exceed CAT6 at 8-bit.
+        let mut coefs = vec![1_000_000i64, -1_000_000, 42];
+        quantize_block_tx(&mut coefs, 1, 1, 0, 8);
+        let max = max_codeable_coef(8);
+        assert_eq!(coefs[0], max);
+        assert_eq!(coefs[1], -max);
+        assert_eq!(coefs[2], 42);
+    }
+
+    /// The measured forward ADST bases invert the *ideal* inverse: the
+    /// product `F · M` recovered by pushing every forward basis row back
+    /// through the integer inverse is the identity within fixed-point
+    /// noise (per-column probe at unit scale).
+    #[test]
+    fn fwd_adst_basis_is_inverse_of_integer_network() {
+        for n in 3..=4u32 {
+            let n0 = 1usize << n;
+            for i in 0..n0 {
+                // Forward-transform the scaled impulse 64·e_i, then run
+                // the §8.7.1.9 integer inverse: expect 64·e_i back
+                // within a couple of units.
+                let src: Vec<f64> = (0..n0).map(|j| if j == i { 64.0 } else { 0.0 }).collect();
+                let mut coefs = vec![0.0f64; n0];
+                fwd_adst_1d(&src, &mut coefs, n);
+                let mut t: Vec<i64> = coefs.iter().map(|&v| v.round() as i64).collect();
+                crate::idct::inverse_adst(&mut t, n);
+                for (j, &v) in t.iter().enumerate() {
+                    let want = if j == i { 64 } else { 0 };
+                    assert!(
+                        (v - want).abs() <= 2,
+                        "n={n} impulse {i} slot {j}: got {v}, want {want}"
                     );
                 }
             }

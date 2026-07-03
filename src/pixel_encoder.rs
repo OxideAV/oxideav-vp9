@@ -74,13 +74,54 @@ pub(crate) fn padded_plane_from_bytes(
     plane
 }
 
+/// Build a padded target [`Plane`] from a row-major `u16` source
+/// rectangle (10/12-bit content), edge-replicating the right / bottom
+/// padding exactly like [`padded_plane_from_bytes`].
+pub(crate) fn padded_plane_from_u16(
+    data: &[u16],
+    vis_w: usize,
+    vis_h: usize,
+    pad_w: usize,
+    pad_h: usize,
+) -> Plane {
+    debug_assert!(data.len() >= vis_w * vis_h);
+    debug_assert!(pad_w >= vis_w && pad_h >= vis_h && vis_w > 0 && vis_h > 0);
+    let mut plane = Plane::new(pad_w, pad_h);
+    for y in 0..pad_h {
+        let sy = y.min(vis_h - 1);
+        for x in 0..pad_w {
+            let sx = x.min(vis_w - 1);
+            plane.set(x, y, i32::from(data[sy * vis_w + sx]));
+        }
+    }
+    plane
+}
+
 /// The §6.2 header for a lossless keyframe: profile 0, 8-bit 4:2:0,
 /// `base_q_idx == 0` with zero deltas (the §6.2.9 `Lossless` derivation),
 /// loop filter off (lossless reconstruction must not be filtered),
 /// single tile.
 pub(crate) fn lossless_keyframe_header(width: u32, height: u32) -> Vp9FrameHeader {
+    lossless_keyframe_header_ex(width, height, 0, 8, true, true)
+}
+
+/// [`lossless_keyframe_header`] generalised over the §6.2 profile /
+/// bit-depth / chroma-subsampling triple:
+///
+/// * profile 0 — 8-bit 4:2:0;
+/// * profile 1 — 8-bit 4:4:4 (`subsampling_x == subsampling_y == false`);
+/// * profile 2 — 10/12-bit 4:2:0;
+/// * profile 3 — 10/12-bit 4:4:4.
+pub(crate) fn lossless_keyframe_header_ex(
+    width: u32,
+    height: u32,
+    profile: u8,
+    bit_depth: u8,
+    ssx: bool,
+    ssy: bool,
+) -> Vp9FrameHeader {
     Vp9FrameHeader {
-        profile: 0,
+        profile,
         show_existing_frame: false,
         frame_to_show_map_idx: None,
         frame_type: FrameType::KeyFrame,
@@ -88,11 +129,11 @@ pub(crate) fn lossless_keyframe_header(width: u32, height: u32) -> Vp9FrameHeade
         error_resilient_mode: false,
         intra_only: false,
         color_config: ColorConfig {
-            bit_depth: 8,
+            bit_depth,
             color_space: ColorSpace::Bt601,
             color_range_full: false,
-            subsampling_x: true,
-            subsampling_y: true,
+            subsampling_x: ssx,
+            subsampling_y: ssy,
         },
         frame_width: width,
         frame_height: height,
@@ -345,6 +386,91 @@ pub(crate) fn encode_keyframe_lossless_420(
     encode_keyframe_lossless(&hdr, &[y_plane, u_plane, v_plane])
 }
 
+/// Encode an 8-bit **4:4:4** planar frame (`Y` then `U` then `V`, each
+/// `width × height`) into a lossless profile-1 VP9 keyframe that decodes
+/// byte-exact back to `pixels`.
+pub(crate) fn encode_keyframe_lossless_444(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, Error> {
+    if width == 0 || height == 0 || width > (1 << 16) || height > (1 << 16) {
+        return Err(Error::Unsupported);
+    }
+    let w = width as usize;
+    let h = height as usize;
+    if pixels.len() < 3 * w * h {
+        return Err(Error::Unsupported);
+    }
+
+    let hdr = lossless_keyframe_header_ex(width, height, 1, 8, false, false);
+    let mi_cols = ((width + 7) >> 3) as usize;
+    let mi_rows = ((height + 7) >> 3) as usize;
+    let y_w = mi_cols * 8;
+    let y_h = mi_rows * 8;
+
+    let y_plane = padded_plane_from_bytes(&pixels[..w * h], w, h, y_w, y_h);
+    let u_plane = padded_plane_from_bytes(&pixels[w * h..2 * w * h], w, h, y_w, y_h);
+    let v_plane = padded_plane_from_bytes(&pixels[2 * w * h..], w, h, y_w, y_h);
+
+    encode_keyframe_lossless(&hdr, &[y_plane, u_plane, v_plane])
+}
+
+/// Encode a 10/12-bit planar frame (native `u16` samples, `Y` then `U`
+/// then `V`) into a lossless high-bit-depth VP9 keyframe that decodes
+/// sample-exact back to `samples`.
+///
+/// `subsample == true` selects 4:2:0 (profile 2, chroma planes
+/// `ceil(w/2) × ceil(h/2)`); `false` selects 4:4:4 (profile 3, chroma
+/// planes `width × height`). `bit_depth` must be 10 or 12 and every
+/// sample must fit in `[0, (1 << bit_depth) - 1]`.
+pub(crate) fn encode_keyframe_lossless_hbd(
+    samples: &[u16],
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    subsample: bool,
+) -> Result<Vec<u8>, Error> {
+    if width == 0 || height == 0 || width > (1 << 16) || height > (1 << 16) {
+        return Err(Error::Unsupported);
+    }
+    if bit_depth != 10 && bit_depth != 12 {
+        return Err(Error::Unsupported);
+    }
+    let w = width as usize;
+    let h = height as usize;
+    let (cw, ch) = if subsample {
+        (width.div_ceil(2) as usize, height.div_ceil(2) as usize)
+    } else {
+        (w, h)
+    };
+    if samples.len() < w * h + 2 * cw * ch {
+        return Err(Error::Unsupported);
+    }
+    let max = (1u16 << bit_depth) - 1;
+    if samples.iter().any(|&s| s > max) {
+        return Err(Error::Unsupported);
+    }
+
+    let profile = if subsample { 2 } else { 3 };
+    let hdr = lossless_keyframe_header_ex(width, height, profile, bit_depth, subsample, subsample);
+    let mi_cols = ((width + 7) >> 3) as usize;
+    let mi_rows = ((height + 7) >> 3) as usize;
+    let y_w = mi_cols * 8;
+    let y_h = mi_rows * 8;
+    let (uv_w, uv_h) = if subsample {
+        (y_w >> 1, y_h >> 1)
+    } else {
+        (y_w, y_h)
+    };
+
+    let y_plane = padded_plane_from_u16(&samples[..w * h], w, h, y_w, y_h);
+    let u_plane = padded_plane_from_u16(&samples[w * h..w * h + cw * ch], cw, ch, uv_w, uv_h);
+    let v_plane = padded_plane_from_u16(&samples[w * h + cw * ch..], cw, ch, uv_w, uv_h);
+
+    encode_keyframe_lossless(&hdr, &[y_plane, u_plane, v_plane])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,6 +604,108 @@ mod tests {
         );
         assert_eq!(
             encode_keyframe_lossless_420(&[0u8; 8], 0, 4).unwrap_err(),
+            Error::Unsupported
+        );
+    }
+
+    /// An 8-bit 4:4:4 (profile 1) frame round-trips byte-exact — the
+    /// chroma planes carry full-resolution content.
+    #[test]
+    fn noise_444_roundtrips_sample_exact() {
+        let (w, h) = (40u32, 32u32);
+        let n = (w * h) as usize;
+        let mut state: u64 = 0x1357_9BDF_2468_ACE0;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u8
+        };
+        let px: Vec<u8> = (0..3 * n).map(|_| next()).collect();
+        let stream = encode_keyframe_lossless_444(&px, w, h).expect("encode");
+        let frame = decode_intra_frame(&stream).expect("decode");
+        assert_eq!((frame.width, frame.height), (w, h));
+        assert!(!frame.subsampling_x && !frame.subsampling_y, "not 4:4:4");
+        let y_ok = frame
+            .y
+            .iter()
+            .zip(&px[..n])
+            .all(|(&d, &s)| d == u16::from(s));
+        let u_ok = frame
+            .u
+            .iter()
+            .zip(&px[n..2 * n])
+            .all(|(&d, &s)| d == u16::from(s));
+        let v_ok = frame
+            .v
+            .iter()
+            .zip(&px[2 * n..])
+            .all(|(&d, &s)| d == u16::from(s));
+        assert!(y_ok && u_ok && v_ok, "4:4:4 round-trip not sample-exact");
+    }
+
+    /// 10-bit and 12-bit 4:2:0 (profile 2) frames round-trip
+    /// sample-exact — the residual range exceeds 8-bit and the token
+    /// writer's high-bit CAT6 path carries it.
+    #[test]
+    fn noise_hbd_420_roundtrips_sample_exact() {
+        for &bd in &[10u8, 12u8] {
+            let (w, h) = (24u32, 16u32);
+            let cw = w.div_ceil(2) as usize;
+            let ch = h.div_ceil(2) as usize;
+            let n = (w * h) as usize + 2 * cw * ch;
+            let max = (1u32 << bd) - 1;
+            let mut state: u64 = 0xFEED_D0D0_0BAD_F00D ^ u64::from(bd);
+            let mut next = move || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) as u32 % (max + 1)) as u16
+            };
+            let samples: Vec<u16> = (0..n).map(|_| next()).collect();
+            let stream =
+                encode_keyframe_lossless_hbd(&samples, w, h, bd, true).expect("encode hbd");
+            let frame = decode_intra_frame(&stream).expect("decode hbd");
+            assert_eq!(frame.bit_depth, bd);
+            let wh = (w * h) as usize;
+            assert_eq!(frame.y, samples[..wh], "{bd}-bit luma");
+            assert_eq!(frame.u, samples[wh..wh + cw * ch], "{bd}-bit U");
+            assert_eq!(frame.v, samples[wh + cw * ch..], "{bd}-bit V");
+        }
+    }
+
+    /// 10-bit 4:4:4 (profile 3) round-trips sample-exact.
+    #[test]
+    fn noise_hbd_444_roundtrips_sample_exact() {
+        let (w, h) = (16u32, 24u32);
+        let n = 3 * (w * h) as usize;
+        let samples: Vec<u16> = (0..n).map(|i| ((i * 619 + 41) % 1024) as u16).collect();
+        let stream = encode_keyframe_lossless_hbd(&samples, w, h, 10, false).expect("encode");
+        let frame = decode_intra_frame(&stream).expect("decode");
+        assert_eq!(frame.bit_depth, 10);
+        assert!(!frame.subsampling_x && !frame.subsampling_y);
+        let wh = (w * h) as usize;
+        assert_eq!(frame.y, samples[..wh]);
+        assert_eq!(frame.u, samples[wh..2 * wh]);
+        assert_eq!(frame.v, samples[2 * wh..]);
+    }
+
+    /// HBD rejections: bad bit depth, out-of-range samples, short input.
+    #[test]
+    fn hbd_encode_rejects_bad_inputs() {
+        let samples = vec![0u16; 6 * 16];
+        assert_eq!(
+            encode_keyframe_lossless_hbd(&samples, 8, 8, 9, true).unwrap_err(),
+            Error::Unsupported
+        );
+        let mut over = vec![0u16; 8 * 8 + 2 * 16];
+        over[0] = 1 << 10; // exceeds 10-bit range
+        assert_eq!(
+            encode_keyframe_lossless_hbd(&over, 8, 8, 10, true).unwrap_err(),
+            Error::Unsupported
+        );
+        assert_eq!(
+            encode_keyframe_lossless_hbd(&samples[..4], 8, 8, 10, true).unwrap_err(),
             Error::Unsupported
         );
     }

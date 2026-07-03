@@ -670,6 +670,36 @@ pub fn encode_vp9(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Err
     pixel_encoder::encode_keyframe_lossless_420(pixels, width, height)
 }
 
+/// Encode an 8-bit **4:4:4** planar frame (`Y` then `U` then `V`, each
+/// plane `width × height`) into a lossless profile-1 VP9 keyframe.
+///
+/// Like [`encode_vp9`], the output decodes byte-exact back to `pixels`
+/// (chroma at full resolution). Returns [`Error::Unsupported`] for
+/// degenerate dimensions or a too-short buffer.
+pub fn encode_vp9_lossless_444(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Error> {
+    pixel_encoder::encode_keyframe_lossless_444(pixels, width, height)
+}
+
+/// Encode a 10/12-bit planar frame (native `u16` samples, `Y` then `U`
+/// then `V`) into a lossless high-bit-depth VP9 keyframe.
+///
+/// `subsample == true` selects 4:2:0 (profile 2, chroma planes
+/// `ceil(w/2) × ceil(h/2)`); `false` selects 4:4:4 (profile 3, chroma at
+/// full resolution). The output decodes **sample-exact** back to
+/// `samples` (compare against [`Vp9DecodedFrame`]'s native `u16`
+/// planes). Returns [`Error::Unsupported`] when `bit_depth` is not 10 or
+/// 12, any sample exceeds the bit-depth range, the buffer is too short,
+/// or the dimensions are degenerate.
+pub fn encode_vp9_lossless_hbd(
+    samples: &[u16],
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    subsample: bool,
+) -> Result<Vec<u8>, Error> {
+    pixel_encoder::encode_keyframe_lossless_hbd(samples, width, height, bit_depth, subsample)
+}
+
 /// Encode a minimal VP9 **inter (P-frame) sequence** of `width × height`:
 /// a keyframe followed by `num_pframes` all-skip, single-reference-`LAST`,
 /// `ZEROMV` P-frames.

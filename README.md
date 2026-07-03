@@ -12,8 +12,11 @@ is **pixel-accurate**: `encode_vp9` emits a lossless keyframe that
 decodes byte-exact back to its input, `encode_vp9_lossless_sequence`
 does the same for whole videos (motion-compensated P-frames), and
 `encode_vp9_lossy` / `encode_vp9_lossy_sequence` provide quantized
-encoding whose output equals the encoder's in-loop reconstruction
-bit-for-bit (see the "Encoder" section). [`decode_vp9`]
+encoding over a content-adaptive partition/transform tree (`BLOCK_8X8`
+..`BLOCK_64X64`, `TX_4X4`..`TX_32X32`) whose output equals the
+encoder's in-loop reconstruction bit-for-bit, and
+`encode_vp9_lossy_sequence_rc` adds per-frame byte-budget rate control
+(see the "Encoder" section). [`decode_vp9`]
 and [`decode_intra_frame`] decode a complete VP9 keyframe to packed
 planar samples, byte-exact against a 13-fixture staged corpus covering
 4:2:0 and 4:4:4 chroma, 8/10/12-bit depth, RGB, multiple tile columns,
@@ -152,19 +155,37 @@ prediction sees the decoder's exact state. Public entry points:
   error-resilient framing so the §7.2.6 `UsePrevFrameMvs == 0`
   derivation is pinned identically on both sides.
 * [`encode_vp9_lossy`] / [`encode_vp9_lossy_sequence`] — **lossy**
-  encoding at a caller-chosen `base_q_idx` (1..=255): forward DCT /
-  ADST4 (float bases matched to the §8.7 integer inverses, ±4
-  round-trip tolerance), §8.6.1 quantization (dequantized-coefficient
-  error ≤ `quant / 2`), per-block intra **mode selection** over all
-  ten §7.4.5 modes (trial-prediction SAD; the §6.4.25 `TxType` follows
-  the coded mode), and — in the sequence — motion-compensated
-  P-frames referencing the previous frame's in-loop *reconstruction*.
+  encoding at a caller-chosen `base_q_idx` (1..=255) with a
+  **content-adaptive partition + transform-size planner**
+  (`plan_keyframe_tree`): the keyframe's superblock tree splits where
+  the four quadrant means deviate from the node mean by more than one
+  §8.6.1 AC quantizer step (flat content codes one `BLOCK_64X64` /
+  `TX_32X32` leaf per superblock; detail splits toward `BLOCK_8X8`),
+  every leaf codes the largest §6.4.10-codeable transform under
+  `TX_MODE_SELECT`, and per-leaf `y_mode` / `uv_mode` come from
+  trial-prediction SAD over all ten §7.4.5 modes at the leaf's
+  transform-block granularity (the §6.4.25 `TxType` — including the
+  ADST8 / ADST16 rows — follows the coded mode). Sequence P-frames are
+  motion-compensated against the previous frame's in-loop
+  *reconstruction* at the §6.4.10-**inferred** `TX_8X8` (`Allow8x8`;
+  no per-block tx bits) with **per-block skip election** (a block
+  whose quantized residual is all-zero codes no residual — the
+  decoder reconstructs it from prediction alone, byte-identically).
   The decoder's output equals the encoder's reconstruction
-  bit-for-bit (pinned sample-for-sample on all three planes, and
-  chain-level: the final frame of a 4-frame sequence re-encodes
-  byte-identical from the decoder's own output as reference), so
-  encoder and decoder never drift; only the bounded quantization
-  error separates the result from the source.
+  bit-for-bit at every partition / transform size (pinned
+  sample-for-sample on all three planes across `TX_8X8` / `TX_16X16` /
+  `TX_32X32` uniform trees, ADST-mode mixes, partial superblocks, and
+  chain-level across a 4-frame sequence), so encoder and decoder never
+  drift; only the bounded quantization error separates the result
+  from the source. On mixed content the adaptive tree codes fewer
+  bytes than the fixed all-4x4 layout at the same quantizer (pinned).
+* [`encode_vp9_lossy_sequence_rc`] — **rate control**: every frame is
+  coded at the lowest `base_q_idx` whose size fits a caller-chosen
+  per-frame byte budget, via an exact per-frame binary search over the
+  quantizer range (≤ 8 byte-deterministic trial encodes per frame;
+  best-effort `q == 255` when the budget is below the frame's syntax
+  floor). Budget compliance, monotone quality-vs-budget, and
+  end-to-end decodability are pinned.
 
 The encode path composes the bitstream-writer
 primitives — each derived as the exact inverse of the matching decode step
@@ -202,10 +223,14 @@ external encoder consulted):
 * the §6.4.6 keyframe intra **mode-info writer** (`mode_writer`) — a
   generic §9.3.1 `tree_encode` plus `skip` / `segment_id` /
   `default_intra_mode` / `default_uv_mode` / `tx_size`;
-* the §6.4.3 **partition-tree writer** (`partition_writer`) — the all-8x8
-  partition recursion with its §9.3.2 neighbour-context bookkeeping (shared
-  with the decoder so a written partition stream decodes to the identical
-  leaf set);
+* the §6.4.3 **partition-tree writer** (`partition_writer`) — any
+  caller-chosen `NONE` / `HORZ` / `VERT` / `SPLIT` layout
+  (`write_partition_tree`, mirroring `decode_partition( )`
+  arm-for-arm incl. the frame-edge conditional second leaf and the
+  uncodeable-edge-pick rejection) plus the fixed all-8x8 recursion,
+  with the §9.3.2 neighbour-context bookkeeping shared with the
+  decoder so a written partition stream decodes to the identical leaf
+  set;
 * the §6.4.21 **residual encode driver** (`residual_writer`) — the inverse
   of `BlockDecoder::residual( )`, walking the same per-plane / per-4x4 grid,
   per-block tx-size (§6.4.22) / `TxType` (§6.4.25) / scan selection, and
@@ -219,25 +244,40 @@ external encoder consulted):
   from the spec's §8.7 *inverse* listings: the exact lossless forward
   WHT (bit-exact round-trips pinned over 2000 random + extreme-range
   vectors), the forward DCT-II / ADST4 bases matched to the §8.7.1.3 /
-  §8.7.1.6 integer inverses for all four §6.4.25 `TxType`s, and the
-  §8.6.1 `quantize_block` (round-to-nearest, error ≤ `quant / 2`);
+  §8.7.1.6 integer inverses, and the forward **ADST8 / ADST16** bases
+  obtained by measuring the §8.7.1.7 / §8.7.1.8 integer networks'
+  response matrices (scaled impulses through the in-crate
+  transcription) and Gauss-Jordan-inverting them — every §6.4.25
+  `TxType` at every transform size round-trips the decoder's integer
+  inverse within a small fixed-point tolerance. `quantize_block_tx`
+  applies the §8.6.2 `dqDenom` (2 at `TX_32X32`; round-to-nearest,
+  error ≤ `quant / 2`) and clamps tokens into the §6.4.26-codeable
+  CAT6 range per bit depth;
 * the top-level **frame assemblers** (`frame_writer`) — thread the
   uncompressed + compressed headers and the single-tile §6.4 partition /
   block walk into a complete frame, with `header_size_in_bytes` set to
-  the compressed-header length. The **inter assembler**
-  (`assemble_inter_frame_planned`) walks the all-`BLOCK_8X8` partition
-  with a per-block **planner** callback that receives the shared
-  `Vp9FrameState` in decode order and dictates each block's
-  `ZEROMV` / `NEWMV` mode + motion vector; the all-skip `ZEROMV`
-  specialisation reconstructs to a verbatim copy of its `LAST`
-  reference (validated byte-exact through `decode_vp9_sequence` across
-  64x64, 128x64 and 40x24 geometries).
+  the compressed-header length. The **tree-plan keyframe assembler**
+  (`assemble_keyframe_tree`) codes an arbitrary partition tree with
+  per-leaf `tx_size` (coded through the §6.4.10 tree under
+  `TX_MODE_SELECT`, or validated against the inferred size otherwise),
+  incl. non-square `HORZ` / `VERT` leaves and frame-edge-overhanging
+  blocks the §6.4.3 `hasRows` / `hasCols` rules admit. The **inter
+  assembler** (`assemble_inter_frame_planned`) walks the
+  all-`BLOCK_8X8` partition at any non-`SELECT` `tx_mode` (blocks code
+  the §6.4.10 inferred size) with a per-block **planner** callback
+  that receives the shared `Vp9FrameState` in decode order and
+  dictates each block's `ZEROMV` / `NEWMV` mode + motion vector +
+  `skip`; the all-skip `ZEROMV` specialisation reconstructs to a
+  verbatim copy of its `LAST` reference (validated byte-exact through
+  `decode_vp9_sequence` across 64x64, 128x64 and 40x24 geometries).
 
 The `pixel_encoder` layer drives those writers with real content (see
-the entry points above): reconstruction-mirrored prediction, exact or
-quantized residuals, per-block intra mode selection, and integer
-motion search. Everything is byte-deterministic, and every encode test
-validates end-to-end through the in-crate decoder.
+the entry points above): reconstruction-mirrored prediction at every
+partition / transform size, exact or quantized residuals, the
+superblock-tree partition planner, per-leaf intra mode selection,
+integer motion search with per-block skip election, and per-frame
+quantizer rate control. Everything is byte-deterministic, and every
+encode test validates end-to-end through the in-crate decoder.
 
 ### Not yet supported
 
@@ -305,18 +345,19 @@ validates end-to-end through the in-crate decoder.
   end-of-section paragraph is blank). Contexts are reset to §10 defaults
   per frame meanwhile, which is exact for the all-parallel-mode corpus.
 * §9.2.4 multi-coder tile parallelism (tiles decode sequentially).
-* Encoder depth beyond the pixel-accurate baseline. The encoder codes
-  every frame as an all-`BLOCK_8X8` partition at `TX_4X4`
-  (`tx_mode = ONLY_4X4`); larger transforms / partition-size decisions,
-  compound-reference and sub-pel motion *search* (the searched MVs are
-  full-pel; snapped vectors may carry a sub-pel phase the §8.5.2
-  filters handle), encode-side loop filtering (frames are coded with
-  `filter_level == 0`), rate control, and the sub-8x8 per-(idy, idx)
-  MV walk / §6.4.12 temporal-predicted segment-id branch are later
-  milestones. Lossy encoding is 8-bit 4:2:0 (the lossless path covers
-  all four profiles). The inter *writers* already carry compound
-  references and `MiSize >= BLOCK_8X8`; the planner simply does not
-  elect them yet.
+* Encoder depth beyond the planner-driven baseline. Keyframes plan
+  partitions `BLOCK_8X8`..`BLOCK_64X64` with transforms `TX_4X4`..
+  `TX_32X32`; P-frames stay all-`BLOCK_8X8` at the inferred `TX_8X8`
+  (per-block inter tx *selection*, larger inter partitions, and
+  compound-reference / sub-pel motion *search* are later milestones —
+  the searched MVs are full-pel; snapped vectors may carry a sub-pel
+  phase the §8.5.2 filters handle). Encode-side loop filtering (frames
+  are coded with `filter_level == 0`), keyframe skip election, and the
+  sub-8x8 per-(idy, idx) MV walk / §6.4.12 temporal-predicted
+  segment-id branch are also later milestones. Lossy encoding is 8-bit
+  4:2:0 (the lossless path covers all four profiles). The inter
+  *writers* already carry compound references and
+  `MiSize >= BLOCK_8X8`; the planner simply does not elect them yet.
 
 ## Testing
 

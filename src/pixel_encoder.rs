@@ -1072,9 +1072,256 @@ pub(crate) fn encode_pframe_lossless_motion(
     crate::frame_writer::assemble_inter_frame_planned(hdr, false, &mut *planner, &mut *coeffs)
 }
 
-/// Integer motion-search window (±luma pixels) for the lossless
-/// P-frame sequence encoder.
+/// Integer motion-search window (±luma pixels) for the P-frame
+/// sequence encoders.
 pub(crate) const PFRAME_SEARCH_RANGE: i32 = 8;
+
+/// Encode one **lossy** P-frame at the header's `base_q_idx`: per-block
+/// `ZEROMV` / `NEWMV` motion (integer full search against the reference —
+/// the previous frame's *reconstruction*, not its source), quantized
+/// forward-DCT residual, and the decoder's §8.6.2 reconstruction replayed
+/// in place — so the returned [`ReconState`] equals the decoder's output
+/// bit-for-bit and its visible crop is the next frame's reference.
+///
+/// Requires an error-resilient non-key lossy header (see
+/// [`crate::frame_writer::assemble_inter_frame_planned`]).
+pub(crate) fn encode_pframe_lossy_motion(
+    hdr: &Vp9FrameHeader,
+    targets: &[Plane; 3],
+    reference: &[(&[i32], usize); 3],
+    ref_w: u32,
+    ref_h: u32,
+    search_range: i32,
+) -> Result<(Vec<u8>, ReconState), Error> {
+    use crate::inter_decode::FrameStateMvSource;
+    use crate::mode_info::{LAST_FRAME, NEWMV, ZEROMV};
+    use crate::mv::use_mv_hp;
+    use crate::mv_ref::MvRefGeometry;
+    use std::cell::RefCell;
+
+    if hdr.frame_type != FrameType::NonKeyFrame || hdr.quantization.lossless {
+        return Err(Error::Unsupported);
+    }
+    let mi_cols = (hdr.frame_width + 7) >> 3;
+    let mi_rows = (hdr.frame_height + 7) >> 3;
+    let ssx = hdr.color_config.subsampling_x;
+    let ssy = hdr.color_config.subsampling_y;
+    let bit_depth = u32::from(hdr.color_config.bit_depth);
+    let sign_bias = [
+        false,
+        hdr.ref_frame_sign_bias[0],
+        hdr.ref_frame_sign_bias[1],
+        hdr.ref_frame_sign_bias[2],
+    ];
+    let seg = hdr.segmentation;
+    let quant = hdr.quantization;
+    let bd8 = hdr.color_config.bit_depth;
+
+    // Work planes: the planner writes each block's §8.5.2 prediction,
+    // then the residual callback's §8.6.2 replay turns it into the
+    // decoder's reconstruction in place.
+    let work = RefCell::new(ReconState::new(mi_cols, mi_rows, ssx, ssy, bit_depth));
+
+    const NEWMV_SAD_MARGIN: u64 = 64;
+
+    let mut planner: Box<crate::frame_writer::InterBlockPlanner<'_>> =
+        Box::new(|r, c, state| -> (u8, [i32; 2]) {
+            let mut choice: (u8, [i32; 2]) = (ZEROMV, [0, 0]);
+            if search_range > 0 {
+                let ((dy, dx), best_sad, zero_sad) = search_block_mv(
+                    &targets[0],
+                    reference[0].0,
+                    reference[0].1,
+                    ref_w as i32,
+                    ref_h as i32,
+                    (c * 8) as i32,
+                    (r * 8) as i32,
+                    search_range,
+                );
+                if (dy, dx) != (0, 0) && best_sad + NEWMV_SAD_MARGIN < zero_sad {
+                    let geom = MvRefGeometry {
+                        mi_row: r as i32,
+                        mi_col: c as i32,
+                        mi_rows: mi_rows as i32,
+                        mi_cols: mi_cols as i32,
+                        mi_size: BLOCK_8X8 as usize,
+                        mi_col_start: 0,
+                        mi_col_end: mi_cols as i32,
+                    };
+                    let src = FrameStateMvSource::new(state, None);
+                    let mv_refs = geom.find_mv_refs(&src, LAST_FRAME, -1, &sign_bias, false);
+                    let best =
+                        geom.find_best_ref_mvs(mv_refs.ref_list_mv, hdr.allow_high_precision_mv)[0];
+
+                    let mut mv = [8 * dy, 8 * dx];
+                    let use_hp = hdr.allow_high_precision_mv && use_mv_hp(best);
+                    for (comp, m) in mv.iter_mut().enumerate() {
+                        let d = *m - best[comp];
+                        if d != 0 && !use_hp && (d & 1) != 0 {
+                            *m -= 1;
+                        }
+                    }
+                    choice = (NEWMV, mv);
+                }
+            }
+            predict_mi_block(
+                &mut work.borrow_mut().planes,
+                reference,
+                ref_w,
+                ref_h,
+                r,
+                c,
+                choice.1,
+                mi_cols,
+                mi_rows,
+                ssx,
+                ssy,
+                bit_depth,
+            );
+            choice
+        });
+
+    let mut coeffs: Box<FrameCoefSource<'_>> = Box::new(
+        |_mi_r: u32, _mi_c: u32, plane: usize, sx: u32, sy: u32, _b: usize| -> Vec<i64> {
+            let mut work = work.borrow_mut();
+            let mut block = vec![0i64; 16];
+            for i in 0..4usize {
+                for j in 0..4usize {
+                    let t = targets[plane].get(sx as usize + j, sy as usize + i);
+                    let p = work.planes[plane].get(sx as usize + j, sy as usize + i);
+                    block[i * 4 + j] = i64::from(t) - i64::from(p);
+                }
+            }
+            let dc_q = get_dc_quant(plane, &seg, &quant, 0, bd8);
+            let ac_q = get_ac_quant(plane, &seg, &quant, 0, bd8);
+            // §6.4.25: inter blocks transform with DCT_DCT at every size.
+            crate::fwd_transform::forward_dct_2d(&mut block, 2);
+            crate::fwd_transform::quantize_block(&mut block, dc_q, ac_q);
+            reconstruct_block(
+                &mut work.planes[plane],
+                sx as usize,
+                sy as usize,
+                0,
+                &block,
+                dc_q,
+                ac_q,
+                DCT_DCT,
+                false,
+                bit_depth,
+            );
+            block
+        },
+    );
+
+    let bytes =
+        crate::frame_writer::assemble_inter_frame_planned(hdr, false, &mut *planner, &mut *coeffs)?;
+    drop(planner);
+    drop(coeffs);
+    Ok((bytes, work.into_inner()))
+}
+
+/// Encode a sequence of 8-bit 4:2:0 planar frames into a **lossy** VP9
+/// stream at quantizer index `base_q_idx` (`1..=255`): a lossy keyframe
+/// followed by lossy P-frames with per-block `ZEROMV` / `NEWMV` motion,
+/// each referencing the previous frame's in-loop **reconstruction** (the
+/// decoder's exact output), so encoder and decoder never drift.
+pub(crate) fn encode_sequence_lossy_420(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+) -> Result<Vec<Vec<u8>>, Error> {
+    if frames.is_empty() || base_q_idx == 0 {
+        return Err(Error::Unsupported);
+    }
+    if width == 0 || height == 0 || width > (1 << 16) || height > (1 << 16) {
+        return Err(Error::Unsupported);
+    }
+    let w = width as usize;
+    let h = height as usize;
+    let cw = width.div_ceil(2) as usize;
+    let ch = height.div_ceil(2) as usize;
+    let need = w * h + 2 * cw * ch;
+    if frames.iter().any(|f| f.len() < need) {
+        return Err(Error::Unsupported);
+    }
+
+    let mi_cols = ((width + 7) >> 3) as usize;
+    let mi_rows = ((height + 7) >> 3) as usize;
+    let y_w = mi_cols * 8;
+    let y_h = mi_rows * 8;
+    let uv_w = y_w >> 1;
+    let uv_h = y_h >> 1;
+
+    let padded_targets = |pixels: &[u8]| -> [Plane; 3] {
+        [
+            padded_plane_from_bytes(&pixels[..w * h], w, h, y_w, y_h),
+            padded_plane_from_bytes(&pixels[w * h..w * h + cw * ch], cw, ch, uv_w, uv_h),
+            padded_plane_from_bytes(&pixels[w * h + cw * ch..], cw, ch, uv_w, uv_h),
+        ]
+    };
+    // §8.10 FrameStore crop of a reconstruction: the visible extents.
+    let visible_crop = |recon: &ReconState| -> [Vec<i32>; 3] {
+        let crop = |p: &Plane, vw: usize, vh: usize| -> Vec<i32> {
+            let mut out = Vec::with_capacity(vw * vh);
+            for y in 0..vh {
+                for x in 0..vw {
+                    out.push(p.get(x, y));
+                }
+            }
+            out
+        };
+        [
+            crop(&recon.planes[0], w, h),
+            crop(&recon.planes[1], cw, ch),
+            crop(&recon.planes[2], cw, ch),
+        ]
+    };
+
+    // Lossy keyframe.
+    let mut kf_hdr = lossless_keyframe_header(width, height);
+    kf_hdr.quantization = QuantizationParams {
+        base_q_idx,
+        delta_q_y_dc: 0,
+        delta_q_uv_dc: 0,
+        delta_q_uv_ac: 0,
+        lossless: false,
+    };
+    let (kf_bytes, kf_recon) = encode_keyframe_lossy(&kf_hdr, &padded_targets(frames[0]), true)?;
+
+    let mut out = Vec::with_capacity(frames.len());
+    out.push(kf_bytes);
+    let mut prev_recon = kf_recon;
+
+    for &frame in frames.iter().skip(1) {
+        let targets = padded_targets(frame);
+        let prev = visible_crop(&prev_recon);
+        let reference: [(&[i32], usize); 3] = [
+            (prev[0].as_slice(), w),
+            (prev[1].as_slice(), cw),
+            (prev[2].as_slice(), cw),
+        ];
+        let mut hdr = lossless_pframe_header(width, height);
+        hdr.quantization = QuantizationParams {
+            base_q_idx,
+            delta_q_y_dc: 0,
+            delta_q_uv_dc: 0,
+            delta_q_uv_ac: 0,
+            lossless: false,
+        };
+        let (bytes, recon) = encode_pframe_lossy_motion(
+            &hdr,
+            &targets,
+            &reference,
+            width,
+            height,
+            PFRAME_SEARCH_RANGE,
+        )?;
+        out.push(bytes);
+        prev_recon = recon;
+    }
+    Ok(out)
+}
 
 /// Encode a sequence of 8-bit 4:2:0 planar frames (each `Y` then `U`
 /// then `V`, the [`crate::decode_vp9`] layout) into a lossless VP9
@@ -1678,6 +1925,143 @@ mod tests {
         for (i, (frame, input)) in decoded.iter().zip(&inputs).enumerate() {
             assert_eq!(&frame.to_planar_bytes(), input, "frame {i}");
         }
+    }
+
+    /// The lossy **sequence** encoder's per-frame in-loop reconstruction
+    /// equals the decoder's `decode_vp9_sequence` output bit-for-bit —
+    /// the chain-level decoder-mirror pin: prediction references, motion
+    /// compensation, quantized residuals and reconstructions all agree
+    /// across every hop.
+    #[test]
+    fn lossy_sequence_decode_matches_encoder_recon_chain() {
+        use crate::decode_frame::decode_vp9_sequence;
+
+        let (w, h) = (48u32, 32u32);
+        let cw = w.div_ceil(2) as usize;
+        let ch = h.div_ceil(2) as usize;
+        let pattern = |x: i64, y: i64| -> u8 { (((x * 5 + y * 11) % 53) * 4 + (x * y) % 23) as u8 };
+        let inputs: Vec<Vec<u8>> = (0..4i64)
+            .map(|t| {
+                let mut px = Vec::with_capacity((w * h) as usize + 2 * cw * ch);
+                for i in 0..h as i64 {
+                    for j in 0..w as i64 {
+                        px.push(pattern(j + 2 * t, i + t));
+                    }
+                }
+                for i in 0..ch as i64 {
+                    for j in 0..cw as i64 {
+                        px.push(pattern(j + t + 30, i));
+                    }
+                }
+                for i in 0..ch as i64 {
+                    for j in 0..cw as i64 {
+                        px.push(pattern(j, i + t + 30));
+                    }
+                }
+                px
+            })
+            .collect();
+        let refs: Vec<&[u8]> = inputs.iter().map(|f| f.as_slice()).collect();
+
+        let coded = encode_sequence_lossy_420(&refs, w, h, 70).expect("encode");
+        assert_eq!(coded.len(), 4);
+        let coded_refs: Vec<&[u8]> = coded.iter().map(|f| f.as_slice()).collect();
+        let decoded = decode_vp9_sequence(&coded_refs).expect("decode");
+
+        // Distortion stays bounded across the chain (no drift): each
+        // frame's MSE against its source is in the quantizer regime.
+        for (i, (frame, input)) in decoded.iter().zip(&inputs).enumerate() {
+            let out = frame.to_planar_bytes();
+            let mse: f64 = out
+                .iter()
+                .zip(input)
+                .map(|(&a, &b)| {
+                    let d = f64::from(a) - f64::from(b);
+                    d * d
+                })
+                .sum::<f64>()
+                / out.len() as f64;
+            assert!(mse < 400.0, "frame {i}: MSE {mse} out of the q=70 regime");
+        }
+
+        // Bit-exact mirror: re-encode and compare the final frame's
+        // ReconState against the decode (the sequence API discards the
+        // intermediate states, so rebuild the last hop explicitly).
+        let w_us = w as usize;
+        let y_w = (((w + 7) >> 3) * 8) as usize;
+        let y_h = (((h + 7) >> 3) * 8) as usize;
+        let last = inputs.last().unwrap();
+        let targets = [
+            padded_plane_from_bytes(&last[..w_us * h as usize], w_us, h as usize, y_w, y_h),
+            padded_plane_from_bytes(
+                &last[w_us * h as usize..w_us * h as usize + cw * ch],
+                cw,
+                ch,
+                y_w >> 1,
+                y_h >> 1,
+            ),
+            padded_plane_from_bytes(
+                &last[w_us * h as usize + cw * ch..],
+                cw,
+                ch,
+                y_w >> 1,
+                y_h >> 1,
+            ),
+        ];
+        // Reference = decoder's frame 2 output (== encoder recon).
+        let prev_frame = &decoded[2];
+        let prev: [Vec<i32>; 3] = [
+            prev_frame.y.iter().map(|&s| i32::from(s)).collect(),
+            prev_frame.u.iter().map(|&s| i32::from(s)).collect(),
+            prev_frame.v.iter().map(|&s| i32::from(s)).collect(),
+        ];
+        let reference: [(&[i32], usize); 3] = [
+            (prev[0].as_slice(), w_us),
+            (prev[1].as_slice(), cw),
+            (prev[2].as_slice(), cw),
+        ];
+        let mut hdr = lossless_pframe_header(w, h);
+        hdr.quantization = QuantizationParams {
+            base_q_idx: 70,
+            delta_q_y_dc: 0,
+            delta_q_uv_dc: 0,
+            delta_q_uv_ac: 0,
+            lossless: false,
+        };
+        let (bytes, recon) =
+            encode_pframe_lossy_motion(&hdr, &targets, &reference, w, h, PFRAME_SEARCH_RANGE)
+                .expect("re-encode last hop");
+        assert_eq!(bytes, coded[3], "re-encoded last frame must be identical");
+        let last_decoded = &decoded[3];
+        for row in 0..h as usize {
+            for col in 0..w as usize {
+                assert_eq!(
+                    i32::from(last_decoded.y[row * w_us + col]),
+                    recon.planes[0].get(col, row),
+                    "luma mirror ({col},{row})"
+                );
+            }
+        }
+    }
+
+    /// The lossy sequence rejections mirror the lossless ones plus the
+    /// lossless-qindex guard.
+    #[test]
+    fn lossy_sequence_rejects_bad_inputs() {
+        let ok = vec![0u8; 16 * 16 + 2 * 64];
+        assert_eq!(
+            encode_sequence_lossy_420(&[], 16, 16, 50).unwrap_err(),
+            Error::Unsupported
+        );
+        assert_eq!(
+            encode_sequence_lossy_420(&[&ok], 16, 16, 0).unwrap_err(),
+            Error::Unsupported
+        );
+        let short = vec![0u8; 4];
+        assert_eq!(
+            encode_sequence_lossy_420(&[&ok, &short], 16, 16, 50).unwrap_err(),
+            Error::Unsupported
+        );
     }
 
     /// On translating content the `NEWMV` motion search codes a

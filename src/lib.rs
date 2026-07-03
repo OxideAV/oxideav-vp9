@@ -742,6 +742,28 @@ pub fn encode_vp9_lossy(
     pixel_encoder::encode_keyframe_lossy_420(pixels, width, height, base_q_idx)
 }
 
+/// Encode a **sequence** of 8-bit 4:2:0 planar frames into a lossy VP9
+/// stream at quantizer index `base_q_idx` (`1..=255`): a lossy keyframe
+/// followed by lossy inter (P-)frames with per-block `ZEROMV` / `NEWMV`
+/// integer motion search, each quantizing the forward-DCT residual
+/// against the previous frame's in-loop **reconstruction** (the
+/// decoder's exact output, replayed by the encoder), so encoder and
+/// decoder never drift across the chain.
+///
+/// The decoded output of every frame equals the encoder's in-loop
+/// reconstruction bit-for-bit; distortion against the source is bounded
+/// by the quantizer step. Returns [`Error::Unsupported`] for an empty
+/// sequence, `base_q_idx == 0` (use [`encode_vp9_lossless_sequence`]),
+/// degenerate dimensions, or any too-short frame buffer.
+pub fn encode_vp9_lossy_sequence(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+) -> Result<Vec<Vec<u8>>, Error> {
+    pixel_encoder::encode_sequence_lossy_420(frames, width, height, base_q_idx)
+}
+
 /// Encode a minimal VP9 **inter (P-frame) sequence** of `width × height`:
 /// a keyframe followed by `num_pframes` all-skip, single-reference-`LAST`,
 /// `ZEROMV` P-frames.

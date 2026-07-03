@@ -1,5 +1,7 @@
 # oxideav-vp9
 
+[![CI](https://github.com/OxideAV/oxideav-vp9/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-vp9/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-vp9.svg)](https://crates.io/crates/oxideav-vp9) [![docs.rs](https://docs.rs/oxideav-vp9/badge.svg)](https://docs.rs/oxideav-vp9) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust, clean-room VP9 codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework,
 implemented against the VP9 Bitstream & Decoding Process Specification

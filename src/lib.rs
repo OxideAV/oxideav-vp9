@@ -764,6 +764,33 @@ pub fn encode_vp9_lossy_sequence(
     pixel_encoder::encode_sequence_lossy_420(frames, width, height, base_q_idx)
 }
 
+/// **Rate-controlled** lossy sequence encode: like
+/// [`encode_vp9_lossy_sequence`] but instead of a fixed quantizer, every
+/// frame is coded at the *lowest* `base_q_idx` (best quality) whose
+/// coded size fits `target_bytes_per_frame` — a per-frame binary search
+/// over the quantizer range (at most 8 trial encodes per frame; every
+/// encoder in the chain is byte-deterministic, so the search is exact).
+///
+/// When even the coarsest quantizer (`base_q_idx == 255`) overflows the
+/// budget, that frame is returned **best-effort** at `q == 255` rather
+/// than failing: a budget below the frame's syntax floor is not
+/// representable, and the stream stays decodable. The decoder-mirror
+/// guarantee is unchanged — each frame's decoded output equals the
+/// encoder's in-loop reconstruction bit-for-bit at whatever quantizer
+/// it landed on, and P-frames reference the *chosen* previous
+/// reconstruction.
+///
+/// Returns [`Error::Unsupported`] for an empty sequence, degenerate
+/// dimensions, or any too-short frame buffer.
+pub fn encode_vp9_lossy_sequence_rc(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    target_bytes_per_frame: usize,
+) -> Result<Vec<Vec<u8>>, Error> {
+    pixel_encoder::encode_sequence_lossy_rc_420(frames, width, height, target_bytes_per_frame)
+}
+
 /// Encode a minimal VP9 **inter (P-frame) sequence** of `width × height`:
 /// a keyframe followed by `num_pframes` all-skip, single-reference-`LAST`,
 /// `ZEROMV` P-frames.

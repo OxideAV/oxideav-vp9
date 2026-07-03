@@ -1810,6 +1810,145 @@ pub(crate) fn encode_sequence_lossy_420(
     Ok(out)
 }
 
+/// Bisect `base_q_idx` for the **lowest** quantizer whose coded frame
+/// fits `target_bytes` — the per-frame rate-control primitive.
+///
+/// `encode( q )` must be a pure function of `q` (byte-deterministic,
+/// which every encoder in this module is). Coded size is monotone
+/// non-increasing in `q` for all practical content, so a binary search
+/// over `1..=255` finds the best-quality fitting quantizer in at most 8
+/// probes; each accepted probe re-uses its actual encode (no re-run).
+/// If even `q == 255` overflows the budget the `q == 255` encode is
+/// returned **best-effort** (the caller keeps a decodable stream rather
+/// than an error — a budget below the syntax floor is unrepresentable).
+fn bisect_q<T>(
+    mut encode: impl FnMut(u8) -> Result<(Vec<u8>, T), Error>,
+    target_bytes: usize,
+) -> Result<(Vec<u8>, T, u8), Error> {
+    let mut lo = 1u16;
+    let mut hi = 255u16;
+    let mut best: Option<(Vec<u8>, T, u8)> = None;
+    while lo <= hi {
+        let mid = ((lo + hi) / 2) as u8;
+        let (bytes, aux) = encode(mid)?;
+        if bytes.len() <= target_bytes {
+            best = Some((bytes, aux, mid));
+            if mid == 1 {
+                break;
+            }
+            hi = u16::from(mid) - 1;
+        } else {
+            lo = u16::from(mid) + 1;
+        }
+    }
+    match best {
+        Some(b) => Ok(b),
+        None => {
+            let (bytes, aux) = encode(255)?;
+            Ok((bytes, aux, 255))
+        }
+    }
+}
+
+/// Rate-controlled lossy sequence encoder: every frame is coded at the
+/// **lowest** `base_q_idx` whose size fits `target_bytes_per_frame`
+/// (per-frame [`bisect_q`]; best-effort `q == 255` when the budget is
+/// below the syntax floor). The keyframe runs the content-adaptive
+/// partition/tx planner per probe; P-frames motion-search against the
+/// chosen previous reconstruction, so the decoder mirror stays exact at
+/// whatever quantizer each frame lands on.
+pub(crate) fn encode_sequence_lossy_rc_420(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    target_bytes_per_frame: usize,
+) -> Result<Vec<Vec<u8>>, Error> {
+    if frames.is_empty() {
+        return Err(Error::Unsupported);
+    }
+    if width == 0 || height == 0 || width > (1 << 16) || height > (1 << 16) {
+        return Err(Error::Unsupported);
+    }
+    let w = width as usize;
+    let h = height as usize;
+    let cw = width.div_ceil(2) as usize;
+    let ch = height.div_ceil(2) as usize;
+    let need = w * h + 2 * cw * ch;
+    if frames.iter().any(|f| f.len() < need) {
+        return Err(Error::Unsupported);
+    }
+
+    let padded_targets = |pixels: &[u8]| -> [Plane; 3] {
+        let y_w = (((width + 7) >> 3) * 8) as usize;
+        let y_h = (((height + 7) >> 3) * 8) as usize;
+        [
+            padded_plane_from_bytes(&pixels[..w * h], w, h, y_w, y_h),
+            padded_plane_from_bytes(&pixels[w * h..w * h + cw * ch], cw, ch, y_w >> 1, y_h >> 1),
+            padded_plane_from_bytes(&pixels[w * h + cw * ch..], cw, ch, y_w >> 1, y_h >> 1),
+        ]
+    };
+    let visible_crop = |recon: &ReconState| -> [Vec<i32>; 3] {
+        let crop = |p: &Plane, vw: usize, vh: usize| -> Vec<i32> {
+            let mut out = Vec::with_capacity(vw * vh);
+            for y in 0..vh {
+                for x in 0..vw {
+                    out.push(p.get(x, y));
+                }
+            }
+            out
+        };
+        [
+            crop(&recon.planes[0], w, h),
+            crop(&recon.planes[1], cw, ch),
+            crop(&recon.planes[2], cw, ch),
+        ]
+    };
+
+    // Keyframe: bisect q over the planner-driven encoder.
+    let (kf_bytes, kf_recon, _kf_q) = bisect_q(
+        |q| encode_keyframe_lossy_420_with_recon(frames[0], width, height, q),
+        target_bytes_per_frame,
+    )?;
+
+    let mut out = Vec::with_capacity(frames.len());
+    out.push(kf_bytes);
+    let mut prev_recon = kf_recon;
+
+    for &frame in frames.iter().skip(1) {
+        let targets = padded_targets(frame);
+        let prev = visible_crop(&prev_recon);
+        let reference: [(&[i32], usize); 3] = [
+            (prev[0].as_slice(), w),
+            (prev[1].as_slice(), cw),
+            (prev[2].as_slice(), cw),
+        ];
+        let (bytes, recon, _q) = bisect_q(
+            |q| {
+                let mut hdr = lossless_pframe_header(width, height);
+                hdr.quantization = QuantizationParams {
+                    base_q_idx: q,
+                    delta_q_y_dc: 0,
+                    delta_q_uv_dc: 0,
+                    delta_q_uv_ac: 0,
+                    lossless: false,
+                };
+                encode_pframe_lossy_motion(
+                    &hdr,
+                    &targets,
+                    &reference,
+                    width,
+                    height,
+                    PFRAME_SEARCH_RANGE,
+                )
+            },
+            target_bytes_per_frame,
+        )?;
+        out.push(bytes);
+        prev_recon = recon;
+    }
+    Ok(out)
+}
+
 /// Encode a sequence of 8-bit 4:2:0 planar frames (each `Y` then `U`
 /// then `V`, the [`crate::decode_vp9`] layout) into a lossless VP9
 /// stream: a keyframe followed by P-frames, each coding the exact
@@ -2391,6 +2530,107 @@ mod tests {
         }
         mse /= f64::from(64 * h);
         assert!(mse < 200.0, "smooth-half MSE {mse} too high at q=80");
+    }
+
+    // ----- rate control -----
+
+    /// Every frame of a rate-controlled sequence fits the byte budget
+    /// (when the budget is above the syntax floor), and the stream
+    /// decodes end-to-end.
+    #[test]
+    fn rc_sequence_respects_frame_budget() {
+        use crate::decode_frame::decode_vp9_sequence;
+        let (w, h) = (64u32, 64u32);
+        let n = (w * h) as usize + 2 * 32 * 32;
+        let frames: Vec<Vec<u8>> = (0..3u64)
+            .map(|t| {
+                (0..n)
+                    .map(|i| ((i as u64 * 73 + 19 + 5 * t) % 256) as u8)
+                    .collect()
+            })
+            .collect();
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+
+        let budget = 2000usize;
+        let coded = encode_sequence_lossy_rc_420(&refs, w, h, budget).expect("rc encode");
+        assert_eq!(coded.len(), 3);
+        for (i, f) in coded.iter().enumerate() {
+            assert!(
+                f.len() <= budget,
+                "frame {i} size {} exceeds budget {budget}",
+                f.len()
+            );
+        }
+        let coded_refs: Vec<&[u8]> = coded.iter().map(|f| f.as_slice()).collect();
+        let decoded = decode_vp9_sequence(&coded_refs).expect("decode");
+        assert_eq!(decoded.len(), 3);
+    }
+
+    /// A larger budget buys lower distortion (the bisection lands on a
+    /// finer quantizer).
+    #[test]
+    fn rc_quality_improves_with_budget() {
+        use crate::decode_frame::decode_vp9_sequence;
+        let (w, h) = (64u32, 64u32);
+        let n = (w * h) as usize + 2 * 32 * 32;
+        let px: Vec<u8> = (0..n).map(|i| ((i * 73 + 19) % 256) as u8).collect();
+        let refs: Vec<&[u8]> = vec![px.as_slice()];
+
+        let mse_at = |budget: usize| -> f64 {
+            let coded = encode_sequence_lossy_rc_420(&refs, w, h, budget).expect("rc");
+            assert!(coded[0].len() <= budget, "budget {budget} not met");
+            let coded_refs: Vec<&[u8]> = coded.iter().map(|f| f.as_slice()).collect();
+            let dec = decode_vp9_sequence(&coded_refs).expect("decode");
+            let mut mse = 0f64;
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let d =
+                        f64::from(dec[0].y[y * w as usize + x]) - f64::from(px[y * w as usize + x]);
+                    mse += d * d;
+                }
+            }
+            mse / f64::from(w * h)
+        };
+        let coarse = mse_at(600);
+        let fine = mse_at(8000);
+        assert!(
+            fine <= coarse,
+            "MSE at 8000 B ({fine}) worse than at 600 B ({coarse})"
+        );
+    }
+
+    /// A budget below the syntax floor returns a best-effort q=255
+    /// stream (still decodable) instead of failing.
+    #[test]
+    fn rc_best_effort_below_syntax_floor() {
+        use crate::decode_frame::decode_vp9_sequence;
+        let (w, h) = (64u32, 64u32);
+        let n = (w * h) as usize + 2 * 32 * 32;
+        let px: Vec<u8> = (0..n).map(|i| ((i * 31 + 3) % 256) as u8).collect();
+        let refs: Vec<&[u8]> = vec![px.as_slice()];
+        let coded = encode_sequence_lossy_rc_420(&refs, w, h, 4).expect("best effort");
+        assert!(coded[0].len() > 4, "a 4-byte frame is not representable");
+        let coded_refs: Vec<&[u8]> = coded.iter().map(|f| f.as_slice()).collect();
+        decode_vp9_sequence(&coded_refs).expect("decode");
+    }
+
+    /// Rate-control input validation matches the fixed-q sequence path.
+    #[test]
+    fn rc_rejects_bad_inputs() {
+        assert_eq!(
+            encode_sequence_lossy_rc_420(&[], 64, 64, 1000).unwrap_err(),
+            Error::Unsupported
+        );
+        let short = vec![0u8; 10];
+        assert_eq!(
+            encode_sequence_lossy_rc_420(&[short.as_slice()], 64, 64, 1000).unwrap_err(),
+            Error::Unsupported
+        );
+        let px = vec![0u8; 64 * 64 + 2 * 32 * 32];
+        assert_eq!(
+            encode_sequence_lossy_rc_420(&[px.as_slice()], 0, 64, 1000).unwrap_err(),
+            Error::Unsupported
+        );
     }
 
     /// Skip leaves are rejected (the mirror never replays a skip block's

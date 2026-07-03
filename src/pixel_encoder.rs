@@ -37,9 +37,7 @@
 //! in-crate decoder exactly.
 
 use crate::dequant::{get_ac_quant, get_dc_quant};
-use crate::frame_writer::{
-    assemble_inter_frame_zeromv, assemble_keyframe, BlockPlan, FrameCoefSource, KeyframePlan,
-};
+use crate::frame_writer::{assemble_keyframe, BlockPlan, FrameCoefSource, KeyframePlan};
 use crate::fwd_transform::forward_wht_2d;
 use crate::header::{
     ColorConfig, ColorSpace, FrameType, LoopFilterParams, QuantizationParams, SegmentationParams,
@@ -772,16 +770,30 @@ pub(crate) fn encode_keyframe_lossy_420(
 
 // ----- Lossless inter (P-frame) encoding -----
 
-/// The §6.2 header for a lossless ZEROMV P-frame: profile 0, 8-bit
-/// 4:2:0, `LAST` / `GOLDEN` / `ALTREF` all resolving to slot 0,
+/// The §6.2 header for a lossless P-frame: profile 0, 8-bit 4:2:0,
+/// `LAST` / `GOLDEN` / `ALTREF` all resolving to slot 0,
 /// `refresh_frame_flags == 0x01` so each frame becomes the next frame's
 /// `LAST` reference, EIGHTTAP filter, loop filter off, lossless
 /// quantization.
+///
+/// The frame is **error-resilient**: §7.2.6 then pins
+/// `UsePrevFrameMvs == 0` on the decode side, matching the inter block
+/// writer's model exactly, so the §6.5 MV candidate scan (which reaches
+/// the coded syntax through `BestMv` and the `inter_mode` probability
+/// context) is bit-identical between encoder and decoder for every
+/// mode including `NEWMV`. `allow_high_precision_mv` is enabled so
+/// eighth-pel MV differences are codeable whenever the §6.5.13
+/// `use_mv_hp` gate allows.
 pub(crate) fn lossless_pframe_header(width: u32, height: u32) -> Vp9FrameHeader {
     let mut hdr = lossless_keyframe_header(width, height);
     hdr.frame_type = FrameType::NonKeyFrame;
+    hdr.error_resilient_mode = true;
+    hdr.refresh_frame_context = false;
+    hdr.frame_parallel_decoding_mode = true;
+    hdr.frame_context_idx = 0;
     hdr.refresh_frame_flags = 0x01;
     hdr.ref_frame_idx = Some([0, 0, 0]);
+    hdr.allow_high_precision_mv = true;
     hdr
 }
 
@@ -793,101 +805,162 @@ pub(crate) fn lossless_pframe_header(width: u32, height: u32) -> Vp9FrameHeader 
 /// `reference` carries the previous frame's **visible-extent** planes
 /// (the §8.10 `FrameStore` crop): `(samples, stride)` per plane, with
 /// `vis_w × vis_h` the reference's luma dimensions.
+/// Run the §8.5.2 inter prediction for one `BLOCK_8X8` MI block at
+/// `(r, c)` with the (eighth-pel) motion vector `mv`, writing all three
+/// planes' predicted regions — exactly what the decoder's §6.4.21 inter
+/// arm produces before the token loop.
+///
+/// `reference` carries the previous frame's **visible-extent** planes
+/// (the §8.10 `FrameStore` crop): `(samples, stride)` per plane, with
+/// `vis_w × vis_h` the reference's luma dimensions.
 // Spec-shaped geometry fan-in, matching the style of the §8.5.2 driver.
 #[allow(clippy::too_many_arguments)]
-fn predict_frame_zeromv(
+fn predict_mi_block(
+    pred: &mut [Plane; 3],
     reference: &[(&[i32], usize); 3],
     vis_w: u32,
     vis_h: u32,
+    r: u32,
+    c: u32,
+    mv: [i32; 2],
     mi_cols: u32,
     mi_rows: u32,
     ssx: bool,
     ssy: bool,
     bit_depth: u32,
-) -> [Plane; 3] {
-    let y_w = (mi_cols * 8) as usize;
-    let y_h = (mi_rows * 8) as usize;
-    let uv_w = y_w >> usize::from(ssx);
-    let uv_h = y_h >> usize::from(ssy);
-    let mut pred = [
-        Plane::new(y_w, y_h),
-        Plane::new(uv_w, uv_h),
-        Plane::new(uv_w, uv_h),
-    ];
+) {
+    let block_mvs = [[mv; 4], [[0i32; 2]; 4]];
+    for (plane, pred_plane) in pred.iter_mut().enumerate() {
+        let sub_x = plane > 0 && ssx;
+        let sub_y = plane > 0 && ssy;
+        let base_x = (c * 8) >> u32::from(sub_x);
+        let base_y = (r * 8) >> u32::from(sub_y);
+        let region = 8usize >> usize::from(sub_x);
+        let region_h = 8usize >> usize::from(sub_y);
 
-    let zero_mvs = [[[0i32; 2]; 4]; 2];
-    for r in 0..mi_rows {
-        for c in 0..mi_cols {
-            for (plane, pred_plane) in pred.iter_mut().enumerate() {
-                let sub_x = plane > 0 && ssx;
-                let sub_y = plane > 0 && ssy;
-                let base_x = (c * 8) >> u32::from(sub_x);
-                let base_y = (r * 8) >> u32::from(sub_y);
-                let region = 8usize >> usize::from(sub_x);
-                let region_h = 8usize >> usize::from(sub_y);
-
-                let (samples, stride) = reference[plane];
-                let refs = RefPlanes {
-                    list: [
-                        Some(RefPlane {
-                            samples,
-                            stride,
-                            ref_frame_width: vis_w as i32,
-                            ref_frame_height: vis_h as i32,
-                        }),
-                        None,
-                    ],
-                };
-                let grid = BlockGrid {
-                    mi_row: r as i32,
-                    mi_col: c as i32,
-                    mi_rows: mi_rows as i32,
-                    mi_cols: mi_cols as i32,
-                    mi_size: BLOCK_8X8,
-                };
-                let geom = ScaleGeom {
+        let (samples, stride) = reference[plane];
+        let refs = RefPlanes {
+            list: [
+                Some(RefPlane {
+                    samples,
+                    stride,
                     ref_frame_width: vis_w as i32,
                     ref_frame_height: vis_h as i32,
-                    frame_width: vis_w as i32,
-                    frame_height: vis_h as i32,
-                    subsampling_x: ssx,
-                    subsampling_y: ssy,
-                };
-                let args = InterPredArgs {
-                    plane,
-                    x: base_x as i32,
-                    y: base_y as i32,
-                    w: region,
-                    h: region_h,
-                    block_idx: 0,
-                    interp_filter: 0, // EIGHTTAP; ZEROMV full-pel is a copy.
-                    bit_depth,
-                    is_compound: false,
-                };
-                predict_inter(pred_plane, &args, &grid, &geom, &zero_mvs, &refs, ssx, ssy);
+                }),
+                None,
+            ],
+        };
+        let grid = BlockGrid {
+            mi_row: r as i32,
+            mi_col: c as i32,
+            mi_rows: mi_rows as i32,
+            mi_cols: mi_cols as i32,
+            mi_size: BLOCK_8X8,
+        };
+        let geom = ScaleGeom {
+            ref_frame_width: vis_w as i32,
+            ref_frame_height: vis_h as i32,
+            frame_width: vis_w as i32,
+            frame_height: vis_h as i32,
+            subsampling_x: ssx,
+            subsampling_y: ssy,
+        };
+        let args = InterPredArgs {
+            plane,
+            x: base_x as i32,
+            y: base_y as i32,
+            w: region,
+            h: region_h,
+            block_idx: 0,
+            interp_filter: 0, // EIGHTTAP.
+            bit_depth,
+            is_compound: false,
+        };
+        predict_inter(pred_plane, &args, &grid, &geom, &block_mvs, &refs, ssx, ssy);
+    }
+}
+
+/// Full-search one 8x8 luma block over integer motion vectors in
+/// `[-range, range]²`, returning `((dy, dx), best_sad, zero_sad)`.
+///
+/// The reference read is edge-clamped to the visible extents, matching
+/// the §8.5.2.4 `Clip3( 0, lastX/lastY, . )` sampling for full-pel
+/// vectors, so the SAD equals the true prediction error.
+#[allow(clippy::too_many_arguments)]
+fn search_block_mv(
+    target: &Plane,
+    ref_samples: &[i32],
+    ref_stride: usize,
+    vis_w: i32,
+    vis_h: i32,
+    bx: i32,
+    by: i32,
+    range: i32,
+) -> ((i32, i32), u64, u64) {
+    let sad_at = |dy: i32, dx: i32| -> u64 {
+        let mut sad = 0u64;
+        for i in 0..8i32 {
+            for j in 0..8i32 {
+                let ry = (by + i + dy).clamp(0, vis_h - 1) as usize;
+                let rx = (bx + j + dx).clamp(0, vis_w - 1) as usize;
+                let t = target.get((bx + j) as usize, (by + i) as usize);
+                let p = ref_samples[ry * ref_stride + rx];
+                sad += (t - p).unsigned_abs() as u64;
+            }
+        }
+        sad
+    };
+    let zero_sad = sad_at(0, 0);
+    let mut best = ((0i32, 0i32), zero_sad);
+    for dy in -range..=range {
+        for dx in -range..=range {
+            if dy == 0 && dx == 0 {
+                continue;
+            }
+            let sad = sad_at(dy, dx);
+            if sad < best.1 {
+                best = ((dy, dx), sad);
             }
         }
     }
-    pred
+    (best.0, best.1, zero_sad)
 }
 
-/// Encode one lossless `ZEROMV` P-frame whose reconstruction equals
-/// `targets` (MI-padded planes) exactly, referencing `reference` (the
-/// previous frame's visible-extent planes).
+/// Encode one lossless P-frame whose reconstruction equals `targets`
+/// (MI-padded planes) exactly, referencing `reference` (the previous
+/// frame's visible-extent planes), with per-block integer motion search
+/// over `[-search_range, search_range]²` luma pixels (`0` disables the
+/// search: every block codes `ZEROMV`).
 ///
-/// Per coded transform block the §6.4.21 walk supplies the coefficient
-/// callback; the residual is `target − prediction` with the prediction
-/// computed by the decoder's own §8.5.2 process, forward-WHT-transformed
-/// exactly. With zero motion the reconstruction is `Clip1( prediction +
-/// residual ) == target` sample-for-sample, so the frame chain stays
-/// bit-exact and the next frame may reference `targets`' visible crop.
-pub(crate) fn encode_pframe_lossless_zeromv(
+/// The planner derives each block's §6.5.12 `BestMv` with the **shared**
+/// `find_mv_refs` / `find_best_ref_mvs` over the same `Vp9FrameState`
+/// the inter block writer reads (so the predictors are bit-identical),
+/// elects `NEWMV` when the searched vector beats `ZEROMV` by a margin,
+/// and snaps the MV difference to the §6.4.20-codeable grid when the
+/// §6.5.13 `use_mv_hp( BestMv )` gate disables the eighth-pel bit (the
+/// no-hp decode fixes `hp == 1`, so only even-magnitude differences are
+/// codeable; a snapped vector merely changes the prediction, which the
+/// exact WHT residual absorbs). Each block is §8.5.2-predicted with the
+/// vector actually coded, so `Clip1( prediction + residual ) == target`
+/// holds sample-for-sample and the frame chain stays bit-exact.
+///
+/// `search_range > 0` requires an error-resilient header (the §7.2.6
+/// `UsePrevFrameMvs == 0` model — see
+/// [`crate::frame_writer::assemble_inter_frame_planned`]).
+pub(crate) fn encode_pframe_lossless_motion(
     hdr: &Vp9FrameHeader,
     targets: &[Plane; 3],
     reference: &[(&[i32], usize); 3],
     ref_w: u32,
     ref_h: u32,
+    search_range: i32,
 ) -> Result<Vec<u8>, Error> {
+    use crate::inter_decode::FrameStateMvSource;
+    use crate::mode_info::{LAST_FRAME, NEWMV, ZEROMV};
+    use crate::mv::use_mv_hp;
+    use crate::mv_ref::MvRefGeometry;
+    use std::cell::RefCell;
+
     if hdr.frame_type != FrameType::NonKeyFrame || !hdr.quantization.lossless {
         return Err(Error::Unsupported);
     }
@@ -896,13 +969,93 @@ pub(crate) fn encode_pframe_lossless_zeromv(
     let ssx = hdr.color_config.subsampling_x;
     let ssy = hdr.color_config.subsampling_y;
     let bit_depth = u32::from(hdr.color_config.bit_depth);
+    let sign_bias = [
+        false,
+        hdr.ref_frame_sign_bias[0],
+        hdr.ref_frame_sign_bias[1],
+        hdr.ref_frame_sign_bias[2],
+    ];
 
-    let pred = predict_frame_zeromv(
-        reference, ref_w, ref_h, mi_cols, mi_rows, ssx, ssy, bit_depth,
-    );
+    let y_w = (mi_cols * 8) as usize;
+    let y_h = (mi_rows * 8) as usize;
+    let uv_w = y_w >> usize::from(ssx);
+    let uv_h = y_h >> usize::from(ssy);
+    let pred = RefCell::new([
+        Plane::new(y_w, y_h),
+        Plane::new(uv_w, uv_h),
+        Plane::new(uv_w, uv_h),
+    ]);
+
+    // Prefer NEWMV only for a clear win: the mode + MV syntax costs bits
+    // that a marginal SAD gain does not repay.
+    const NEWMV_SAD_MARGIN: u64 = 64;
+
+    let mut planner: Box<crate::frame_writer::InterBlockPlanner<'_>> =
+        Box::new(|r, c, state| -> (u8, [i32; 2]) {
+            let mut choice: (u8, [i32; 2]) = (ZEROMV, [0, 0]);
+            if search_range > 0 {
+                let ((dy, dx), best_sad, zero_sad) = search_block_mv(
+                    &targets[0],
+                    reference[0].0,
+                    reference[0].1,
+                    ref_w as i32,
+                    ref_h as i32,
+                    (c * 8) as i32,
+                    (r * 8) as i32,
+                    search_range,
+                );
+                if (dy, dx) != (0, 0) && best_sad + NEWMV_SAD_MARGIN < zero_sad {
+                    // §6.5 predictors over the shared state — identical
+                    // to the derivation the inter block writer performs.
+                    let geom = MvRefGeometry {
+                        mi_row: r as i32,
+                        mi_col: c as i32,
+                        mi_rows: mi_rows as i32,
+                        mi_cols: mi_cols as i32,
+                        mi_size: BLOCK_8X8 as usize,
+                        mi_col_start: 0,
+                        mi_col_end: mi_cols as i32,
+                    };
+                    let src = FrameStateMvSource::new(state, None);
+                    let mv_refs = geom.find_mv_refs(&src, LAST_FRAME, -1, &sign_bias, false);
+                    let best =
+                        geom.find_best_ref_mvs(mv_refs.ref_list_mv, hdr.allow_high_precision_mv)[0];
+
+                    let mut mv = [8 * dy, 8 * dx];
+                    let use_hp = hdr.allow_high_precision_mv && use_mv_hp(best);
+                    for (comp, m) in mv.iter_mut().enumerate() {
+                        let d = *m - best[comp];
+                        if d != 0 && !use_hp && (d & 1) != 0 {
+                            // Only even-magnitude differences are codeable
+                            // without the hp bit; nudge by one eighth-pel.
+                            *m -= 1;
+                        }
+                    }
+                    choice = (NEWMV, mv);
+                }
+            }
+            // Predict this block with the vector that will be coded, so
+            // the residual callbacks below see the decoder's prediction.
+            predict_mi_block(
+                &mut pred.borrow_mut(),
+                reference,
+                ref_w,
+                ref_h,
+                r,
+                c,
+                choice.1,
+                mi_cols,
+                mi_rows,
+                ssx,
+                ssy,
+                bit_depth,
+            );
+            choice
+        });
 
     let mut coeffs: Box<FrameCoefSource<'_>> = Box::new(
-        move |_mi_r: u32, _mi_c: u32, plane: usize, sx: u32, sy: u32, _b: usize| -> Vec<i64> {
+        |_mi_r: u32, _mi_c: u32, plane: usize, sx: u32, sy: u32, _b: usize| -> Vec<i64> {
+            let pred = pred.borrow();
             let mut block = vec![0i64; 16];
             for i in 0..4usize {
                 for j in 0..4usize {
@@ -916,13 +1069,18 @@ pub(crate) fn encode_pframe_lossless_zeromv(
         },
     );
 
-    assemble_inter_frame_zeromv(hdr, false, &mut *coeffs)
+    crate::frame_writer::assemble_inter_frame_planned(hdr, false, &mut *planner, &mut *coeffs)
 }
+
+/// Integer motion-search window (±luma pixels) for the lossless
+/// P-frame sequence encoder.
+pub(crate) const PFRAME_SEARCH_RANGE: i32 = 8;
 
 /// Encode a sequence of 8-bit 4:2:0 planar frames (each `Y` then `U`
 /// then `V`, the [`crate::decode_vp9`] layout) into a lossless VP9
-/// stream: a keyframe followed by `ZEROMV` P-frames, each coding the
-/// exact `frame − prediction` residual.
+/// stream: a keyframe followed by P-frames, each coding the exact
+/// `frame − prediction` residual with per-block `ZEROMV` / `NEWMV`
+/// motion (integer full search over ±[`PFRAME_SEARCH_RANGE`] pixels).
 ///
 /// Every returned coded frame decodes **byte-exact** back to its input
 /// through [`crate::decode_frame::decode_vp9_sequence`].
@@ -989,8 +1147,13 @@ pub(crate) fn encode_sequence_lossless_420(
             (prev[2].as_slice(), cw),
         ];
         let hdr = lossless_pframe_header(width, height);
-        out.push(encode_pframe_lossless_zeromv(
-            &hdr, &targets, &reference, width, height,
+        out.push(encode_pframe_lossless_motion(
+            &hdr,
+            &targets,
+            &reference,
+            width,
+            height,
+            PFRAME_SEARCH_RANGE,
         )?);
     }
     Ok(out)
@@ -1514,6 +1677,99 @@ mod tests {
         assert_eq!(decoded.len(), 5);
         for (i, (frame, input)) in decoded.iter().zip(&inputs).enumerate() {
             assert_eq!(&frame.to_planar_bytes(), input, "frame {i}");
+        }
+    }
+
+    /// On translating content the `NEWMV` motion search codes a
+    /// substantially smaller P-frame than forced `ZEROMV` — and both
+    /// stay byte-exact through the full decoder (which also pins the
+    /// §6.5 predictor derivation and the §6.4.20 hp-gate snapping
+    /// against the decode side, since any mismatch desyncs the stream).
+    #[test]
+    fn motion_search_beats_zeromv_on_translating_content() {
+        use crate::decode_frame::decode_vp9_sequence;
+
+        let (w, h) = (64u32, 48u32);
+        let cw = w.div_ceil(2) as usize;
+        let ch = h.div_ceil(2) as usize;
+        // Textured pattern translated by (dy, dx) = (3, 5) px between
+        // frames (sampled from a shared infinite pattern so the motion
+        // is real, not a wrap-around).
+        let pattern = |x: i64, y: i64| -> u8 { (((x * 7 + y * 13) % 61) * 4 + (x + y) % 17) as u8 };
+        let frame_at = |ox: i64, oy: i64| -> Vec<u8> {
+            let mut px = Vec::with_capacity((w * h) as usize + 2 * cw * ch);
+            for i in 0..h as i64 {
+                for j in 0..w as i64 {
+                    px.push(pattern(j + ox, i + oy));
+                }
+            }
+            for i in 0..ch as i64 {
+                for j in 0..cw as i64 {
+                    px.push(pattern(j + ox / 2 + 40, i + oy / 2));
+                }
+            }
+            for i in 0..ch as i64 {
+                for j in 0..cw as i64 {
+                    px.push(pattern(j + ox / 2, i + oy / 2 + 40));
+                }
+            }
+            px
+        };
+        let f0 = frame_at(0, 0);
+        let f1 = frame_at(5, 3);
+
+        // Shared setup for both P-frame encodes.
+        let wl = w as usize;
+        let y_w = (((w + 7) >> 3) * 8) as usize;
+        let y_h = (((h + 7) >> 3) * 8) as usize;
+        let targets = [
+            padded_plane_from_bytes(&f1[..wl * h as usize], wl, h as usize, y_w, y_h),
+            padded_plane_from_bytes(
+                &f1[wl * h as usize..wl * h as usize + cw * ch],
+                cw,
+                ch,
+                y_w >> 1,
+                y_h >> 1,
+            ),
+            padded_plane_from_bytes(&f1[wl * h as usize + cw * ch..], cw, ch, y_w >> 1, y_h >> 1),
+        ];
+        let prev: [Vec<i32>; 3] = [
+            f0[..wl * h as usize]
+                .iter()
+                .map(|&s| i32::from(s))
+                .collect(),
+            f0[wl * h as usize..wl * h as usize + cw * ch]
+                .iter()
+                .map(|&s| i32::from(s))
+                .collect(),
+            f0[wl * h as usize + cw * ch..]
+                .iter()
+                .map(|&s| i32::from(s))
+                .collect(),
+        ];
+        let reference: [(&[i32], usize); 3] = [
+            (prev[0].as_slice(), wl),
+            (prev[1].as_slice(), cw),
+            (prev[2].as_slice(), cw),
+        ];
+        let hdr = lossless_pframe_header(w, h);
+
+        let with_motion =
+            encode_pframe_lossless_motion(&hdr, &targets, &reference, w, h, 8).expect("motion");
+        let zero_only =
+            encode_pframe_lossless_motion(&hdr, &targets, &reference, w, h, 0).expect("zeromv");
+        assert!(
+            with_motion.len() * 2 < zero_only.len(),
+            "motion search ({} B) should code far fewer bits than ZEROMV ({} B)",
+            with_motion.len(),
+            zero_only.len()
+        );
+
+        // Both must still be byte-exact through the full decoder.
+        let kf = encode_keyframe_lossless_420(&f0, w, h).expect("keyframe");
+        for pf in [&with_motion, &zero_only] {
+            let decoded = decode_vp9_sequence(&[&kf, pf]).expect("decode");
+            assert_eq!(decoded[1].to_planar_bytes(), f1, "P-frame not byte-exact");
         }
     }
 

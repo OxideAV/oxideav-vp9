@@ -400,13 +400,48 @@ pub(crate) fn assemble_inter_frame_all_skip_zeromv(hdr: &Vp9FrameHeader) -> Resu
 /// syntax, and the decoder reconstructs `prediction + residual` — the
 /// carrier for a pixel-accurate inter encode.
 ///
+pub(crate) fn assemble_inter_frame_zeromv(
+    hdr: &Vp9FrameHeader,
+    skip_all: bool,
+    coeffs: &mut FrameCoefSource<'_>,
+) -> Result<Vec<u8>, Error> {
+    let mut planner: Box<InterBlockPlanner<'_>> =
+        Box::new(|_r, _c, _state| (crate::mode_info::ZEROMV, [0, 0]));
+    assemble_inter_frame_planned(hdr, skip_all, &mut *planner, coeffs)
+}
+
+/// Per-block inter mode planner: called once per `BLOCK_8X8` leaf (in
+/// §6.4.3 partition order, i.e. exactly the decode order) with the MI
+/// coordinates and the **shared** [`Vp9FrameState`] as it stands *before*
+/// this block is written — the same state the inter block writer derives
+/// its §6.5 MV predictors and §9.3.2 contexts from — and returns the
+/// block's `(y_mode, mv)` pair: `ZEROMV` with `[0, 0]`, or `NEWMV` with
+/// an eighth-pel `[row, col]` vector (the difference onto the §6.5.12
+/// `BestMv` is coded, so the planner must pick a difference the §6.4.20
+/// decomposition can carry under the frame's high-precision gate).
+pub(crate) type InterBlockPlanner<'f> = dyn FnMut(u32, u32, &Vp9FrameState) -> (u8, [i32; 2]) + 'f;
+
+/// Assemble a complete VP9 **inter** frame: an all-`BLOCK_8X8`,
+/// single-reference-`LAST` P-frame whose per-block inter mode / motion
+/// vector a caller-supplied [`InterBlockPlanner`] dictates and whose
+/// per-block residual comes from `coeffs` (never fired when
+/// `skip_all == true`).
+///
 /// `hdr` must be a non-key frame (`FrameType::NonKeyFrame`, `!intra_only`,
 /// shown, `tile_cols_log2 == tile_rows_log2 == 0`) carrying a valid
 /// `ref_frame_idx`; the `header_size_in_bytes` field is overwritten with
 /// the actual compressed-header length.
-pub(crate) fn assemble_inter_frame_zeromv(
+///
+/// The writer models §6.5 `UsePrevFrameMvs == 0` (it holds no
+/// previous-frame motion field), which matches the decoder's §7.2.6
+/// derivation only when `error_resilient_mode == 1` — so any plan that
+/// returns a non-`ZEROMV` block (where the §6.5 candidate scan reaches
+/// the coded syntax through `BestMv`) requires an error-resilient header,
+/// and a `NEWMV` plan on a non-error-resilient header is rejected.
+pub(crate) fn assemble_inter_frame_planned(
     hdr: &Vp9FrameHeader,
     skip_all: bool,
+    planner: &mut InterBlockPlanner<'_>,
     coeffs: &mut FrameCoefSource<'_>,
 ) -> Result<Vec<u8>, Error> {
     use crate::compressed::ReferenceMode;
@@ -524,6 +559,13 @@ pub(crate) fn assemble_inter_frame_zeromv(
         while c < mi_cols {
             let mut leaf =
                 |enc: &mut BoolEncoder, lr: u32, lc: u32, _ls: u8| -> Result<(), Error> {
+                    let (y_mode, mv) = planner(lr, lc, &state);
+                    if y_mode != ZEROMV && !hdr.error_resilient_mode {
+                        // §7.2.6: the decoder would run the §6.5 scan with
+                        // UsePrevFrameMvs == 1, which this writer does not
+                        // model — see the function docs.
+                        return Err(Error::Unsupported);
+                    }
                     let spec = InterBlockSpec {
                         r: lr,
                         mi_col_start: 0,
@@ -533,13 +575,13 @@ pub(crate) fn assemble_inter_frame_zeromv(
                         skip: skip_all,
                         tx_size: 0,
                         ref_frame: [LAST_FRAME, NONE_REF_FRAME],
-                        y_mode: ZEROMV,
+                        y_mode,
                         interp_filter: if switchable {
                             0
                         } else {
                             hdr.interpolation_filter
                         },
-                        mv: [[0, 0], [0, 0]],
+                        mv: [mv, [0, 0]],
                     };
                     let mut src = |p: usize, tx_sz: u32, sx: u32, sy: u32, b: usize| {
                         let n0 = 1usize << (tx_sz + 2);

@@ -37,13 +37,17 @@
 //! in-crate decoder exactly.
 
 use crate::dequant::{get_ac_quant, get_dc_quant};
-use crate::frame_writer::{assemble_keyframe, BlockPlan, FrameCoefSource, KeyframePlan};
+use crate::frame_writer::{
+    assemble_inter_frame_zeromv, assemble_keyframe, BlockPlan, FrameCoefSource, KeyframePlan,
+};
 use crate::fwd_transform::forward_wht_2d;
 use crate::header::{
     ColorConfig, ColorSpace, FrameType, LoopFilterParams, QuantizationParams, SegmentationParams,
     TileInfo, Vp9FrameHeader,
 };
 use crate::idct::DCT_DCT;
+use crate::inter_mv::{BlockGrid, ScaleGeom};
+use crate::inter_pred::{predict_inter, InterPredArgs, RefPlane, RefPlanes};
 use crate::intra::{predict_intra, Plane, PredMode};
 use crate::reconstruct::reconstruct_block;
 use crate::residual::{get_plane_block_size, BLOCK_8X8, NUM_4X4_BLOCKS_WIDE_LOOKUP};
@@ -471,6 +475,232 @@ pub(crate) fn encode_keyframe_lossless_hbd(
     encode_keyframe_lossless(&hdr, &[y_plane, u_plane, v_plane])
 }
 
+// ----- Lossless inter (P-frame) encoding -----
+
+/// The §6.2 header for a lossless ZEROMV P-frame: profile 0, 8-bit
+/// 4:2:0, `LAST` / `GOLDEN` / `ALTREF` all resolving to slot 0,
+/// `refresh_frame_flags == 0x01` so each frame becomes the next frame's
+/// `LAST` reference, EIGHTTAP filter, loop filter off, lossless
+/// quantization.
+pub(crate) fn lossless_pframe_header(width: u32, height: u32) -> Vp9FrameHeader {
+    let mut hdr = lossless_keyframe_header(width, height);
+    hdr.frame_type = FrameType::NonKeyFrame;
+    hdr.refresh_frame_flags = 0x01;
+    hdr.ref_frame_idx = Some([0, 0, 0]);
+    hdr
+}
+
+/// Run the §8.5.2 inter prediction for every all-`BLOCK_8X8` `ZEROMV`
+/// MI block of a P-frame, writing the predicted planes (at the MI-padded
+/// working extents) — exactly what the decoder's §6.4.21 inter arm
+/// produces before the token loop.
+///
+/// `reference` carries the previous frame's **visible-extent** planes
+/// (the §8.10 `FrameStore` crop): `(samples, stride)` per plane, with
+/// `vis_w × vis_h` the reference's luma dimensions.
+// Spec-shaped geometry fan-in, matching the style of the §8.5.2 driver.
+#[allow(clippy::too_many_arguments)]
+fn predict_frame_zeromv(
+    reference: &[(&[i32], usize); 3],
+    vis_w: u32,
+    vis_h: u32,
+    mi_cols: u32,
+    mi_rows: u32,
+    ssx: bool,
+    ssy: bool,
+    bit_depth: u32,
+) -> [Plane; 3] {
+    let y_w = (mi_cols * 8) as usize;
+    let y_h = (mi_rows * 8) as usize;
+    let uv_w = y_w >> usize::from(ssx);
+    let uv_h = y_h >> usize::from(ssy);
+    let mut pred = [
+        Plane::new(y_w, y_h),
+        Plane::new(uv_w, uv_h),
+        Plane::new(uv_w, uv_h),
+    ];
+
+    let zero_mvs = [[[0i32; 2]; 4]; 2];
+    for r in 0..mi_rows {
+        for c in 0..mi_cols {
+            for (plane, pred_plane) in pred.iter_mut().enumerate() {
+                let sub_x = plane > 0 && ssx;
+                let sub_y = plane > 0 && ssy;
+                let base_x = (c * 8) >> u32::from(sub_x);
+                let base_y = (r * 8) >> u32::from(sub_y);
+                let region = 8usize >> usize::from(sub_x);
+                let region_h = 8usize >> usize::from(sub_y);
+
+                let (samples, stride) = reference[plane];
+                let refs = RefPlanes {
+                    list: [
+                        Some(RefPlane {
+                            samples,
+                            stride,
+                            ref_frame_width: vis_w as i32,
+                            ref_frame_height: vis_h as i32,
+                        }),
+                        None,
+                    ],
+                };
+                let grid = BlockGrid {
+                    mi_row: r as i32,
+                    mi_col: c as i32,
+                    mi_rows: mi_rows as i32,
+                    mi_cols: mi_cols as i32,
+                    mi_size: BLOCK_8X8,
+                };
+                let geom = ScaleGeom {
+                    ref_frame_width: vis_w as i32,
+                    ref_frame_height: vis_h as i32,
+                    frame_width: vis_w as i32,
+                    frame_height: vis_h as i32,
+                    subsampling_x: ssx,
+                    subsampling_y: ssy,
+                };
+                let args = InterPredArgs {
+                    plane,
+                    x: base_x as i32,
+                    y: base_y as i32,
+                    w: region,
+                    h: region_h,
+                    block_idx: 0,
+                    interp_filter: 0, // EIGHTTAP; ZEROMV full-pel is a copy.
+                    bit_depth,
+                    is_compound: false,
+                };
+                predict_inter(pred_plane, &args, &grid, &geom, &zero_mvs, &refs, ssx, ssy);
+            }
+        }
+    }
+    pred
+}
+
+/// Encode one lossless `ZEROMV` P-frame whose reconstruction equals
+/// `targets` (MI-padded planes) exactly, referencing `reference` (the
+/// previous frame's visible-extent planes).
+///
+/// Per coded transform block the §6.4.21 walk supplies the coefficient
+/// callback; the residual is `target − prediction` with the prediction
+/// computed by the decoder's own §8.5.2 process, forward-WHT-transformed
+/// exactly. With zero motion the reconstruction is `Clip1( prediction +
+/// residual ) == target` sample-for-sample, so the frame chain stays
+/// bit-exact and the next frame may reference `targets`' visible crop.
+pub(crate) fn encode_pframe_lossless_zeromv(
+    hdr: &Vp9FrameHeader,
+    targets: &[Plane; 3],
+    reference: &[(&[i32], usize); 3],
+    ref_w: u32,
+    ref_h: u32,
+) -> Result<Vec<u8>, Error> {
+    if hdr.frame_type != FrameType::NonKeyFrame || !hdr.quantization.lossless {
+        return Err(Error::Unsupported);
+    }
+    let mi_cols = (hdr.frame_width + 7) >> 3;
+    let mi_rows = (hdr.frame_height + 7) >> 3;
+    let ssx = hdr.color_config.subsampling_x;
+    let ssy = hdr.color_config.subsampling_y;
+    let bit_depth = u32::from(hdr.color_config.bit_depth);
+
+    let pred = predict_frame_zeromv(
+        reference, ref_w, ref_h, mi_cols, mi_rows, ssx, ssy, bit_depth,
+    );
+
+    let mut coeffs: Box<FrameCoefSource<'_>> = Box::new(
+        move |_mi_r: u32, _mi_c: u32, plane: usize, sx: u32, sy: u32, _b: usize| -> Vec<i64> {
+            let mut block = vec![0i64; 16];
+            for i in 0..4usize {
+                for j in 0..4usize {
+                    let t = targets[plane].get(sx as usize + j, sy as usize + i);
+                    let p = pred[plane].get(sx as usize + j, sy as usize + i);
+                    block[i * 4 + j] = i64::from(t) - i64::from(p);
+                }
+            }
+            forward_wht_2d(&mut block);
+            block
+        },
+    );
+
+    assemble_inter_frame_zeromv(hdr, false, &mut *coeffs)
+}
+
+/// Encode a sequence of 8-bit 4:2:0 planar frames (each `Y` then `U`
+/// then `V`, the [`crate::decode_vp9`] layout) into a lossless VP9
+/// stream: a keyframe followed by `ZEROMV` P-frames, each coding the
+/// exact `frame − prediction` residual.
+///
+/// Every returned coded frame decodes **byte-exact** back to its input
+/// through [`crate::decode_frame::decode_vp9_sequence`].
+pub(crate) fn encode_sequence_lossless_420(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+) -> Result<Vec<Vec<u8>>, Error> {
+    if frames.is_empty() {
+        return Err(Error::Unsupported);
+    }
+    if width == 0 || height == 0 || width > (1 << 16) || height > (1 << 16) {
+        return Err(Error::Unsupported);
+    }
+    let w = width as usize;
+    let h = height as usize;
+    let cw = width.div_ceil(2) as usize;
+    let ch = height.div_ceil(2) as usize;
+    let need = w * h + 2 * cw * ch;
+    if frames.iter().any(|f| f.len() < need) {
+        return Err(Error::Unsupported);
+    }
+
+    let mi_cols = ((width + 7) >> 3) as usize;
+    let mi_rows = ((height + 7) >> 3) as usize;
+    let y_w = mi_cols * 8;
+    let y_h = mi_rows * 8;
+    let uv_w = y_w >> 1;
+    let uv_h = y_h >> 1;
+
+    let padded_targets = |pixels: &[u8]| -> [Plane; 3] {
+        [
+            padded_plane_from_bytes(&pixels[..w * h], w, h, y_w, y_h),
+            padded_plane_from_bytes(&pixels[w * h..w * h + cw * ch], cw, ch, uv_w, uv_h),
+            padded_plane_from_bytes(&pixels[w * h + cw * ch..], cw, ch, uv_w, uv_h),
+        ]
+    };
+    // Visible-extent reference planes (the §8.10 FrameStore crop) for
+    // the next frame: the previous frame's source samples, since a
+    // lossless frame reconstructs to its target exactly.
+    let visible_ref = |pixels: &[u8]| -> [Vec<i32>; 3] {
+        [
+            pixels[..w * h].iter().map(|&s| i32::from(s)).collect(),
+            pixels[w * h..w * h + cw * ch]
+                .iter()
+                .map(|&s| i32::from(s))
+                .collect(),
+            pixels[w * h + cw * ch..w * h + 2 * cw * ch]
+                .iter()
+                .map(|&s| i32::from(s))
+                .collect(),
+        ]
+    };
+
+    let mut out = Vec::with_capacity(frames.len());
+    out.push(encode_keyframe_lossless_420(frames[0], width, height)?);
+
+    for i in 1..frames.len() {
+        let targets = padded_targets(frames[i]);
+        let prev = visible_ref(frames[i - 1]);
+        let reference: [(&[i32], usize); 3] = [
+            (prev[0].as_slice(), w),
+            (prev[1].as_slice(), cw),
+            (prev[2].as_slice(), cw),
+        ];
+        let hdr = lossless_pframe_header(width, height);
+        out.push(encode_pframe_lossless_zeromv(
+            &hdr, &targets, &reference, width, height,
+        )?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,6 +834,158 @@ mod tests {
         );
         assert_eq!(
             encode_keyframe_lossless_420(&[0u8; 8], 0, 4).unwrap_err(),
+            Error::Unsupported
+        );
+    }
+
+    /// A three-frame moving-content sequence (keyframe + two ZEROMV
+    /// P-frames with real coded residuals) reconstructs **byte-exact**
+    /// frame-for-frame through `decode_vp9_sequence` — the lossless
+    /// inter path end-to-end, §8.5.2 motion compensation and §8.10
+    /// reference threading included.
+    #[test]
+    fn moving_sequence_roundtrips_byte_exact() {
+        use crate::decode_frame::decode_vp9_sequence;
+
+        let (w, h) = (48u32, 32u32);
+        let cw = w.div_ceil(2) as usize;
+        let ch = h.div_ceil(2) as usize;
+        // A diagonal gradient translating by (t, t) per frame plus a
+        // moving bright square: every frame differs from its predecessor.
+        let make_frame = |t: usize| -> Vec<u8> {
+            let mut px = Vec::with_capacity((w * h) as usize + 2 * cw * ch);
+            for i in 0..h as usize {
+                for j in 0..w as usize {
+                    let mut v = ((i + j + 5 * t) % 256) as u8;
+                    let (sq_x, sq_y) = (4 + 6 * t, 8 + 2 * t);
+                    if (sq_y..sq_y + 8).contains(&i) && (sq_x..sq_x + 8).contains(&j) {
+                        v = 240;
+                    }
+                    px.push(v);
+                }
+            }
+            for i in 0..ch {
+                for j in 0..cw {
+                    px.push(((100 + i * 2 + j + 3 * t) % 256) as u8);
+                }
+            }
+            for i in 0..ch {
+                for j in 0..cw {
+                    push_v(&mut px, i, j, t);
+                }
+            }
+            px
+        };
+        fn push_v(px: &mut Vec<u8>, i: usize, j: usize, t: usize) {
+            px.push(((200 + i + j * 2 + 7 * t) % 256) as u8);
+        }
+
+        let inputs: Vec<Vec<u8>> = (0..3).map(make_frame).collect();
+        let refs: Vec<&[u8]> = inputs.iter().map(|f| f.as_slice()).collect();
+        let coded = encode_sequence_lossless_420(&refs, w, h).expect("encode sequence");
+        assert_eq!(coded.len(), 3);
+
+        let coded_refs: Vec<&[u8]> = coded.iter().map(|f| f.as_slice()).collect();
+        let decoded = decode_vp9_sequence(&coded_refs).expect("decode sequence");
+        assert_eq!(decoded.len(), 3);
+        for (i, (frame, input)) in decoded.iter().zip(&inputs).enumerate() {
+            assert_eq!((frame.width, frame.height), (w, h), "frame {i} geometry");
+            assert_eq!(&frame.to_planar_bytes(), input, "frame {i} not byte-exact");
+        }
+    }
+
+    /// A mostly-static sequence codes its P-frames far smaller than the
+    /// keyframe: unchanged blocks carry all-zero residual syntax.
+    #[test]
+    fn static_sequence_pframes_are_smaller_than_keyframe() {
+        use crate::decode_frame::decode_vp9_sequence;
+
+        let (w, h) = (64u32, 64u32);
+        let cw = w.div_ceil(2) as usize;
+        let ch = h.div_ceil(2) as usize;
+        let n = (w * h) as usize + 2 * cw * ch;
+        // Textured base frame; frame 2 changes only one 8x8 region.
+        let base: Vec<u8> = (0..n).map(|i| ((i * 61 + 17) % 256) as u8).collect();
+        let mut moved = base.clone();
+        for i in 16..24usize {
+            for j in 32..40usize {
+                moved[i * w as usize + j] = 255 - moved[i * w as usize + j];
+            }
+        }
+
+        let refs: [&[u8]; 2] = [&base, &moved];
+        let coded = encode_sequence_lossless_420(&refs, w, h).expect("encode");
+        assert!(
+            coded[1].len() < coded[0].len() / 4,
+            "static P-frame ({} B) should be far smaller than keyframe ({} B)",
+            coded[1].len(),
+            coded[0].len()
+        );
+
+        let coded_refs: Vec<&[u8]> = coded.iter().map(|f| f.as_slice()).collect();
+        let decoded = decode_vp9_sequence(&coded_refs).expect("decode");
+        assert_eq!(decoded[0].to_planar_bytes(), base);
+        assert_eq!(decoded[1].to_planar_bytes(), moved);
+    }
+
+    /// Non-multiple-of-8 geometry through the inter path (padded-region
+    /// prediction clamps against the visible reference extents).
+    #[test]
+    fn sequence_partial_superblock_roundtrips_byte_exact() {
+        use crate::decode_frame::decode_vp9_sequence;
+
+        let (w, h) = (36u32, 20u32);
+        let cw = w.div_ceil(2) as usize;
+        let ch = h.div_ceil(2) as usize;
+        let n = (w * h) as usize + 2 * cw * ch;
+        let f0: Vec<u8> = (0..n).map(|i| ((i * 41 + 3) % 256) as u8).collect();
+        let f1: Vec<u8> = (0..n).map(|i| ((i * 97 + 29) % 256) as u8).collect();
+        let refs: [&[u8]; 2] = [&f0, &f1];
+        let coded = encode_sequence_lossless_420(&refs, w, h).expect("encode");
+        let coded_refs: Vec<&[u8]> = coded.iter().map(|f| f.as_slice()).collect();
+        let decoded = decode_vp9_sequence(&coded_refs).expect("decode");
+        assert_eq!(decoded[0].to_planar_bytes(), f0, "frame 0");
+        assert_eq!(decoded[1].to_planar_bytes(), f1, "frame 1");
+    }
+
+    /// A longer chain (keyframe + 4 P-frames) keeps the reference
+    /// threading exact across every hop.
+    #[test]
+    fn five_frame_chain_roundtrips_byte_exact() {
+        use crate::decode_frame::decode_vp9_sequence;
+
+        let (w, h) = (32u32, 24u32);
+        let cw = w.div_ceil(2) as usize;
+        let ch = h.div_ceil(2) as usize;
+        let n = (w * h) as usize + 2 * cw * ch;
+        let inputs: Vec<Vec<u8>> = (0..5u64)
+            .map(|t| {
+                (0..n)
+                    .map(|i| (((i as u64) * 13 + t * 37 + 5) % 256) as u8)
+                    .collect()
+            })
+            .collect();
+        let refs: Vec<&[u8]> = inputs.iter().map(|f| f.as_slice()).collect();
+        let coded = encode_sequence_lossless_420(&refs, w, h).expect("encode");
+        let coded_refs: Vec<&[u8]> = coded.iter().map(|f| f.as_slice()).collect();
+        let decoded = decode_vp9_sequence(&coded_refs).expect("decode");
+        assert_eq!(decoded.len(), 5);
+        for (i, (frame, input)) in decoded.iter().zip(&inputs).enumerate() {
+            assert_eq!(&frame.to_planar_bytes(), input, "frame {i}");
+        }
+    }
+
+    /// Sequence rejections: empty input, short frame buffer.
+    #[test]
+    fn sequence_encode_rejects_bad_inputs() {
+        assert_eq!(
+            encode_sequence_lossless_420(&[], 16, 16).unwrap_err(),
+            Error::Unsupported
+        );
+        let ok = vec![0u8; 16 * 16 + 2 * 64];
+        let short = vec![0u8; 10];
+        assert_eq!(
+            encode_sequence_lossless_420(&[&ok, &short], 16, 16).unwrap_err(),
             Error::Unsupported
         );
     }

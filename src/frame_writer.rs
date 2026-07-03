@@ -385,12 +385,30 @@ pub(crate) fn inter_pframe_header(width: u32, height: u32) -> Vp9FrameHeader {
 /// copies its co-located samples from the `LAST` reference (zero motion,
 /// no residual), so the frame reconstructs to a verbatim copy of that
 /// reference — the minimal complete decodable inter frame.
+pub(crate) fn assemble_inter_frame_all_skip_zeromv(hdr: &Vp9FrameHeader) -> Result<Vec<u8>, Error> {
+    let mut no_coeffs: Box<FrameCoefSource<'_>> = Box::new(|_r, _c, _p, _x, _y, _b| Vec::new());
+    assemble_inter_frame_zeromv(hdr, true, &mut *no_coeffs)
+}
+
+/// Assemble a complete VP9 **inter** frame: an all-`BLOCK_8X8`,
+/// single-reference-`LAST`, `ZEROMV` P-frame whose per-block residual a
+/// caller-supplied [`FrameCoefSource`] dictates.
+///
+/// With `skip_all == true` no residual is coded (`coeffs` never fires)
+/// and the frame reconstructs to a verbatim copy of its `LAST` reference;
+/// with `skip_all == false` every leaf block codes the §6.4.21 residual
+/// syntax, and the decoder reconstructs `prediction + residual` — the
+/// carrier for a pixel-accurate inter encode.
 ///
 /// `hdr` must be a non-key frame (`FrameType::NonKeyFrame`, `!intra_only`,
 /// shown, `tile_cols_log2 == tile_rows_log2 == 0`) carrying a valid
 /// `ref_frame_idx`; the `header_size_in_bytes` field is overwritten with
 /// the actual compressed-header length.
-pub(crate) fn assemble_inter_frame_all_skip_zeromv(hdr: &Vp9FrameHeader) -> Result<Vec<u8>, Error> {
+pub(crate) fn assemble_inter_frame_zeromv(
+    hdr: &Vp9FrameHeader,
+    skip_all: bool,
+    coeffs: &mut FrameCoefSource<'_>,
+) -> Result<Vec<u8>, Error> {
     use crate::compressed::ReferenceMode;
     use crate::compressed_writer::write_compressed_header_inter;
     use crate::inter_block_writer::{
@@ -512,7 +530,7 @@ pub(crate) fn assemble_inter_frame_all_skip_zeromv(hdr: &Vp9FrameHeader) -> Resu
                         c: lc,
                         mi_size: BLOCK_8X8,
                         segment_id: 0,
-                        skip: true,
+                        skip: skip_all,
                         tx_size: 0,
                         ref_frame: [LAST_FRAME, NONE_REF_FRAME],
                         y_mode: ZEROMV,
@@ -523,9 +541,15 @@ pub(crate) fn assemble_inter_frame_all_skip_zeromv(hdr: &Vp9FrameHeader) -> Resu
                         },
                         mv: [[0, 0], [0, 0]],
                     };
-                    let mut src = |_p: usize, tx_sz: u32, _x: u32, _y: u32, _b: usize| {
+                    let mut src = |p: usize, tx_sz: u32, sx: u32, sy: u32, b: usize| {
                         let n0 = 1usize << (tx_sz + 2);
-                        vec![0i64; n0 * n0]
+                        if skip_all {
+                            vec![0i64; n0 * n0]
+                        } else {
+                            let mut v = coeffs(lr, lc, p, sx, sy, b);
+                            v.resize(n0 * n0, 0);
+                            v
+                        }
                     };
                     write_inter_block(
                         enc,

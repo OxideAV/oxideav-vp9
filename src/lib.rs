@@ -700,6 +700,26 @@ pub fn encode_vp9_lossless_hbd(
     pixel_encoder::encode_keyframe_lossless_hbd(samples, width, height, bit_depth, subsample)
 }
 
+/// Encode a **sequence** of 8-bit 4:2:0 planar frames into a lossless
+/// VP9 stream: a keyframe followed by `ZEROMV` inter (P-)frames, each
+/// coding the exact `frame − prediction` residual against the previous
+/// frame (single `LAST` reference, §8.10 slot 0 refreshed per frame).
+///
+/// Every frame of `decode_vp9_sequence( encode_vp9_lossless_sequence(
+/// frames ) )` equals its input **byte-exact**. Each element of `frames`
+/// is one planar frame in the [`decode_vp9`] layout (`Y` then `U` then
+/// `V`, chroma `ceil(w/2) × ceil(h/2)`).
+///
+/// Returns [`Error::Unsupported`] for an empty sequence, degenerate
+/// dimensions, or any too-short frame buffer.
+pub fn encode_vp9_lossless_sequence(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+) -> Result<Vec<Vec<u8>>, Error> {
+    pixel_encoder::encode_sequence_lossless_420(frames, width, height)
+}
+
 /// Encode a minimal VP9 **inter (P-frame) sequence** of `width × height`:
 /// a keyframe followed by `num_pframes` all-skip, single-reference-`LAST`,
 /// `ZEROMV` P-frames.

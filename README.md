@@ -7,9 +7,13 @@ v0.7.
 
 ## Status
 
-Intra **and inter (P-frame)** decode work end-to-end, and a **keyframe
-encoder** assembles a complete decoder-reconstructible frame (see the
-"Encoder" section). [`decode_vp9`]
+Intra **and inter (P-frame)** decode work end-to-end, and the encoder
+is **pixel-accurate**: `encode_vp9` emits a lossless keyframe that
+decodes byte-exact back to its input, `encode_vp9_lossless_sequence`
+does the same for whole videos (motion-compensated P-frames), and
+`encode_vp9_lossy` / `encode_vp9_lossy_sequence` provide quantized
+encoding whose output equals the encoder's in-loop reconstruction
+bit-for-bit (see the "Encoder" section). [`decode_vp9`]
 and [`decode_intra_frame`] decode a complete VP9 keyframe to packed
 planar samples, byte-exact against a 13-fixture staged corpus covering
 4:2:0 and 4:4:4 chroma, 8/10/12-bit depth, RGB, multiple tile columns,
@@ -118,10 +122,51 @@ map between frames.
 
 ### Encoder
 
-[`encode_vp9`] assembles a **complete, decoder-reconstructible VP9
-keyframe**, and [`encode_vp9_pframe_sequence`] assembles a **complete,
-decoder-reconstructible inter (P-frame) sequence** (keyframe + N
-P-frames), both end-to-end. The encode path composes the bitstream-writer
+The encoder is **pixel-accurate**, built as a mirror of the decoder's
+own reconstruction loop: per coded transform block (visited in exactly
+the §6.4.21 `residual( )` decode order) it predicts with the decoder's
+§8.5.1 intra / §8.5.2 inter process over encoder-held reconstruction
+planes, forward-transforms the `target − prediction` residual, and
+replays the decoder's §8.6.2 reconstruction so the next block's
+prediction sees the decoder's exact state. Public entry points:
+
+* [`encode_vp9`] — **lossless keyframe** (8-bit 4:2:0, profile 0):
+  `decode_vp9( encode_vp9( pixels ) ) == pixels` bit-for-bit. The
+  forward WHT is a *perfect* integer inverse of the §8.7.2 lossless
+  path (the §8.7.1.10 butterfly at `shift == 0` is proven an exact
+  involution), so any input round-trips exactly — validated across
+  noise / gradients / 0-255 extremes and an 11-geometry sweep (1x1
+  through 256x144). [`encode_vp9_lossless_444`] (profile 1) and
+  [`encode_vp9_lossless_hbd`] (profiles 2/3, 10/12-bit native `u16`)
+  extend the same guarantee to all four VP9 profiles.
+* [`encode_vp9_lossless_sequence`] — **lossless video**: a keyframe
+  plus P-frames coding the exact `frame − prediction` residual with
+  per-block `ZEROMV` / `NEWMV` integer motion search (±8 px full
+  search; the §6.5.12 `BestMv` is derived with the *shared*
+  `find_mv_refs` / `find_best_ref_mvs` over the same `Vp9FrameState`
+  the writer codes against, and the MV difference is snapped to the
+  §6.4.20-codeable grid when the §6.5.13 `use_mv_hp` gate disables the
+  eighth-pel bit). Every frame decodes byte-exact through
+  [`decode_vp9_sequence`]; on translating content the motion search
+  codes less than half the forced-`ZEROMV` bytes. P-frames use
+  error-resilient framing so the §7.2.6 `UsePrevFrameMvs == 0`
+  derivation is pinned identically on both sides.
+* [`encode_vp9_lossy`] / [`encode_vp9_lossy_sequence`] — **lossy**
+  encoding at a caller-chosen `base_q_idx` (1..=255): forward DCT /
+  ADST4 (float bases matched to the §8.7 integer inverses, ±4
+  round-trip tolerance), §8.6.1 quantization (dequantized-coefficient
+  error ≤ `quant / 2`), per-block intra **mode selection** over all
+  ten §7.4.5 modes (trial-prediction SAD; the §6.4.25 `TxType` follows
+  the coded mode), and — in the sequence — motion-compensated
+  P-frames referencing the previous frame's in-loop *reconstruction*.
+  The decoder's output equals the encoder's reconstruction
+  bit-for-bit (pinned sample-for-sample on all three planes, and
+  chain-level: the final frame of a 4-frame sequence re-encodes
+  byte-identical from the decoder's own output as reference), so
+  encoder and decoder never drift; only the bounded quantization
+  error separates the result from the source.
+
+The encode path composes the bitstream-writer
 primitives — each derived as the exact inverse of the matching decode step
 and validated by round-tripping back through the in-crate decoder (no
 external encoder consulted):
@@ -170,30 +215,29 @@ external encoder consulted):
   the shared `Vp9FrameState`, writing the §6.4.7/§6.4.6/§6.4.21 syntax, and
   fanning the per-MI values into the frame-wide arrays via
   `decode_block_apply`;
-* the top-level **frame assembler** (`frame_writer`) — threads the
+* the **forward transforms** (`fwd_transform`) — derived exclusively
+  from the spec's §8.7 *inverse* listings: the exact lossless forward
+  WHT (bit-exact round-trips pinned over 2000 random + extreme-range
+  vectors), the forward DCT-II / ADST4 bases matched to the §8.7.1.3 /
+  §8.7.1.6 integer inverses for all four §6.4.25 `TxType`s, and the
+  §8.6.1 `quantize_block` (round-to-nearest, error ≤ `quant / 2`);
+* the top-level **frame assemblers** (`frame_writer`) — thread the
   uncompressed + compressed headers and the single-tile §6.4 partition /
-  block walk into a complete frame, with `header_size_in_bytes` set to the
-  compressed-header length. The **inter assembler**
-  (`assemble_inter_frame_all_skip_zeromv`) emits an all-`BLOCK_8X8`,
-  all-skip, single-reference-`LAST`, `ZEROMV` P-frame; with zero motion and
-  no residual every block copies its co-located reference samples, so the
-  P-frame reconstructs to a verbatim copy of its `LAST` reference. This is
-  validated **byte-exact end-to-end through the full decoder**
-  (`decode_vp9_sequence`, including §8.5.2 motion compensation and the
-  §8.10 reference-buffer threading) across 64x64, 128x64 (two-superblock
-  partition / neighbour threading), and 40x24 (frame-edge splits).
+  block walk into a complete frame, with `header_size_in_bytes` set to
+  the compressed-header length. The **inter assembler**
+  (`assemble_inter_frame_planned`) walks the all-`BLOCK_8X8` partition
+  with a per-block **planner** callback that receives the shared
+  `Vp9FrameState` in decode order and dictates each block's
+  `ZEROMV` / `NEWMV` mode + motion vector; the all-skip `ZEROMV`
+  specialisation reconstructs to a verbatim copy of its `LAST`
+  reference (validated byte-exact through `decode_vp9_sequence` across
+  64x64, 128x64 and 40x24 geometries).
 
-The residual writer's coefficients are validated to reconstruct to known
-samples through the *full* decode pipeline (§8.6.1 dequant + §8.7 inverse
-transform + §8.6.2 reconstruct): a DC-only block coded on the top-left 4x4
-luma block (which predicts from no neighbours) reconstructs to `128 + r`
-where `r` is the independently-computed inverse transform of the
-dequantized DC. The assembler covers 8/10-bit (profile 0 / 2), 4:2:0,
-segmentation (per-block `segment_id` via the §6.4.7 tree), partial- and
-multi-superblock geometries (1x1 through 256x144 including degenerate
-strips), and is byte-deterministic. The emitted frame is an all-skip
-`DC_PRED` keyframe — structurally complete but a flat DC reconstruction
-rather than a pixel-accurate encode of the input (see "Not yet supported").
+The `pixel_encoder` layer drives those writers with real content (see
+the entry points above): reconstruction-mirrored prediction, exact or
+quantized residuals, per-block intra mode selection, and integer
+motion search. Everything is byte-deterministic, and every encode test
+validates end-to-end through the in-crate decoder.
 
 ### Not yet supported
 
@@ -261,32 +305,29 @@ rather than a pixel-accurate encode of the input (see "Not yet supported").
   end-of-section paragraph is blank). Contexts are reset to §10 defaults
   per frame meanwhile, which is exact for the all-parallel-mode corpus.
 * §9.2.4 multi-coder tile parallelism (tiles decode sequentially).
-* Pixel-accurate encoding (forward transform + quantization + intra-mode
-  / partition / motion search). `encode_vp9` /
-  [`encode_vp9_pframe_sequence`] now produce **complete,
-  decoder-reconstructible keyframes and inter (P-)frames** (see the
-  "Encoder" section), but the emitted keyframe is an all-`BLOCK_8X8`,
-  all-skip, `DC_PRED` flat-DC frame and the emitted P-frame is an
-  all-skip, `ZEROMV`, single-`LAST` frame that *copies* its reference —
-  neither is a rate-distortion-optimised encode of arbitrary input
-  samples. Choosing the residual coefficients / modes / partition layout /
-  motion vectors that reconstruct an arbitrary input frame is the next
-  encoder milestone; the residual + MV *machinery* to carry such a choice
-  is already landed and validated end-to-end (a chosen DC coefficient
-  reconstructs to known samples through the full decode pipeline, and a
-  `NEWMV` difference round-trips through the shared decode MV-prediction
-  scan). The inter block writer covers `MiSize >= BLOCK_8X8` with
-  single / compound references; the sub-8x8 per-(idy, idx) MV walk and the
-  §6.4.12 temporal-predicted segment-id branch are later milestones.
+* Encoder depth beyond the pixel-accurate baseline. The encoder codes
+  every frame as an all-`BLOCK_8X8` partition at `TX_4X4`
+  (`tx_mode = ONLY_4X4`); larger transforms / partition-size decisions,
+  compound-reference and sub-pel motion *search* (the searched MVs are
+  full-pel; snapped vectors may carry a sub-pel phase the §8.5.2
+  filters handle), encode-side loop filtering (frames are coded with
+  `filter_level == 0`), rate control, and the sub-8x8 per-(idy, idx)
+  MV walk / §6.4.12 temporal-predicted segment-id branch are later
+  milestones. Lossy encoding is 8-bit 4:2:0 (the lossless path covers
+  all four profiles). The inter *writers* already carry compound
+  references and `MiSize >= BLOCK_8X8`; the planner simply does not
+  elect them yet.
 
 ## Testing
 
-The crate carries 900+ lib unit tests plus integration suites in
+The crate carries 940+ lib unit tests plus integration suites in
 `tests/` (including the keyframe **and inter** encoder writers, each
-round-tripped back through the in-crate decoder, `encode_keyframe`
-exercising the public `encode_vp9` → decode round-trip across a geometry
-sweep, and the inter assembler's keyframe + P-frame sequence reconstructed
-byte-exact through `decode_vp9_sequence`). Tests construct their inputs bit-by-bit; §9.2 golden buffers
+round-tripped back through the in-crate decoder; `encode_keyframe`
+exercising the public `encode_vp9` → decode **byte-exact lossless**
+round-trip across a geometry sweep; the lossless / lossy sequence
+encoders reconstructed through `decode_vp9_sequence` with chain-level
+decoder-mirror pins; and the motion-search / mode-selection rate
+assertions). Tests construct their inputs bit-by-bit; §9.2 golden buffers
 are hand-derived by stepping the decoder, not borrowed from any
 third-party VP9 implementation. Several precision-critical primitives
 also carry *independent* oracles that share no code with the

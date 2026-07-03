@@ -475,6 +475,145 @@ pub(crate) fn encode_keyframe_lossless_hbd(
     encode_keyframe_lossless(&hdr, &[y_plane, u_plane, v_plane])
 }
 
+// ----- Lossy keyframe encoding -----
+
+/// Encode a **lossy** keyframe at `base_q_idx` whose reconstruction is
+/// exactly the decoder's: per coded 4x4 block the encoder predicts with
+/// the decoder's §8.5.1 process over its reconstruction planes,
+/// forward-DCT-transforms the `target − prediction` residual, quantizes
+/// it with the §8.6.1 quantizers, then replays the decoder's §8.6.2
+/// dequant + integer inverse transform + `Clip1` reconstruction — so the
+/// encoder's in-loop reference state and the decoder's output are
+/// bit-identical, and only the (bounded) quantization error separates
+/// the reconstruction from the source.
+///
+/// Returns the coded frame plus the encoder's reconstruction state (the
+/// decoder's exact output at the MI-padded extents) so callers and tests
+/// can pin the mirror.
+pub(crate) fn encode_keyframe_lossy(
+    hdr: &Vp9FrameHeader,
+    targets: &[Plane; 3],
+) -> Result<(Vec<u8>, ReconState), Error> {
+    if hdr.frame_type != FrameType::KeyFrame || hdr.quantization.lossless {
+        return Err(Error::Unsupported);
+    }
+    let mi_cols = (hdr.frame_width + 7) >> 3;
+    let mi_rows = (hdr.frame_height + 7) >> 3;
+    let ssx = hdr.color_config.subsampling_x;
+    let ssy = hdr.color_config.subsampling_y;
+    let bit_depth = u32::from(hdr.color_config.bit_depth);
+
+    let n = (mi_rows as usize) * (mi_cols as usize);
+    let plan = KeyframePlan {
+        plans: vec![
+            BlockPlan {
+                y_mode: 0, // DC_PRED -> §6.4.25 DCT_DCT on the luma path.
+                uv_mode: 0,
+                skip: false,
+                segment_id: 0,
+            };
+            n
+        ],
+        tx_mode: crate::compressed::TxMode::Only4x4,
+    };
+
+    let mut recon = ReconState::new(mi_cols, mi_rows, ssx, ssy, bit_depth);
+    let seg = hdr.segmentation;
+    let quant = hdr.quantization;
+    let bd8 = hdr.color_config.bit_depth;
+
+    let bytes = {
+        let recon_ref = &mut recon;
+        let mut coeffs: Box<FrameCoefSource<'_>> = Box::new(
+            move |mi_r: u32, mi_c: u32, plane: usize, sx: u32, sy: u32, _b: usize| -> Vec<i64> {
+                recon_ref.predict_block(mi_r, mi_c, BLOCK_8X8, plane, 0, sx, sy, PredMode::DcPred);
+
+                let mut block = vec![0i64; 16];
+                for i in 0..4usize {
+                    for j in 0..4usize {
+                        let t = targets[plane].get(sx as usize + j, sy as usize + i);
+                        let p = recon_ref.planes[plane].get(sx as usize + j, sy as usize + i);
+                        block[i * 4 + j] = i64::from(t) - i64::from(p);
+                    }
+                }
+
+                let dc_q = get_dc_quant(plane, &seg, &quant, 0, bd8);
+                let ac_q = get_ac_quant(plane, &seg, &quant, 0, bd8);
+                crate::fwd_transform::forward_dct_2d(&mut block, 2);
+                crate::fwd_transform::quantize_block(&mut block, dc_q, ac_q);
+
+                // Replay the decoder's reconstruction (integer inverse,
+                // not the float forward) to keep encoder state exact.
+                reconstruct_block(
+                    &mut recon_ref.planes[plane],
+                    sx as usize,
+                    sy as usize,
+                    0,
+                    &block,
+                    dc_q,
+                    ac_q,
+                    DCT_DCT,
+                    false,
+                    bit_depth,
+                );
+
+                block
+            },
+        );
+        assemble_keyframe(hdr, &plan, &mut *coeffs)?
+    };
+
+    Ok((bytes, recon))
+}
+
+/// Encode an 8-bit 4:2:0 planar frame into a **lossy** VP9 keyframe at
+/// quantizer index `base_q_idx` (`1..=255`; use [`crate::encode_vp9`]
+/// for lossless). The decoder's output equals the encoder's in-loop
+/// reconstruction bit-for-bit; distortion against the source is bounded
+/// by the §8.6.1 quantizer step.
+pub(crate) fn encode_keyframe_lossy_420(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+) -> Result<Vec<u8>, Error> {
+    if width == 0 || height == 0 || width > (1 << 16) || height > (1 << 16) {
+        return Err(Error::Unsupported);
+    }
+    if base_q_idx == 0 {
+        return Err(Error::Unsupported); // qindex 0 is the lossless path.
+    }
+    let w = width as usize;
+    let h = height as usize;
+    let cw = width.div_ceil(2) as usize;
+    let ch = height.div_ceil(2) as usize;
+    if pixels.len() < w * h + 2 * cw * ch {
+        return Err(Error::Unsupported);
+    }
+
+    let mut hdr = lossless_keyframe_header(width, height);
+    hdr.quantization = QuantizationParams {
+        base_q_idx,
+        delta_q_y_dc: 0,
+        delta_q_uv_dc: 0,
+        delta_q_uv_ac: 0,
+        lossless: false,
+    };
+
+    let mi_cols = ((width + 7) >> 3) as usize;
+    let mi_rows = ((height + 7) >> 3) as usize;
+    let y_w = mi_cols * 8;
+    let y_h = mi_rows * 8;
+    let uv_w = y_w >> 1;
+    let uv_h = y_h >> 1;
+
+    let y_plane = padded_plane_from_bytes(&pixels[..w * h], w, h, y_w, y_h);
+    let u_plane = padded_plane_from_bytes(&pixels[w * h..w * h + cw * ch], cw, ch, uv_w, uv_h);
+    let v_plane = padded_plane_from_bytes(&pixels[w * h + cw * ch..], cw, ch, uv_w, uv_h);
+
+    encode_keyframe_lossy(&hdr, &[y_plane, u_plane, v_plane]).map(|(bytes, _)| bytes)
+}
+
 // ----- Lossless inter (P-frame) encoding -----
 
 /// The §6.2 header for a lossless ZEROMV P-frame: profile 0, 8-bit
@@ -834,6 +973,158 @@ mod tests {
         );
         assert_eq!(
             encode_keyframe_lossless_420(&[0u8; 8], 0, 4).unwrap_err(),
+            Error::Unsupported
+        );
+    }
+
+    /// The lossy encoder's in-loop reconstruction equals the decoder's
+    /// output **bit-for-bit** — the strong decoder-mirror pin: whatever
+    /// quantization discards, encoder and decoder agree exactly on what
+    /// was kept.
+    #[test]
+    fn lossy_decode_equals_encoder_recon_exactly() {
+        let (w, h) = (48u32, 40u32);
+        let cw = w.div_ceil(2) as usize;
+        let ch = h.div_ceil(2) as usize;
+        let n = (w * h) as usize + 2 * cw * ch;
+        let px: Vec<u8> = (0..n).map(|i| ((i * 73 + 19) % 256) as u8).collect();
+
+        let mut hdr = lossless_keyframe_header(w, h);
+        hdr.quantization = QuantizationParams {
+            base_q_idx: 80,
+            delta_q_y_dc: 0,
+            delta_q_uv_dc: 0,
+            delta_q_uv_ac: 0,
+            lossless: false,
+        };
+        let y_w = (((w + 7) >> 3) * 8) as usize;
+        let y_h = (((h + 7) >> 3) * 8) as usize;
+        let targets = [
+            padded_plane_from_bytes(&px[..(w * h) as usize], w as usize, h as usize, y_w, y_h),
+            padded_plane_from_bytes(
+                &px[(w * h) as usize..(w * h) as usize + cw * ch],
+                cw,
+                ch,
+                y_w >> 1,
+                y_h >> 1,
+            ),
+            padded_plane_from_bytes(
+                &px[(w * h) as usize + cw * ch..],
+                cw,
+                ch,
+                y_w >> 1,
+                y_h >> 1,
+            ),
+        ];
+        let (bytes, recon) = encode_keyframe_lossy(&hdr, &targets).expect("encode");
+        let frame = decode_intra_frame(&bytes).expect("decode");
+
+        // Visible-region comparison, all three planes.
+        for row in 0..h as usize {
+            for col in 0..w as usize {
+                assert_eq!(
+                    i32::from(frame.y[row * w as usize + col]),
+                    recon.planes[0].get(col, row),
+                    "luma ({col},{row})"
+                );
+            }
+        }
+        for row in 0..ch {
+            for col in 0..cw {
+                assert_eq!(
+                    i32::from(frame.u[row * cw + col]),
+                    recon.planes[1].get(col, row),
+                    "U ({col},{row})"
+                );
+                assert_eq!(
+                    i32::from(frame.v[row * cw + col]),
+                    recon.planes[2].get(col, row),
+                    "V ({col},{row})"
+                );
+            }
+        }
+    }
+
+    /// At `base_q_idx == 1` (quantizer 8/8) the lossy path is
+    /// near-lossless: every reconstructed sample is within a small bound
+    /// of the source.
+    #[test]
+    fn lossy_q1_is_near_lossless() {
+        let (w, h) = (32u32, 32u32);
+        let px = noise_frame(w, h, 0xC0FF_EE00_1234_5678);
+        let bytes = encode_keyframe_lossy_420(&px, w, h, 1).expect("encode");
+        let frame = decode_intra_frame(&bytes).expect("decode");
+        let out = frame.to_planar_bytes();
+        let max_err = out
+            .iter()
+            .zip(&px)
+            .map(|(&a, &b)| (i32::from(a) - i32::from(b)).abs())
+            .max()
+            .unwrap();
+        assert!(max_err <= 12, "q=1 max sample error {max_err} > 12");
+    }
+
+    /// Distortion shrinks and the stream grows as `base_q_idx`
+    /// decreases; the decode also stays deterministic.
+    #[test]
+    fn lossy_distortion_and_size_scale_with_q() {
+        let (w, h) = (64u32, 48u32);
+        let cw = w.div_ceil(2) as usize;
+        let ch = h.div_ceil(2) as usize;
+        let n = (w * h) as usize + 2 * cw * ch;
+        // Textured but not pure noise (some spatial correlation).
+        let px: Vec<u8> = (0..n)
+            .map(|i| {
+                let x = i % w as usize;
+                let y = i / w as usize;
+                (((x * 3 + y * 5) % 97) + ((x * y) % 41) + 60) as u8
+            })
+            .collect();
+
+        let mse = |q: u8| -> (f64, usize) {
+            let bytes = encode_keyframe_lossy_420(&px, w, h, q).expect("encode");
+            let size = bytes.len();
+            let out = decode_intra_frame(&bytes)
+                .expect("decode")
+                .to_planar_bytes();
+            let sum: f64 = out
+                .iter()
+                .zip(&px)
+                .map(|(&a, &b)| {
+                    let d = f64::from(a) - f64::from(b);
+                    d * d
+                })
+                .sum();
+            (sum / out.len() as f64, size)
+        };
+
+        let (mse_lo_q, size_lo_q) = mse(40);
+        let (mse_hi_q, size_hi_q) = mse(200);
+        assert!(
+            mse_lo_q <= mse_hi_q,
+            "MSE must not grow as q drops: q40 {mse_lo_q} vs q200 {mse_hi_q}"
+        );
+        assert!(
+            size_hi_q <= size_lo_q,
+            "stream must not grow as q rises: q200 {size_hi_q} B vs q40 {size_lo_q} B"
+        );
+        assert!(mse_lo_q < 100.0, "q40 MSE {mse_lo_q} unexpectedly large");
+    }
+
+    /// The lossy entry rejects the lossless qindex and bad geometry.
+    #[test]
+    fn lossy_encode_rejects_bad_inputs() {
+        let px = noise_frame(16, 16, 3);
+        assert_eq!(
+            encode_keyframe_lossy_420(&px, 16, 16, 0).unwrap_err(),
+            Error::Unsupported
+        );
+        assert_eq!(
+            encode_keyframe_lossy_420(&px[..4], 16, 16, 50).unwrap_err(),
+            Error::Unsupported
+        );
+        assert_eq!(
+            encode_keyframe_lossy_420(&px, 0, 16, 50).unwrap_err(),
             Error::Unsupported
         );
     }

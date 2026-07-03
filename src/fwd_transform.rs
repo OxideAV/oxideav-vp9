@@ -155,6 +155,23 @@ pub(crate) fn forward_dct_2d(block: &mut [i64], n: u32) {
     }
 }
 
+/// Quantize a transform-domain coefficient block to the `Tokens[ ]`
+/// values the §6.4.24 syntax codes — the inverse of the §8.6.2 step-1/2
+/// dequant `Dequant[ i ] = Tokens[ i ] * quant / dqDenom` (with
+/// `dqDenom == 1` for the sizes below TX_32X32 this encoder emits).
+///
+/// Rounds to nearest with ties away from zero, so the decoder's
+/// dequantized coefficient differs from the input by at most `quant / 2`
+/// per coefficient. `coefs[ 0 ]` uses `dc_quant`; the rest `ac_quant`.
+pub(crate) fn quantize_block(coefs: &mut [i64], dc_quant: i32, ac_quant: i32) {
+    for (i, c) in coefs.iter_mut().enumerate() {
+        let q = i64::from(if i == 0 { dc_quant } else { ac_quant });
+        let a = c.abs();
+        let t = (2 * a + q) / (2 * q);
+        *c = if *c < 0 { -t } else { t };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +299,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Quantize + dequantize brackets every coefficient within
+    /// `quant / 2`, and exact multiples pass through unchanged.
+    #[test]
+    fn quantize_roundtrip_error_is_bounded() {
+        let dcq = 8i32;
+        let acq = 12i32;
+        let mut coefs: Vec<i64> = (-100..100).map(|i| i * 7 + 3).collect();
+        let orig = coefs.clone();
+        quantize_block(&mut coefs, dcq, acq);
+        for (i, (&tok, &c)) in coefs.iter().zip(orig.iter()).enumerate() {
+            let q = i64::from(if i == 0 { dcq } else { acq });
+            let deq = tok * q;
+            assert!(
+                (deq - c).abs() <= q / 2,
+                "i={i}: coef {c} -> token {tok} -> {deq}"
+            );
+        }
+        // Exact multiples are preserved.
+        let mut exact = vec![0i64, 24, -36, 12];
+        quantize_block(&mut exact, 8, 12);
+        assert_eq!(exact, vec![0, 2, -3, 1]);
     }
 
     /// DC-only forward: a flat residual concentrates (almost) all its

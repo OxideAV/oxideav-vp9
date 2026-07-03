@@ -477,8 +477,25 @@ pub fn predict_intra(
     }
 
     // Store pred back into CurrFrame.
+    //
+    // The §8.5.1 store covers the full size x size block, which for a
+    // frame-edge prediction block admitted by the §6.4.3 `hasRows` /
+    // `hasCols` rules (only the top / left half must be in-frame) can
+    // extend past the MiCols*8 x MiRows*8 working extent this
+    // implementation allocates — conceptually into the superblock
+    // padding a spec CurrFrame carries. Samples out there are
+    // unobservable (§8.5.1 neighbour reads clamp at maxX / maxY inside
+    // the working extent, §8.8 filters the MI grid, §8.10 crops to the
+    // visible frame), so clipping the store to the allocated extent is
+    // exactly equivalent to allocating the padding.
     for i in 0..size {
+        if y + i >= plane_buf.height() {
+            break;
+        }
         for j in 0..size {
+            if x + j >= plane_buf.width() {
+                break;
+            }
             plane_buf.set(x + j, y + i, pred[idx(i, j)]);
         }
     }

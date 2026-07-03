@@ -97,13 +97,14 @@ impl KeyframePlan {
 pub(crate) type FrameCoefSource<'f> = dyn FnMut(u32, u32, usize, u32, u32, usize) -> Vec<i64> + 'f;
 
 /// Per-leaf spec of a [`KeyframeTreePlan`]: the mode info one §6.4.3
-/// leaf block codes. The leaf's `MiSize` comes from the partition tree
-/// itself (the `subsize` at the leaf call site).
-// Consumed by the tree-plan lossy encoder (the next step in this
-// subsystem); exercised now by the assembler round-trip tests below.
-#[allow(dead_code)]
+/// leaf block codes.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TreeLeafPlan {
+    /// `MiSize` this leaf is expected to be coded at — must equal the
+    /// `subsize` the partition tree produces at the leaf's call site
+    /// (validated at assembly; the coefficient source relies on it for
+    /// the §6.4.21 availability derivation).
+    pub mi_size: u8,
     /// `tx_size` (`TX_*` 0..=3). Under `TxModeSelect` any value up to
     /// `MAX_TXSIZE_LOOKUP[ MiSize ]` is codeable; under the other tx
     /// modes it must equal the §6.4.10 inferred size (validated).
@@ -121,7 +122,6 @@ pub(crate) struct TreeLeafPlan {
 /// A keyframe over an **arbitrary §6.4.3 partition tree**: per-node
 /// partition choices plus per-leaf mode/tx specs — the generalisation of
 /// [`KeyframePlan`] past the fixed all-`BLOCK_8X8` / `TX_4X4` layout.
-#[allow(dead_code)]
 pub(crate) struct KeyframeTreePlan {
     /// §6.3.1 `tx_mode`.
     pub tx_mode: TxMode,
@@ -134,6 +134,89 @@ pub(crate) struct KeyframeTreePlan {
     pub leaves: HashMap<(u32, u32), TreeLeafPlan>,
 }
 
+impl KeyframeTreePlan {
+    /// A uniform partition layout: every leaf is `leaf_size` (square,
+    /// `>= BLOCK_8X8`) at `Min( tx_size, MAX_TXSIZE_LOOKUP[ leaf ] )`
+    /// under `TX_MODE_SELECT`, except where the §6.4.3 frame-edge rules
+    /// force a split — edge nodes recurse toward `BLOCK_8X8` (which is
+    /// always codeable as `PARTITION_NONE`), so any frame geometry gets
+    /// a conforming tree. All leaves start `DC_PRED`, non-skip.
+    // Uniform-layout utility for the fixed-transform-size mirror tests
+    // (the production planner builds content-adaptive trees instead).
+    #[allow(dead_code)]
+    pub fn uniform(mi_rows: u32, mi_cols: u32, leaf_size: u8, tx_size: u32) -> Self {
+        let mut plan = Self {
+            tx_mode: TxMode::TxModeSelect,
+            partitions: HashMap::new(),
+            leaves: HashMap::new(),
+        };
+        for r in (0..mi_rows).step_by(8) {
+            for c in (0..mi_cols).step_by(8) {
+                plan.fill_uniform(r, c, BLOCK_64X64, leaf_size, tx_size, mi_rows, mi_cols);
+            }
+        }
+        plan
+    }
+
+    #[allow(dead_code)]
+    // Spec-shaped geometry fan-in (r/c/bsize + frame extents), matching
+    // the §6.4.3 recursion signature style used across the crate.
+    #[allow(clippy::too_many_arguments)]
+    fn fill_uniform(
+        &mut self,
+        r: u32,
+        c: u32,
+        bsize: u8,
+        leaf_size: u8,
+        tx_size: u32,
+        mi_rows: u32,
+        mi_cols: u32,
+    ) {
+        use crate::partition::{NUM_8X8_BLOCKS_WIDE_LOOKUP, SUBSIZE_LOOKUP};
+        if r >= mi_rows || c >= mi_cols {
+            return;
+        }
+        let num8x8 = NUM_8X8_BLOCKS_WIDE_LOOKUP[bsize as usize] as u32;
+        let half = num8x8 >> 1;
+        // NONE only for **fully-contained** blocks (stricter than the
+        // §6.4.3 hasRows / hasCols admission, which lets a block's right
+        // / bottom half overhang the frame): the encoder's residual is
+        // computed from MI-extent target planes, so an overhanging leaf
+        // would read outside them — and its overhang bits would be
+        // wasted anyway. Frame-edge regions split toward BLOCK_8X8
+        // (num8x8 == 1, always contained on an in-frame node).
+        let contained = (r + num8x8) <= mi_rows && (c + num8x8) <= mi_cols;
+        if (bsize <= leaf_size || bsize == BLOCK_8X8) && contained {
+            self.partitions.insert((r, c, bsize), PARTITION_NONE);
+            self.leaves.insert(
+                (r, c),
+                TreeLeafPlan {
+                    mi_size: bsize,
+                    tx_size: tx_size.min(MAX_TXSIZE_LOOKUP[bsize as usize]),
+                    y_mode: 0,
+                    uv_mode: 0,
+                    skip: false,
+                    segment_id: 0,
+                },
+            );
+            return;
+        }
+        self.partitions.insert((r, c, bsize), PARTITION_SPLIT);
+        let subsize = SUBSIZE_LOOKUP[PARTITION_SPLIT as usize][bsize as usize];
+        for (dr, dc) in [(0, 0), (0, half), (half, 0), (half, half)] {
+            self.fill_uniform(
+                r + dr,
+                c + dc,
+                subsize,
+                leaf_size,
+                tx_size,
+                mi_rows,
+                mi_cols,
+            );
+        }
+    }
+}
+
 /// Assemble a complete VP9 keyframe from `hdr` + a [`KeyframeTreePlan`],
 /// returning the full frame bytes — [`assemble_keyframe`] generalised
 /// over the partition tree and per-leaf transform sizes.
@@ -143,7 +226,6 @@ pub(crate) struct KeyframeTreePlan {
 /// `TxModeSelect`, or validated against the inferred
 /// `Min( maxTxSize, tx_mode_to_biggest_tx_size )` otherwise (a mismatch
 /// would silently desync the reconstruction, so it is rejected).
-#[allow(dead_code)]
 pub(crate) fn assemble_keyframe_tree(
     hdr: &Vp9FrameHeader,
     plan: &KeyframeTreePlan,
@@ -227,6 +309,11 @@ pub(crate) fn assemble_keyframe_tree(
                         .get(&(lr, lc))
                         .copied()
                         .ok_or(Error::Unsupported)?;
+                    // The plan's leaf size must match the tree's subsize
+                    // (the coefficient source predicts at lp.mi_size).
+                    if lp.mi_size != subsize {
+                        return Err(Error::Unsupported);
+                    }
                     // tx-size codeability / inference validation.
                     let max_tx = MAX_TXSIZE_LOOKUP[subsize as usize];
                     if lp.tx_size > max_tx {
@@ -1168,55 +1255,12 @@ mod tests {
         tx_size: u32,
         skip: bool,
     ) -> KeyframeTreePlan {
-        let mut partitions = HashMap::new();
-        let mut leaves = HashMap::new();
-        // Walk every recursion node: split above leaf_size, NONE at it.
-        for r in (0..mi_rows).step_by(8) {
-            for c in (0..mi_cols).step_by(8) {
-                fill_uniform(&mut partitions, &mut leaves, r, c, BLOCK_64X64, leaf_size);
-            }
-        }
-        for lp in leaves.values_mut() {
-            lp.tx_size = tx_size;
+        let mut plan = KeyframeTreePlan::uniform(mi_rows, mi_cols, leaf_size, tx_size);
+        for lp in plan.leaves.values_mut() {
+            lp.tx_size = tx_size; // deliberately unclamped: rejection tests.
             lp.skip = skip;
         }
-        KeyframeTreePlan {
-            tx_mode: TxMode::TxModeSelect,
-            partitions,
-            leaves,
-        }
-    }
-
-    fn fill_uniform(
-        partitions: &mut HashMap<(u32, u32, u8), u8>,
-        leaves: &mut HashMap<(u32, u32), TreeLeafPlan>,
-        r: u32,
-        c: u32,
-        bsize: u8,
-        leaf_size: u8,
-    ) {
-        use crate::partition::NUM_8X8_BLOCKS_WIDE_LOOKUP;
-        if bsize == leaf_size {
-            partitions.insert((r, c, bsize), crate::partition::PARTITION_NONE);
-            leaves.insert(
-                (r, c),
-                TreeLeafPlan {
-                    tx_size: 0,
-                    y_mode: 0,
-                    uv_mode: 0,
-                    skip: false,
-                    segment_id: 0,
-                },
-            );
-            return;
-        }
-        partitions.insert((r, c, bsize), crate::partition::PARTITION_SPLIT);
-        let half = (NUM_8X8_BLOCKS_WIDE_LOOKUP[bsize as usize] >> 1) as u32;
-        let subsize = crate::partition::SUBSIZE_LOOKUP[crate::partition::PARTITION_SPLIT as usize]
-            [bsize as usize];
-        for (dr, dc) in [(0, 0), (0, half), (half, 0), (half, half)] {
-            fill_uniform(partitions, leaves, r + dr, c + dc, subsize, leaf_size);
-        }
+        plan
     }
 
     /// An all-skip uniform-32x32 tree keyframe under TX_MODE_SELECT
@@ -1317,10 +1361,16 @@ mod tests {
         let mut leaves = HashMap::new();
         partitions.insert((0, 0, BLOCK_64X64), PARTITION_HORZ);
         partitions.insert((0, 8, BLOCK_64X64), PARTITION_VERT);
-        for key in [(0u32, 0u32), (4, 0), (0, 8), (0, 12)] {
+        for (key, sz) in [
+            ((0u32, 0u32), crate::residual::BLOCK_64X32),
+            ((4, 0), crate::residual::BLOCK_64X32),
+            ((0, 8), crate::residual::BLOCK_32X64),
+            ((0, 12), crate::residual::BLOCK_32X64),
+        ] {
             leaves.insert(
                 key,
                 TreeLeafPlan {
+                    mi_size: sz,
                     tx_size: 3,
                     y_mode: 0,
                     uv_mode: 0,
@@ -1408,6 +1458,7 @@ mod tests {
             plan.leaves.insert(
                 *key,
                 TreeLeafPlan {
+                    mi_size: BLOCK_16X16,
                     tx_size: (i as u32) % 3, // TX_4X4 / TX_8X8 / TX_16X16
                     y_mode: 0,
                     uv_mode: 0,
@@ -1424,6 +1475,51 @@ mod tests {
         let bytes = assemble_keyframe_tree(&hdr, &plan, &mut *coeffs).expect("assemble");
         let frame = decode_intra_frame(&bytes).expect("decode");
         assert_eq!((frame.width, frame.height), (64, 64));
+    }
+
+    /// A legal §6.4.3 layout whose 32x32 NONE leaves **overhang** the
+    /// frame edge (the hasRows / hasCols admission only requires the
+    /// top / left half in-frame): a 56x56 frame is 7x7 MIs, so the
+    /// 32x32 leaves at MI (0,4) / (4,0) / (4,4) extend past the
+    /// MiCols*8 working extent. The §8.5.1 / §8.6.2 stores clip at the
+    /// allocated planes (equivalent to a spec CurrFrame's superblock
+    /// padding), so the stream decodes without panic — a regression
+    /// test for the decoder-side out-of-bounds this layout used to hit.
+    #[test]
+    fn tree_overhanging_leaves_decode_without_panic() {
+        let hdr = keyframe_header(56, 56);
+        let mut partitions = HashMap::new();
+        let mut leaves = HashMap::new();
+        partitions.insert((0u32, 0u32, BLOCK_64X64), PARTITION_SPLIT);
+        for key in [(0u32, 0u32), (0, 4), (4, 0), (4, 4)] {
+            partitions.insert(
+                (key.0, key.1, BLOCK_32X32),
+                crate::partition::PARTITION_NONE,
+            );
+            leaves.insert(
+                key,
+                TreeLeafPlan {
+                    mi_size: BLOCK_32X32,
+                    tx_size: 3,
+                    y_mode: 0,
+                    uv_mode: 0,
+                    skip: false,
+                    segment_id: 0,
+                },
+            );
+        }
+        let plan = KeyframeTreePlan {
+            tx_mode: TxMode::TxModeSelect,
+            partitions,
+            leaves,
+        };
+        let mut coeffs: Box<FrameCoefSource> = Box::new(|_r, _c, _p, _sx, _sy, _b| vec![7i64]);
+        let bytes = assemble_keyframe_tree(&hdr, &plan, &mut *coeffs).expect("assemble");
+        let frame = decode_intra_frame(&bytes).expect("decode");
+        assert_eq!((frame.width, frame.height), (56, 56));
+        // Deterministic re-decode.
+        let frame2 = decode_intra_frame(&bytes).expect("decode2");
+        assert_eq!(frame.y, frame2.y);
     }
 
     /// The tree assembler is byte-deterministic.

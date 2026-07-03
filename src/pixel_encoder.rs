@@ -486,6 +486,9 @@ pub(crate) fn encode_keyframe_lossless_hbd(
 /// lowest-SAD mode wins. This is an encoder-side heuristic only — the
 /// coded mode reaches the decoder through the §6.4.6 syntax and any
 /// choice is decodable; a better choice just shrinks the residual.
+// Retained as the fixed-layout baseline the tree-encoder tests compare
+// against (the public path now plans adaptively).
+#[allow(dead_code)]
 fn select_keyframe_modes(
     targets: &[Plane; 3],
     mi_cols: u32,
@@ -626,6 +629,9 @@ fn select_keyframe_modes(
 /// Returns the coded frame plus the encoder's reconstruction state (the
 /// decoder's exact output at the MI-padded extents) so callers and tests
 /// can pin the mirror.
+// Retained as the fixed all-BLOCK_8X8 / TX_4X4 baseline engine the
+// tree-encoder tests compare compression against.
+#[allow(dead_code)]
 pub(crate) fn encode_keyframe_lossy(
     hdr: &Vp9FrameHeader,
     targets: &[Plane; 3],
@@ -725,12 +731,30 @@ pub(crate) fn encode_keyframe_lossy(
 /// for lossless). The decoder's output equals the encoder's in-loop
 /// reconstruction bit-for-bit; distortion against the source is bounded
 /// by the §8.6.1 quantizer step.
+///
+/// The partition / transform layout is content-adaptive
+/// ([`plan_keyframe_tree`]): smooth regions code large blocks up to
+/// `BLOCK_64X64` at `TX_32X32`, detailed regions split toward
+/// `BLOCK_8X8`, and every leaf picks its intra modes by trial
+/// prediction.
 pub(crate) fn encode_keyframe_lossy_420(
     pixels: &[u8],
     width: u32,
     height: u32,
     base_q_idx: u8,
 ) -> Result<Vec<u8>, Error> {
+    encode_keyframe_lossy_420_with_recon(pixels, width, height, base_q_idx).map(|(bytes, _)| bytes)
+}
+
+/// [`encode_keyframe_lossy_420`] also returning the encoder's in-loop
+/// reconstruction (== the decoder's exact output) for reference
+/// threading by the sequence encoder.
+pub(crate) fn encode_keyframe_lossy_420_with_recon(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+) -> Result<(Vec<u8>, ReconState), Error> {
     if width == 0 || height == 0 || width > (1 << 16) || height > (1 << 16) {
         return Err(Error::Unsupported);
     }
@@ -764,8 +788,448 @@ pub(crate) fn encode_keyframe_lossy_420(
     let y_plane = padded_plane_from_bytes(&pixels[..w * h], w, h, y_w, y_h);
     let u_plane = padded_plane_from_bytes(&pixels[w * h..w * h + cw * ch], cw, ch, uv_w, uv_h);
     let v_plane = padded_plane_from_bytes(&pixels[w * h + cw * ch..], cw, ch, uv_w, uv_h);
+    let targets = [y_plane, u_plane, v_plane];
 
-    encode_keyframe_lossy(&hdr, &[y_plane, u_plane, v_plane], true).map(|(bytes, _)| bytes)
+    let plan = plan_keyframe_tree(
+        &targets,
+        mi_rows as u32,
+        mi_cols as u32,
+        true,
+        true,
+        8,
+        base_q_idx,
+    );
+    encode_keyframe_lossy_tree(&hdr, &targets, &plan)
+}
+
+/// Plan a content-adaptive partition + transform-size tree for a lossy
+/// keyframe — the superblock-tree decision layer feeding
+/// [`encode_keyframe_lossy_tree`].
+///
+/// This is an **encoder-side heuristic only** (any conforming tree is
+/// decodable; a better tree just codes fewer bits): starting at each
+/// `BLOCK_64X64` root, a node is split when the luma content is
+/// *prediction-inhomogeneous* at the quantizer's scale — the maximum
+/// deviation of the four quadrant means from the node mean exceeds the
+/// §8.6.1 AC quantizer step (structure a single leaf prediction cannot
+/// track but the quantizer would preserve) — or when the block is not
+/// fully contained in the MI grid (frame edge). Recursion stops at
+/// `BLOCK_8X8`. Each leaf codes the largest §6.4.10-codeable transform
+/// (`MAX_TXSIZE_LOOKUP[ MiSize ]`) and picks its `y_mode` / `uv_mode`
+/// over all ten §7.4.5 intra modes by trial §8.5.1 prediction SAD at
+/// the leaf's transform-block granularity (over a scratch copy of the
+/// targets, so neighbour samples approximate a high-quality
+/// reconstruction — the same approximation the 4x4 selector uses).
+pub(crate) fn plan_keyframe_tree(
+    targets: &[Plane; 3],
+    mi_rows: u32,
+    mi_cols: u32,
+    ssx: bool,
+    ssy: bool,
+    bit_depth: u32,
+    base_q_idx: u8,
+) -> crate::frame_writer::KeyframeTreePlan {
+    use crate::frame_writer::KeyframeTreePlan;
+    use crate::residual::BLOCK_64X64;
+
+    // The split threshold: one AC quantizer step at segment 0. Content
+    // whose quadrant means differ by less than a quantizer step gains
+    // nothing from a finer prediction grid.
+    let quant = QuantizationParams {
+        base_q_idx,
+        delta_q_y_dc: 0,
+        delta_q_uv_dc: 0,
+        delta_q_uv_ac: 0,
+        lossless: false,
+    };
+    let seg = SegmentationParams::default_disabled();
+    let threshold = i64::from(get_ac_quant(0, &seg, &quant, 0, bit_depth as u8));
+
+    let mut plan = KeyframeTreePlan {
+        tx_mode: crate::compressed::TxMode::TxModeSelect,
+        partitions: std::collections::HashMap::new(),
+        leaves: std::collections::HashMap::new(),
+    };
+    let mut scratch = [targets[0].clone(), targets[1].clone(), targets[2].clone()];
+    let ctx = PlannerCtx {
+        targets,
+        mi_rows,
+        mi_cols,
+        ssx,
+        ssy,
+        bit_depth,
+        threshold,
+    };
+
+    for r in (0..mi_rows).step_by(8) {
+        for c in (0..mi_cols).step_by(8) {
+            ctx.walk(&mut plan, &mut scratch, r, c, BLOCK_64X64);
+        }
+    }
+    plan
+}
+
+/// Frame-level inputs of the [`plan_keyframe_tree`] recursion.
+struct PlannerCtx<'t> {
+    targets: &'t [Plane; 3],
+    mi_rows: u32,
+    mi_cols: u32,
+    ssx: bool,
+    ssy: bool,
+    bit_depth: u32,
+    /// The quantizer-scaled split threshold (one §8.6.1 AC step).
+    threshold: i64,
+}
+
+impl PlannerCtx<'_> {
+    /// Luma mean over an MI-aligned region (in 8px MI units).
+    fn mean_of(&self, r: u32, c: u32, mi_w: u32, mi_h: u32) -> i64 {
+        let x0 = (c * 8) as usize;
+        let y0 = (r * 8) as usize;
+        let w = (mi_w * 8) as usize;
+        let h = (mi_h * 8) as usize;
+        let mut sum = 0i64;
+        for y in y0..y0 + h {
+            for x in x0..x0 + w {
+                sum += i64::from(self.targets[0].get(x, y));
+            }
+        }
+        sum / (w as i64 * h as i64)
+    }
+
+    /// The recursive split-or-leaf decision (see [`plan_keyframe_tree`]).
+    fn walk(
+        &self,
+        plan: &mut crate::frame_writer::KeyframeTreePlan,
+        scratch: &mut [Plane; 3],
+        r: u32,
+        c: u32,
+        bsize: u8,
+    ) {
+        use crate::frame_writer::TreeLeafPlan;
+        use crate::partition::{
+            NUM_8X8_BLOCKS_WIDE_LOOKUP, PARTITION_NONE, PARTITION_SPLIT, SUBSIZE_LOOKUP,
+        };
+        use crate::residual::{BLOCK_8X8 as B8, MAX_TXSIZE_LOOKUP};
+        if r >= self.mi_rows || c >= self.mi_cols {
+            return;
+        }
+        let num8x8 = NUM_8X8_BLOCKS_WIDE_LOOKUP[bsize as usize] as u32;
+        let half = num8x8 >> 1;
+        let contained = (r + num8x8) <= self.mi_rows && (c + num8x8) <= self.mi_cols;
+
+        let mut split = !contained;
+        if contained && bsize != B8 {
+            // Quadrant-mean inhomogeneity at the quantizer scale.
+            let m = self.mean_of(r, c, num8x8, num8x8);
+            for (dr, dc) in [(0, 0), (0, half), (half, 0), (half, half)] {
+                let qm = self.mean_of(r + dr, c + dc, half, half);
+                if (qm - m).abs() > self.threshold {
+                    split = true;
+                    break;
+                }
+            }
+        }
+
+        if !split {
+            let tx_size = MAX_TXSIZE_LOOKUP[bsize as usize];
+            let (y_mode, uv_mode) = select_leaf_modes(
+                scratch,
+                self.targets,
+                r,
+                c,
+                bsize,
+                tx_size,
+                self.mi_rows,
+                self.mi_cols,
+                self.ssx,
+                self.ssy,
+                self.bit_depth,
+            );
+            plan.partitions.insert((r, c, bsize), PARTITION_NONE);
+            plan.leaves.insert(
+                (r, c),
+                TreeLeafPlan {
+                    mi_size: bsize,
+                    tx_size,
+                    y_mode,
+                    uv_mode,
+                    skip: false,
+                    segment_id: 0,
+                },
+            );
+            return;
+        }
+
+        plan.partitions.insert((r, c, bsize), PARTITION_SPLIT);
+        let subsize = SUBSIZE_LOOKUP[PARTITION_SPLIT as usize][bsize as usize];
+        for (dr, dc) in [(0, 0), (0, half), (half, 0), (half, half)] {
+            self.walk(plan, scratch, r + dr, c + dc, subsize);
+        }
+    }
+}
+
+/// Pick the `(y_mode, uv_mode)` for one tree leaf by trial §8.5.1
+/// prediction SAD over all ten §7.4.5 intra modes at the leaf's
+/// transform-block granularity — [`select_keyframe_modes`] generalised
+/// past the 8x8/4x4 layout. `scratch` is a mutable copy of `targets`
+/// whose leaf region each trial predicts into and restores.
+#[allow(clippy::too_many_arguments)]
+fn select_leaf_modes(
+    scratch: &mut [Plane; 3],
+    targets: &[Plane; 3],
+    r: u32,
+    c: u32,
+    mi_size: u8,
+    tx_size: u32,
+    mi_rows: u32,
+    mi_cols: u32,
+    ssx: bool,
+    ssy: bool,
+    bit_depth: u32,
+) -> (u8, u8) {
+    use crate::residual::{get_uv_tx_size, NUM_4X4_BLOCKS_HIGH_LOOKUP, NUM_4X4_BLOCKS_WIDE_LOOKUP};
+
+    // Trial-predict one transform block on `scratch`, SAD it against the
+    // target, restore the region.
+    let mut trial = |plane: usize,
+                     mode: PredMode,
+                     sx: usize,
+                     sy: usize,
+                     tx_sz: u32,
+                     have_left: bool,
+                     have_above: bool,
+                     not_on_right: bool,
+                     max_x: usize,
+                     max_y: usize|
+     -> u64 {
+        predict_intra(
+            &mut scratch[plane],
+            sx,
+            sy,
+            have_left,
+            have_above,
+            not_on_right,
+            tx_sz,
+            mode,
+            max_x,
+            max_y,
+            bit_depth,
+        );
+        let n0 = 4usize << tx_sz;
+        let mut sad = 0u64;
+        for i in 0..n0 {
+            if sy + i > max_y {
+                break;
+            }
+            for j in 0..n0 {
+                if sx + j > max_x {
+                    break;
+                }
+                let d = scratch[plane].get(sx + j, sy + i) - targets[plane].get(sx + j, sy + i);
+                sad += d.unsigned_abs() as u64;
+                scratch[plane].set(sx + j, sy + i, targets[plane].get(sx + j, sy + i));
+            }
+        }
+        sad
+    };
+
+    let modes: Vec<PredMode> = (0..10u8).map(|m| PredMode::from_raw(m).unwrap()).collect();
+    let bsize = mi_size.max(BLOCK_8X8);
+
+    // Luma sweep at tx_size granularity.
+    let plane_sz0 = get_plane_block_size(bsize, 0, ssx, ssy);
+    let n4w0 = NUM_4X4_BLOCKS_WIDE_LOOKUP[plane_sz0 as usize];
+    let n4h0 = NUM_4X4_BLOCKS_HIGH_LOOKUP[plane_sz0 as usize];
+    let step0 = 1u32 << tx_size;
+    let maxx0 = (mi_cols * 8) as usize - 1;
+    let maxy0 = (mi_rows * 8) as usize - 1;
+    let mut best_y = (u64::MAX, 0u8);
+    for (m_raw, &mode) in modes.iter().enumerate() {
+        let mut sad = 0u64;
+        let mut y = 0u32;
+        while y < n4h0 {
+            let mut x = 0u32;
+            while x < n4w0 {
+                let sx = (c * 8 + 4 * x) as usize;
+                let sy = (r * 8 + 4 * y) as usize;
+                if sx <= maxx0 && sy <= maxy0 {
+                    sad += trial(
+                        0,
+                        mode,
+                        sx,
+                        sy,
+                        tx_size,
+                        c > 0 || x > 0,
+                        r > 0 || y > 0,
+                        x + step0 < n4w0,
+                        maxx0,
+                        maxy0,
+                    );
+                }
+                x += step0;
+            }
+            y += step0;
+        }
+        if sad < best_y.0 {
+            best_y = (sad, m_raw as u8);
+        }
+    }
+
+    // Chroma sweep at the §6.4.22 UV tx size, U + V summed.
+    let uv_tx = get_uv_tx_size(tx_size, mi_size, ssx, ssy);
+    let plane_sz1 = get_plane_block_size(bsize, 1, ssx, ssy);
+    let n4w1 = NUM_4X4_BLOCKS_WIDE_LOOKUP[plane_sz1 as usize];
+    let n4h1 = NUM_4X4_BLOCKS_HIGH_LOOKUP[plane_sz1 as usize];
+    let step1 = 1u32 << uv_tx;
+    let maxx1 = ((mi_cols * 8) >> u32::from(ssx)) as usize - 1;
+    let maxy1 = ((mi_rows * 8) >> u32::from(ssy)) as usize - 1;
+    let mut best_uv = (u64::MAX, 0u8);
+    for (m_raw, &mode) in modes.iter().enumerate() {
+        let mut sad = 0u64;
+        for plane in 1..3usize {
+            let base_x = ((c * 8) >> u32::from(ssx)) as usize;
+            let base_y = ((r * 8) >> u32::from(ssy)) as usize;
+            let mut y = 0u32;
+            while y < n4h1 {
+                let mut x = 0u32;
+                while x < n4w1 {
+                    let sx = base_x + (4 * x) as usize;
+                    let sy = base_y + (4 * y) as usize;
+                    if sx <= maxx1 && sy <= maxy1 {
+                        sad += trial(
+                            plane,
+                            mode,
+                            sx,
+                            sy,
+                            uv_tx,
+                            c > 0 || x > 0,
+                            r > 0 || y > 0,
+                            x + step1 < n4w1,
+                            maxx1,
+                            maxy1,
+                        );
+                    }
+                    x += step1;
+                }
+                y += step1;
+            }
+        }
+        if sad < best_uv.0 {
+            best_uv = (sad, m_raw as u8);
+        }
+    }
+
+    (best_y.1, best_uv.1)
+}
+
+/// Encode a **lossy** keyframe over an arbitrary [`KeyframeTreePlan`] —
+/// the decoder-mirror loop of [`encode_keyframe_lossy`] generalised to
+/// every partition / transform size the tree elects.
+///
+/// Per coded transform block (any `tx_size` 0..=3, at the §6.4.21 walk
+/// order of the leaf's `MiSize`) the encoder:
+///
+/// 1. predicts with the decoder's §8.5.1 process at the block's actual
+///    transform size over its reconstruction planes,
+/// 2. forward-transforms the `target − prediction` residual with the
+///    §6.4.25 `TxType` the decoder will derive (chroma / `TX_32X32`
+///    force `DCT_DCT`; luma follows `mode2txfm_map[ y_mode ]`, with the
+///    forward ADST8 / ADST16 bases where the mode selects them),
+/// 3. quantizes with the §8.6.1 quantizers under the §8.6.2 `dqDenom`
+///    (2 at `TX_32X32`), and
+/// 4. replays the decoder's §8.6.2 integer reconstruction — so the
+///    decoder's output equals the encoder's in-loop state bit-for-bit
+///    for **any** plan.
+///
+/// Plan leaves must be non-skip (a skip leaf reconstructs from
+/// prediction the mirror never replays; the planner codes all-zero
+/// blocks instead, which cost only the per-block `more_coefs` bits).
+pub(crate) fn encode_keyframe_lossy_tree(
+    hdr: &Vp9FrameHeader,
+    targets: &[Plane; 3],
+    plan: &crate::frame_writer::KeyframeTreePlan,
+) -> Result<(Vec<u8>, ReconState), Error> {
+    if hdr.frame_type != FrameType::KeyFrame || hdr.quantization.lossless {
+        return Err(Error::Unsupported);
+    }
+    if plan.leaves.values().any(|lp| lp.skip) {
+        return Err(Error::Unsupported);
+    }
+    let mi_cols = (hdr.frame_width + 7) >> 3;
+    let mi_rows = (hdr.frame_height + 7) >> 3;
+    let ssx = hdr.color_config.subsampling_x;
+    let ssy = hdr.color_config.subsampling_y;
+    let bit_depth = u32::from(hdr.color_config.bit_depth);
+
+    let mut recon = ReconState::new(mi_cols, mi_rows, ssx, ssy, bit_depth);
+    let seg = hdr.segmentation;
+    let quant = hdr.quantization;
+    let bd8 = hdr.color_config.bit_depth;
+
+    let bytes = {
+        let recon_ref = &mut recon;
+        let mut coeffs: Box<FrameCoefSource<'_>> = Box::new(
+            move |mi_r: u32, mi_c: u32, plane: usize, sx: u32, sy: u32, _b: usize| -> Vec<i64> {
+                let lp = plan
+                    .leaves
+                    .get(&(mi_r, mi_c))
+                    .copied()
+                    .expect("assembler validated the leaf exists");
+                // Per-plane tx size exactly as §6.4.21 derives it.
+                let tx_sz = if plane == 0 {
+                    lp.tx_size
+                } else {
+                    crate::residual::get_uv_tx_size(lp.tx_size, lp.mi_size, ssx, ssy)
+                };
+                let mode_raw = if plane == 0 { lp.y_mode } else { lp.uv_mode };
+                let mode = PredMode::from_raw(mode_raw).expect("plan mode in range");
+                // §6.4.25 TxType for a non-lossless intra block.
+                let tx_type = if plane > 0 || tx_sz == 3 {
+                    DCT_DCT
+                } else {
+                    crate::reconstruct::tx_type_for_intra(mode)
+                };
+
+                recon_ref.predict_block(mi_r, mi_c, lp.mi_size, plane, tx_sz, sx, sy, mode);
+
+                let n0 = 4usize << tx_sz;
+                let mut block = vec![0i64; n0 * n0];
+                for i in 0..n0 {
+                    for j in 0..n0 {
+                        let t = targets[plane].get(sx as usize + j, sy as usize + i);
+                        let p = recon_ref.planes[plane].get(sx as usize + j, sy as usize + i);
+                        block[i * n0 + j] = i64::from(t) - i64::from(p);
+                    }
+                }
+
+                let dc_q = get_dc_quant(plane, &seg, &quant, 0, bd8);
+                let ac_q = get_ac_quant(plane, &seg, &quant, 0, bd8);
+                crate::fwd_transform::forward_transform_2d(&mut block, tx_sz + 2, tx_type);
+                crate::fwd_transform::quantize_block_tx(&mut block, dc_q, ac_q, tx_sz, bit_depth);
+
+                // Replay the decoder's §8.6.2 reconstruction (incl. the
+                // dqDenom division) so encoder state stays exact.
+                reconstruct_block(
+                    &mut recon_ref.planes[plane],
+                    sx as usize,
+                    sy as usize,
+                    tx_sz,
+                    &block,
+                    dc_q,
+                    ac_q,
+                    tx_type,
+                    false,
+                    bit_depth,
+                );
+
+                block
+            },
+        );
+        crate::frame_writer::assemble_keyframe_tree(hdr, plan, &mut *coeffs)?
+    };
+
+    Ok((bytes, recon))
 }
 
 // ----- Lossless inter (P-frame) encoding -----
@@ -1278,16 +1742,9 @@ pub(crate) fn encode_sequence_lossy_420(
         ]
     };
 
-    // Lossy keyframe.
-    let mut kf_hdr = lossless_keyframe_header(width, height);
-    kf_hdr.quantization = QuantizationParams {
-        base_q_idx,
-        delta_q_y_dc: 0,
-        delta_q_uv_dc: 0,
-        delta_q_uv_ac: 0,
-        lossless: false,
-    };
-    let (kf_bytes, kf_recon) = encode_keyframe_lossy(&kf_hdr, &padded_targets(frames[0]), true)?;
+    // Lossy keyframe over the content-adaptive partition/tx tree.
+    let (kf_bytes, kf_recon) =
+        encode_keyframe_lossy_420_with_recon(frames[0], width, height, base_q_idx)?;
 
     let mut out = Vec::with_capacity(frames.len());
     out.push(kf_bytes);
@@ -1608,6 +2065,320 @@ mod tests {
                     "V ({col},{row})"
                 );
             }
+        }
+    }
+
+    // ----- tree-plan lossy encoder (large transforms) -----
+
+    fn padded_targets_420(px: &[u8], w: u32, h: u32) -> [Plane; 3] {
+        let cw = w.div_ceil(2) as usize;
+        let ch = h.div_ceil(2) as usize;
+        let y_w = (((w + 7) >> 3) * 8) as usize;
+        let y_h = (((h + 7) >> 3) * 8) as usize;
+        [
+            padded_plane_from_bytes(&px[..(w * h) as usize], w as usize, h as usize, y_w, y_h),
+            padded_plane_from_bytes(
+                &px[(w * h) as usize..(w * h) as usize + cw * ch],
+                cw,
+                ch,
+                y_w >> 1,
+                y_h >> 1,
+            ),
+            padded_plane_from_bytes(
+                &px[(w * h) as usize + cw * ch..],
+                cw,
+                ch,
+                y_w >> 1,
+                y_h >> 1,
+            ),
+        ]
+    }
+
+    fn lossy_header(w: u32, h: u32, q: u8) -> Vp9FrameHeader {
+        let mut hdr = lossless_keyframe_header(w, h);
+        hdr.quantization = QuantizationParams {
+            base_q_idx: q,
+            delta_q_y_dc: 0,
+            delta_q_uv_dc: 0,
+            delta_q_uv_ac: 0,
+            lossless: false,
+        };
+        hdr
+    }
+
+    fn assert_tree_mirror_exact(w: u32, h: u32, q: u8, leaf_size: u8, tx_size: u32) -> usize {
+        use crate::frame_writer::KeyframeTreePlan;
+        let cw = w.div_ceil(2) as usize;
+        let ch = h.div_ceil(2) as usize;
+        let n = (w * h) as usize + 2 * cw * ch;
+        let px: Vec<u8> = (0..n).map(|i| ((i * 73 + 19) % 256) as u8).collect();
+        let hdr = lossy_header(w, h, q);
+        let targets = padded_targets_420(&px, w, h);
+        let mi_cols = (w + 7) >> 3;
+        let mi_rows = (h + 7) >> 3;
+        let plan = KeyframeTreePlan::uniform(mi_rows, mi_cols, leaf_size, tx_size);
+        let (bytes, recon) = encode_keyframe_lossy_tree(&hdr, &targets, &plan).expect("encode");
+        let frame = decode_intra_frame(&bytes).expect("decode");
+        for row in 0..h as usize {
+            for col in 0..w as usize {
+                assert_eq!(
+                    i32::from(frame.y[row * w as usize + col]),
+                    recon.planes[0].get(col, row),
+                    "luma ({col},{row}) leaf={leaf_size} tx={tx_size}"
+                );
+            }
+        }
+        for row in 0..ch {
+            for col in 0..cw {
+                assert_eq!(
+                    i32::from(frame.u[row * cw + col]),
+                    recon.planes[1].get(col, row),
+                    "U ({col},{row})"
+                );
+                assert_eq!(
+                    i32::from(frame.v[row * cw + col]),
+                    recon.planes[2].get(col, row),
+                    "V ({col},{row})"
+                );
+            }
+        }
+        bytes.len()
+    }
+
+    /// TX_32X32 / TX_16X16 / TX_8X8 tree keyframes on noise: the decoder
+    /// output equals the encoder's in-loop reconstruction bit-for-bit at
+    /// every transform size (the first >4x4 transform *content* the
+    /// encoder emits, incl. the §8.6.2 dqDenom == 2 path).
+    #[test]
+    fn lossy_tree_decode_equals_encoder_recon_all_tx_sizes() {
+        use crate::residual::{BLOCK_16X16, BLOCK_32X32, BLOCK_64X64};
+        assert_tree_mirror_exact(64, 64, 80, BLOCK_64X64, 3);
+        assert_tree_mirror_exact(64, 64, 80, BLOCK_32X32, 2);
+        assert_tree_mirror_exact(64, 64, 80, BLOCK_16X16, 1);
+    }
+
+    /// Non-multiple-of-64 geometry: the uniform plan splits at frame
+    /// edges (mixed leaf sizes) and the mirror stays exact.
+    #[test]
+    fn lossy_tree_partial_superblock_mirror_exact() {
+        use crate::residual::BLOCK_32X32;
+        assert_tree_mirror_exact(80, 48, 64, BLOCK_32X32, 3);
+        assert_tree_mirror_exact(40, 24, 120, BLOCK_32X32, 2);
+    }
+
+    /// On smooth content a large-transform tree codes fewer bytes than
+    /// the all-4x4 encoder at the same quantizer — the point of >4x4
+    /// transform support.
+    #[test]
+    fn lossy_tree_large_tx_smaller_on_smooth_content() {
+        use crate::frame_writer::KeyframeTreePlan;
+        use crate::residual::BLOCK_64X64;
+        let (w, h) = (64u32, 64u32);
+        let cw = w.div_ceil(2) as usize;
+        let ch = h.div_ceil(2) as usize;
+        // Smooth diagonal gradient.
+        let mut px = Vec::with_capacity((w * h) as usize + 2 * cw * ch);
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                px.push(((x + y) * 2) as u8);
+            }
+        }
+        for y in 0..ch {
+            for x in 0..cw {
+                px.push((128 + x + y) as u8);
+            }
+        }
+        for y in 0..ch {
+            for x in 0..cw {
+                px.push((64 + 2 * x + y) as u8);
+            }
+        }
+        let q = 60u8;
+        let hdr = lossy_header(w, h, q);
+        let targets = padded_targets_420(&px, w, h);
+        let plan = KeyframeTreePlan::uniform(8, 8, BLOCK_64X64, 3);
+        let (tree_bytes, _) = encode_keyframe_lossy_tree(&hdr, &targets, &plan).expect("tree");
+        // Compare against the fixed all-BLOCK_8X8 / TX_4X4 engine (the
+        // public path now plans adaptively, so invoke it directly).
+        let (small_bytes, _) = encode_keyframe_lossy(&hdr, &targets, true).expect("4x4");
+        assert!(
+            tree_bytes.len() < small_bytes.len(),
+            "TX_32X32 tree ({}) not smaller than all-4x4 ({}) on smooth content",
+            tree_bytes.len(),
+            small_bytes.len()
+        );
+        // And it still decodes to bounded distortion vs the source.
+        let frame = decode_intra_frame(&tree_bytes).expect("decode");
+        let mut mse = 0f64;
+        for row in 0..h as usize {
+            for col in 0..w as usize {
+                let d = f64::from(frame.y[row * w as usize + col])
+                    - f64::from(px[row * w as usize + col]);
+                mse += d * d;
+            }
+        }
+        mse /= f64::from(w * h);
+        assert!(mse < 100.0, "TX_32X32 gradient MSE {mse} too high");
+    }
+
+    /// Directional-mode leaves at TX_8X8 / TX_16X16 exercise the forward
+    /// ADST8 / ADST16 bases through the full encode → decode mirror.
+    #[test]
+    fn lossy_tree_adst_modes_mirror_exact() {
+        use crate::frame_writer::KeyframeTreePlan;
+        use crate::residual::BLOCK_16X16;
+        let (w, h) = (64u32, 64u32);
+        let cw = w.div_ceil(2) as usize;
+        let ch = h.div_ceil(2) as usize;
+        let n = (w * h) as usize + 2 * cw * ch;
+        let px: Vec<u8> = (0..n).map(|i| ((i * 31 + 7) % 256) as u8).collect();
+        let hdr = lossy_header(w, h, 100);
+        let targets = padded_targets_420(&px, w, h);
+        let mut plan = KeyframeTreePlan::uniform(8, 8, BLOCK_16X16, 2);
+        // V_PRED -> ADST_DCT, H_PRED -> DCT_ADST, TM_PRED -> ADST_ADST
+        // (§6.4.25 mode2txfm_map), cycled across the leaves; chroma keeps
+        // DC (forced DCT_DCT on chroma regardless).
+        let modes = [1u8, 2, 9, 5];
+        for (i, lp) in plan.leaves.values_mut().enumerate() {
+            lp.y_mode = modes[i % modes.len()];
+        }
+        let (bytes, recon) = encode_keyframe_lossy_tree(&hdr, &targets, &plan).expect("encode");
+        let frame = decode_intra_frame(&bytes).expect("decode");
+        for row in 0..h as usize {
+            for col in 0..w as usize {
+                assert_eq!(
+                    i32::from(frame.y[row * w as usize + col]),
+                    recon.planes[0].get(col, row),
+                    "luma ({col},{row})"
+                );
+            }
+        }
+    }
+
+    /// The planner elects one 64x64 leaf at TX_32X32 per superblock on
+    /// flat content, and splits toward 8x8 on high-contrast structure.
+    #[test]
+    fn planner_adapts_partition_to_content() {
+        let (w, h) = (64u32, 64u32);
+        // Flat frame.
+        let flat = vec![90u8; (w * h) as usize + 2 * 32 * 32];
+        let t_flat = padded_targets_420(&flat, w, h);
+        let plan_flat = plan_keyframe_tree(&t_flat, 8, 8, true, true, 8, 60);
+        assert_eq!(plan_flat.leaves.len(), 1, "flat content: one 64x64 leaf");
+        let lp = plan_flat.leaves[&(0, 0)];
+        assert_eq!(lp.mi_size, crate::residual::BLOCK_64X64);
+        assert_eq!(lp.tx_size, 3);
+
+        // Quadrant-contrast frame: four flat 32x32 luma quadrants at
+        // very different levels force a split at the 64x64 root, then
+        // each 32x32 quadrant is homogeneous.
+        let mut px = vec![0u8; (w * h) as usize + 2 * 32 * 32];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let q = (usize::from(y >= 32) << 1) | usize::from(x >= 32);
+                px[y * w as usize + x] = [30u8, 100, 170, 240][q];
+            }
+        }
+        for s in px[(w * h) as usize..].iter_mut() {
+            *s = 128;
+        }
+        let t = padded_targets_420(&px, w, h);
+        let plan = plan_keyframe_tree(&t, 8, 8, true, true, 8, 60);
+        assert_eq!(plan.leaves.len(), 4, "quadrant content: four 32x32 leaves");
+        assert!(plan
+            .leaves
+            .values()
+            .all(|l| l.mi_size == crate::residual::BLOCK_32X32));
+    }
+
+    /// The planner's split threshold scales with the quantizer: content
+    /// that splits at a fine quantizer stays whole at a coarse one.
+    #[test]
+    fn planner_threshold_scales_with_q() {
+        let (w, h) = (64u32, 64u32);
+        // Mild quadrant contrast (±18 around 128) — above the fine-q
+        // AC step, far below the coarse-q one.
+        let mut px = vec![128u8; (w * h) as usize + 2 * 32 * 32];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let q = (usize::from(y >= 32) << 1) | usize::from(x >= 32);
+                px[y * w as usize + x] = [110u8, 122, 134, 146][q];
+            }
+        }
+        let t = padded_targets_420(&px, w, h);
+        let plan_fine = plan_keyframe_tree(&t, 8, 8, true, true, 8, 5);
+        let plan_coarse = plan_keyframe_tree(&t, 8, 8, true, true, 8, 220);
+        assert!(
+            plan_fine.leaves.len() > plan_coarse.leaves.len(),
+            "fine q leaves {} <= coarse q leaves {}",
+            plan_fine.leaves.len(),
+            plan_coarse.leaves.len()
+        );
+        assert_eq!(plan_coarse.leaves.len(), 1);
+    }
+
+    /// The public lossy path (now planner-driven) round-trips: the
+    /// coded frame decodes, distortion is bounded, and on mixed
+    /// content it codes fewer bytes than the fixed all-4x4 engine.
+    #[test]
+    fn public_lossy_adaptive_beats_fixed_4x4_on_mixed_content() {
+        let (w, h) = (128u32, 64u32);
+        let cw = 64usize;
+        let ch = 32usize;
+        // Left superblock: smooth gradient; right superblock: noise.
+        let mut px = vec![0u8; (w * h) as usize + 2 * cw * ch];
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                px[y * w as usize + x] = if x < 64 {
+                    ((x + y) / 2) as u8
+                } else {
+                    ((x * 37 + y * 91 + 13) % 256) as u8
+                };
+            }
+        }
+        for s in px[(w * h) as usize..].iter_mut() {
+            *s = 128;
+        }
+        let q = 80u8;
+        let adaptive = encode_keyframe_lossy_420(&px, w, h, q).expect("adaptive");
+        let hdr = lossy_header(w, h, q);
+        let targets = padded_targets_420(&px, w, h);
+        let (fixed, _) = encode_keyframe_lossy(&hdr, &targets, true).expect("fixed 4x4");
+        assert!(
+            adaptive.len() < fixed.len(),
+            "adaptive ({}) not smaller than fixed 4x4 ({})",
+            adaptive.len(),
+            fixed.len()
+        );
+        // Bounded distortion on the smooth half.
+        let frame = decode_intra_frame(&adaptive).expect("decode");
+        let mut mse = 0f64;
+        for y in 0..h as usize {
+            for x in 0..64usize {
+                let d = f64::from(frame.y[y * w as usize + x]) - f64::from(px[y * w as usize + x]);
+                mse += d * d;
+            }
+        }
+        mse /= f64::from(64 * h);
+        assert!(mse < 200.0, "smooth-half MSE {mse} too high at q=80");
+    }
+
+    /// Skip leaves are rejected (the mirror never replays a skip block's
+    /// prediction).
+    #[test]
+    fn lossy_tree_rejects_skip_leaves() {
+        use crate::frame_writer::KeyframeTreePlan;
+        use crate::residual::BLOCK_32X32;
+        let hdr = lossy_header(64, 64, 80);
+        let px = vec![128u8; 64 * 64 + 2 * 32 * 32];
+        let targets = padded_targets_420(&px, 64, 64);
+        let mut plan = KeyframeTreePlan::uniform(8, 8, BLOCK_32X32, 3);
+        for lp in plan.leaves.values_mut() {
+            lp.skip = true;
+        }
+        match encode_keyframe_lossy_tree(&hdr, &targets, &plan) {
+            Err(e) => assert_eq!(e, Error::Unsupported),
+            Ok(_) => panic!("skip leaves must be rejected"),
         }
     }
 

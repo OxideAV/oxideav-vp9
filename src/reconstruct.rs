@@ -157,8 +157,20 @@ pub(crate) fn reconstruct_block(
 
     // Step 4: CurrFrame[plane][y+i][x+j] =
     //   Clip1( CurrFrame[plane][y+i][x+j] + Dequant[i][j] ).
+    //
+    // Clipped to the allocated working extent for the same reason as
+    // the §8.5.1 store (see `predict_intra`): a frame-edge block the
+    // §6.4.3 `hasRows` / `hasCols` rules admit may extend past the
+    // MiCols*8 x MiRows*8 planes into (unobservable) superblock
+    // padding a spec CurrFrame would carry.
     for i in 0..n0 {
+        if y + i >= plane_buf.height() {
+            break;
+        }
         for j in 0..n0 {
+            if x + j >= plane_buf.width() {
+                break;
+            }
             let pred = plane_buf.get(x + j, y + i) as i64;
             let recon = clip1(pred + dequant[i * n0 + j], bit_depth);
             plane_buf.set(x + j, y + i, recon as i32);

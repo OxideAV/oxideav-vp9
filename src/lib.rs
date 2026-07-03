@@ -507,6 +507,7 @@ mod filter_mask;
 mod filter_size;
 mod frame_loop_filter;
 mod frame_writer;
+mod fwd_transform;
 mod header;
 // The §6.2 uncompressed-header writer is built ahead of the keyframe
 // encoder that consumes it; the allowance is removed when that lands.

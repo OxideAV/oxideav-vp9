@@ -695,7 +695,7 @@ pub(crate) fn assemble_inter_frame_zeromv(
     coeffs: &mut FrameCoefSource<'_>,
 ) -> Result<Vec<u8>, Error> {
     let mut planner: Box<InterBlockPlanner<'_>> =
-        Box::new(|_r, _c, _state| (crate::mode_info::ZEROMV, [0, 0]));
+        Box::new(|_r, _c, _state| (crate::mode_info::ZEROMV, [0, 0], false));
     assemble_inter_frame_planned(hdr, TxMode::Only4x4, skip_all, &mut *planner, coeffs)
 }
 
@@ -704,11 +704,16 @@ pub(crate) fn assemble_inter_frame_zeromv(
 /// coordinates and the **shared** [`Vp9FrameState`] as it stands *before*
 /// this block is written — the same state the inter block writer derives
 /// its §6.5 MV predictors and §9.3.2 contexts from — and returns the
-/// block's `(y_mode, mv)` pair: `ZEROMV` with `[0, 0]`, or `NEWMV` with
-/// an eighth-pel `[row, col]` vector (the difference onto the §6.5.12
-/// `BestMv` is coded, so the planner must pick a difference the §6.4.20
-/// decomposition can carry under the frame's high-precision gate).
-pub(crate) type InterBlockPlanner<'f> = dyn FnMut(u32, u32, &Vp9FrameState) -> (u8, [i32; 2]) + 'f;
+/// block's `(y_mode, mv, skip)` triple: `ZEROMV` with `[0, 0]`, or
+/// `NEWMV` with an eighth-pel `[row, col]` vector (the difference onto
+/// the §6.5.12 `BestMv` is coded, so the planner must pick a difference
+/// the §6.4.20 decomposition can carry under the frame's high-precision
+/// gate). A `skip == true` block codes no residual — the decoder
+/// reconstructs it from §8.5.2 prediction alone, so the planner elects
+/// it only when the block's quantized residual is all-zero (identical
+/// reconstruction, minus the per-block end-of-block bits).
+pub(crate) type InterBlockPlanner<'f> =
+    dyn FnMut(u32, u32, &Vp9FrameState) -> (u8, [i32; 2], bool) + 'f;
 
 /// Assemble a complete VP9 **inter** frame: an all-`BLOCK_8X8`,
 /// single-reference-`LAST` P-frame whose per-block inter mode / motion
@@ -863,7 +868,7 @@ pub(crate) fn assemble_inter_frame_planned(
         while c < mi_cols {
             let mut leaf =
                 |enc: &mut BoolEncoder, lr: u32, lc: u32, _ls: u8| -> Result<(), Error> {
-                    let (y_mode, mv) = planner(lr, lc, &state);
+                    let (y_mode, mv, block_skip) = planner(lr, lc, &state);
                     if y_mode != ZEROMV && !hdr.error_resilient_mode {
                         // §7.2.6: the decoder would run the §6.5 scan with
                         // UsePrevFrameMvs == 1, which this writer does not
@@ -876,7 +881,7 @@ pub(crate) fn assemble_inter_frame_planned(
                         c: lc,
                         mi_size: BLOCK_8X8,
                         segment_id: 0,
-                        skip: skip_all,
+                        skip: skip_all || block_skip,
                         // §6.4.10 inferred size (tx_mode is never SELECT
                         // here, so no tx bits are coded).
                         tx_size: inferred_tx_size(MAX_TXSIZE_LOOKUP[BLOCK_8X8 as usize], tx_mode),
@@ -1652,7 +1657,7 @@ mod tests {
         // A DC-only residual on every luma TX_8X8 block (the src closure
         // receives the 8x8 segEob via resize).
         let p_hdr = inter_header(64, 64);
-        let mut planner: Box<InterBlockPlanner> = Box::new(|_r, _c, _s| (ZEROMV, [0, 0]));
+        let mut planner: Box<InterBlockPlanner> = Box::new(|_r, _c, _s| (ZEROMV, [0, 0], false));
         let mut coeffs: Box<FrameCoefSource> =
             Box::new(
                 |_r, _c, p, _sx, _sy, _b| {
@@ -1676,7 +1681,7 @@ mod tests {
         assert!(frames[1].y.iter().all(|&s| s != 128));
 
         // Gates.
-        let mut p2: Box<InterBlockPlanner> = Box::new(|_r, _c, _s| (ZEROMV, [0, 0]));
+        let mut p2: Box<InterBlockPlanner> = Box::new(|_r, _c, _s| (ZEROMV, [0, 0], false));
         let mut c2: Box<FrameCoefSource> = Box::new(|_r, _c, _p, _sx, _sy, _b| Vec::new());
         assert_eq!(
             assemble_inter_frame_planned(&p_hdr, TxMode::TxModeSelect, true, &mut *p2, &mut *c2)

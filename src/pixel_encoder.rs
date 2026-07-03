@@ -1455,7 +1455,7 @@ pub(crate) fn encode_pframe_lossless_motion(
     const NEWMV_SAD_MARGIN: u64 = 64;
 
     let mut planner: Box<crate::frame_writer::InterBlockPlanner<'_>> =
-        Box::new(|r, c, state| -> (u8, [i32; 2]) {
+        Box::new(|r, c, state| -> (u8, [i32; 2], bool) {
             let mut choice: (u8, [i32; 2]) = (ZEROMV, [0, 0]);
             if search_range > 0 {
                 let ((dy, dx), best_sad, zero_sad) = search_block_mv(
@@ -1500,21 +1500,38 @@ pub(crate) fn encode_pframe_lossless_motion(
             }
             // Predict this block with the vector that will be coded, so
             // the residual callbacks below see the decoder's prediction.
+            let mut pred = pred.borrow_mut();
             predict_mi_block(
-                &mut pred.borrow_mut(),
-                reference,
-                ref_w,
-                ref_h,
-                r,
-                c,
-                choice.1,
-                mi_cols,
-                mi_rows,
-                ssx,
-                ssy,
+                &mut pred, reference, ref_w, ref_h, r, c, choice.1, mi_cols, mi_rows, ssx, ssy,
                 bit_depth,
             );
-            choice
+            // Elect `skip` when the prediction is *exact* over every
+            // visible sample of the MI block (all three planes): the
+            // WHT of an all-zero residual is all-zero tokens, so a skip
+            // block reconstructs identically while saving the per-block
+            // end-of-block bits.
+            let mut exact = true;
+            'outer: for plane in 0..3usize {
+                let sub_x = plane > 0 && ssx;
+                let sub_y = plane > 0 && ssy;
+                let base_x = ((c * 8) >> u32::from(sub_x)) as usize;
+                let base_y = ((r * 8) >> u32::from(sub_y)) as usize;
+                let maxx = ((mi_cols * 8) >> u32::from(sub_x)) as usize;
+                let maxy = ((mi_rows * 8) >> u32::from(sub_y)) as usize;
+                let region_w = 8usize >> usize::from(sub_x);
+                let region_h = 8usize >> usize::from(sub_y);
+                for i in 0..region_h {
+                    for j in 0..region_w {
+                        let (x, y) = (base_x + j, base_y + i);
+                        if x < maxx && y < maxy && targets[plane].get(x, y) != pred[plane].get(x, y)
+                        {
+                            exact = false;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            (choice.0, choice.1, exact)
         });
 
     let mut coeffs: Box<FrameCoefSource<'_>> = Box::new(
@@ -1593,14 +1610,28 @@ pub(crate) fn encode_pframe_lossy_motion(
     let bd8 = hdr.color_config.bit_depth;
 
     // Work planes: the planner writes each block's §8.5.2 prediction,
-    // then the residual callback's §8.6.2 replay turns it into the
-    // decoder's reconstruction in place.
+    // then (for non-skip blocks) replays the decoder's §8.6.2
+    // reconstruction in place with the pre-computed tokens.
     let work = RefCell::new(ReconState::new(mi_cols, mi_rows, ssx, ssy, bit_depth));
+    // Per-transform-block quantized tokens, computed by the planner (it
+    // needs them all before the block's syntax is written to elect
+    // `skip`) and served back by the coefficient callback, keyed by
+    // `(plane, start_x, start_y)`.
+    let token_cache: RefCell<std::collections::HashMap<(usize, u32, u32), Vec<i64>>> =
+        RefCell::new(std::collections::HashMap::new());
+
+    // §6.4.10 inferred tx under Allow8x8 at BLOCK_8X8: TX_8X8 luma; the
+    // chroma size follows §6.4.22.
+    let tx_mode = crate::compressed::TxMode::Allow8x8;
+    let luma_tx = crate::mode_writer::inferred_tx_size(
+        crate::residual::MAX_TXSIZE_LOOKUP[BLOCK_8X8 as usize],
+        tx_mode,
+    );
 
     const NEWMV_SAD_MARGIN: u64 = 64;
 
     let mut planner: Box<crate::frame_writer::InterBlockPlanner<'_>> =
-        Box::new(|r, c, state| -> (u8, [i32; 2]) {
+        Box::new(|r, c, state| -> (u8, [i32; 2], bool) {
             let mut choice: (u8, [i32; 2]) = (ZEROMV, [0, 0]);
             if search_range > 0 {
                 let ((dy, dx), best_sad, zero_sad) = search_block_mv(
@@ -1639,8 +1670,9 @@ pub(crate) fn encode_pframe_lossy_motion(
                     choice = (NEWMV, mv);
                 }
             }
+            let mut work = work.borrow_mut();
             predict_mi_block(
-                &mut work.borrow_mut().planes,
+                &mut work.planes,
                 reference,
                 ref_w,
                 ref_h,
@@ -1653,52 +1685,95 @@ pub(crate) fn encode_pframe_lossy_motion(
                 ssy,
                 bit_depth,
             );
-            choice
-        });
 
-    // §6.4.10 inferred tx under Allow8x8 at BLOCK_8X8: TX_8X8 luma; the
-    // chroma size follows §6.4.22.
-    let tx_mode = crate::compressed::TxMode::Allow8x8;
-    let luma_tx = crate::mode_writer::inferred_tx_size(
-        crate::residual::MAX_TXSIZE_LOOKUP[BLOCK_8X8 as usize],
-        tx_mode,
-    );
+            // Quantize every coded transform block of this MI now (the
+            // same §6.4.21 grid the residual writer will walk), elect
+            // `skip` when the whole block is zero, and for a non-skip
+            // block replay the decoder's reconstruction immediately.
+            let mut cache = token_cache.borrow_mut();
+            let mut all_zero = true;
+            let mut blocks: Vec<(usize, u32, u32, u32, Vec<i64>)> = Vec::new();
+            // The §6.4.21 loop is keyed by `plane` and indexes the work /
+            // target planes and subsampling by that same index, mirroring
+            // the spec listing directly.
+            #[allow(clippy::needless_range_loop)]
+            for plane in 0..3usize {
+                let tx_sz = if plane == 0 {
+                    luma_tx
+                } else {
+                    crate::residual::get_uv_tx_size(luma_tx, BLOCK_8X8, ssx, ssy)
+                };
+                let sub_x = plane > 0 && ssx;
+                let sub_y = plane > 0 && ssy;
+                let base_x = (c * 8) >> u32::from(sub_x);
+                let base_y = (r * 8) >> u32::from(sub_y);
+                let maxx = (mi_cols * 8) >> u32::from(sub_x);
+                let maxy = (mi_rows * 8) >> u32::from(sub_y);
+                let n0 = 4u32 << tx_sz;
+                let region_w = 8u32 >> u32::from(sub_x);
+                let region_h = 8u32 >> u32::from(sub_y);
+                let dc_q = get_dc_quant(plane, &seg, &quant, 0, bd8);
+                let ac_q = get_ac_quant(plane, &seg, &quant, 0, bd8);
+                let mut sy = base_y;
+                while sy < base_y + region_h {
+                    let mut sx = base_x;
+                    while sx < base_x + region_w {
+                        if sx < maxx && sy < maxy {
+                            let n0u = n0 as usize;
+                            let mut block = vec![0i64; n0u * n0u];
+                            for i in 0..n0u {
+                                for j in 0..n0u {
+                                    let t = targets[plane].get(sx as usize + j, sy as usize + i);
+                                    let p =
+                                        work.planes[plane].get(sx as usize + j, sy as usize + i);
+                                    block[i * n0u + j] = i64::from(t) - i64::from(p);
+                                }
+                            }
+                            // §6.4.25: inter blocks are DCT_DCT at every size.
+                            crate::fwd_transform::forward_dct_2d(&mut block, tx_sz + 2);
+                            crate::fwd_transform::quantize_block_tx(
+                                &mut block, dc_q, ac_q, tx_sz, bit_depth,
+                            );
+                            all_zero &= block.iter().all(|&v| v == 0);
+                            blocks.push((plane, sx, sy, tx_sz, block));
+                        }
+                        sx += n0;
+                    }
+                    sy += n0;
+                }
+            }
+            let skip = all_zero;
+            for (plane, sx, sy, tx_sz, block) in blocks {
+                if !skip {
+                    let dc_q = get_dc_quant(plane, &seg, &quant, 0, bd8);
+                    let ac_q = get_ac_quant(plane, &seg, &quant, 0, bd8);
+                    reconstruct_block(
+                        &mut work.planes[plane],
+                        sx as usize,
+                        sy as usize,
+                        tx_sz,
+                        &block,
+                        dc_q,
+                        ac_q,
+                        DCT_DCT,
+                        false,
+                        bit_depth,
+                    );
+                    cache.insert((plane, sx, sy), block);
+                }
+                // Skip blocks reconstruct from prediction alone — the
+                // work planes already hold it.
+            }
+
+            (choice.0, choice.1, skip)
+        });
 
     let mut coeffs: Box<FrameCoefSource<'_>> = Box::new(
         |_mi_r: u32, _mi_c: u32, plane: usize, sx: u32, sy: u32, _b: usize| -> Vec<i64> {
-            let mut work = work.borrow_mut();
-            let tx_sz = if plane == 0 {
-                luma_tx
-            } else {
-                crate::residual::get_uv_tx_size(luma_tx, BLOCK_8X8, ssx, ssy)
-            };
-            let n0 = 4usize << tx_sz;
-            let mut block = vec![0i64; n0 * n0];
-            for i in 0..n0 {
-                for j in 0..n0 {
-                    let t = targets[plane].get(sx as usize + j, sy as usize + i);
-                    let p = work.planes[plane].get(sx as usize + j, sy as usize + i);
-                    block[i * n0 + j] = i64::from(t) - i64::from(p);
-                }
-            }
-            let dc_q = get_dc_quant(plane, &seg, &quant, 0, bd8);
-            let ac_q = get_ac_quant(plane, &seg, &quant, 0, bd8);
-            // §6.4.25: inter blocks transform with DCT_DCT at every size.
-            crate::fwd_transform::forward_dct_2d(&mut block, tx_sz + 2);
-            crate::fwd_transform::quantize_block_tx(&mut block, dc_q, ac_q, tx_sz, bit_depth);
-            reconstruct_block(
-                &mut work.planes[plane],
-                sx as usize,
-                sy as usize,
-                tx_sz,
-                &block,
-                dc_q,
-                ac_q,
-                DCT_DCT,
-                false,
-                bit_depth,
-            );
-            block
+            token_cache
+                .borrow_mut()
+                .remove(&(plane, sx, sy))
+                .expect("planner pre-computed this block's tokens")
         },
     );
 
@@ -2530,6 +2605,109 @@ mod tests {
         }
         mse /= f64::from(64 * h);
         assert!(mse < 200.0, "smooth-half MSE {mse} too high at q=80");
+    }
+
+    /// Per-block skip election, pinned directly: a lossy P-frame whose
+    /// reference **equals** its target (exact prediction at `ZEROMV`)
+    /// quantizes every residual to zero, elects skip on every block,
+    /// and codes a tiny all-syntax frame whose reconstruction equals
+    /// the reference. On a static *sequence* (where each P-frame
+    /// legitimately refines the previous frame's quantization error
+    /// toward the source) the P-frames still shrink an order of
+    /// magnitude below the keyframe and decode through the chain
+    /// mirror.
+    #[test]
+    fn lossy_pframe_skip_election_on_static_content() {
+        use crate::decode_frame::decode_vp9_sequence;
+        let (w, h) = (64u32, 64u32);
+        let n = (w * h) as usize + 2 * 32 * 32;
+        let px: Vec<u8> = (0..n).map(|i| ((i * 73 + 19) % 256) as u8).collect();
+
+        // Direct pin: reference == target => all-skip.
+        let targets = padded_targets_420(&px, w, h);
+        let crop = |p: &Plane, vw: usize, vh: usize| -> Vec<i32> {
+            let mut out = Vec::with_capacity(vw * vh);
+            for y in 0..vh {
+                for x in 0..vw {
+                    out.push(p.get(x, y));
+                }
+            }
+            out
+        };
+        let (cw, ch) = (32usize, 32usize);
+        let ref_planes = [
+            crop(&targets[0], w as usize, h as usize),
+            crop(&targets[1], cw, ch),
+            crop(&targets[2], cw, ch),
+        ];
+        let reference: [(&[i32], usize); 3] = [
+            (ref_planes[0].as_slice(), w as usize),
+            (ref_planes[1].as_slice(), cw),
+            (ref_planes[2].as_slice(), cw),
+        ];
+        let mut hdr = lossless_pframe_header(w, h);
+        hdr.quantization = QuantizationParams {
+            base_q_idx: 60,
+            delta_q_y_dc: 0,
+            delta_q_uv_dc: 0,
+            delta_q_uv_ac: 0,
+            lossless: false,
+        };
+        let (bytes, recon) =
+            encode_pframe_lossy_motion(&hdr, &targets, &reference, w, h, PFRAME_SEARCH_RANGE)
+                .expect("p-frame");
+        assert!(
+            bytes.len() < 100,
+            "exact-prediction P-frame ({} B) should be all-skip-small",
+            bytes.len()
+        );
+        // Skip reconstruction == prediction == reference.
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                assert_eq!(recon.planes[0].get(x, y), targets[0].get(x, y), "({x},{y})");
+            }
+        }
+
+        // Sequence-level: static P-frames stay an order of magnitude
+        // below the keyframe and the chain decodes.
+        let frames: Vec<&[u8]> = vec![&px, &px, &px];
+        let coded = encode_sequence_lossy_420(&frames, w, h, 60).expect("encode");
+        assert!(coded[1].len() * 8 < coded[0].len(), "P1 << keyframe");
+        assert!(coded[2].len() <= coded[1].len(), "P2 <= P1 (converging)");
+        let refs: Vec<&[u8]> = coded.iter().map(|f| f.as_slice()).collect();
+        decode_vp9_sequence(&refs).expect("decode");
+    }
+
+    /// The lossless P-frame elects skip on exactly-predicted blocks: a
+    /// static lossless pair codes a near-empty P-frame and stays
+    /// byte-exact.
+    #[test]
+    fn lossless_pframe_skip_election_stays_byte_exact() {
+        use crate::decode_frame::decode_vp9_sequence;
+        let (w, h) = (64u32, 64u32);
+        let n = (w * h) as usize + 2 * 32 * 32;
+        let px: Vec<u8> = (0..n).map(|i| ((i * 31 + 7) % 256) as u8).collect();
+        let frames: Vec<&[u8]> = vec![&px, &px];
+        let coded = encode_sequence_lossless_420(&frames, w, h).expect("encode");
+        assert!(
+            coded[1].len() < 100,
+            "static lossless P-frame ({} B) should be all-skip-small",
+            coded[1].len()
+        );
+        let refs: Vec<&[u8]> = coded.iter().map(|f| f.as_slice()).collect();
+        let dec = decode_vp9_sequence(&refs).expect("decode");
+        for (i, f) in dec.iter().enumerate() {
+            let y_w = w as usize;
+            for row in 0..h as usize {
+                for col in 0..y_w {
+                    assert_eq!(
+                        f.y[row * y_w + col],
+                        u16::from(px[row * y_w + col]),
+                        "frame {i} luma ({col},{row})"
+                    );
+                }
+            }
+        }
     }
 
     // ----- rate control -----

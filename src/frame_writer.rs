@@ -35,11 +35,15 @@ use crate::compressed_writer::write_compressed_header_intra;
 use crate::decode_block::Vp9FrameState;
 use crate::header::{FrameType, Vp9FrameHeader};
 use crate::header_writer::write_uncompressed_header;
-use crate::partition::{PartitionContextState, PartitionProbsKind};
-use crate::partition_writer::write_partition_8x8;
-use crate::residual::{BLOCK_64X64, BLOCK_8X8};
+use crate::mode_writer::{inferred_tx_size, tx_size_is_coded};
+use crate::partition::{
+    PartitionContextState, PartitionProbsKind, PARTITION_NONE, PARTITION_SPLIT,
+};
+use crate::partition_writer::{write_partition_8x8, write_partition_tree};
+use crate::residual::{BLOCK_64X64, BLOCK_8X8, MAX_TXSIZE_LOOKUP};
 use crate::tokens::NonzeroContext;
 use crate::Error;
+use std::collections::HashMap;
 
 /// Per-8x8-block plan: the mode / skip / segment a leaf block codes.
 #[derive(Debug, Clone, Copy)]
@@ -91,6 +95,204 @@ impl KeyframePlan {
 /// transform block with `(mi_r, mi_c, plane, start_x, start_y, block_idx)`,
 /// returning the `segEob`-length quantized `Tokens` array (raster order).
 pub(crate) type FrameCoefSource<'f> = dyn FnMut(u32, u32, usize, u32, u32, usize) -> Vec<i64> + 'f;
+
+/// Per-leaf spec of a [`KeyframeTreePlan`]: the mode info one §6.4.3
+/// leaf block codes. The leaf's `MiSize` comes from the partition tree
+/// itself (the `subsize` at the leaf call site).
+// Consumed by the tree-plan lossy encoder (the next step in this
+// subsystem); exercised now by the assembler round-trip tests below.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TreeLeafPlan {
+    /// `tx_size` (`TX_*` 0..=3). Under `TxModeSelect` any value up to
+    /// `MAX_TXSIZE_LOOKUP[ MiSize ]` is codeable; under the other tx
+    /// modes it must equal the §6.4.10 inferred size (validated).
+    pub tx_size: u32,
+    /// Luma `y_mode` (0..=9).
+    pub y_mode: u8,
+    /// Chroma `uv_mode` (0..=9).
+    pub uv_mode: u8,
+    /// `skip` flag.
+    pub skip: bool,
+    /// `segment_id` (0..=7).
+    pub segment_id: u8,
+}
+
+/// A keyframe over an **arbitrary §6.4.3 partition tree**: per-node
+/// partition choices plus per-leaf mode/tx specs — the generalisation of
+/// [`KeyframePlan`] past the fixed all-`BLOCK_8X8` / `TX_4X4` layout.
+#[allow(dead_code)]
+pub(crate) struct KeyframeTreePlan {
+    /// §6.3.1 `tx_mode`.
+    pub tx_mode: TxMode,
+    /// Partition value per recursion node, keyed `(MiRow, MiCol, bsize)`.
+    /// Missing nodes fall back to the all-8x8 layout (SPLIT above
+    /// `BLOCK_8X8`, NONE at it) so a partial map stays codeable.
+    pub partitions: HashMap<(u32, u32, u8), u8>,
+    /// Leaf spec keyed by the leaf's top-left MI `(row, col)`. Every
+    /// leaf the partition tree produces must have an entry.
+    pub leaves: HashMap<(u32, u32), TreeLeafPlan>,
+}
+
+/// Assemble a complete VP9 keyframe from `hdr` + a [`KeyframeTreePlan`],
+/// returning the full frame bytes — [`assemble_keyframe`] generalised
+/// over the partition tree and per-leaf transform sizes.
+///
+/// Each leaf writes the §6.4.4 intra block at the tree's `subsize` with
+/// the plan's `tx_size`: coded via the §6.4.10 tree under
+/// `TxModeSelect`, or validated against the inferred
+/// `Min( maxTxSize, tx_mode_to_biggest_tx_size )` otherwise (a mismatch
+/// would silently desync the reconstruction, so it is rejected).
+#[allow(dead_code)]
+pub(crate) fn assemble_keyframe_tree(
+    hdr: &Vp9FrameHeader,
+    plan: &KeyframeTreePlan,
+    coeffs: &mut FrameCoefSource<'_>,
+) -> Result<Vec<u8>, Error> {
+    if hdr.frame_type != FrameType::KeyFrame || hdr.intra_only {
+        return Err(Error::Unsupported);
+    }
+    if hdr.tile_info.tile_cols_log2 != 0 || hdr.tile_info.tile_rows_log2 != 0 {
+        return Err(Error::Unsupported);
+    }
+
+    let mi_cols = (hdr.frame_width + 7) >> 3;
+    let mi_rows = (hdr.frame_height + 7) >> 3;
+
+    // §6.3 compressed header (default-probability path).
+    let chdr_bytes = write_compressed_header_intra(plan.tx_mode, hdr.quantization.lossless)?;
+
+    // §6.2 uncompressed header with header_size_in_bytes = compressed len.
+    let mut hdr2 = *hdr;
+    hdr2.header_size_in_bytes = u16::try_from(chdr_bytes.len()).map_err(|_| Error::Unsupported)?;
+    let uhdr_bytes = write_uncompressed_header(&hdr2)?;
+
+    // §6.4 tile data: a single bool-coded payload over the plan's tree.
+    let ssx = hdr.color_config.subsampling_x;
+    let ssy = hdr.color_config.subsampling_y;
+    let bit_depth = u32::from(hdr.color_config.bit_depth);
+    let sb64_cols = ((mi_cols + 7) >> 3) * 8;
+    let sb64_rows = ((mi_rows + 7) >> 3) * 8;
+
+    let mut enc = BoolEncoder::new();
+    let mut state = Vp9FrameState::new(mi_rows, mi_cols);
+    let mut nz = [
+        NonzeroContext::new((2 * mi_cols) as usize, (2 * mi_rows) as usize),
+        NonzeroContext::new(
+            ((2 * mi_cols) >> u32::from(ssx)) as usize,
+            ((2 * mi_rows) >> u32::from(ssy)) as usize,
+        ),
+        NonzeroContext::new(
+            ((2 * mi_cols) >> u32::from(ssx)) as usize,
+            ((2 * mi_rows) >> u32::from(ssy)) as usize,
+        ),
+    ];
+    let mut pctx = PartitionContextState::new(sb64_cols as usize, sb64_rows as usize);
+    let mut token_cache = vec![0u8; 1024];
+
+    let fctx = BlockWriteFrameCtx {
+        mi_cols,
+        mi_rows,
+        subsampling_x: ssx,
+        subsampling_y: ssy,
+        bit_depth,
+        lossless: hdr.quantization.lossless,
+        tx_mode: plan.tx_mode,
+        seg_enabled: hdr.segmentation.enabled,
+        seg_update_map: hdr.segmentation.update_map,
+    };
+    let tree_probs = hdr.segmentation.tree_probs;
+
+    pctx.clear_above();
+
+    let mut r = 0u32;
+    while r < mi_rows {
+        pctx.clear_left();
+        let mut c = 0u32;
+        while c < mi_cols {
+            let mut layout = |lr: u32, lc: u32, bsize: u8| -> u8 {
+                plan.partitions
+                    .get(&(lr, lc, bsize))
+                    .copied()
+                    .unwrap_or(if bsize == BLOCK_8X8 {
+                        PARTITION_NONE
+                    } else {
+                        PARTITION_SPLIT
+                    })
+            };
+            let mut leaf =
+                |enc: &mut BoolEncoder, lr: u32, lc: u32, subsize: u8| -> Result<(), Error> {
+                    let lp = plan
+                        .leaves
+                        .get(&(lr, lc))
+                        .copied()
+                        .ok_or(Error::Unsupported)?;
+                    // tx-size codeability / inference validation.
+                    let max_tx = MAX_TXSIZE_LOOKUP[subsize as usize];
+                    if lp.tx_size > max_tx {
+                        return Err(Error::Unsupported);
+                    }
+                    if !tx_size_is_coded(true, plan.tx_mode, subsize >= BLOCK_8X8)
+                        && lp.tx_size != inferred_tx_size(max_tx, plan.tx_mode)
+                    {
+                        return Err(Error::Unsupported);
+                    }
+                    let spec = IntraBlockSpec {
+                        r: lr,
+                        mi_col_start: 0,
+                        c: lc,
+                        mi_size: subsize,
+                        segment_id: lp.segment_id,
+                        skip: lp.skip,
+                        tx_size: lp.tx_size,
+                        y_mode: lp.y_mode,
+                        uv_mode: lp.uv_mode,
+                    };
+                    let mut src = |plane: usize, tx_sz: u32, sx: u32, sy: u32, b: usize| {
+                        let n0 = 1usize << (tx_sz + 2);
+                        let mut v = coeffs(lr, lc, plane, sx, sy, b);
+                        v.resize(n0 * n0, 0);
+                        v
+                    };
+                    write_keyframe_intra_block(
+                        enc,
+                        &fctx,
+                        &spec,
+                        &mut state,
+                        &mut nz,
+                        &mut token_cache,
+                        tree_probs.as_ref(),
+                        &DEFAULT_SKIP_PROB,
+                        &DEFAULT_TX_PROBS,
+                        &DEFAULT_COEF_PROBS,
+                        &mut src,
+                    )
+                };
+            write_partition_tree(
+                &mut enc,
+                r,
+                c,
+                BLOCK_64X64,
+                mi_rows,
+                mi_cols,
+                &mut pctx,
+                PartitionProbsKind::Keyframe,
+                &mut layout,
+                &mut leaf,
+            )?;
+            c += 8;
+        }
+        r += 8;
+    }
+
+    let tile_bytes = enc.finish();
+
+    let mut out = Vec::with_capacity(uhdr_bytes.len() + chdr_bytes.len() + tile_bytes.len());
+    out.extend_from_slice(&uhdr_bytes);
+    out.extend_from_slice(&chdr_bytes);
+    out.extend_from_slice(&tile_bytes);
+    Ok(out)
+}
 
 /// Assemble a complete VP9 keyframe from `hdr` + `plan`, returning the
 /// full frame bytes (uncompressed header + compressed header + single
@@ -952,6 +1154,286 @@ mod tests {
                 assert_eq!(s, exp, "top-left luma ({i},{j})");
             }
         }
+    }
+
+    // ----- Tree-plan keyframe assembler -----
+
+    use crate::partition::{PARTITION_HORZ, PARTITION_VERT};
+    use crate::residual::{BLOCK_16X16, BLOCK_32X32};
+
+    fn uniform_tree_plan(
+        mi_rows: u32,
+        mi_cols: u32,
+        leaf_size: u8,
+        tx_size: u32,
+        skip: bool,
+    ) -> KeyframeTreePlan {
+        let mut partitions = HashMap::new();
+        let mut leaves = HashMap::new();
+        // Walk every recursion node: split above leaf_size, NONE at it.
+        for r in (0..mi_rows).step_by(8) {
+            for c in (0..mi_cols).step_by(8) {
+                fill_uniform(&mut partitions, &mut leaves, r, c, BLOCK_64X64, leaf_size);
+            }
+        }
+        for lp in leaves.values_mut() {
+            lp.tx_size = tx_size;
+            lp.skip = skip;
+        }
+        KeyframeTreePlan {
+            tx_mode: TxMode::TxModeSelect,
+            partitions,
+            leaves,
+        }
+    }
+
+    fn fill_uniform(
+        partitions: &mut HashMap<(u32, u32, u8), u8>,
+        leaves: &mut HashMap<(u32, u32), TreeLeafPlan>,
+        r: u32,
+        c: u32,
+        bsize: u8,
+        leaf_size: u8,
+    ) {
+        use crate::partition::NUM_8X8_BLOCKS_WIDE_LOOKUP;
+        if bsize == leaf_size {
+            partitions.insert((r, c, bsize), crate::partition::PARTITION_NONE);
+            leaves.insert(
+                (r, c),
+                TreeLeafPlan {
+                    tx_size: 0,
+                    y_mode: 0,
+                    uv_mode: 0,
+                    skip: false,
+                    segment_id: 0,
+                },
+            );
+            return;
+        }
+        partitions.insert((r, c, bsize), crate::partition::PARTITION_SPLIT);
+        let half = (NUM_8X8_BLOCKS_WIDE_LOOKUP[bsize as usize] >> 1) as u32;
+        let subsize = crate::partition::SUBSIZE_LOOKUP[crate::partition::PARTITION_SPLIT as usize]
+            [bsize as usize];
+        for (dr, dc) in [(0, 0), (0, half), (half, 0), (half, half)] {
+            fill_uniform(partitions, leaves, r + dr, c + dc, subsize, leaf_size);
+        }
+    }
+
+    /// An all-skip uniform-32x32 tree keyframe under TX_MODE_SELECT
+    /// decodes to the flat DC fill — the partition + tx_size syntax at
+    /// >8x8 leaves threads through the whole §6.4 walk.
+    #[test]
+    fn tree_uniform_32x32_all_skip_decodes_flat() {
+        let hdr = keyframe_header(64, 64);
+        let plan = uniform_tree_plan(8, 8, BLOCK_32X32, 3, true);
+        let bytes = assemble_keyframe_tree(&hdr, &plan, &mut *no_coeffs()).expect("assemble");
+        let frame = decode_intra_frame(&bytes).expect("decode");
+        assert!(frame.y.iter().all(|&s| s == 128), "luma not flat 128");
+    }
+
+    /// A single 64x64 NONE leaf at TX_32X32 with a DC token: the
+    /// top-left 32x32 transform block predicts from no neighbours (flat
+    /// 128) and reconstructs to `Clip1( 128 + r )` where `r` is the
+    /// independently-probed §8.6.2 dequant (dqDenom == 2!) + §8.7
+    /// inverse. Pins the TX_32X32 residual path through the assembler.
+    #[test]
+    fn tree_64x64_tx32_dc_residual_reconstructs() {
+        use crate::dequant::get_dc_quant;
+        use crate::idct::{inverse_transform_2d, DCT_DCT};
+
+        let hdr = keyframe_header(64, 64);
+        let mut plan = uniform_tree_plan(8, 8, BLOCK_64X64, 3, false);
+        for lp in plan.leaves.values_mut() {
+            lp.y_mode = 0; // DC_PRED
+            lp.uv_mode = 0;
+        }
+        let dc_token: i64 = 5;
+        let mut coeffs: Box<FrameCoefSource> = Box::new(move |_r, _c, plane, sx, sy, _b| {
+            let mut v = Vec::new();
+            if plane == 0 && sx == 0 && sy == 0 {
+                v = vec![0i64; 32 * 32];
+                v[0] = dc_token;
+            }
+            v
+        });
+        let bytes = assemble_keyframe_tree(&hdr, &plan, &mut *coeffs).expect("assemble");
+        let frame = decode_intra_frame(&bytes).expect("decode");
+
+        // Independent probe: dqDenom = 2 at TX_32X32.
+        let seg = SegmentationParams::default_disabled();
+        let dcq = get_dc_quant(0, &seg, &hdr.quantization, 0, 8) as i64;
+        let mut probe = vec![0i64; 32 * 32];
+        probe[0] = (dc_token * dcq) / 2;
+        inverse_transform_2d(&mut probe, 5, DCT_DCT, false);
+        for i in 0..32usize {
+            for j in 0..32usize {
+                let exp = (128i64 + probe[i * 32 + j]).clamp(0, 255) as i32;
+                assert_eq!(frame.y[i * 64 + j] as i32, exp, "({i},{j})");
+            }
+        }
+    }
+
+    /// Uniform 16x16 leaves at TX_16X16: the top-left block's DC
+    /// residual reconstructs against the independent probe (dqDenom 1).
+    #[test]
+    fn tree_16x16_tx16_dc_residual_reconstructs() {
+        use crate::dequant::get_dc_quant;
+        use crate::idct::{inverse_transform_2d, DCT_DCT};
+
+        let hdr = keyframe_header(64, 64);
+        let plan = uniform_tree_plan(8, 8, BLOCK_16X16, 2, false);
+        let dc_token: i64 = 4;
+        let mut coeffs: Box<FrameCoefSource> = Box::new(move |r, c, plane, sx, sy, _b| {
+            let mut v = Vec::new();
+            if r == 0 && c == 0 && plane == 0 && sx == 0 && sy == 0 {
+                v = vec![0i64; 16 * 16];
+                v[0] = dc_token;
+            }
+            v
+        });
+        let bytes = assemble_keyframe_tree(&hdr, &plan, &mut *coeffs).expect("assemble");
+        let frame = decode_intra_frame(&bytes).expect("decode");
+
+        let seg = SegmentationParams::default_disabled();
+        let dcq = get_dc_quant(0, &seg, &hdr.quantization, 0, 8) as i64;
+        let mut probe = vec![0i64; 16 * 16];
+        probe[0] = dc_token * dcq;
+        inverse_transform_2d(&mut probe, 4, DCT_DCT, false);
+        for i in 0..16usize {
+            for j in 0..16usize {
+                let exp = (128i64 + probe[i * 16 + j]).clamp(0, 255) as i32;
+                assert_eq!(frame.y[i * 64 + j] as i32, exp, "({i},{j})");
+            }
+        }
+    }
+
+    /// Non-square leaves: a HORZ superblock (two 64x32 leaves at
+    /// TX_32X32) and a VERT one (two 32x64) both decode; the residual
+    /// walk covers the rectangular num4x4w != num4x4h grids.
+    #[test]
+    fn tree_horz_vert_nonsquare_leaves_decode() {
+        let hdr = keyframe_header(128, 64);
+        let mut partitions = HashMap::new();
+        let mut leaves = HashMap::new();
+        partitions.insert((0, 0, BLOCK_64X64), PARTITION_HORZ);
+        partitions.insert((0, 8, BLOCK_64X64), PARTITION_VERT);
+        for key in [(0u32, 0u32), (4, 0), (0, 8), (0, 12)] {
+            leaves.insert(
+                key,
+                TreeLeafPlan {
+                    tx_size: 3,
+                    y_mode: 0,
+                    uv_mode: 0,
+                    skip: false,
+                    segment_id: 0,
+                },
+            );
+        }
+        let plan = KeyframeTreePlan {
+            tx_mode: TxMode::TxModeSelect,
+            partitions,
+            leaves,
+        };
+        let dc = 3i64;
+        let mut coeffs: Box<FrameCoefSource> = Box::new(move |_r, _c, _p, _sx, _sy, _b| {
+            let mut v = vec![0i64; 1];
+            v[0] = dc;
+            v
+        });
+        let bytes = assemble_keyframe_tree(&hdr, &plan, &mut *coeffs).expect("assemble");
+        let frame = decode_intra_frame(&bytes).expect("decode");
+        assert_eq!((frame.width, frame.height), (128, 64));
+        // The DC residual shifts every sample off the flat-128 baseline.
+        assert!(frame.y.iter().all(|&s| s != 128), "residual did not code");
+    }
+
+    /// Under a non-select tx_mode the leaf's tx_size must equal the
+    /// §6.4.10 inferred value: the correct value assembles + decodes,
+    /// a mismatch is rejected.
+    #[test]
+    fn tree_inferred_tx_size_validated() {
+        let hdr = keyframe_header(64, 64);
+        // Allow8x8: inferred tx at a 32x32 leaf = min(TX_32X32-cap, 8x8)
+        // = TX_8X8 (1).
+        let mut plan = uniform_tree_plan(8, 8, BLOCK_32X32, 1, true);
+        plan.tx_mode = TxMode::Allow8x8;
+        let bytes = assemble_keyframe_tree(&hdr, &plan, &mut *no_coeffs()).expect("assemble");
+        let frame = decode_intra_frame(&bytes).expect("decode");
+        assert!(frame.y.iter().all(|&s| s == 128));
+
+        // Wrong tx (TX_4X4) under Allow8x8 -> rejected.
+        let mut bad = uniform_tree_plan(8, 8, BLOCK_32X32, 0, true);
+        bad.tx_mode = TxMode::Allow8x8;
+        assert_eq!(
+            assemble_keyframe_tree(&hdr, &bad, &mut *no_coeffs()).unwrap_err(),
+            Error::Unsupported
+        );
+
+        // tx_size above the leaf's MAX_TXSIZE -> rejected (TX_32X32 on a
+        // 16x16 leaf).
+        let over = uniform_tree_plan(8, 8, BLOCK_16X16, 3, true);
+        assert_eq!(
+            assemble_keyframe_tree(&hdr, &over, &mut *no_coeffs()).unwrap_err(),
+            Error::Unsupported
+        );
+    }
+
+    /// A leaf without a plan entry is rejected (not silently defaulted).
+    #[test]
+    fn tree_missing_leaf_entry_rejected() {
+        let hdr = keyframe_header(64, 64);
+        let mut plan = uniform_tree_plan(8, 8, BLOCK_32X32, 3, true);
+        plan.leaves.remove(&(0, 4));
+        assert_eq!(
+            assemble_keyframe_tree(&hdr, &plan, &mut *no_coeffs()).unwrap_err(),
+            Error::Unsupported
+        );
+    }
+
+    /// A mixed-depth tree (one 32x32 quadrant split to 16x16 with mixed
+    /// per-leaf tx sizes, skip and non-skip) assembles and decodes.
+    #[test]
+    fn tree_mixed_depth_mixed_tx_decodes() {
+        let hdr = keyframe_header(64, 64);
+        let mut plan = uniform_tree_plan(8, 8, BLOCK_32X32, 3, false);
+        // Split the TL 32x32 into 16x16 leaves with varying tx sizes.
+        plan.partitions
+            .insert((0, 0, BLOCK_32X32), crate::partition::PARTITION_SPLIT);
+        plan.leaves.remove(&(0, 0));
+        for (i, key) in [(0u32, 0u32), (0, 2), (2, 0), (2, 2)].iter().enumerate() {
+            plan.partitions.insert(
+                (key.0, key.1, BLOCK_16X16),
+                crate::partition::PARTITION_NONE,
+            );
+            plan.leaves.insert(
+                *key,
+                TreeLeafPlan {
+                    tx_size: (i as u32) % 3, // TX_4X4 / TX_8X8 / TX_16X16
+                    y_mode: 0,
+                    uv_mode: 0,
+                    skip: i == 1,
+                    segment_id: 0,
+                },
+            );
+        }
+        let mut coeffs: Box<FrameCoefSource> = Box::new(|_r, _c, _p, _sx, _sy, _b| {
+            let mut v = vec![0i64; 1];
+            v[0] = 2;
+            v
+        });
+        let bytes = assemble_keyframe_tree(&hdr, &plan, &mut *coeffs).expect("assemble");
+        let frame = decode_intra_frame(&bytes).expect("decode");
+        assert_eq!((frame.width, frame.height), (64, 64));
+    }
+
+    /// The tree assembler is byte-deterministic.
+    #[test]
+    fn tree_assembly_is_deterministic() {
+        let hdr = keyframe_header(64, 64);
+        let plan = uniform_tree_plan(8, 8, BLOCK_16X16, 2, true);
+        let a = assemble_keyframe_tree(&hdr, &plan, &mut *no_coeffs()).expect("a");
+        let b = assemble_keyframe_tree(&hdr, &plan, &mut *no_coeffs()).expect("b");
+        assert_eq!(a, b);
     }
 
     // ----- Inter-frame assembler -----

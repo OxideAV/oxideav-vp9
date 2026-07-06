@@ -198,3 +198,28 @@ fn degenerate_inputs_are_rejected_cleanly() {
     std::panic::set_hook(prev);
     assert!(panics.is_empty(), "degenerate input panicked: {panics:?}");
 }
+
+/// Fuzz-found OOM regression (scheduled-fuzz run 28736285692, target
+/// `decode_frame`): a syntactically valid §6.2 header claiming a huge
+/// `frame_size` drove a multi-GiB `CurrFrame` plane allocation before
+/// any tile data was validated. The decoder now bounds the MI-padded
+/// luma picture size by the largest `Max luma picture size` any VP9
+/// level defines (35 651 584, levels 6.x) and rejects such frames as
+/// `Unsupported` *before* allocating. Pinned with the original crash
+/// input plus a hand-built maximal-dimensions header prefix.
+#[test]
+fn oversized_frame_dimensions_are_rejected_before_allocation() {
+    // The minimised fuzz artifact (41 bytes) — decode must return an
+    // error without attempting the frame-geometry-sized allocations.
+    let crash: &[u8] = &[
+        0x83, 0x49, 0x83, 0x42, 0x83, 0xff, 0xff, 0x7a, 0xbb, 0x27, 0xff, 0x29, 0xff, 0x36, 0x24,
+        0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0x00, 0x00, 0x01, 0x00, 0x20, 0x00, 0x00, 0x1e, 0xff, 0x37,
+        0x9c, 0xef, 0xff, 0xdf, 0xb2, 0x4b, 0x02, 0x49, 0x83, 0x42, 0x83,
+    ];
+    assert!(oxideav_vp9::decode_vp9(crash).is_err());
+    let subs = oxideav_vp9::split_superframe(crash);
+    for sub in &subs {
+        assert!(oxideav_vp9::decode_vp9(sub).is_err());
+    }
+    assert!(oxideav_vp9::decode_vp9_sequence(&subs).is_err());
+}

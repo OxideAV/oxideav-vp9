@@ -1161,6 +1161,16 @@ pub fn decode_intra_frame(data: &[u8]) -> Result<Vp9DecodedFrame, Error> {
     Ok(products.out)
 }
 
+/// Decoder resource bound on the MI-padded luma picture size, in
+/// samples: the largest `Max luma picture size` any VP9 level defines
+/// (35 651 584, levels 6 / 6.1 / 6.2 — see the level table staged at
+/// `docs/video/vp9/webmproject-vp9-levels-testing.html`). A syntactically
+/// valid §6.2 header can claim up to 65536 × 65536 (17 GiB of working
+/// planes per frame); no conformant stream exceeds this bound, so frames
+/// past it are rejected as [`Error::Unsupported`] before any
+/// frame-geometry-sized allocation happens.
+const MAX_LUMA_PICTURE_SIZE: u64 = 35_651_584;
+
 /// Decode one frame (intra or inter) given the parsed header, the
 /// compressed header, the optional §8.10 reference buffers, and the
 /// optional previous-frame motion field. Returns the reconstruction
@@ -1180,6 +1190,13 @@ fn decode_single_frame(
     // spans (AbovePartitionContext is read beyond MiCols).
     let mi_cols = (hdr.frame_width + 7) >> 3;
     let mi_rows = (hdr.frame_height + 7) >> 3;
+    // Resource guard: bound the working-plane allocation by the largest
+    // luma picture size any VP9 level admits (see
+    // [`MAX_LUMA_PICTURE_SIZE`]) before allocating anything sized by the
+    // header's claimed geometry.
+    if u64::from(mi_cols * 8) * u64::from(mi_rows * 8) > MAX_LUMA_PICTURE_SIZE {
+        return Err(Error::Unsupported);
+    }
     let sb64_cols = (mi_cols + 7) >> 3;
     let sb64_rows = (mi_rows + 7) >> 3;
     let ssx = hdr.color_config.subsampling_x;

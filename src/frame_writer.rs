@@ -2056,6 +2056,53 @@ mod tests {
         );
     }
 
+    /// NEARESTMV codes strictly fewer bits than NEWMV for the same
+    /// motion vector once a neighbour established the predictor: the
+    /// §6.4.18 `assign_mv` arm for predictor-referencing modes emits no
+    /// §6.4.20 mv-diff syntax at all — the premise behind the encoder's
+    /// NEWMV → NEARESTMV/NEARMV mode mapping.
+    #[test]
+    fn nearestmv_codes_fewer_bits_than_newmv_for_same_vector() {
+        use crate::mode_info::{NEARESTMV, NEWMV};
+
+        let mut hdr = inter_header(64, 64);
+        hdr.error_resilient_mode = true; // non-ZEROMV leaves require it.
+        hdr.allow_high_precision_mv = true;
+        let plan = InterFrameTreePlan {
+            tx_mode: TxMode::Only4x4,
+            reference_mode: ReferenceMode::SingleReference,
+            partitions: HashMap::new(),
+        };
+        // Variant A: every 8x8 leaf codes NEWMV [8, 8] (the first leaf
+        // establishes the predictor; the rest re-code a zero diff).
+        let mk = |modes: bool| -> Vec<u8> {
+            let mut first = true;
+            let mut planner: Box<InterTreePlanner> = Box::new(move |_r, _c, sz, _s| {
+                let mut l = skip_leaf(sz, TxMode::Only4x4);
+                l.mv = [[8, 8], [0, 0]];
+                if first {
+                    l.y_mode = NEWMV;
+                    first = false;
+                } else {
+                    // Variant B maps to NEARESTMV (the writer verifies
+                    // the vector equals the derived §6.5.12 NearestMv,
+                    // so this also pins the predictor derivation).
+                    l.y_mode = if modes { NEARESTMV } else { NEWMV };
+                }
+                l
+            });
+            assemble_inter_frame_tree(&hdr, &plan, &mut *planner, &mut *no_coeffs()).expect("frame")
+        };
+        let all_newmv = mk(false);
+        let mapped = mk(true);
+        assert!(
+            mapped.len() < all_newmv.len(),
+            "NEARESTMV frame ({} B) must beat all-NEWMV ({} B)",
+            mapped.len(),
+            all_newmv.len()
+        );
+    }
+
     /// The tree assembler is byte-deterministic and byte-identical to the
     /// legacy all-8x8 assembler when given the fallback (empty) partition
     /// map — the delegation path is a strict generalisation.

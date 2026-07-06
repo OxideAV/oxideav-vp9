@@ -1670,7 +1670,7 @@ pub(crate) fn encode_pframe_lossless_motion(
     subpel: bool,
 ) -> Result<Vec<u8>, Error> {
     use crate::inter_decode::FrameStateMvSource;
-    use crate::mode_info::{LAST_FRAME, NEWMV, ZEROMV};
+    use crate::mode_info::{LAST_FRAME, NEARESTMV, NEARMV, NEWMV, ZEROMV};
     use crate::mv::use_mv_hp;
     use crate::mv_ref::MvRefGeometry;
     use std::cell::RefCell;
@@ -1737,8 +1737,22 @@ pub(crate) fn encode_pframe_lossless_motion(
                     };
                     let src = FrameStateMvSource::new(state, None);
                     let mv_refs = geom.find_mv_refs(&src, LAST_FRAME, -1, &sign_bias, false);
-                    let best =
-                        geom.find_best_ref_mvs(mv_refs.ref_list_mv, hdr.allow_high_precision_mv)[0];
+                    let preds =
+                        geom.find_best_ref_mvs(mv_refs.ref_list_mv, hdr.allow_high_precision_mv);
+                    let best = preds[0];
+
+                    // §6.4.16 mode mapping: a vector equal to a §6.5
+                    // predictor codes NEARESTMV / NEARMV (no §6.4.20
+                    // mv-diff bits) instead of NEWMV.
+                    let mode_for = |mv: [i32; 2]| -> u8 {
+                        if mv == preds[0] {
+                            NEARESTMV
+                        } else if mv == preds[1] {
+                            NEARMV
+                        } else {
+                            NEWMV
+                        }
+                    };
 
                     let start = if int_winner { [8 * dy, 8 * dx] } else { [0, 0] };
                     let mut mv = start;
@@ -1768,10 +1782,10 @@ pub(crate) fn encode_pframe_lossless_motion(
                             &mut scratch.borrow_mut(),
                         );
                         if refined != [0, 0] && refined_sad + NEWMV_SAD_MARGIN < zero_sad {
-                            choice = (NEWMV, refined);
+                            choice = (mode_for(refined), refined);
                         }
                     } else if int_winner {
-                        choice = (NEWMV, mv);
+                        choice = (mode_for(mv), mv);
                     }
                 }
             }
@@ -2463,7 +2477,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
 ) -> Result<(Vec<u8>, ReconState), Error> {
     use crate::frame_writer::{InterFrameTreePlan, InterTreeLeaf, InterTreePlanner};
     use crate::inter_decode::FrameStateMvSource;
-    use crate::mode_info::{LAST_FRAME, NEWMV, NONE_REF_FRAME, ZEROMV};
+    use crate::mode_info::{LAST_FRAME, NEARESTMV, NEARMV, NEWMV, NONE_REF_FRAME, ZEROMV};
     use crate::mv::use_mv_hp;
     use crate::mv_ref::MvRefGeometry;
     use crate::residual::MAX_TXSIZE_LOOKUP;
@@ -2716,6 +2730,38 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
                 }
             }
             let is_compound = choice.0[1] > crate::mode_info::INTRA_FRAME;
+            // §6.4.16 mode mapping: a NEWMV whose vector(s) equal a §6.5
+            // predictor codes the predictor-referencing mode instead —
+            // NEARESTMV / NEARMV carry **no** §6.4.20 mv-diff bits (the
+            // decoder recovers the MV from the same shared `find_mv_refs`
+            // / `find_best_ref_mvs` scan the writer verifies against).
+            if choice.1 == NEWMV {
+                let geom = MvRefGeometry {
+                    mi_row: r as i32,
+                    mi_col: c as i32,
+                    mi_rows: mi_rows as i32,
+                    mi_cols: mi_cols as i32,
+                    mi_size: subsize as usize,
+                    mi_col_start: 0,
+                    mi_col_end: mi_cols as i32,
+                };
+                let src = FrameStateMvSource::new(state, None);
+                let lists = 1 + usize::from(is_compound);
+                let mut nearest_all = true;
+                let mut near_all = true;
+                for j in 0..lists {
+                    let mv_refs = geom.find_mv_refs(&src, choice.0[j], -1, &sign_bias, false);
+                    let best =
+                        geom.find_best_ref_mvs(mv_refs.ref_list_mv, hdr.allow_high_precision_mv);
+                    nearest_all &= choice.2[j] == best[0];
+                    near_all &= choice.2[j] == best[1];
+                }
+                if nearest_all {
+                    choice.1 = NEARESTMV;
+                } else if near_all {
+                    choice.1 = NEARMV;
+                }
+            }
             let ref_planes: &[(&[i32], usize); 3] = if choice.0[0] == LAST_FRAME {
                 reference
             } else {

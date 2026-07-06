@@ -1320,10 +1320,51 @@ fn predict_inter_leaf(
     ssy: bool,
     bit_depth: u32,
 ) {
+    predict_inter_leaf2(
+        pred,
+        reference,
+        None,
+        vis_w,
+        vis_h,
+        r,
+        c,
+        mi_size,
+        [mv, [0, 0]],
+        mi_cols,
+        mi_rows,
+        ssx,
+        ssy,
+        bit_depth,
+    );
+}
+
+/// [`predict_inter_leaf`] generalised over **compound** prediction: with
+/// `second == Some( planes )` the §8.5.2 driver forms both lists'
+/// predictions (list 0 from `reference` at `mv[ 0 ]`, list 1 from
+/// `second` at `mv[ 1 ]`) and writes the `Round2( p0 + p1, 1 )` average
+/// — the exact decoder compound path.
+// Spec-shaped geometry fan-in, matching the style of the §8.5.2 driver.
+#[allow(clippy::too_many_arguments)]
+fn predict_inter_leaf2(
+    pred: &mut [Plane; 3],
+    reference: &[(&[i32], usize); 3],
+    second: Option<&[(&[i32], usize); 3]>,
+    vis_w: u32,
+    vis_h: u32,
+    r: u32,
+    c: u32,
+    mi_size: u8,
+    mv: [[i32; 2]; 2],
+    mi_cols: u32,
+    mi_rows: u32,
+    ssx: bool,
+    ssy: bool,
+    bit_depth: u32,
+) {
     use crate::partition::{NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP};
     let num8x8w = u32::from(NUM_8X8_BLOCKS_WIDE_LOOKUP[mi_size as usize]);
     let num8x8h = u32::from(NUM_8X8_BLOCKS_HIGH_LOOKUP[mi_size as usize]);
-    let block_mvs = [[mv; 4], [[0i32; 2]; 4]];
+    let block_mvs = [[mv[0]; 4], [mv[1]; 4]];
     for (plane, pred_plane) in pred.iter_mut().enumerate() {
         let sub_x = plane > 0 && ssx;
         let sub_y = plane > 0 && ssy;
@@ -1341,7 +1382,15 @@ fn predict_inter_leaf(
                     ref_frame_width: vis_w as i32,
                     ref_frame_height: vis_h as i32,
                 }),
-                None,
+                second.map(|sp| {
+                    let (s2, stride2) = sp[plane];
+                    RefPlane {
+                        samples: s2,
+                        stride: stride2,
+                        ref_frame_width: vis_w as i32,
+                        ref_frame_height: vis_h as i32,
+                    }
+                }),
             ],
         };
         let grid = BlockGrid {
@@ -1368,7 +1417,7 @@ fn predict_inter_leaf(
             block_idx: 0,
             interp_filter: 0, // EIGHTTAP.
             bit_depth,
-            is_compound: false,
+            is_compound: second.is_some(),
         };
         predict_inter(pred_plane, &args, &grid, &geom, &block_mvs, &refs, ssx, ssy);
     }
@@ -2305,6 +2354,37 @@ fn leaf_sse(
     sse
 }
 
+/// Luma-only SAD of `target − work` over one leaf's region, clipped to
+/// the MI-padded plane extents (the compound-candidate score).
+fn leaf_luma_sad(
+    targets: &[Plane; 3],
+    work: &[Plane; 3],
+    r: u32,
+    c: u32,
+    mi_size: u8,
+    mi_cols: u32,
+    mi_rows: u32,
+) -> u64 {
+    use crate::partition::NUM_8X8_BLOCKS_WIDE_LOOKUP;
+    let num8x8 = u32::from(NUM_8X8_BLOCKS_WIDE_LOOKUP[mi_size as usize]);
+    let base_x = (c * 8) as usize;
+    let base_y = (r * 8) as usize;
+    let maxx = (mi_cols * 8) as usize;
+    let maxy = (mi_rows * 8) as usize;
+    let region = (num8x8 * 8) as usize;
+    let mut sad = 0u64;
+    for i in 0..region {
+        for j in 0..region {
+            let (x, y) = (base_x + j, base_y + i);
+            if x < maxx && y < maxy {
+                let d = targets[0].get(x, y) - work[0].get(x, y);
+                sad += d.unsigned_abs() as u64;
+            }
+        }
+    }
+    sad
+}
+
 /// Whether the transform block starting at plane coordinates
 /// `(sx, sy)` of `plane` lies inside the leaf at MI `(r, c)` of size
 /// `mi_size` (used to drop a reverted leaf's cached tokens).
@@ -2420,6 +2500,20 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
     let token_cache: RefCell<std::collections::HashMap<(usize, u32, u32), Vec<i64>>> =
         RefCell::new(std::collections::HashMap::new());
     let scratch = RefCell::new(Plane::new((mi_cols * 8) as usize, (mi_rows * 8) as usize));
+    let scratch3 = RefCell::new(ReconState::new(mi_cols, mi_rows, ssx, ssy, bit_depth).planes);
+
+    // Compound prediction needs a second reference *and* the §6.3.12
+    // sign-bias asymmetry (compoundReferenceAllowed). The candidate
+    // pair coded is [ LAST, ALTREF ], which is the §6.3.18
+    // fixed/variable layout exactly when LAST and GOLDEN share a bias
+    // that ALTREF does not.
+    let compound_ok =
+        golden.is_some() && sign_bias[1] == sign_bias[2] && sign_bias[3] != sign_bias[1];
+    let reference_mode = if compound_ok {
+        crate::compressed::ReferenceMode::ReferenceModeSelect
+    } else {
+        crate::compressed::ReferenceMode::SingleReference
+    };
 
     let tx_mode = crate::compressed::TxMode::TxModeSelect;
     const NEWMV_SAD_MARGIN: u64 = 64;
@@ -2505,42 +2599,139 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
                     }
                 };
 
-            // Candidate sweep over the available references: score =
-            // SAD + the NEWMV syntax margin; ties keep the earlier
+            // Candidate sweep over the available references (and, when
+            // the sign biases admit it, the compound pair): score =
+            // SAD + the mode's syntax margin; ties keep the earlier
             // (cheaper-to-code) candidate.
-            let mut choice: (i32, u8, [i32; 2]) = (LAST_FRAME, ZEROMV, [0, 0]);
+            let mut choice: ([i32; 2], u8, [[i32; 2]; 2]) =
+                ([LAST_FRAME, NONE_REF_FRAME], ZEROMV, [[0, 0], [0, 0]]);
             {
                 let (l_zero, l_new) = eval_ref(LAST_FRAME, reference);
                 let mut best_score = l_zero;
                 if let Some((mv, sad)) = l_new {
                     if search_range > 0 && sad + NEWMV_SAD_MARGIN < best_score {
                         best_score = sad + NEWMV_SAD_MARGIN;
-                        choice = (LAST_FRAME, NEWMV, mv);
+                        choice = ([LAST_FRAME, NONE_REF_FRAME], NEWMV, [mv, [0, 0]]);
                     }
                 }
+                let mut g_new_mv: Option<[i32; 2]> = None;
                 if let Some(gplanes) = golden {
                     let (g_zero, g_new) = eval_ref(crate::mode_info::GOLDEN_FRAME, gplanes);
                     if g_zero < best_score {
                         best_score = g_zero;
-                        choice = (crate::mode_info::GOLDEN_FRAME, ZEROMV, [0, 0]);
+                        choice = (
+                            [crate::mode_info::GOLDEN_FRAME, NONE_REF_FRAME],
+                            ZEROMV,
+                            [[0, 0], [0, 0]],
+                        );
                     }
                     if let Some((mv, sad)) = g_new {
+                        g_new_mv = Some(mv);
                         if search_range > 0 && sad + NEWMV_SAD_MARGIN < best_score {
-                            choice = (crate::mode_info::GOLDEN_FRAME, NEWMV, mv);
+                            best_score = sad + NEWMV_SAD_MARGIN;
+                            choice = (
+                                [crate::mode_info::GOLDEN_FRAME, NONE_REF_FRAME],
+                                NEWMV,
+                                [mv, [0, 0]],
+                            );
+                        }
+                    }
+                }
+                // Compound (LAST + ALTREF) candidates — the §8.5.2
+                // Round2( p0 + p1, 1 ) average of both references
+                // (ALTREF resolves to the same slot as GOLDEN in the
+                // sequence layout). ZEROMV averages the co-located
+                // blocks; NEWMV pairs the per-reference winners, each
+                // re-snapped against its own list's §6.5.12 BestMv.
+                if compound_ok {
+                    let gplanes = golden.expect("compound requires golden planes");
+                    let comp_pair = [LAST_FRAME, crate::mode_info::ALTREF_FRAME];
+                    let comp_sad = |mvs: [[i32; 2]; 2]| -> u64 {
+                        let mut sc = scratch3.borrow_mut();
+                        predict_inter_leaf2(
+                            &mut sc,
+                            reference,
+                            Some(gplanes),
+                            ref_w,
+                            ref_h,
+                            r,
+                            c,
+                            subsize,
+                            mvs,
+                            mi_cols,
+                            mi_rows,
+                            ssx,
+                            ssy,
+                            bit_depth,
+                        );
+                        leaf_luma_sad(targets, &sc, r, c, subsize, mi_cols, mi_rows)
+                    };
+                    let zero_pair = [[0, 0], [0, 0]];
+                    let cz = comp_sad(zero_pair);
+                    // The comp-mode + second-ref syntax is a few bits;
+                    // a token margin keeps ties on the single path.
+                    if cz + 8 < best_score {
+                        best_score = cz + 8;
+                        choice = (comp_pair, ZEROMV, zero_pair);
+                    }
+                    let l_mv = l_new.map(|(mv, _)| mv).unwrap_or([0, 0]);
+                    let a_mv = g_new_mv.unwrap_or([0, 0]);
+                    if search_range > 0 && (l_mv != [0, 0] || a_mv != [0, 0]) {
+                        // Re-snap the ALTREF-list vector against the
+                        // ALTREF predictors (its parity gate may differ
+                        // from GOLDEN's).
+                        let geom = MvRefGeometry {
+                            mi_row: r as i32,
+                            mi_col: c as i32,
+                            mi_rows: mi_rows as i32,
+                            mi_cols: mi_cols as i32,
+                            mi_size: subsize as usize,
+                            mi_col_start: 0,
+                            mi_col_end: mi_cols as i32,
+                        };
+                        let src = FrameStateMvSource::new(state, None);
+                        let mv_refs = geom.find_mv_refs(
+                            &src,
+                            crate::mode_info::ALTREF_FRAME,
+                            -1,
+                            &sign_bias,
+                            false,
+                        );
+                        let best_a = geom
+                            .find_best_ref_mvs(mv_refs.ref_list_mv, hdr.allow_high_precision_mv)[0];
+                        let use_hp_a = hdr.allow_high_precision_mv && use_mv_hp(best_a);
+                        let mut a_mv = a_mv;
+                        for (comp, m) in a_mv.iter_mut().enumerate() {
+                            let d = *m - best_a[comp];
+                            if d != 0 && !use_hp_a && (d & 1) != 0 {
+                                *m -= 1;
+                            }
+                        }
+                        let pair = [l_mv, a_mv];
+                        let cn = comp_sad(pair);
+                        if cn + 2 * NEWMV_SAD_MARGIN < best_score {
+                            choice = (comp_pair, NEWMV, pair);
                         }
                     }
                 }
             }
-            let ref_planes: &[(&[i32], usize); 3] = if choice.0 == LAST_FRAME {
+            let is_compound = choice.0[1] > crate::mode_info::INTRA_FRAME;
+            let ref_planes: &[(&[i32], usize); 3] = if choice.0[0] == LAST_FRAME {
                 reference
             } else {
                 golden.expect("GOLDEN elected only when present")
             };
+            let second_planes: Option<&[(&[i32], usize); 3]> = if is_compound {
+                Some(golden.expect("compound requires golden planes"))
+            } else {
+                None
+            };
 
             let mut work = work.borrow_mut();
-            predict_inter_leaf(
+            predict_inter_leaf2(
                 &mut work.planes,
                 ref_planes,
+                second_planes,
                 ref_w,
                 ref_h,
                 r,
@@ -2632,9 +2823,10 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
                     token_cache.borrow_mut().retain(|&(p, sx, sy), _| {
                         !leaf_contains(r, c, subsize, ssx, ssy, p, sx, sy)
                     });
-                    predict_inter_leaf(
+                    predict_inter_leaf2(
                         &mut work.planes,
                         ref_planes,
+                        second_planes,
                         ref_w,
                         ref_h,
                         r,
@@ -2659,8 +2851,8 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
                 tx_size: if skip { max_tx } else { tx },
                 y_mode: choice.1,
                 interp_filter: 0,
-                ref_frame: [choice.0, NONE_REF_FRAME],
-                mv: [choice.2, [0, 0]],
+                ref_frame: choice.0,
+                mv: choice.2,
                 skip,
             }
         });
@@ -2676,7 +2868,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
 
     let plan = InterFrameTreePlan {
         tx_mode,
-        reference_mode: crate::compressed::ReferenceMode::SingleReference,
+        reference_mode,
         partitions,
     };
     let bytes =
@@ -2773,6 +2965,10 @@ pub(crate) fn encode_sequence_lossy_420(
         ];
         let mut hdr = lossless_pframe_header(width, height);
         hdr.ref_frame_idx = Some([0, 1, 1]);
+        // ALTREF (also slot 1) carries the opposite sign bias so the
+        // §6.3.12 compoundReferenceAllowed derivation admits the
+        // [ LAST, ALTREF ] compound pair.
+        hdr.ref_frame_sign_bias = [false, false, true];
         hdr.quantization = QuantizationParams {
             base_q_idx,
             delta_q_y_dc: 0,
@@ -2920,6 +3116,7 @@ pub(crate) fn encode_sequence_lossy_rc_420(
             |q| {
                 let mut hdr = lossless_pframe_header(width, height);
                 hdr.ref_frame_idx = Some([0, 1, 1]);
+                hdr.ref_frame_sign_bias = [false, false, true];
                 hdr.quantization = QuantizationParams {
                     base_q_idx: q,
                     delta_q_y_dc: 0,
@@ -4177,6 +4374,7 @@ mod tests {
         ];
         let mut hdr = lossless_pframe_header(w, h);
         hdr.ref_frame_idx = Some([0, 1, 1]);
+        hdr.ref_frame_sign_bias = [false, false, true];
         hdr.quantization = QuantizationParams {
             base_q_idx: 70,
             delta_q_y_dc: 0,
@@ -4608,6 +4806,148 @@ mod tests {
         // slot, P-frames refresh only slot 0, so GOLDEN (slot 1) is the
         // keyframe when P2 decodes.
         let decoded = decode_vp9_sequence(&[&kf, &p1, &p2_multi]).expect("decode");
+        let d = &decoded[2];
+        for y in 0..64usize {
+            for x in 0..64usize {
+                assert_eq!(
+                    i32::from(d.y[y * 64 + x]),
+                    p2_recon.planes[0].get(x, y),
+                    "luma mirror ({x},{y})"
+                );
+            }
+        }
+        for y in 0..32usize {
+            for x in 0..32usize {
+                assert_eq!(i32::from(d.u[y * 32 + x]), p2_recon.planes[1].get(x, y));
+                assert_eq!(i32::from(d.v[y * 32 + x]), p2_recon.planes[2].get(x, y));
+            }
+        }
+    }
+
+    /// Compound prediction pays on a cross-fade: a frame that is the
+    /// pixel average of the keyframe (A) and the previous frame (B)
+    /// codes far fewer bytes when the [ LAST, ALTREF ] compound average
+    /// is available (sign-bias asymmetry admits it) than with single
+    /// references only — and the compound frame decodes to exactly the
+    /// encoder's reconstruction.
+    #[test]
+    fn compound_prediction_pays_on_crossfade() {
+        use crate::decode_frame::decode_vp9_sequence;
+
+        let (w, h) = (64u32, 64u32);
+        let n = (w * h) as usize + 2 * 32 * 32;
+        let noise = |seed: u64| -> Vec<u8> {
+            let mut v = Vec::with_capacity(n);
+            let mut s = seed;
+            for i in 0..n {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                v.push(if i < (w * h) as usize {
+                    (s >> 33) as u8
+                } else {
+                    128
+                });
+            }
+            v
+        };
+        let fa = noise(0x1111_2222_3333_4444);
+        let fb = noise(0x9999_8888_7777_6666);
+        // The cross-fade midpoint.
+        let fmid: Vec<u8> = fa
+            .iter()
+            .zip(&fb)
+            .map(|(&a, &b)| (u16::from(a) + u16::from(b)).div_ceil(2) as u8)
+            .collect();
+        let q = 60u8;
+
+        fn as_ref_planes(v: &[Vec<i32>; 3]) -> [(&[i32], usize); 3] {
+            [
+                (v[0].as_slice(), 64),
+                (v[1].as_slice(), 32),
+                (v[2].as_slice(), 32),
+            ]
+        }
+        let crop3 = |r: &ReconState| -> [Vec<i32>; 3] {
+            let crop = |p: &Plane, vw: usize, vh: usize| -> Vec<i32> {
+                let mut out = Vec::with_capacity(vw * vh);
+                for y in 0..vh {
+                    for x in 0..vw {
+                        out.push(p.get(x, y));
+                    }
+                }
+                out
+            };
+            [
+                crop(&r.planes[0], 64, 64),
+                crop(&r.planes[1], 32, 32),
+                crop(&r.planes[2], 32, 32),
+            ]
+        };
+
+        let (kf, kf_recon) = encode_keyframe_lossy_420_with_recon(&fa, w, h, q).expect("kf");
+        let gold = crop3(&kf_recon);
+
+        // Compound-capable header: sign-bias asymmetry on ALTREF.
+        let mut hdr = lossless_pframe_header(w, h);
+        hdr.ref_frame_idx = Some([0, 1, 1]);
+        hdr.ref_frame_sign_bias = [false, false, true];
+        hdr.quantization = QuantizationParams {
+            base_q_idx: q,
+            delta_q_y_dc: 0,
+            delta_q_uv_dc: 0,
+            delta_q_uv_ac: 0,
+            lossless: false,
+        };
+        let (p1, p1_recon) = encode_pframe_lossy_tree_motion(
+            &hdr,
+            &padded_targets_420(&fb, w, h),
+            &as_ref_planes(&gold),
+            None,
+            w,
+            h,
+            PFRAME_SEARCH_RANGE,
+            true,
+        )
+        .expect("p1");
+        let prev = crop3(&p1_recon);
+
+        let targets2 = padded_targets_420(&fmid, w, h);
+        let (p2_comp, p2_recon) = encode_pframe_lossy_tree_motion(
+            &hdr,
+            &targets2,
+            &as_ref_planes(&prev),
+            Some(&as_ref_planes(&gold)),
+            w,
+            h,
+            PFRAME_SEARCH_RANGE,
+            true,
+        )
+        .expect("p2 compound");
+        // Baseline: same references, but symmetric sign biases forbid
+        // compound (single-reference election only).
+        let mut hdr_single = hdr;
+        hdr_single.ref_frame_sign_bias = [false, false, false];
+        let (p2_single, _) = encode_pframe_lossy_tree_motion(
+            &hdr_single,
+            &targets2,
+            &as_ref_planes(&prev),
+            Some(&as_ref_planes(&gold)),
+            w,
+            h,
+            PFRAME_SEARCH_RANGE,
+            true,
+        )
+        .expect("p2 single");
+        assert!(
+            p2_comp.len() * 2 < p2_single.len(),
+            "compound average ({} B) should be far below single-ref ({} B) on a cross-fade",
+            p2_comp.len(),
+            p2_single.len()
+        );
+
+        // Decoder mirror for the compound frame.
+        let decoded = decode_vp9_sequence(&[&kf, &p1, &p2_comp]).expect("decode");
         let d = &decoded[2];
         for y in 0..64usize {
             for x in 0..64usize {

@@ -1450,6 +1450,140 @@ fn search_block_mv_wh(
     (best.0, best.1, zero_sad)
 }
 
+/// Sub-pel refinement of one leaf's motion vector around an integer
+/// (or already-refined) starting point, scoring candidates with the
+/// **decoder-mirror §8.5.2 interpolation**: each candidate's luma
+/// prediction is produced by the same `predict_inter` chain (§8.5.2.1
+/// select / §8.5.2.2 clamp / §8.5.2.3 scale / §8.5.2.4 two-pass 8-tap
+/// convolution over the `subpel_filters` kernels) the coded block will
+/// reconstruct with, so the SAD is the *true* prediction error at that
+/// vector — not a bilinear approximation.
+///
+/// The walk is a coarse-to-fine neighbourhood descent in eighth-pel
+/// units: half-pel (±4), then quarter-pel (±2), then eighth-pel (±1)
+/// **only when the §6.5.13 `use_mv_hp` gate allows the hp bit**
+/// (`start_mv` must already be §6.4.20-codeable against the predictor;
+/// even steps preserve the difference parity, so every candidate stays
+/// codeable, and the ±1 step is reachable only when odd differences
+/// are).
+///
+/// Returns the best vector and its luma SAD over the leaf's region
+/// (clipped to the MI-padded plane extents).
+#[allow(clippy::too_many_arguments)]
+fn refine_leaf_mv_subpel(
+    targets: &[Plane; 3],
+    reference: &[(&[i32], usize); 3],
+    vis_w: u32,
+    vis_h: u32,
+    r: u32,
+    c: u32,
+    mi_size: u8,
+    start_mv: [i32; 2],
+    use_hp: bool,
+    mi_cols: u32,
+    mi_rows: u32,
+    bit_depth: u32,
+    scratch: &mut Plane,
+) -> ([i32; 2], u64) {
+    use crate::partition::{NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP};
+
+    let num8x8w = u32::from(NUM_8X8_BLOCKS_WIDE_LOOKUP[mi_size as usize]);
+    let num8x8h = u32::from(NUM_8X8_BLOCKS_HIGH_LOOKUP[mi_size as usize]);
+    let base_x = (c * 8) as usize;
+    let base_y = (r * 8) as usize;
+    let maxx = (mi_cols * 8) as usize;
+    let maxy = (mi_rows * 8) as usize;
+    let region_w = (num8x8w * 8) as usize;
+    let region_h = (num8x8h * 8) as usize;
+
+    let (samples, stride) = reference[0];
+    let mut sad_of = |mv: [i32; 2]| -> u64 {
+        let block_mvs = [[mv; 4], [[0i32; 2]; 4]];
+        let refs = RefPlanes {
+            list: [
+                Some(RefPlane {
+                    samples,
+                    stride,
+                    ref_frame_width: vis_w as i32,
+                    ref_frame_height: vis_h as i32,
+                }),
+                None,
+            ],
+        };
+        let grid = BlockGrid {
+            mi_row: r as i32,
+            mi_col: c as i32,
+            mi_rows: mi_rows as i32,
+            mi_cols: mi_cols as i32,
+            mi_size,
+        };
+        let geom = ScaleGeom {
+            ref_frame_width: vis_w as i32,
+            ref_frame_height: vis_h as i32,
+            frame_width: vis_w as i32,
+            frame_height: vis_h as i32,
+            subsampling_x: false,
+            subsampling_y: false,
+        };
+        let args = InterPredArgs {
+            plane: 0,
+            x: base_x as i32,
+            y: base_y as i32,
+            w: region_w,
+            h: region_h,
+            block_idx: 0,
+            interp_filter: 0, // EIGHTTAP — what the leaf will code.
+            bit_depth,
+            is_compound: false,
+        };
+        predict_inter(
+            scratch, &args, &grid, &geom, &block_mvs, &refs, false, false,
+        );
+        let mut sad = 0u64;
+        for i in 0..region_h {
+            for j in 0..region_w {
+                let (x, y) = (base_x + j, base_y + i);
+                if x < maxx && y < maxy {
+                    let d = targets[0].get(x, y) - scratch.get(x, y);
+                    sad += d.unsigned_abs() as u64;
+                }
+            }
+        }
+        sad
+    };
+
+    let mut best = (start_mv, sad_of(start_mv));
+    // Coarse-to-fine: half-pel, quarter-pel, then eighth-pel under hp.
+    for &step in &[4i32, 2, 1] {
+        if step == 1 && !use_hp {
+            break; // odd differences are not §6.4.20-codeable.
+        }
+        // Descend at this granularity until no neighbour improves
+        // (bounded: each move strictly lowers the SAD).
+        let mut moved = true;
+        let mut rounds = 0;
+        while moved && rounds < 4 {
+            moved = false;
+            rounds += 1;
+            let centre = best.0;
+            for dy in [-step, 0, step] {
+                for dx in [-step, 0, step] {
+                    if dy == 0 && dx == 0 {
+                        continue;
+                    }
+                    let cand = [centre[0] + dy, centre[1] + dx];
+                    let sad = sad_of(cand);
+                    if sad < best.1 {
+                        best = (cand, sad);
+                        moved = true;
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
 /// Encode one lossless P-frame whose reconstruction equals `targets`
 /// (MI-padded planes) exactly, referencing `reference` (the previous
 /// frame's visible-extent planes), with per-block integer motion search
@@ -1468,6 +1602,12 @@ fn search_block_mv_wh(
 /// vector actually coded, so `Clip1( prediction + residual ) == target`
 /// holds sample-for-sample and the frame chain stays bit-exact.
 ///
+/// With `subpel == true` the integer winner is additionally refined at
+/// half- / quarter- / (under the hp gate) eighth-pel precision against
+/// the decoder-mirror §8.5.2 interpolation ([`refine_leaf_mv_subpel`]),
+/// and blocks whose integer winner is `(0, 0)` but whose `ZEROMV` error
+/// is non-trivial are probed for pure sub-pel motion too.
+///
 /// `search_range > 0` requires an error-resilient header (the §7.2.6
 /// `UsePrevFrameMvs == 0` model — see
 /// [`crate::frame_writer::assemble_inter_frame_planned`]).
@@ -1478,6 +1618,7 @@ pub(crate) fn encode_pframe_lossless_motion(
     ref_w: u32,
     ref_h: u32,
     search_range: i32,
+    subpel: bool,
 ) -> Result<Vec<u8>, Error> {
     use crate::inter_decode::FrameStateMvSource;
     use crate::mode_info::{LAST_FRAME, NEWMV, ZEROMV};
@@ -1509,6 +1650,7 @@ pub(crate) fn encode_pframe_lossless_motion(
         Plane::new(uv_w, uv_h),
         Plane::new(uv_w, uv_h),
     ]);
+    let scratch = RefCell::new(Plane::new(y_w, y_h));
 
     // Prefer NEWMV only for a clear win: the mode + MV syntax costs bits
     // that a marginal SAD gain does not repay.
@@ -1528,7 +1670,11 @@ pub(crate) fn encode_pframe_lossless_motion(
                     (r * 8) as i32,
                     search_range,
                 );
-                if (dy, dx) != (0, 0) && best_sad + NEWMV_SAD_MARGIN < zero_sad {
+                // Worth deriving predictors: an integer winner beating
+                // ZEROMV by the margin, or (sub-pel mode) a non-trivial
+                // ZEROMV error that pure sub-pel motion might explain.
+                let int_winner = (dy, dx) != (0, 0) && best_sad + NEWMV_SAD_MARGIN < zero_sad;
+                if int_winner || (subpel && zero_sad > NEWMV_SAD_MARGIN) {
                     // §6.5 predictors over the shared state — identical
                     // to the derivation the inter block writer performs.
                     let geom = MvRefGeometry {
@@ -1545,7 +1691,8 @@ pub(crate) fn encode_pframe_lossless_motion(
                     let best =
                         geom.find_best_ref_mvs(mv_refs.ref_list_mv, hdr.allow_high_precision_mv)[0];
 
-                    let mut mv = [8 * dy, 8 * dx];
+                    let start = if int_winner { [8 * dy, 8 * dx] } else { [0, 0] };
+                    let mut mv = start;
                     let use_hp = hdr.allow_high_precision_mv && use_mv_hp(best);
                     for (comp, m) in mv.iter_mut().enumerate() {
                         let d = *m - best[comp];
@@ -1555,7 +1702,28 @@ pub(crate) fn encode_pframe_lossless_motion(
                             *m -= 1;
                         }
                     }
-                    choice = (NEWMV, mv);
+                    if subpel {
+                        let (refined, refined_sad) = refine_leaf_mv_subpel(
+                            targets,
+                            reference,
+                            ref_w,
+                            ref_h,
+                            r,
+                            c,
+                            BLOCK_8X8,
+                            mv,
+                            use_hp,
+                            mi_cols,
+                            mi_rows,
+                            bit_depth,
+                            &mut scratch.borrow_mut(),
+                        );
+                        if refined != [0, 0] && refined_sad + NEWMV_SAD_MARGIN < zero_sad {
+                            choice = (NEWMV, refined);
+                        }
+                    } else if int_winner {
+                        choice = (NEWMV, mv);
+                    }
                 }
             }
             // Predict this block with the vector that will be coded, so
@@ -2184,6 +2352,12 @@ fn leaf_contains(
 ///   place, so the returned [`ReconState`] equals the decoder's output
 ///   bit-for-bit and its visible crop is the next frame's reference.
 ///
+/// With `subpel == true` each leaf's motion vector is additionally
+/// refined at half- / quarter- / (under the hp gate) eighth-pel
+/// precision against the decoder-mirror §8.5.2 interpolation
+/// ([`refine_leaf_mv_subpel`]), including pure-sub-pel probes on leaves
+/// whose integer winner is `(0, 0)`.
+///
 /// Requires an error-resilient non-key lossy header (see
 /// [`crate::frame_writer::assemble_inter_frame_tree`]).
 pub(crate) fn encode_pframe_lossy_tree_motion(
@@ -2193,6 +2367,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
     ref_w: u32,
     ref_h: u32,
     search_range: i32,
+    subpel: bool,
 ) -> Result<(Vec<u8>, ReconState), Error> {
     use crate::frame_writer::{InterFrameTreePlan, InterTreeLeaf, InterTreePlanner};
     use crate::inter_decode::FrameStateMvSource;
@@ -2232,8 +2407,10 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
     let work = RefCell::new(ReconState::new(mi_cols, mi_rows, ssx, ssy, bit_depth));
     let token_cache: RefCell<std::collections::HashMap<(usize, u32, u32), Vec<i64>>> =
         RefCell::new(std::collections::HashMap::new());
+    let scratch = RefCell::new(Plane::new((mi_cols * 8) as usize, (mi_rows * 8) as usize));
 
     let tx_mode = crate::compressed::TxMode::TxModeSelect;
+    const NEWMV_SAD_MARGIN: u64 = 64;
 
     let mut planner: Box<InterTreePlanner<'_>> =
         Box::new(|r: u32, c: u32, subsize: u8, state| -> InterTreeLeaf {
@@ -2241,7 +2418,22 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
             let hint = hints.get(&(r, c)).copied().unwrap_or((0, 0));
 
             let mut choice: (u8, [i32; 2]) = (ZEROMV, [0, 0]);
-            if hint != (0, 0) {
+            // Leaf-level ZEROMV error (full-pel copy), for the sub-pel
+            // probe gate and the final mode margin.
+            let num8x8 = u32::from(crate::partition::NUM_8X8_BLOCKS_WIDE_LOOKUP[subsize as usize]);
+            let (_, _, zero_sad) = search_block_mv_wh(
+                &targets[0],
+                reference[0].0,
+                reference[0].1,
+                ref_w as i32,
+                ref_h as i32,
+                (c * 8) as i32,
+                (r * 8) as i32,
+                (num8x8 * 8) as i32,
+                (num8x8 * 8) as i32,
+                0,
+            );
+            if hint != (0, 0) || (subpel && search_range > 0 && zero_sad > NEWMV_SAD_MARGIN) {
                 // §6.5 predictors over the shared state — identical to
                 // the derivation the inter block writer performs.
                 let geom = MvRefGeometry {
@@ -2268,7 +2460,28 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
                         *m -= 1;
                     }
                 }
-                choice = (NEWMV, mv);
+                if subpel {
+                    let (refined, refined_sad) = refine_leaf_mv_subpel(
+                        targets,
+                        reference,
+                        ref_w,
+                        ref_h,
+                        r,
+                        c,
+                        subsize,
+                        mv,
+                        use_hp,
+                        mi_cols,
+                        mi_rows,
+                        bit_depth,
+                        &mut scratch.borrow_mut(),
+                    );
+                    if refined != [0, 0] && refined_sad + NEWMV_SAD_MARGIN < zero_sad {
+                        choice = (NEWMV, refined);
+                    }
+                } else if hint != (0, 0) {
+                    choice = (NEWMV, mv);
+                }
             }
 
             let mut work = work.borrow_mut();
@@ -2509,6 +2722,7 @@ pub(crate) fn encode_sequence_lossy_420(
             width,
             height,
             PFRAME_SEARCH_RANGE,
+            true,
         )?;
         out.push(bytes);
         prev_recon = recon;
@@ -2645,6 +2859,7 @@ pub(crate) fn encode_sequence_lossy_rc_420(
                     width,
                     height,
                     PFRAME_SEARCH_RANGE,
+                    true,
                 )
             },
             target_bytes_per_frame,
@@ -2733,6 +2948,7 @@ pub(crate) fn encode_sequence_lossless_420(
             width,
             height,
             PFRAME_SEARCH_RANGE,
+            true,
         )?);
     }
     Ok(out)
@@ -3878,9 +4094,16 @@ mod tests {
             delta_q_uv_ac: 0,
             lossless: false,
         };
-        let (bytes, recon) =
-            encode_pframe_lossy_tree_motion(&hdr, &targets, &reference, w, h, PFRAME_SEARCH_RANGE)
-                .expect("re-encode last hop");
+        let (bytes, recon) = encode_pframe_lossy_tree_motion(
+            &hdr,
+            &targets,
+            &reference,
+            w,
+            h,
+            PFRAME_SEARCH_RANGE,
+            true,
+        )
+        .expect("re-encode last hop");
         assert_eq!(bytes, coded[3], "re-encoded last frame must be identical");
         let last_decoded = &decoded[3];
         for row in 0..h as usize {
@@ -3988,10 +4211,10 @@ mod tests {
         ];
         let hdr = lossless_pframe_header(w, h);
 
-        let with_motion =
-            encode_pframe_lossless_motion(&hdr, &targets, &reference, w, h, 8).expect("motion");
-        let zero_only =
-            encode_pframe_lossless_motion(&hdr, &targets, &reference, w, h, 0).expect("zeromv");
+        let with_motion = encode_pframe_lossless_motion(&hdr, &targets, &reference, w, h, 8, true)
+            .expect("motion");
+        let zero_only = encode_pframe_lossless_motion(&hdr, &targets, &reference, w, h, 0, true)
+            .expect("zeromv");
         assert!(
             with_motion.len() * 2 < zero_only.len(),
             "motion search ({} B) should code far fewer bits than ZEROMV ({} B)",
@@ -4004,6 +4227,163 @@ mod tests {
         for pf in [&with_motion, &zero_only] {
             let decoded = decode_vp9_sequence(&[&kf, pf]).expect("decode");
             assert_eq!(decoded[1].to_planar_bytes(), f1, "P-frame not byte-exact");
+        }
+    }
+
+    /// Build a 4:2:0 frame pair `(f0, f1)` where `f1`'s luma is `f0`'s
+    /// shifted by exactly **half a pixel** horizontally (each sample the
+    /// rounded average of two neighbours of a smooth ramp — no integer
+    /// vector can explain it), chroma flat.
+    fn halfpel_pair(w: u32, h: u32) -> (Vec<u8>, Vec<u8>) {
+        let (cw, ch) = (w.div_ceil(2) as usize, h.div_ceil(2) as usize);
+        let ramp = |x: i64, y: i64| -> i64 { (4 * x).min(180) + y + 10 };
+        let mut f0 = Vec::with_capacity((w * h) as usize + 2 * cw * ch);
+        let mut f1 = Vec::with_capacity((w * h) as usize + 2 * cw * ch);
+        for y in 0..i64::from(h) {
+            for x in 0..i64::from(w) {
+                f0.push(ramp(x, y) as u8);
+                // ref(x + 0.5): the average of ref(x) and ref(x + 1).
+                f1.push(((ramp(x, y) + ramp(x + 1, y) + 1) / 2) as u8);
+            }
+        }
+        for _ in 0..2 * cw * ch {
+            f0.push(128);
+            f1.push(128);
+        }
+        (f0, f1)
+    }
+
+    /// Sub-pel refinement pays on half-pel motion: the lossless P-frame
+    /// with quarter/eighth-pel search codes fewer bytes than the
+    /// full-pel-only search on content translated by exactly half a
+    /// pixel, and both stay byte-exact through the decoder.
+    #[test]
+    fn subpel_search_beats_fullpel_on_halfpel_motion() {
+        use crate::decode_frame::decode_vp9_sequence;
+
+        let (w, h) = (64u32, 48u32);
+        let (f0, f1) = halfpel_pair(w, h);
+
+        let y_w = (((w + 7) >> 3) * 8) as usize;
+        let y_h = (((h + 7) >> 3) * 8) as usize;
+        let (cw, ch) = (32usize, 24usize);
+        let wl = w as usize;
+        let targets = [
+            padded_plane_from_bytes(&f1[..wl * h as usize], wl, h as usize, y_w, y_h),
+            padded_plane_from_bytes(
+                &f1[wl * h as usize..wl * h as usize + cw * ch],
+                cw,
+                ch,
+                y_w >> 1,
+                y_h >> 1,
+            ),
+            padded_plane_from_bytes(&f1[wl * h as usize + cw * ch..], cw, ch, y_w >> 1, y_h >> 1),
+        ];
+        let prev: [Vec<i32>; 3] = [
+            f0[..wl * h as usize]
+                .iter()
+                .map(|&s| i32::from(s))
+                .collect(),
+            f0[wl * h as usize..wl * h as usize + cw * ch]
+                .iter()
+                .map(|&s| i32::from(s))
+                .collect(),
+            f0[wl * h as usize + cw * ch..]
+                .iter()
+                .map(|&s| i32::from(s))
+                .collect(),
+        ];
+        let reference: [(&[i32], usize); 3] = [
+            (prev[0].as_slice(), wl),
+            (prev[1].as_slice(), cw),
+            (prev[2].as_slice(), cw),
+        ];
+        let hdr = lossless_pframe_header(w, h);
+
+        let subpel = encode_pframe_lossless_motion(&hdr, &targets, &reference, w, h, 8, true)
+            .expect("subpel");
+        let fullpel = encode_pframe_lossless_motion(&hdr, &targets, &reference, w, h, 8, false)
+            .expect("fullpel");
+        assert!(
+            subpel.len() < fullpel.len(),
+            "sub-pel search ({} B) should beat full-pel-only ({} B) on half-pel motion",
+            subpel.len(),
+            fullpel.len()
+        );
+
+        // Both remain byte-exact through the full decoder.
+        let kf = encode_keyframe_lossless_420(&f0, w, h).expect("keyframe");
+        for pf in [&subpel, &fullpel] {
+            let decoded = decode_vp9_sequence(&[&kf, pf]).expect("decode");
+            assert_eq!(decoded[1].to_planar_bytes(), f1, "P-frame not byte-exact");
+        }
+    }
+
+    /// The lossy tree encoder's sub-pel refinement also pays on half-pel
+    /// motion, and the sub-pel frame still mirrors the decoder exactly.
+    #[test]
+    fn lossy_tree_subpel_beats_fullpel_on_halfpel_motion() {
+        use crate::decode_frame::decode_vp9_sequence;
+
+        let (w, h) = (64u32, 64u32);
+        let (f0, f1) = halfpel_pair(w, h);
+        // Low quantizer: the half-pel residual (±2 on the ramp) must
+        // survive quantization, or both variants skip everything.
+        let q = 4u8;
+        let (kf, kf_recon) = encode_keyframe_lossy_420_with_recon(&f0, w, h, q).expect("kf");
+        let crop = |p: &Plane, vw: usize, vh: usize| -> Vec<i32> {
+            let mut out = Vec::with_capacity(vw * vh);
+            for y in 0..vh {
+                for x in 0..vw {
+                    out.push(p.get(x, y));
+                }
+            }
+            out
+        };
+        let prev = [
+            crop(&kf_recon.planes[0], 64, 64),
+            crop(&kf_recon.planes[1], 32, 32),
+            crop(&kf_recon.planes[2], 32, 32),
+        ];
+        let reference: [(&[i32], usize); 3] = [
+            (prev[0].as_slice(), 64),
+            (prev[1].as_slice(), 32),
+            (prev[2].as_slice(), 32),
+        ];
+        let targets = padded_targets_420(&f1, w, h);
+        let mut hdr = lossless_pframe_header(w, h);
+        hdr.quantization = QuantizationParams {
+            base_q_idx: q,
+            delta_q_y_dc: 0,
+            delta_q_uv_dc: 0,
+            delta_q_uv_ac: 0,
+            lossless: false,
+        };
+
+        let (subpel, subpel_recon) =
+            encode_pframe_lossy_tree_motion(&hdr, &targets, &reference, w, h, 8, true)
+                .expect("subpel");
+        let (fullpel, _) =
+            encode_pframe_lossy_tree_motion(&hdr, &targets, &reference, w, h, 8, false)
+                .expect("fullpel");
+        assert!(
+            subpel.len() < fullpel.len(),
+            "sub-pel tree ({} B) should beat full-pel tree ({} B) on half-pel motion",
+            subpel.len(),
+            fullpel.len()
+        );
+
+        // Decoder mirror for the sub-pel frame.
+        let decoded = decode_vp9_sequence(&[&kf, &subpel]).expect("decode");
+        let d = &decoded[1];
+        for y in 0..64usize {
+            for x in 0..64usize {
+                assert_eq!(
+                    i32::from(d.y[y * 64 + x]),
+                    subpel_recon.planes[0].get(x, y),
+                    "luma mirror ({x},{y})"
+                );
+            }
         }
     }
 
@@ -4243,9 +4623,16 @@ mod tests {
             lossless: false,
         };
 
-        let (tree, tree_recon) =
-            encode_pframe_lossy_tree_motion(&hdr, &targets, &reference, w, h, PFRAME_SEARCH_RANGE)
-                .expect("tree p-frame");
+        let (tree, tree_recon) = encode_pframe_lossy_tree_motion(
+            &hdr,
+            &targets,
+            &reference,
+            w,
+            h,
+            PFRAME_SEARCH_RANGE,
+            true,
+        )
+        .expect("tree p-frame");
         let (fixed, _) =
             encode_pframe_lossy_motion(&hdr, &targets, &reference, w, h, PFRAME_SEARCH_RANGE)
                 .expect("fixed p-frame");

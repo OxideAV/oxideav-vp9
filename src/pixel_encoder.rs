@@ -2358,12 +2358,24 @@ fn leaf_contains(
 /// ([`refine_leaf_mv_subpel`]), including pure-sub-pel probes on leaves
 /// whose integer winner is `(0, 0)`.
 ///
+/// With `golden == Some( planes )` the encoder is **multi-reference**:
+/// every leaf evaluates both `LAST` (`reference`) and `GOLDEN`
+/// (`golden`) — ZEROMV error plus a searched/refined NEWMV per
+/// reference — and codes the §6.4.17 `ref_frame` of the winner. The
+/// header's `ref_frame_idx` must map `GOLDEN` to a slot holding the
+/// `golden` planes (the sequence encoders park the keyframe there as a
+/// long-term reference).
+///
 /// Requires an error-resilient non-key lossy header (see
 /// [`crate::frame_writer::assemble_inter_frame_tree`]).
+// Spec-shaped fan-in (header + targets + per-reference planes + search
+// options), matching the crate's encoder-driver style.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_pframe_lossy_tree_motion(
     hdr: &Vp9FrameHeader,
     targets: &[Plane; 3],
     reference: &[(&[i32], usize); 3],
+    golden: Option<&[(&[i32], usize); 3]>,
     ref_w: u32,
     ref_h: u32,
     search_range: i32,
@@ -2394,7 +2406,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
     let seg = hdr.segmentation;
     let quant = hdr.quantization;
 
-    let (partitions, hints) = plan_inter_partitions(
+    let (partitions, _hints) = plan_inter_partitions(
         targets,
         reference,
         ref_w,
@@ -2415,85 +2427,126 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
     let mut planner: Box<InterTreePlanner<'_>> =
         Box::new(|r: u32, c: u32, subsize: u8, state| -> InterTreeLeaf {
             let max_tx = MAX_TXSIZE_LOOKUP[subsize as usize];
-            let hint = hints.get(&(r, c)).copied().unwrap_or((0, 0));
-
-            let mut choice: (u8, [i32; 2]) = (ZEROMV, [0, 0]);
-            // Leaf-level ZEROMV error (full-pel copy), for the sub-pel
-            // probe gate and the final mode margin.
             let num8x8 = u32::from(crate::partition::NUM_8X8_BLOCKS_WIDE_LOOKUP[subsize as usize]);
-            let (_, _, zero_sad) = search_block_mv_wh(
-                &targets[0],
-                reference[0].0,
-                reference[0].1,
-                ref_w as i32,
-                ref_h as i32,
-                (c * 8) as i32,
-                (r * 8) as i32,
-                (num8x8 * 8) as i32,
-                (num8x8 * 8) as i32,
-                0,
-            );
-            if hint != (0, 0) || (subpel && search_range > 0 && zero_sad > NEWMV_SAD_MARGIN) {
-                // §6.5 predictors over the shared state — identical to
-                // the derivation the inter block writer performs.
-                let geom = MvRefGeometry {
-                    mi_row: r as i32,
-                    mi_col: c as i32,
-                    mi_rows: mi_rows as i32,
-                    mi_cols: mi_cols as i32,
-                    mi_size: subsize as usize,
-                    mi_col_start: 0,
-                    mi_col_end: mi_cols as i32,
-                };
-                let src = FrameStateMvSource::new(state, None);
-                let mv_refs = geom.find_mv_refs(&src, LAST_FRAME, -1, &sign_bias, false);
-                let best =
-                    geom.find_best_ref_mvs(mv_refs.ref_list_mv, hdr.allow_high_precision_mv)[0];
 
-                let mut mv = [8 * hint.0, 8 * hint.1];
-                let use_hp = hdr.allow_high_precision_mv && use_mv_hp(best);
-                for (comp, m) in mv.iter_mut().enumerate() {
-                    let d = *m - best[comp];
-                    if d != 0 && !use_hp && (d & 1) != 0 {
-                        // Only even-magnitude differences are codeable
-                        // without the hp bit; nudge by one eighth-pel.
-                        *m -= 1;
+            // Evaluate one reference frame: leaf-level ZEROMV error plus
+            // (when profitable) a snapped / sub-pel-refined NEWMV
+            // candidate. The §6.5 predictors come from the shared state
+            // with the candidate's own `ref_frame`, exactly as the
+            // writer will derive them.
+            let eval_ref =
+                |ref_frame: i32, planes: &[(&[i32], usize); 3]| -> (u64, Option<([i32; 2], u64)>) {
+                    let ((dy, dx), int_sad, zero_sad) = search_block_mv_wh(
+                        &targets[0],
+                        planes[0].0,
+                        planes[0].1,
+                        ref_w as i32,
+                        ref_h as i32,
+                        (c * 8) as i32,
+                        (r * 8) as i32,
+                        (num8x8 * 8) as i32,
+                        (num8x8 * 8) as i32,
+                        search_range,
+                    );
+                    let int_winner = (dy, dx) != (0, 0) && int_sad + NEWMV_SAD_MARGIN < zero_sad;
+                    let probe = subpel && search_range > 0 && zero_sad > NEWMV_SAD_MARGIN;
+                    if !int_winner && !probe {
+                        return (zero_sad, None);
+                    }
+                    let geom = MvRefGeometry {
+                        mi_row: r as i32,
+                        mi_col: c as i32,
+                        mi_rows: mi_rows as i32,
+                        mi_cols: mi_cols as i32,
+                        mi_size: subsize as usize,
+                        mi_col_start: 0,
+                        mi_col_end: mi_cols as i32,
+                    };
+                    let src = FrameStateMvSource::new(state, None);
+                    let mv_refs = geom.find_mv_refs(&src, ref_frame, -1, &sign_bias, false);
+                    let best =
+                        geom.find_best_ref_mvs(mv_refs.ref_list_mv, hdr.allow_high_precision_mv)[0];
+
+                    let mut mv = if int_winner { [8 * dy, 8 * dx] } else { [0, 0] };
+                    let use_hp = hdr.allow_high_precision_mv && use_mv_hp(best);
+                    for (comp, m) in mv.iter_mut().enumerate() {
+                        let d = *m - best[comp];
+                        if d != 0 && !use_hp && (d & 1) != 0 {
+                            // Only even-magnitude differences are codeable
+                            // without the hp bit; nudge by one eighth-pel.
+                            *m -= 1;
+                        }
+                    }
+                    if subpel {
+                        let (refined, refined_sad) = refine_leaf_mv_subpel(
+                            targets,
+                            planes,
+                            ref_w,
+                            ref_h,
+                            r,
+                            c,
+                            subsize,
+                            mv,
+                            use_hp,
+                            mi_cols,
+                            mi_rows,
+                            bit_depth,
+                            &mut scratch.borrow_mut(),
+                        );
+                        if refined != [0, 0] {
+                            (zero_sad, Some((refined, refined_sad)))
+                        } else {
+                            (zero_sad, None)
+                        }
+                    } else if int_winner {
+                        (zero_sad, Some((mv, int_sad)))
+                    } else {
+                        (zero_sad, None)
+                    }
+                };
+
+            // Candidate sweep over the available references: score =
+            // SAD + the NEWMV syntax margin; ties keep the earlier
+            // (cheaper-to-code) candidate.
+            let mut choice: (i32, u8, [i32; 2]) = (LAST_FRAME, ZEROMV, [0, 0]);
+            {
+                let (l_zero, l_new) = eval_ref(LAST_FRAME, reference);
+                let mut best_score = l_zero;
+                if let Some((mv, sad)) = l_new {
+                    if search_range > 0 && sad + NEWMV_SAD_MARGIN < best_score {
+                        best_score = sad + NEWMV_SAD_MARGIN;
+                        choice = (LAST_FRAME, NEWMV, mv);
                     }
                 }
-                if subpel {
-                    let (refined, refined_sad) = refine_leaf_mv_subpel(
-                        targets,
-                        reference,
-                        ref_w,
-                        ref_h,
-                        r,
-                        c,
-                        subsize,
-                        mv,
-                        use_hp,
-                        mi_cols,
-                        mi_rows,
-                        bit_depth,
-                        &mut scratch.borrow_mut(),
-                    );
-                    if refined != [0, 0] && refined_sad + NEWMV_SAD_MARGIN < zero_sad {
-                        choice = (NEWMV, refined);
+                if let Some(gplanes) = golden {
+                    let (g_zero, g_new) = eval_ref(crate::mode_info::GOLDEN_FRAME, gplanes);
+                    if g_zero < best_score {
+                        best_score = g_zero;
+                        choice = (crate::mode_info::GOLDEN_FRAME, ZEROMV, [0, 0]);
                     }
-                } else if hint != (0, 0) {
-                    choice = (NEWMV, mv);
+                    if let Some((mv, sad)) = g_new {
+                        if search_range > 0 && sad + NEWMV_SAD_MARGIN < best_score {
+                            choice = (crate::mode_info::GOLDEN_FRAME, NEWMV, mv);
+                        }
+                    }
                 }
             }
+            let ref_planes: &[(&[i32], usize); 3] = if choice.0 == LAST_FRAME {
+                reference
+            } else {
+                golden.expect("GOLDEN elected only when present")
+            };
 
             let mut work = work.borrow_mut();
             predict_inter_leaf(
                 &mut work.planes,
-                reference,
+                ref_planes,
                 ref_w,
                 ref_h,
                 r,
                 c,
                 subsize,
-                choice.1,
+                choice.2,
                 mi_cols,
                 mi_rows,
                 ssx,
@@ -2581,13 +2634,13 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
                     });
                     predict_inter_leaf(
                         &mut work.planes,
-                        reference,
+                        ref_planes,
                         ref_w,
                         ref_h,
                         r,
                         c,
                         subsize,
-                        choice.1,
+                        choice.2,
                         mi_cols,
                         mi_rows,
                         ssx,
@@ -2604,10 +2657,10 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
             InterTreeLeaf {
                 mi_size: subsize,
                 tx_size: if skip { max_tx } else { tx },
-                y_mode: choice.0,
+                y_mode: choice.1,
                 interp_filter: 0,
-                ref_frame: [LAST_FRAME, NONE_REF_FRAME],
-                mv: [choice.1, [0, 0]],
+                ref_frame: [choice.0, NONE_REF_FRAME],
+                mv: [choice.2, [0, 0]],
                 skip,
             }
         });
@@ -2697,6 +2750,17 @@ pub(crate) fn encode_sequence_lossy_420(
 
     let mut out = Vec::with_capacity(frames.len());
     out.push(kf_bytes);
+
+    // Long-term GOLDEN reference: the keyframe's reconstruction stays
+    // parked in §8.10 slot 1 (the keyframe refreshes every slot; the
+    // P-frames refresh only slot 0), so `ref_frame_idx = [0, 1, 1]`
+    // resolves LAST to the previous frame and GOLDEN to the keyframe.
+    let golden = visible_crop(&kf_recon);
+    let golden_ref: [(&[i32], usize); 3] = [
+        (golden[0].as_slice(), w),
+        (golden[1].as_slice(), cw),
+        (golden[2].as_slice(), cw),
+    ];
     let mut prev_recon = kf_recon;
 
     for &frame in frames.iter().skip(1) {
@@ -2708,6 +2772,7 @@ pub(crate) fn encode_sequence_lossy_420(
             (prev[2].as_slice(), cw),
         ];
         let mut hdr = lossless_pframe_header(width, height);
+        hdr.ref_frame_idx = Some([0, 1, 1]);
         hdr.quantization = QuantizationParams {
             base_q_idx,
             delta_q_y_dc: 0,
@@ -2719,6 +2784,7 @@ pub(crate) fn encode_sequence_lossy_420(
             &hdr,
             &targets,
             &reference,
+            Some(&golden_ref),
             width,
             height,
             PFRAME_SEARCH_RANGE,
@@ -2832,6 +2898,14 @@ pub(crate) fn encode_sequence_lossy_rc_420(
 
     let mut out = Vec::with_capacity(frames.len());
     out.push(kf_bytes);
+
+    // Long-term GOLDEN reference (see `encode_sequence_lossy_420`).
+    let golden = visible_crop(&kf_recon);
+    let golden_ref: [(&[i32], usize); 3] = [
+        (golden[0].as_slice(), w),
+        (golden[1].as_slice(), cw),
+        (golden[2].as_slice(), cw),
+    ];
     let mut prev_recon = kf_recon;
 
     for &frame in frames.iter().skip(1) {
@@ -2845,6 +2919,7 @@ pub(crate) fn encode_sequence_lossy_rc_420(
         let (bytes, recon, _q) = bisect_q(
             |q| {
                 let mut hdr = lossless_pframe_header(width, height);
+                hdr.ref_frame_idx = Some([0, 1, 1]);
                 hdr.quantization = QuantizationParams {
                     base_q_idx: q,
                     delta_q_y_dc: 0,
@@ -2856,6 +2931,7 @@ pub(crate) fn encode_sequence_lossy_rc_420(
                     &hdr,
                     &targets,
                     &reference,
+                    Some(&golden_ref),
                     width,
                     height,
                     PFRAME_SEARCH_RANGE,
@@ -4074,7 +4150,9 @@ mod tests {
                 y_h >> 1,
             ),
         ];
-        // Reference = decoder's frame 2 output (== encoder recon).
+        // Reference = decoder's frame 2 output (== encoder recon);
+        // GOLDEN = the keyframe's output, exactly as the sequence
+        // encoder parks it in slot 1.
         let prev_frame = &decoded[2];
         let prev: [Vec<i32>; 3] = [
             prev_frame.y.iter().map(|&s| i32::from(s)).collect(),
@@ -4086,7 +4164,19 @@ mod tests {
             (prev[1].as_slice(), cw),
             (prev[2].as_slice(), cw),
         ];
+        let kf_frame = &decoded[0];
+        let gold: [Vec<i32>; 3] = [
+            kf_frame.y.iter().map(|&s| i32::from(s)).collect(),
+            kf_frame.u.iter().map(|&s| i32::from(s)).collect(),
+            kf_frame.v.iter().map(|&s| i32::from(s)).collect(),
+        ];
+        let golden_ref: [(&[i32], usize); 3] = [
+            (gold[0].as_slice(), w_us),
+            (gold[1].as_slice(), cw),
+            (gold[2].as_slice(), cw),
+        ];
         let mut hdr = lossless_pframe_header(w, h);
+        hdr.ref_frame_idx = Some([0, 1, 1]);
         hdr.quantization = QuantizationParams {
             base_q_idx: 70,
             delta_q_y_dc: 0,
@@ -4098,6 +4188,7 @@ mod tests {
             &hdr,
             &targets,
             &reference,
+            Some(&golden_ref),
             w,
             h,
             PFRAME_SEARCH_RANGE,
@@ -4361,10 +4452,10 @@ mod tests {
         };
 
         let (subpel, subpel_recon) =
-            encode_pframe_lossy_tree_motion(&hdr, &targets, &reference, w, h, 8, true)
+            encode_pframe_lossy_tree_motion(&hdr, &targets, &reference, None, w, h, 8, true)
                 .expect("subpel");
         let (fullpel, _) =
-            encode_pframe_lossy_tree_motion(&hdr, &targets, &reference, w, h, 8, false)
+            encode_pframe_lossy_tree_motion(&hdr, &targets, &reference, None, w, h, 8, false)
                 .expect("fullpel");
         assert!(
             subpel.len() < fullpel.len(),
@@ -4383,6 +4474,154 @@ mod tests {
                     subpel_recon.planes[0].get(x, y),
                     "luma mirror ({x},{y})"
                 );
+            }
+        }
+    }
+
+    /// Multi-reference election pays when content returns to the
+    /// keyframe: on an A → B → A sequence the third frame codes far
+    /// fewer bytes with the keyframe parked as `GOLDEN` (leaves elect
+    /// `GOLDEN` + `ZEROMV` + skip) than with `LAST` alone, and the
+    /// multi-ref frame decodes to exactly the encoder's reconstruction
+    /// through the §8.10 slot threading.
+    #[test]
+    fn multiref_golden_pays_on_content_returning_to_keyframe() {
+        use crate::decode_frame::decode_vp9_sequence;
+
+        let (w, h) = (64u32, 64u32);
+        let n = (w * h) as usize + 2 * 32 * 32;
+        let pattern = |x: i64, y: i64, ph: i64| -> u8 {
+            ((((x + ph) * 7 + y * 13) % 61) * 4 + (x + y) % 17) as u8
+        };
+        let frame_with_phase = |ph: i64| -> Vec<u8> {
+            let mut px = Vec::with_capacity(n);
+            for i in 0..h as i64 {
+                for j in 0..w as i64 {
+                    px.push(pattern(j, i, ph));
+                }
+            }
+            px.extend(std::iter::repeat_n(128u8, 2 * 32 * 32));
+            px
+        };
+        let fa = frame_with_phase(0);
+        // Unrelated content for B: LCG noise (nothing motion search or
+        // the texture period can explain from A).
+        let fb: Vec<u8> = {
+            let mut v = Vec::with_capacity(n);
+            let mut s: u64 = 0x1234_5678_9abc_def0;
+            for i in 0..n {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                v.push(if i < (w * h) as usize {
+                    (s >> 33) as u8
+                } else {
+                    128
+                });
+            }
+            v
+        };
+        let q = 60u8;
+
+        let crop = |p: &Plane, vw: usize, vh: usize| -> Vec<i32> {
+            let mut out = Vec::with_capacity(vw * vh);
+            for y in 0..vh {
+                for x in 0..vw {
+                    out.push(p.get(x, y));
+                }
+            }
+            out
+        };
+        fn as_ref_planes(v: &[Vec<i32>; 3]) -> [(&[i32], usize); 3] {
+            [
+                (v[0].as_slice(), 64),
+                (v[1].as_slice(), 32),
+                (v[2].as_slice(), 32),
+            ]
+        }
+
+        // Keyframe A, then P1 = B (referencing A).
+        let (kf, kf_recon) = encode_keyframe_lossy_420_with_recon(&fa, w, h, q).expect("kf");
+        let gold = [
+            crop(&kf_recon.planes[0], 64, 64),
+            crop(&kf_recon.planes[1], 32, 32),
+            crop(&kf_recon.planes[2], 32, 32),
+        ];
+        let mut hdr = lossless_pframe_header(w, h);
+        hdr.ref_frame_idx = Some([0, 1, 1]);
+        hdr.quantization = QuantizationParams {
+            base_q_idx: q,
+            delta_q_y_dc: 0,
+            delta_q_uv_dc: 0,
+            delta_q_uv_ac: 0,
+            lossless: false,
+        };
+        let (p1, p1_recon) = encode_pframe_lossy_tree_motion(
+            &hdr,
+            &padded_targets_420(&fb, w, h),
+            &as_ref_planes(&gold),
+            None,
+            w,
+            h,
+            PFRAME_SEARCH_RANGE,
+            true,
+        )
+        .expect("p1");
+        let prev = [
+            crop(&p1_recon.planes[0], 64, 64),
+            crop(&p1_recon.planes[1], 32, 32),
+            crop(&p1_recon.planes[2], 32, 32),
+        ];
+
+        // P2 = A again: with GOLDEN available it should mostly skip.
+        let targets2 = padded_targets_420(&fa, w, h);
+        let (p2_multi, p2_recon) = encode_pframe_lossy_tree_motion(
+            &hdr,
+            &targets2,
+            &as_ref_planes(&prev),
+            Some(&as_ref_planes(&gold)),
+            w,
+            h,
+            PFRAME_SEARCH_RANGE,
+            true,
+        )
+        .expect("p2 multi");
+        let (p2_single, _) = encode_pframe_lossy_tree_motion(
+            &hdr,
+            &targets2,
+            &as_ref_planes(&prev),
+            None,
+            w,
+            h,
+            PFRAME_SEARCH_RANGE,
+            true,
+        )
+        .expect("p2 single");
+        assert!(
+            p2_multi.len() * 4 < p2_single.len(),
+            "GOLDEN election ({} B) should be far below LAST-only ({} B) on A-B-A content",
+            p2_multi.len(),
+            p2_single.len()
+        );
+
+        // Decoder mirror through the §8.10 slots: keyframe fills every
+        // slot, P-frames refresh only slot 0, so GOLDEN (slot 1) is the
+        // keyframe when P2 decodes.
+        let decoded = decode_vp9_sequence(&[&kf, &p1, &p2_multi]).expect("decode");
+        let d = &decoded[2];
+        for y in 0..64usize {
+            for x in 0..64usize {
+                assert_eq!(
+                    i32::from(d.y[y * 64 + x]),
+                    p2_recon.planes[0].get(x, y),
+                    "luma mirror ({x},{y})"
+                );
+            }
+        }
+        for y in 0..32usize {
+            for x in 0..32usize {
+                assert_eq!(i32::from(d.u[y * 32 + x]), p2_recon.planes[1].get(x, y));
+                assert_eq!(i32::from(d.v[y * 32 + x]), p2_recon.planes[2].get(x, y));
             }
         }
     }
@@ -4627,6 +4866,7 @@ mod tests {
             &hdr,
             &targets,
             &reference,
+            None,
             w,
             h,
             PFRAME_SEARCH_RANGE,

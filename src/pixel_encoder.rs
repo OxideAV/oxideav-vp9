@@ -1293,14 +1293,44 @@ fn predict_mi_block(
     ssy: bool,
     bit_depth: u32,
 ) {
+    predict_inter_leaf(
+        pred, reference, vis_w, vis_h, r, c, BLOCK_8X8, mv, mi_cols, mi_rows, ssx, ssy, bit_depth,
+    );
+}
+
+/// Run the §8.5.2 inter prediction for one `MiSize >= BLOCK_8X8` leaf at
+/// `(r, c)` with the (eighth-pel) motion vector `mv`, writing all three
+/// planes' predicted regions — [`predict_mi_block`] generalised over the
+/// leaf's `MiSize`, exactly what the decoder's §6.4.21 inter arm produces
+/// before the token loop.
+// Spec-shaped geometry fan-in, matching the style of the §8.5.2 driver.
+#[allow(clippy::too_many_arguments)]
+fn predict_inter_leaf(
+    pred: &mut [Plane; 3],
+    reference: &[(&[i32], usize); 3],
+    vis_w: u32,
+    vis_h: u32,
+    r: u32,
+    c: u32,
+    mi_size: u8,
+    mv: [i32; 2],
+    mi_cols: u32,
+    mi_rows: u32,
+    ssx: bool,
+    ssy: bool,
+    bit_depth: u32,
+) {
+    use crate::partition::{NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP};
+    let num8x8w = u32::from(NUM_8X8_BLOCKS_WIDE_LOOKUP[mi_size as usize]);
+    let num8x8h = u32::from(NUM_8X8_BLOCKS_HIGH_LOOKUP[mi_size as usize]);
     let block_mvs = [[mv; 4], [[0i32; 2]; 4]];
     for (plane, pred_plane) in pred.iter_mut().enumerate() {
         let sub_x = plane > 0 && ssx;
         let sub_y = plane > 0 && ssy;
         let base_x = (c * 8) >> u32::from(sub_x);
         let base_y = (r * 8) >> u32::from(sub_y);
-        let region = 8usize >> usize::from(sub_x);
-        let region_h = 8usize >> usize::from(sub_y);
+        let region = (num8x8w * 8) as usize >> usize::from(sub_x);
+        let region_h = (num8x8h * 8) as usize >> usize::from(sub_y);
 
         let (samples, stride) = reference[plane];
         let refs = RefPlanes {
@@ -1319,7 +1349,7 @@ fn predict_mi_block(
             mi_col: c as i32,
             mi_rows: mi_rows as i32,
             mi_cols: mi_cols as i32,
-            mi_size: BLOCK_8X8,
+            mi_size,
         };
         let geom = ScaleGeom {
             ref_frame_width: vis_w as i32,
@@ -1361,10 +1391,40 @@ fn search_block_mv(
     by: i32,
     range: i32,
 ) -> ((i32, i32), u64, u64) {
+    search_block_mv_wh(
+        target,
+        ref_samples,
+        ref_stride,
+        vis_w,
+        vis_h,
+        bx,
+        by,
+        8,
+        8,
+        range,
+    )
+}
+
+/// Full-search one `bw × bh` luma block over integer motion vectors in
+/// `[-range, range]²` — [`search_block_mv`] generalised over the block
+/// extents. Returns `((dy, dx), best_sad, zero_sad)`.
+#[allow(clippy::too_many_arguments)]
+fn search_block_mv_wh(
+    target: &Plane,
+    ref_samples: &[i32],
+    ref_stride: usize,
+    vis_w: i32,
+    vis_h: i32,
+    bx: i32,
+    by: i32,
+    bw: i32,
+    bh: i32,
+    range: i32,
+) -> ((i32, i32), u64, u64) {
     let sad_at = |dy: i32, dx: i32| -> u64 {
         let mut sad = 0u64;
-        for i in 0..8i32 {
-            for j in 0..8i32 {
+        for i in 0..bh {
+            for j in 0..bw {
                 let ry = (by + i + dy).clamp(0, vis_h - 1) as usize;
                 let rx = (bx + j + dx).clamp(0, vis_w - 1) as usize;
                 let t = target.get((bx + j) as usize, (by + i) as usize);
@@ -1577,6 +1637,11 @@ pub(crate) const PFRAME_SEARCH_RANGE: i32 = 8;
 ///
 /// Requires an error-resilient non-key lossy header (see
 /// [`crate::frame_writer::assemble_inter_frame_planned`]).
+///
+/// Retained as the fixed-layout (`Allow8x8`, all-`BLOCK_8X8`) baseline
+/// the tree encoder's rate tests compare against; the production
+/// sequence encoders drive [`encode_pframe_lossy_tree_motion`].
+#[allow(dead_code)]
 pub(crate) fn encode_pframe_lossy_motion(
     hdr: &Vp9FrameHeader,
     targets: &[Plane; 3],
@@ -1789,6 +1854,572 @@ pub(crate) fn encode_pframe_lossy_motion(
     Ok((bytes, work.into_inner()))
 }
 
+/// The per-8x8-cell margin a searched `NEWMV` must beat `ZEROMV` by
+/// before it is elected: the mode + MV syntax costs bits that a marginal
+/// SAD gain does not repay.
+const NEWMV_SAD_MARGIN_PER_MI: u64 = 64;
+
+/// §6.4.3 partition value per recursion node, keyed `(MiRow, MiCol,
+/// bsize)` (the [`crate::frame_writer::InterFrameTreePlan`] map).
+type InterPartitionMap = std::collections::HashMap<(u32, u32, u8), u8>;
+
+/// Per-leaf integer motion-vector hints keyed by the leaf's top-left MI.
+type InterMvHints = std::collections::HashMap<(u32, u32), (i32, i32)>;
+
+/// Plan the §6.4.3 partition tree of a lossy P-frame from its integer
+/// motion field — the inter counterpart of [`plan_keyframe_tree`].
+///
+/// First every 8x8 MI cell full-searches an integer motion vector
+/// against the reference (electing `(0, 0)` unless the winner beats
+/// `ZEROMV` by [`NEWMV_SAD_MARGIN_PER_MI`]); then the superblock tree
+/// merges bottom-up: a node becomes one leaf when it is fully contained
+/// in the frame's MI extents **and** every 8x8 cell under it elected the
+/// same vector (uniform motion — one coded MV serves the whole leaf,
+/// and a larger transform can span the coherent residual). Anything
+/// else splits toward `BLOCK_8X8`.
+///
+/// Returns the partition map (feeding
+/// [`crate::frame_writer::InterFrameTreePlan`]) and the per-leaf
+/// integer-MV hints keyed by the leaf's top-left MI.
+fn plan_inter_partitions(
+    targets: &[Plane; 3],
+    reference: &[(&[i32], usize); 3],
+    ref_w: u32,
+    ref_h: u32,
+    mi_cols: u32,
+    mi_rows: u32,
+    search_range: i32,
+) -> (InterPartitionMap, InterMvHints) {
+    use crate::partition::{
+        NUM_8X8_BLOCKS_WIDE_LOOKUP, PARTITION_NONE, PARTITION_SPLIT, SUBSIZE_LOOKUP,
+    };
+    use crate::residual::BLOCK_64X64;
+
+    // The per-8x8-cell integer motion field.
+    let mut field = vec![(0i32, 0i32); (mi_rows * mi_cols) as usize];
+    if search_range > 0 {
+        for r in 0..mi_rows {
+            for c in 0..mi_cols {
+                let ((dy, dx), best_sad, zero_sad) = search_block_mv(
+                    &targets[0],
+                    reference[0].0,
+                    reference[0].1,
+                    ref_w as i32,
+                    ref_h as i32,
+                    (c * 8) as i32,
+                    (r * 8) as i32,
+                    search_range,
+                );
+                if (dy, dx) != (0, 0) && best_sad + NEWMV_SAD_MARGIN_PER_MI < zero_sad {
+                    field[(r * mi_cols + c) as usize] = (dy, dx);
+                }
+            }
+        }
+    }
+
+    let mut partitions = std::collections::HashMap::new();
+    let mut hints = std::collections::HashMap::new();
+
+    // Recursive merge: leaf on contained + uniform motion.
+    // Spec-shaped geometry fan-in, matching the §6.4.3 recursion style.
+    #[allow(clippy::too_many_arguments)]
+    fn walk(
+        partitions: &mut InterPartitionMap,
+        hints: &mut InterMvHints,
+        field: &[(i32, i32)],
+        mi_rows: u32,
+        mi_cols: u32,
+        r: u32,
+        c: u32,
+        bsize: u8,
+    ) {
+        use crate::residual::BLOCK_8X8 as B8;
+        if r >= mi_rows || c >= mi_cols {
+            return;
+        }
+        let num8x8 = u32::from(NUM_8X8_BLOCKS_WIDE_LOOKUP[bsize as usize]);
+        let half = num8x8 >> 1;
+        let contained = (r + num8x8) <= mi_rows && (c + num8x8) <= mi_cols;
+
+        let mut merge = contained;
+        if contained {
+            let mv0 = field[(r * mi_cols + c) as usize];
+            'scan: for i in 0..num8x8 {
+                for j in 0..num8x8 {
+                    if field[((r + i) * mi_cols + (c + j)) as usize] != mv0 {
+                        merge = false;
+                        break 'scan;
+                    }
+                }
+            }
+        }
+
+        if merge || bsize == B8 {
+            partitions.insert((r, c, bsize), PARTITION_NONE);
+            hints.insert((r, c), field[(r * mi_cols + c) as usize]);
+            return;
+        }
+        partitions.insert((r, c, bsize), PARTITION_SPLIT);
+        let subsize = SUBSIZE_LOOKUP[PARTITION_SPLIT as usize][bsize as usize];
+        for (dr, dc) in [(0, 0), (0, half), (half, 0), (half, half)] {
+            walk(
+                partitions,
+                hints,
+                field,
+                mi_rows,
+                mi_cols,
+                r + dr,
+                c + dc,
+                subsize,
+            );
+        }
+    }
+
+    for r in (0..mi_rows).step_by(8) {
+        for c in (0..mi_cols).step_by(8) {
+            walk(
+                &mut partitions,
+                &mut hints,
+                &field,
+                mi_rows,
+                mi_cols,
+                r,
+                c,
+                BLOCK_64X64,
+            );
+        }
+    }
+    (partitions, hints)
+}
+
+/// One quantized transform block of an inter leaf: `(plane, start_x,
+/// start_y, tx_size, tokens)` in §6.4.21 walk order.
+type LeafTokenBlock = (usize, u32, u32, u32, Vec<i64>);
+
+/// Elect the **per-block inter transform size** of one non-skip leaf:
+/// trial forward-DCT + §8.6 quantization at every §6.4.10-codeable luma
+/// size (`TX_4X4` up to `MAX_TXSIZE_LOOKUP[ MiSize ]`, chroma following
+/// §6.4.22), costing each candidate by its total nonzero-token count
+/// plus one per coded transform block (the per-block `more_coefs` /
+/// EOB overhead proxy). Ties prefer the larger transform. Inter blocks
+/// are `DCT_DCT` at every size (§6.4.25).
+///
+/// `work` must already hold the leaf's §8.5.2 prediction. Returns the
+/// winning `(tx_size, blocks, all_zero)`; the caller replays the
+/// decoder's §8.6.2 reconstruction with `blocks` (or elects `skip` when
+/// `all_zero`).
+#[allow(clippy::too_many_arguments)]
+fn select_inter_leaf_tx(
+    targets: &[Plane; 3],
+    work: &[Plane; 3],
+    r: u32,
+    c: u32,
+    mi_size: u8,
+    mi_cols: u32,
+    mi_rows: u32,
+    ssx: bool,
+    ssy: bool,
+    bit_depth: u32,
+    seg: &SegmentationParams,
+    quant: &QuantizationParams,
+) -> (u32, Vec<LeafTokenBlock>, bool) {
+    use crate::partition::NUM_8X8_BLOCKS_WIDE_LOOKUP;
+    use crate::residual::MAX_TXSIZE_LOOKUP;
+
+    let bd8 = bit_depth as u8;
+    let num8x8 = u32::from(NUM_8X8_BLOCKS_WIDE_LOOKUP[mi_size as usize]);
+    let max_tx = MAX_TXSIZE_LOOKUP[mi_size as usize];
+
+    let mut best: Option<(u64, u32, Vec<LeafTokenBlock>, bool)> = None;
+    // Larger candidates first so a cost tie keeps the larger transform
+    // (fewer coded blocks, fewer per-block overheads).
+    for cand in (0..=max_tx).rev() {
+        let mut cost = 0u64;
+        let mut blocks: Vec<LeafTokenBlock> = Vec::new();
+        let mut all_zero = true;
+        // The §6.4.21 loop is keyed by `plane` and indexes the planes /
+        // subsampling by that same index, mirroring the spec listing.
+        #[allow(clippy::needless_range_loop)]
+        for plane in 0..3usize {
+            let tx_sz = if plane == 0 {
+                cand
+            } else {
+                crate::residual::get_uv_tx_size(cand, mi_size, ssx, ssy)
+            };
+            let sub_x = plane > 0 && ssx;
+            let sub_y = plane > 0 && ssy;
+            let base_x = (c * 8) >> u32::from(sub_x);
+            let base_y = (r * 8) >> u32::from(sub_y);
+            let maxx = (mi_cols * 8) >> u32::from(sub_x);
+            let maxy = (mi_rows * 8) >> u32::from(sub_y);
+            let n0 = 4u32 << tx_sz;
+            let region_w = (num8x8 * 8) >> u32::from(sub_x);
+            let region_h = (num8x8 * 8) >> u32::from(sub_y);
+            let dc_q = get_dc_quant(plane, seg, quant, 0, bd8);
+            let ac_q = get_ac_quant(plane, seg, quant, 0, bd8);
+            let mut sy = base_y;
+            while sy < base_y + region_h {
+                let mut sx = base_x;
+                while sx < base_x + region_w {
+                    if sx < maxx && sy < maxy {
+                        let n0u = n0 as usize;
+                        let mut block = vec![0i64; n0u * n0u];
+                        for i in 0..n0u {
+                            for j in 0..n0u {
+                                let t = targets[plane].get(sx as usize + j, sy as usize + i);
+                                let p = work[plane].get(sx as usize + j, sy as usize + i);
+                                block[i * n0u + j] = i64::from(t) - i64::from(p);
+                            }
+                        }
+                        // §6.4.25: inter blocks are DCT_DCT at every size.
+                        crate::fwd_transform::forward_dct_2d(&mut block, tx_sz + 2);
+                        crate::fwd_transform::quantize_block_tx(
+                            &mut block, dc_q, ac_q, tx_sz, bit_depth,
+                        );
+                        let nonzero = block.iter().filter(|&&v| v != 0).count() as u64;
+                        all_zero &= nonzero == 0;
+                        cost += nonzero + 1;
+                        blocks.push((plane, sx, sy, tx_sz, block));
+                    }
+                    sx += n0;
+                }
+                sy += n0;
+            }
+        }
+        let better = match &best {
+            None => true,
+            Some((bc, ..)) => cost < *bc,
+        };
+        if better {
+            best = Some((cost, cand, blocks, all_zero));
+        }
+    }
+    let (_, tx, blocks, all_zero) = best.expect("at least one tx candidate");
+    (tx, blocks, all_zero)
+}
+
+/// Sum of squared `target − work` errors over one leaf's region, all
+/// three planes, clipped to the MI-padded plane extents.
+#[allow(clippy::too_many_arguments)]
+fn leaf_sse(
+    targets: &[Plane; 3],
+    work: &[Plane; 3],
+    r: u32,
+    c: u32,
+    mi_size: u8,
+    mi_cols: u32,
+    mi_rows: u32,
+    ssx: bool,
+    ssy: bool,
+) -> u64 {
+    use crate::partition::NUM_8X8_BLOCKS_WIDE_LOOKUP;
+    let num8x8 = u32::from(NUM_8X8_BLOCKS_WIDE_LOOKUP[mi_size as usize]);
+    let mut sse = 0u64;
+    for plane in 0..3usize {
+        let sub_x = plane > 0 && ssx;
+        let sub_y = plane > 0 && ssy;
+        let base_x = ((c * 8) >> u32::from(sub_x)) as usize;
+        let base_y = ((r * 8) >> u32::from(sub_y)) as usize;
+        let maxx = ((mi_cols * 8) >> u32::from(sub_x)) as usize;
+        let maxy = ((mi_rows * 8) >> u32::from(sub_y)) as usize;
+        let region_w = ((num8x8 * 8) >> u32::from(sub_x)) as usize;
+        let region_h = ((num8x8 * 8) >> u32::from(sub_y)) as usize;
+        for i in 0..region_h {
+            for j in 0..region_w {
+                let (x, y) = (base_x + j, base_y + i);
+                if x < maxx && y < maxy {
+                    let d = i64::from(targets[plane].get(x, y)) - i64::from(work[plane].get(x, y));
+                    sse += (d * d) as u64;
+                }
+            }
+        }
+    }
+    sse
+}
+
+/// Whether the transform block starting at plane coordinates
+/// `(sx, sy)` of `plane` lies inside the leaf at MI `(r, c)` of size
+/// `mi_size` (used to drop a reverted leaf's cached tokens).
+// Spec-shaped geometry fan-in, matching the crate's §6.4.21 helpers.
+#[allow(clippy::too_many_arguments)]
+fn leaf_contains(
+    r: u32,
+    c: u32,
+    mi_size: u8,
+    ssx: bool,
+    ssy: bool,
+    plane: usize,
+    sx: u32,
+    sy: u32,
+) -> bool {
+    use crate::partition::NUM_8X8_BLOCKS_WIDE_LOOKUP;
+    let num8x8 = u32::from(NUM_8X8_BLOCKS_WIDE_LOOKUP[mi_size as usize]);
+    let sub_x = plane > 0 && ssx;
+    let sub_y = plane > 0 && ssy;
+    let base_x = (c * 8) >> u32::from(sub_x);
+    let base_y = (r * 8) >> u32::from(sub_y);
+    let region_w = (num8x8 * 8) >> u32::from(sub_x);
+    let region_h = (num8x8 * 8) >> u32::from(sub_y);
+    sx >= base_x && sx < base_x + region_w && sy >= base_y && sy < base_y + region_h
+}
+
+/// Encode one **lossy** P-frame over a content-adaptive §6.4.3 partition
+/// tree — [`encode_pframe_lossy_motion`] generalised past the fixed
+/// all-`BLOCK_8X8` / inferred-`TX_8X8` layout:
+///
+/// * the partition tree merges uniform-motion regions into leaves up to
+///   `BLOCK_64X64` ([`plan_inter_partitions`]);
+/// * each leaf codes `ZEROMV` or `NEWMV` from the integer full search
+///   (the §6.5.12 `BestMv` is derived with the shared `find_mv_refs` /
+///   `find_best_ref_mvs` over the same `Vp9FrameState` the writer codes
+///   against, with the §6.4.20 codeability snap under the §6.5.13
+///   `use_mv_hp` gate);
+/// * the frame codes `tx_mode = TX_MODE_SELECT` and every non-skip leaf
+///   elects its **own** §6.4.10 transform size by trial quantization
+///   ([`select_inter_leaf_tx`]);
+/// * per-leaf `skip` election: a leaf whose quantized residual is
+///   all-zero codes no residual (and carries the §6.4.10 inferred tx
+///   size, since `read_tx_size( allowSelect = !skip )` codes nothing);
+/// * non-skip leaves replay the decoder's §8.6.2 reconstruction in
+///   place, so the returned [`ReconState`] equals the decoder's output
+///   bit-for-bit and its visible crop is the next frame's reference.
+///
+/// Requires an error-resilient non-key lossy header (see
+/// [`crate::frame_writer::assemble_inter_frame_tree`]).
+pub(crate) fn encode_pframe_lossy_tree_motion(
+    hdr: &Vp9FrameHeader,
+    targets: &[Plane; 3],
+    reference: &[(&[i32], usize); 3],
+    ref_w: u32,
+    ref_h: u32,
+    search_range: i32,
+) -> Result<(Vec<u8>, ReconState), Error> {
+    use crate::frame_writer::{InterFrameTreePlan, InterTreeLeaf, InterTreePlanner};
+    use crate::inter_decode::FrameStateMvSource;
+    use crate::mode_info::{LAST_FRAME, NEWMV, NONE_REF_FRAME, ZEROMV};
+    use crate::mv::use_mv_hp;
+    use crate::mv_ref::MvRefGeometry;
+    use crate::residual::MAX_TXSIZE_LOOKUP;
+    use std::cell::RefCell;
+
+    if hdr.frame_type != FrameType::NonKeyFrame || hdr.quantization.lossless {
+        return Err(Error::Unsupported);
+    }
+    let mi_cols = (hdr.frame_width + 7) >> 3;
+    let mi_rows = (hdr.frame_height + 7) >> 3;
+    let ssx = hdr.color_config.subsampling_x;
+    let ssy = hdr.color_config.subsampling_y;
+    let bit_depth = u32::from(hdr.color_config.bit_depth);
+    let sign_bias = [
+        false,
+        hdr.ref_frame_sign_bias[0],
+        hdr.ref_frame_sign_bias[1],
+        hdr.ref_frame_sign_bias[2],
+    ];
+    let seg = hdr.segmentation;
+    let quant = hdr.quantization;
+
+    let (partitions, hints) = plan_inter_partitions(
+        targets,
+        reference,
+        ref_w,
+        ref_h,
+        mi_cols,
+        mi_rows,
+        search_range,
+    );
+
+    let work = RefCell::new(ReconState::new(mi_cols, mi_rows, ssx, ssy, bit_depth));
+    let token_cache: RefCell<std::collections::HashMap<(usize, u32, u32), Vec<i64>>> =
+        RefCell::new(std::collections::HashMap::new());
+
+    let tx_mode = crate::compressed::TxMode::TxModeSelect;
+
+    let mut planner: Box<InterTreePlanner<'_>> =
+        Box::new(|r: u32, c: u32, subsize: u8, state| -> InterTreeLeaf {
+            let max_tx = MAX_TXSIZE_LOOKUP[subsize as usize];
+            let hint = hints.get(&(r, c)).copied().unwrap_or((0, 0));
+
+            let mut choice: (u8, [i32; 2]) = (ZEROMV, [0, 0]);
+            if hint != (0, 0) {
+                // §6.5 predictors over the shared state — identical to
+                // the derivation the inter block writer performs.
+                let geom = MvRefGeometry {
+                    mi_row: r as i32,
+                    mi_col: c as i32,
+                    mi_rows: mi_rows as i32,
+                    mi_cols: mi_cols as i32,
+                    mi_size: subsize as usize,
+                    mi_col_start: 0,
+                    mi_col_end: mi_cols as i32,
+                };
+                let src = FrameStateMvSource::new(state, None);
+                let mv_refs = geom.find_mv_refs(&src, LAST_FRAME, -1, &sign_bias, false);
+                let best =
+                    geom.find_best_ref_mvs(mv_refs.ref_list_mv, hdr.allow_high_precision_mv)[0];
+
+                let mut mv = [8 * hint.0, 8 * hint.1];
+                let use_hp = hdr.allow_high_precision_mv && use_mv_hp(best);
+                for (comp, m) in mv.iter_mut().enumerate() {
+                    let d = *m - best[comp];
+                    if d != 0 && !use_hp && (d & 1) != 0 {
+                        // Only even-magnitude differences are codeable
+                        // without the hp bit; nudge by one eighth-pel.
+                        *m -= 1;
+                    }
+                }
+                choice = (NEWMV, mv);
+            }
+
+            let mut work = work.borrow_mut();
+            predict_inter_leaf(
+                &mut work.planes,
+                reference,
+                ref_w,
+                ref_h,
+                r,
+                c,
+                subsize,
+                choice.1,
+                mi_cols,
+                mi_rows,
+                ssx,
+                ssy,
+                bit_depth,
+            );
+
+            // Per-leaf transform-size election + skip election, then the
+            // decoder-mirror reconstruction replay for non-skip leaves.
+            let (tx, blocks, all_zero) = select_inter_leaf_tx(
+                targets,
+                &work.planes,
+                r,
+                c,
+                subsize,
+                mi_cols,
+                mi_rows,
+                ssx,
+                ssy,
+                bit_depth,
+                &seg,
+                &quant,
+            );
+            let mut skip = all_zero;
+            let bd8 = hdr.color_config.bit_depth;
+            if !skip {
+                // Prediction-vs-target SSE before coding: the distortion
+                // of electing `skip`.
+                let sse_skip = leaf_sse(
+                    targets,
+                    &work.planes,
+                    r,
+                    c,
+                    subsize,
+                    mi_cols,
+                    mi_rows,
+                    ssx,
+                    ssy,
+                );
+                {
+                    let mut cache = token_cache.borrow_mut();
+                    for (plane, sx, sy, tx_sz, block) in blocks {
+                        let dc_q = get_dc_quant(plane, &seg, &quant, 0, bd8);
+                        let ac_q = get_ac_quant(plane, &seg, &quant, 0, bd8);
+                        reconstruct_block(
+                            &mut work.planes[plane],
+                            sx as usize,
+                            sy as usize,
+                            tx_sz,
+                            &block,
+                            dc_q,
+                            ac_q,
+                            DCT_DCT,
+                            false,
+                            bit_depth,
+                        );
+                        cache.insert((plane, sx, sy), block);
+                    }
+                }
+                // Skip-if-no-gain guard: coding the residual must
+                // *strictly* reduce the leaf's SSE, else the bytes are
+                // pure waste — and, chain-wise, a block whose coded
+                // reconstruction is no closer than its prediction would
+                // re-code equivalent noise every frame (the quantized
+                // fixed point is never reached). Electing skip instead
+                // makes the static-content chain monotone: a leaf's
+                // reconstruction only ever changes when it strictly
+                // improves.
+                let sse_coded = leaf_sse(
+                    targets,
+                    &work.planes,
+                    r,
+                    c,
+                    subsize,
+                    mi_cols,
+                    mi_rows,
+                    ssx,
+                    ssy,
+                );
+                if sse_coded >= sse_skip {
+                    // Revert: restore the pure §8.5.2 prediction (the
+                    // reconstruction overwrote it) and drop the tokens.
+                    token_cache.borrow_mut().retain(|&(p, sx, sy), _| {
+                        !leaf_contains(r, c, subsize, ssx, ssy, p, sx, sy)
+                    });
+                    predict_inter_leaf(
+                        &mut work.planes,
+                        reference,
+                        ref_w,
+                        ref_h,
+                        r,
+                        c,
+                        subsize,
+                        choice.1,
+                        mi_cols,
+                        mi_rows,
+                        ssx,
+                        ssy,
+                        bit_depth,
+                    );
+                    skip = true;
+                }
+            }
+            // Skip blocks reconstruct from prediction alone — the work
+            // planes already hold it. §6.4.10: a skip block never codes
+            // tx bits, so it carries the inferred size (== max_tx under
+            // TX_MODE_SELECT).
+            InterTreeLeaf {
+                mi_size: subsize,
+                tx_size: if skip { max_tx } else { tx },
+                y_mode: choice.0,
+                interp_filter: 0,
+                ref_frame: [LAST_FRAME, NONE_REF_FRAME],
+                mv: [choice.1, [0, 0]],
+                skip,
+            }
+        });
+
+    let mut coeffs: Box<FrameCoefSource<'_>> = Box::new(
+        |_mi_r: u32, _mi_c: u32, plane: usize, sx: u32, sy: u32, _b: usize| -> Vec<i64> {
+            token_cache
+                .borrow_mut()
+                .remove(&(plane, sx, sy))
+                .expect("planner pre-computed this block's tokens")
+        },
+    );
+
+    let plan = InterFrameTreePlan {
+        tx_mode,
+        reference_mode: crate::compressed::ReferenceMode::SingleReference,
+        partitions,
+    };
+    let bytes =
+        crate::frame_writer::assemble_inter_frame_tree(hdr, &plan, &mut *planner, &mut *coeffs)?;
+    drop(planner);
+    drop(coeffs);
+    Ok((bytes, work.into_inner()))
+}
+
 /// Encode a sequence of 8-bit 4:2:0 planar frames into a **lossy** VP9
 /// stream at quantizer index `base_q_idx` (`1..=255`): a lossy keyframe
 /// followed by lossy P-frames with per-block `ZEROMV` / `NEWMV` motion,
@@ -1871,7 +2502,7 @@ pub(crate) fn encode_sequence_lossy_420(
             delta_q_uv_ac: 0,
             lossless: false,
         };
-        let (bytes, recon) = encode_pframe_lossy_motion(
+        let (bytes, recon) = encode_pframe_lossy_tree_motion(
             &hdr,
             &targets,
             &reference,
@@ -2007,7 +2638,7 @@ pub(crate) fn encode_sequence_lossy_rc_420(
                     delta_q_uv_ac: 0,
                     lossless: false,
                 };
-                encode_pframe_lossy_motion(
+                encode_pframe_lossy_tree_motion(
                     &hdr,
                     &targets,
                     &reference,
@@ -3248,7 +3879,7 @@ mod tests {
             lossless: false,
         };
         let (bytes, recon) =
-            encode_pframe_lossy_motion(&hdr, &targets, &reference, w, h, PFRAME_SEARCH_RANGE)
+            encode_pframe_lossy_tree_motion(&hdr, &targets, &reference, w, h, PFRAME_SEARCH_RANGE)
                 .expect("re-encode last hop");
         assert_eq!(bytes, coded[3], "re-encoded last frame must be identical");
         let last_decoded = &decoded[3];
@@ -3373,6 +4004,276 @@ mod tests {
         for pf in [&with_motion, &zero_only] {
             let decoded = decode_vp9_sequence(&[&kf, pf]).expect("decode");
             assert_eq!(decoded[1].to_planar_bytes(), f1, "P-frame not byte-exact");
+        }
+    }
+
+    /// Shared texture for the inter-tree planner tests.
+    fn tree_pattern(x: i64, y: i64) -> i32 {
+        ((((x * 7 + y * 13) % 61) * 4 + (x + y) % 17) & 0xff) as i32
+    }
+
+    /// The inter partition planner merges uniform-motion superblocks into
+    /// one `BLOCK_64X64` leaf (with the searched vector as its hint) and
+    /// splits superblocks whose 8x8 cells elected different vectors.
+    #[test]
+    fn inter_partition_planner_merges_uniform_motion_and_splits_mixed() {
+        use crate::partition::{PARTITION_NONE, PARTITION_SPLIT};
+        use crate::residual::{BLOCK_32X32, BLOCK_64X64};
+
+        let (mi_cols, mi_rows) = (8u32, 8u32); // one 64x64 superblock
+        let (w, h) = (64usize, 64usize);
+        let ref_y: Vec<i32> = (0..h as i64)
+            .flat_map(|y| (0..w as i64).map(move |x| tree_pattern(x, y)))
+            .collect();
+        let flat_uv: Vec<i32> = vec![128; (w / 2) * (h / 2)];
+        let reference: [(&[i32], usize); 3] = [
+            (ref_y.as_slice(), w),
+            (flat_uv.as_slice(), w / 2),
+            (flat_uv.as_slice(), w / 2),
+        ];
+        let mk_targets = |luma: &dyn Fn(i64, i64) -> i32| -> [Plane; 3] {
+            let mut t = [
+                Plane::new(w, h),
+                Plane::new(w / 2, h / 2),
+                Plane::new(w / 2, h / 2),
+            ];
+            for y in 0..h {
+                for x in 0..w {
+                    t[0].set(x, y, luma(x as i64, y as i64));
+                }
+            }
+            for y in 0..h / 2 {
+                for x in 0..w / 2 {
+                    t[1].set(x, y, 128);
+                    t[2].set(x, y, 128);
+                }
+            }
+            t
+        };
+
+        // Uniform global (dy, dx) = (2, 3) motion: cur(x, y) =
+        // ref(x+3, y+2), with the source coordinates clamped to the
+        // frame exactly like the §8.5.2.4 edge-clamped reference read —
+        // so the vector is a perfect match on edge cells too.
+        let uniform = mk_targets(&|x, y| tree_pattern((x + 3).min(63), (y + 2).min(63)));
+        let (parts, hints) =
+            plan_inter_partitions(&uniform, &reference, 64, 64, mi_cols, mi_rows, 8);
+        assert_eq!(
+            parts.get(&(0, 0, BLOCK_64X64)),
+            Some(&PARTITION_NONE),
+            "uniform motion must merge to one 64x64 leaf"
+        );
+        assert_eq!(
+            hints.get(&(0, 0)),
+            Some(&(2, 3)),
+            "merged leaf carries the MV"
+        );
+
+        // Mixed motion: the top-left 32x32 quadrant moves by (2, 3), the
+        // rest is static. The root splits; each 32x32 quadrant (uniform
+        // within itself) merges.
+        let mixed = mk_targets(&|x, y| {
+            if x < 32 && y < 32 {
+                tree_pattern(x + 3, y + 2)
+            } else {
+                tree_pattern(x, y)
+            }
+        });
+        let (parts, hints) = plan_inter_partitions(&mixed, &reference, 64, 64, mi_cols, mi_rows, 8);
+        assert_eq!(
+            parts.get(&(0, 0, BLOCK_64X64)),
+            Some(&PARTITION_SPLIT),
+            "mixed motion must split the superblock"
+        );
+        assert_eq!(parts.get(&(0, 0, BLOCK_32X32)), Some(&PARTITION_NONE));
+        assert_eq!(parts.get(&(0, 4, BLOCK_32X32)), Some(&PARTITION_NONE));
+        assert_eq!(hints.get(&(0, 0)), Some(&(2, 3)), "moving quadrant MV");
+        assert_eq!(hints.get(&(0, 4)), Some(&(0, 0)), "static quadrant MV");
+    }
+
+    /// The per-leaf inter transform-size election adapts to the residual:
+    /// a smooth low-frequency residual over a 64x64 leaf elects
+    /// `TX_32X32` (fewest coded blocks, energy compacts into few
+    /// coefficients), while a residual whose energy is dense
+    /// high-frequency noise confined to one 8x8 block elects a small
+    /// transform (isolating the busy block keeps every other block
+    /// all-zero at one end-of-block bit each).
+    #[test]
+    fn inter_leaf_tx_election_adapts_to_residual_shape() {
+        use crate::residual::BLOCK_64X64;
+
+        let (mi_cols, mi_rows) = (8u32, 8u32);
+        let (w, h) = (64usize, 64usize);
+        // Prediction (work planes) = flat 128.
+        let mut work = [
+            Plane::new(w, h),
+            Plane::new(w / 2, h / 2),
+            Plane::new(w / 2, h / 2),
+        ];
+        for p in &mut work {
+            let (pw, ph) = (p.width(), p.height());
+            for y in 0..ph {
+                for x in 0..pw {
+                    p.set(x, y, 128);
+                }
+            }
+        }
+        let seg = SegmentationParams::default_disabled();
+        let quant = QuantizationParams {
+            base_q_idx: 60,
+            delta_q_y_dc: 0,
+            delta_q_uv_dc: 0,
+            delta_q_uv_ac: 0,
+            lossless: false,
+        };
+
+        // Smooth gradient residual: target = 128 + (x + y) / 2.
+        let mut smooth = [work[0].clone(), work[1].clone(), work[2].clone()];
+        for y in 0..h {
+            for x in 0..w {
+                smooth[0].set(x, y, 128 + ((x + y) / 2) as i32);
+            }
+        }
+        let (tx, _, all_zero) = select_inter_leaf_tx(
+            &smooth,
+            &work,
+            0,
+            0,
+            BLOCK_64X64,
+            mi_cols,
+            mi_rows,
+            true,
+            true,
+            8,
+            &seg,
+            &quant,
+        );
+        assert!(!all_zero, "gradient residual must quantize to tokens");
+        assert_eq!(tx, 3, "smooth residual should elect TX_32X32");
+
+        // Dense ±100 checkerboard noise confined to the 8x8 block at
+        // (16, 16); zero residual elsewhere.
+        let mut noisy = [work[0].clone(), work[1].clone(), work[2].clone()];
+        for y in 16..24 {
+            for x in 16..24 {
+                let s = if (x + y) % 2 == 0 { 228 } else { 28 };
+                noisy[0].set(x, y, s);
+            }
+        }
+        let (tx, _, all_zero) = select_inter_leaf_tx(
+            &noisy,
+            &work,
+            0,
+            0,
+            BLOCK_64X64,
+            mi_cols,
+            mi_rows,
+            true,
+            true,
+            8,
+            &seg,
+            &quant,
+        );
+        assert!(!all_zero);
+        assert!(
+            tx <= 1,
+            "localised high-frequency residual should elect a small transform (got TX id {tx})"
+        );
+    }
+
+    /// On uniform-motion content the tree P-frame encoder (one 64x64
+    /// NEWMV leaf, per-leaf tx selection) codes fewer bytes than the
+    /// fixed all-`BLOCK_8X8` / inferred-`TX_8X8` baseline at the same
+    /// quantizer, and the coded frame still decodes to exactly the
+    /// encoder's reconstruction.
+    #[test]
+    fn lossy_tree_pframe_beats_fixed_8x8_on_uniform_motion() {
+        use crate::decode_frame::decode_vp9_sequence;
+
+        let (w, h) = (64u32, 64u32);
+        let n = (w * h) as usize + 2 * 32 * 32;
+        let pattern = |x: i64, y: i64| -> u8 { (((x * 7 + y * 13) % 61) * 4 + (x + y) % 17) as u8 };
+        let frame_at = |ox: i64, oy: i64| -> Vec<u8> {
+            let mut px = Vec::with_capacity(n);
+            for i in 0..h as i64 {
+                for j in 0..w as i64 {
+                    px.push(pattern(j + ox, i + oy));
+                }
+            }
+            for _ in 0..2 {
+                for i in 0..32i64 {
+                    for j in 0..32i64 {
+                        px.push(pattern(j + ox / 2, i + oy / 2));
+                    }
+                }
+            }
+            px
+        };
+        let f0 = frame_at(0, 0);
+        let f1 = frame_at(5, 3);
+
+        let q = 60u8;
+        let (kf, kf_recon) = encode_keyframe_lossy_420_with_recon(&f0, w, h, q).expect("kf");
+        let crop = |p: &Plane, vw: usize, vh: usize| -> Vec<i32> {
+            let mut out = Vec::with_capacity(vw * vh);
+            for y in 0..vh {
+                for x in 0..vw {
+                    out.push(p.get(x, y));
+                }
+            }
+            out
+        };
+        let prev = [
+            crop(&kf_recon.planes[0], 64, 64),
+            crop(&kf_recon.planes[1], 32, 32),
+            crop(&kf_recon.planes[2], 32, 32),
+        ];
+        let reference: [(&[i32], usize); 3] = [
+            (prev[0].as_slice(), 64),
+            (prev[1].as_slice(), 32),
+            (prev[2].as_slice(), 32),
+        ];
+        let targets = padded_targets_420(&f1, w, h);
+        let mut hdr = lossless_pframe_header(w, h);
+        hdr.quantization = QuantizationParams {
+            base_q_idx: q,
+            delta_q_y_dc: 0,
+            delta_q_uv_dc: 0,
+            delta_q_uv_ac: 0,
+            lossless: false,
+        };
+
+        let (tree, tree_recon) =
+            encode_pframe_lossy_tree_motion(&hdr, &targets, &reference, w, h, PFRAME_SEARCH_RANGE)
+                .expect("tree p-frame");
+        let (fixed, _) =
+            encode_pframe_lossy_motion(&hdr, &targets, &reference, w, h, PFRAME_SEARCH_RANGE)
+                .expect("fixed p-frame");
+        assert!(
+            tree.len() < fixed.len(),
+            "adaptive tree ({} B) should beat the fixed 8x8 layout ({} B)",
+            tree.len(),
+            fixed.len()
+        );
+
+        // Decoder mirror: the coded tree frame reconstructs to exactly
+        // the encoder's in-loop state on all three planes.
+        let decoded = decode_vp9_sequence(&[&kf, &tree]).expect("decode");
+        let d = &decoded[1];
+        for y in 0..64usize {
+            for x in 0..64usize {
+                assert_eq!(
+                    i32::from(d.y[y * 64 + x]),
+                    tree_recon.planes[0].get(x, y),
+                    "luma mirror ({x},{y})"
+                );
+            }
+        }
+        for y in 0..32usize {
+            for x in 0..32usize {
+                assert_eq!(i32::from(d.u[y * 32 + x]), tree_recon.planes[1].get(x, y));
+                assert_eq!(i32::from(d.v[y * 32 + x]), tree_recon.planes[2].get(x, y));
+            }
         }
     }
 

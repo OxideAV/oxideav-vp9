@@ -341,12 +341,18 @@ pub(crate) fn max_codeable_coef(bit_depth: u32) -> i64 {
 
 /// [`quantize_block`] generalised over the transform size: applies the
 /// §8.6.2 `dqDenom` (2 for `TX_32X32`, 1 otherwise), so the token is
-/// `round( coef * dqDenom / quant )` — the value minimising the
-/// decoder's `( Tokens * quant ) / dqDenom` dequantization error — and
-/// clamps every token into the §6.4.26-codeable magnitude range for
-/// `bit_depth` (the clamp only fires for extreme content at very low
-/// quantizers; the encoder's reconstruction mirror absorbs the induced
-/// error like any other quantization error).
+/// `round( coef * dqDenom / quant )` — a value minimising the decoder's
+/// `( Tokens * quant ) / dqDenom` dequantization error, with the
+/// **half-step tie broken toward zero**: an error of exactly `quant / 2`
+/// has the same magnitude either way, but the toward-zero token is
+/// cheaper to code *and* makes the P-frame chain converge (a
+/// half-step residual re-quantized away from zero ping-pongs `+q/2 →
+/// −q/2 → …` forever between consecutive frames, coding a token every
+/// frame on static content). Tokens are clamped into the
+/// §6.4.26-codeable magnitude range for `bit_depth` (the clamp only
+/// fires for extreme content at very low quantizers; the encoder's
+/// reconstruction mirror absorbs the induced error like any other
+/// quantization error).
 pub(crate) fn quantize_block_tx(
     coefs: &mut [i64],
     dc_quant: i32,
@@ -359,7 +365,7 @@ pub(crate) fn quantize_block_tx(
     for (i, c) in coefs.iter_mut().enumerate() {
         let q = i64::from(if i == 0 { dc_quant } else { ac_quant });
         let a = c.abs() * dq_denom;
-        let t = ((2 * a + q) / (2 * q)).min(max_tok);
+        let t = ((2 * a + q - 1) / (2 * q)).min(max_tok);
         *c = if *c < 0 { -t } else { t };
     }
 }

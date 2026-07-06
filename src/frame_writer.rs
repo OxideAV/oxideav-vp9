@@ -737,7 +737,9 @@ pub(crate) type InterBlockPlanner<'f> =
 /// codes the §6.4.10 **inferred** size
 /// `Min( maxTxSize, tx_mode_to_biggest_tx_size )` (`TX_8X8` at the
 /// all-`BLOCK_8X8` layout under `Allow8x8` and larger — no per-block tx
-/// bits), so `TxModeSelect` is rejected. A lossless header forces
+/// bits), so `TxModeSelect` is rejected (this legacy planner type
+/// carries no per-block tx choice; use [`assemble_inter_frame_tree`]
+/// for per-block transform-size selection). A lossless header forces
 /// `Only4x4` (the §6.3.1 lossless gate never codes `tx_mode`, and the
 /// WHT path is 4x4-only).
 pub(crate) fn assemble_inter_frame_planned(
@@ -748,11 +750,137 @@ pub(crate) fn assemble_inter_frame_planned(
     coeffs: &mut FrameCoefSource<'_>,
 ) -> Result<Vec<u8>, Error> {
     use crate::compressed::ReferenceMode;
+    use crate::mode_info::{LAST_FRAME, NONE_REF_FRAME};
+
+    if matches!(tx_mode, TxMode::TxModeSelect) {
+        return Err(Error::Unsupported); // no per-block tx in this planner type.
+    }
+    let switchable = hdr.interpolation_filter == 4;
+    let plan = InterFrameTreePlan {
+        tx_mode,
+        reference_mode: ReferenceMode::SingleReference,
+        partitions: HashMap::new(), // default fallback = all-8x8 layout.
+    };
+    let mut tree_planner: Box<InterTreePlanner<'_>> =
+        Box::new(|lr: u32, lc: u32, subsize: u8, state: &Vp9FrameState| {
+            let (y_mode, mv, block_skip) = planner(lr, lc, state);
+            InterTreeLeaf {
+                mi_size: subsize,
+                tx_size: inferred_tx_size(MAX_TXSIZE_LOOKUP[subsize as usize], tx_mode),
+                y_mode,
+                interp_filter: if switchable {
+                    0
+                } else {
+                    hdr.interpolation_filter
+                },
+                ref_frame: [LAST_FRAME, NONE_REF_FRAME],
+                mv: [mv, [0, 0]],
+                skip: skip_all || block_skip,
+            }
+        });
+    let mut src: Box<FrameCoefSource<'_>> =
+        Box::new(|lr: u32, lc: u32, p: usize, sx: u32, sy: u32, b: usize| {
+            if skip_all {
+                Vec::new()
+            } else {
+                coeffs(lr, lc, p, sx, sy, b)
+            }
+        });
+    assemble_inter_frame_tree(hdr, &plan, &mut *tree_planner, &mut *src)
+}
+
+/// Per-leaf inter mode-info an [`InterTreePlanner`] elects: the §6.4.11 /
+/// §6.4.16 syntax values the decoder will recover for one partition-tree
+/// leaf.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InterTreeLeaf {
+    /// `MiSize` — must equal the `subsize` the partition tree produced
+    /// at this leaf's call site (validated at assembly).
+    pub mi_size: u8,
+    /// `tx_size` (`TX_*` 0..=3). Under `TxModeSelect` any value up to
+    /// `MAX_TXSIZE_LOOKUP[ MiSize ]` is codeable on a non-skip block
+    /// (the §6.4.10 tree is coded); under the other tx modes — and on
+    /// every **skip** block, where §6.4.10 `read_tx_size( allowSelect =
+    /// !skip )` never codes bits — it must equal the inferred
+    /// `Min( maxTxSize, tx_mode_to_biggest_tx_size )` (validated).
+    pub tx_size: u32,
+    /// Inter `y_mode` (`NEARESTMV` / `NEARMV` / `ZEROMV` / `NEWMV`).
+    pub y_mode: u8,
+    /// `interp_filter` — coded only when the frame filter is SWITCHABLE.
+    pub interp_filter: u8,
+    /// The §3 reference pair; `ref_frame[ 1 ] == NONE_REF_FRAME` ⇒
+    /// single prediction, otherwise compound.
+    pub ref_frame: [i32; 2],
+    /// Final per-list eighth-pel motion vectors.
+    pub mv: [[i32; 2]; 2],
+    /// `skip` flag (true ⇒ no residual coded).
+    pub skip: bool,
+}
+
+/// Per-leaf inter planner for [`assemble_inter_frame_tree`]: called once
+/// per partition-tree leaf `(mi_row, mi_col, subsize)` in §6.4.3 decode
+/// order with the **shared** [`Vp9FrameState`] as it stands before the
+/// block is written — the same state the inter block writer derives its
+/// §6.5 MV predictors and §9.3.2 contexts from.
+pub(crate) type InterTreePlanner<'f> =
+    dyn FnMut(u32, u32, u8, &Vp9FrameState) -> InterTreeLeaf + 'f;
+
+/// Frame-level plan for [`assemble_inter_frame_tree`]: the §6.3.1
+/// `tx_mode`, the §6.3.12 `reference_mode`, and the §6.4.3 partition
+/// layout (missing nodes fall back to the all-8x8 layout — SPLIT above
+/// `BLOCK_8X8`, NONE at it — so a partial map stays codeable).
+pub(crate) struct InterFrameTreePlan {
+    pub tx_mode: TxMode,
+    pub reference_mode: crate::compressed::ReferenceMode,
+    pub partitions: HashMap<(u32, u32, u8), u8>,
+}
+
+/// Assemble a complete VP9 **inter** frame over an **arbitrary §6.4.3
+/// partition tree** — [`assemble_inter_frame_planned`] generalised over
+/// the partition layout, per-block transform sizes (`TxModeSelect`
+/// included), reference selection (any single reference, or compound
+/// when the plan's `reference_mode` + the header's sign biases allow
+/// it), and per-block switchable interpolation filters.
+///
+/// `hdr` must be a non-key frame (`FrameType::NonKeyFrame`,
+/// `!intra_only`, shown, `tile_cols_log2 == tile_rows_log2 == 0`)
+/// carrying a valid `ref_frame_idx`; the `header_size_in_bytes` field is
+/// overwritten with the actual compressed-header length.
+///
+/// The writer models §6.5 `UsePrevFrameMvs == 0` (it holds no
+/// previous-frame motion field), which matches the decoder's §7.2.6
+/// derivation only when `error_resilient_mode == 1` — so any plan that
+/// returns a non-`ZEROMV` block (where the §6.5 candidate scan reaches
+/// the coded syntax through the MV predictors) requires an
+/// error-resilient header, and a non-`ZEROMV` leaf on a
+/// non-error-resilient header is rejected.
+///
+/// Per-leaf `tx_size` is coded through the §6.4.10 tree when
+/// `read_tx_size( allowSelect = !skip )` codes it (`TxModeSelect`,
+/// non-skip, `MiSize >= BLOCK_8X8`), and validated against the inferred
+/// `Min( maxTxSize, tx_mode_to_biggest_tx_size )` otherwise (a mismatch
+/// would silently desync the reconstruction). A lossless header forces
+/// `Only4x4`.
+///
+/// The compound-reference configuration is the §6.3.18
+/// `setup_compound_reference_mode( )` derivation over the header's sign
+/// biases — the identical shared function the decoder runs — so the
+/// §6.4.17 `read_ref_frames` contexts agree on both sides.
+pub(crate) fn assemble_inter_frame_tree(
+    hdr: &Vp9FrameHeader,
+    plan: &InterFrameTreePlan,
+    planner: &mut InterTreePlanner<'_>,
+    coeffs: &mut FrameCoefSource<'_>,
+) -> Result<Vec<u8>, Error> {
+    use crate::compressed::{setup_compound_reference_mode, RefFrameSignBias, ReferenceMode};
     use crate::compressed_writer::write_compressed_header_inter;
     use crate::inter_block_writer::{
         write_inter_block, InterBlockFrameCtx, InterBlockProbs, InterBlockSpec,
     };
-    use crate::mode_info::{LAST_FRAME, NONE_REF_FRAME, ZEROMV};
+    use crate::mode_info::ZEROMV;
+
+    let tx_mode = plan.tx_mode;
+    let reference_mode = plan.reference_mode;
 
     if hdr.frame_type != FrameType::NonKeyFrame || hdr.intra_only || !hdr.show_frame {
         return Err(Error::Unsupported);
@@ -763,17 +891,12 @@ pub(crate) fn assemble_inter_frame_planned(
     if hdr.ref_frame_idx.is_none() {
         return Err(Error::Unsupported);
     }
-
-    if matches!(tx_mode, TxMode::TxModeSelect) {
-        return Err(Error::Unsupported); // per-block tx sizes: later step.
-    }
     if hdr.quantization.lossless && !matches!(tx_mode, TxMode::Only4x4) {
         return Err(Error::Unsupported);
     }
 
     let mi_cols = (hdr.frame_width + 7) >> 3;
     let mi_rows = (hdr.frame_height + 7) >> 3;
-    let reference_mode = ReferenceMode::SingleReference;
     let switchable = hdr.interpolation_filter == 4;
     // sign_bias indexed by §3 ref value: [INTRA, LAST, GOLDEN, ALTREF].
     let sign_bias = [
@@ -783,7 +906,9 @@ pub(crate) fn assemble_inter_frame_planned(
         hdr.ref_frame_sign_bias[2],
     ];
 
-    // §6.3 compressed header (default-probability path).
+    // §6.3 compressed header (default-probability path). The write
+    // validates `reference_mode` against the sign-bias-derived
+    // `compoundReferenceAllowed` exactly as the §6.3.12 parser does.
     let chdr_bytes = write_compressed_header_inter(
         tx_mode,
         hdr.quantization.lossless,
@@ -806,10 +931,13 @@ pub(crate) fn assemble_inter_frame_planned(
     let sb64_rows = ((mi_rows + 7) >> 3) * 8;
 
     let ctx = crate::compressed::FrameContext::default();
-    let comp_config = crate::compressed::CompoundReferenceConfig {
-        fixed_ref: crate::mode_info::ALTREF_FRAME,
-        var_ref: [LAST_FRAME, crate::mode_info::GOLDEN_FRAME],
-    };
+    // §6.3.18: the same shared derivation the decoder's compressed-header
+    // parse runs on the non-SingleReference arms.
+    let comp_config = setup_compound_reference_mode(&RefFrameSignBias::from_inter_biases(
+        u8::from(sign_bias[1]),
+        u8::from(sign_bias[2]),
+        u8::from(sign_bias[3]),
+    ));
 
     let mut enc = BoolEncoder::new();
     let mut state = Vp9FrameState::new(mi_rows, mi_cols);
@@ -866,37 +994,65 @@ pub(crate) fn assemble_inter_frame_planned(
         pctx.clear_left();
         let mut c = 0u32;
         while c < mi_cols {
+            let mut layout = |lr: u32, lc: u32, bsize: u8| -> u8 {
+                plan.partitions
+                    .get(&(lr, lc, bsize))
+                    .copied()
+                    .unwrap_or(if bsize == BLOCK_8X8 {
+                        PARTITION_NONE
+                    } else {
+                        PARTITION_SPLIT
+                    })
+            };
             let mut leaf =
-                |enc: &mut BoolEncoder, lr: u32, lc: u32, _ls: u8| -> Result<(), Error> {
-                    let (y_mode, mv, block_skip) = planner(lr, lc, &state);
-                    if y_mode != ZEROMV && !hdr.error_resilient_mode {
+                |enc: &mut BoolEncoder, lr: u32, lc: u32, subsize: u8| -> Result<(), Error> {
+                    if subsize < BLOCK_8X8 {
+                        // Sub-8x8 leaves need the per-(idy, idx) MV walk
+                        // the inter block writer defers.
+                        return Err(Error::Unsupported);
+                    }
+                    let lp = planner(lr, lc, subsize, &state);
+                    if lp.mi_size != subsize {
+                        return Err(Error::Unsupported);
+                    }
+                    if lp.y_mode != ZEROMV && !hdr.error_resilient_mode {
                         // §7.2.6: the decoder would run the §6.5 scan with
                         // UsePrevFrameMvs == 1, which this writer does not
                         // model — see the function docs.
+                        return Err(Error::Unsupported);
+                    }
+                    if lp.ref_frame[1] > crate::mode_info::INTRA_FRAME
+                        && reference_mode == ReferenceMode::SingleReference
+                    {
+                        return Err(Error::Unsupported);
+                    }
+                    // tx-size codeability / inference validation, per the
+                    // §6.4.10 `read_tx_size( allowSelect = !skip )` gate.
+                    let max_tx = MAX_TXSIZE_LOOKUP[subsize as usize];
+                    if lp.tx_size > max_tx {
+                        return Err(Error::Unsupported);
+                    }
+                    if !tx_size_is_coded(!lp.skip, tx_mode, subsize >= BLOCK_8X8)
+                        && lp.tx_size != inferred_tx_size(max_tx, tx_mode)
+                    {
                         return Err(Error::Unsupported);
                     }
                     let spec = InterBlockSpec {
                         r: lr,
                         mi_col_start: 0,
                         c: lc,
-                        mi_size: BLOCK_8X8,
+                        mi_size: subsize,
                         segment_id: 0,
-                        skip: skip_all || block_skip,
-                        // §6.4.10 inferred size (tx_mode is never SELECT
-                        // here, so no tx bits are coded).
-                        tx_size: inferred_tx_size(MAX_TXSIZE_LOOKUP[BLOCK_8X8 as usize], tx_mode),
-                        ref_frame: [LAST_FRAME, NONE_REF_FRAME],
-                        y_mode,
-                        interp_filter: if switchable {
-                            0
-                        } else {
-                            hdr.interpolation_filter
-                        },
-                        mv: [mv, [0, 0]],
+                        skip: lp.skip,
+                        tx_size: lp.tx_size,
+                        ref_frame: lp.ref_frame,
+                        y_mode: lp.y_mode,
+                        interp_filter: lp.interp_filter,
+                        mv: lp.mv,
                     };
                     let mut src = |p: usize, tx_sz: u32, sx: u32, sy: u32, b: usize| {
                         let n0 = 1usize << (tx_sz + 2);
-                        if skip_all {
+                        if lp.skip {
                             vec![0i64; n0 * n0]
                         } else {
                             let mut v = coeffs(lr, lc, p, sx, sy, b);
@@ -915,7 +1071,7 @@ pub(crate) fn assemble_inter_frame_planned(
                         &mut src,
                     )
                 };
-            write_partition_8x8(
+            write_partition_tree(
                 &mut enc,
                 r,
                 c,
@@ -924,6 +1080,7 @@ pub(crate) fn assemble_inter_frame_planned(
                 mi_cols,
                 &mut pctx,
                 PartitionProbsKind::Inter(&ctx.partition_probs),
+                &mut layout,
                 &mut leaf,
             )?;
             c += 8;
@@ -1696,5 +1853,226 @@ mod tests {
                 .unwrap_err(),
             Error::Unsupported
         );
+    }
+
+    // ----- §6.4.3 inter tree assembler -----
+
+    use crate::compressed::ReferenceMode;
+    use crate::mode_info::NONE_REF_FRAME;
+    use crate::residual::{BLOCK_16X16 as B16, BLOCK_32X32 as B32};
+
+    /// An all-skip ZEROMV leaf at `subsize` with the §6.4.10 inferred tx.
+    fn skip_leaf(subsize: u8, tx_mode: TxMode) -> InterTreeLeaf {
+        InterTreeLeaf {
+            mi_size: subsize,
+            tx_size: inferred_tx_size(MAX_TXSIZE_LOOKUP[subsize as usize], tx_mode),
+            y_mode: crate::mode_info::ZEROMV,
+            interp_filter: 0,
+            ref_frame: [crate::mode_info::LAST_FRAME, NONE_REF_FRAME],
+            mv: [[0, 0], [0, 0]],
+            skip: true,
+        }
+    }
+
+    /// A mixed-leaf-size all-skip ZEROMV P-frame (64x64 NONE + HORZ +
+    /// VERT + deep SPLIT superblocks) reconstructs to a verbatim copy of
+    /// its reference across every partition shape, end-to-end through
+    /// `decode_vp9_sequence`.
+    #[test]
+    fn inter_tree_mixed_leaf_sizes_copy_reference() {
+        use crate::decode_frame::decode_vp9_sequence;
+        use crate::partition::{PARTITION_HORZ, PARTITION_VERT};
+        use crate::residual::{BLOCK_32X64, BLOCK_64X32};
+
+        let kf_hdr = keyframe_header(128, 128);
+        let plan = KeyframePlan::all_skip(16, 16, 0, 0);
+        let kf = assemble_keyframe(&kf_hdr, &plan, &mut *no_coeffs()).expect("keyframe");
+
+        let p_hdr = inter_header(128, 128);
+        let mut partitions = HashMap::new();
+        // SB (0,0): one 64x64 leaf. SB (0,8): HORZ (two 64x32).
+        // SB (8,0): VERT (two 32x64). SB (8,8): default all-8x8 SPLIT.
+        partitions.insert((0u32, 0u32, BLOCK_64X64), PARTITION_NONE);
+        partitions.insert((0, 8, BLOCK_64X64), PARTITION_HORZ);
+        partitions.insert((8, 0, BLOCK_64X64), PARTITION_VERT);
+        let tree_plan = InterFrameTreePlan {
+            tx_mode: TxMode::Only4x4,
+            reference_mode: ReferenceMode::SingleReference,
+            partitions,
+        };
+        let mut seen: Vec<(u32, u32, u8)> = Vec::new();
+        let mut planner: Box<InterTreePlanner> = Box::new(|r, c, subsize, _s| {
+            seen.push((r, c, subsize));
+            skip_leaf(subsize, TxMode::Only4x4)
+        });
+        let pf = assemble_inter_frame_tree(&p_hdr, &tree_plan, &mut *planner, &mut *no_coeffs())
+            .expect("tree p-frame");
+        drop(planner);
+
+        // The planned tree produced the expected leaf shapes.
+        assert!(seen.contains(&(0, 0, BLOCK_64X64)), "64x64 NONE leaf");
+        assert!(seen.contains(&(0, 8, BLOCK_64X32)), "HORZ top leaf");
+        assert!(seen.contains(&(4, 8, BLOCK_64X32)), "HORZ bottom leaf");
+        assert!(seen.contains(&(8, 0, BLOCK_32X64)), "VERT left leaf");
+        assert!(seen.contains(&(8, 4, BLOCK_32X64)), "VERT right leaf");
+        assert!(seen.contains(&(8, 8, BLOCK_8X8)), "SPLIT 8x8 leaf");
+
+        let frames = decode_vp9_sequence(&[&kf, &pf]).expect("decode sequence");
+        assert_eq!(frames[1].y, frames[0].y, "p-frame luma != reference");
+        assert_eq!(frames[1].u, frames[0].u, "p-frame U != reference");
+        assert_eq!(frames[1].v, frames[0].v, "p-frame V != reference");
+    }
+
+    /// A `TxModeSelect` P-frame codes a different §6.4.10 tx size on each
+    /// of four 32x32 leaves (TX_32X32 / TX_16X16 / TX_8X8 / TX_4X4), each
+    /// with a DC-only luma residual, and decodes end-to-end — per-block
+    /// **inter** transform-size selection.
+    #[test]
+    fn inter_tree_tx_select_codes_per_block_tx() {
+        use crate::decode_frame::decode_vp9_sequence;
+
+        let kf_hdr = keyframe_header(64, 64);
+        let plan = KeyframePlan::all_skip(8, 8, 0, 0);
+        let kf = assemble_keyframe(&kf_hdr, &plan, &mut *no_coeffs()).expect("keyframe");
+
+        let p_hdr = inter_header(64, 64);
+        let mut partitions = HashMap::new();
+        partitions.insert((0u32, 0u32, BLOCK_64X64), PARTITION_SPLIT);
+        for (r, c) in [(0u32, 0u32), (0, 4), (4, 0), (4, 4)] {
+            partitions.insert((r, c, B32), PARTITION_NONE);
+        }
+        let tree_plan = InterFrameTreePlan {
+            tx_mode: TxMode::TxModeSelect,
+            reference_mode: ReferenceMode::SingleReference,
+            partitions,
+        };
+        // Quadrant -> tx size: TL 32x32, TR 16x16, BL 8x8, BR 4x4.
+        let mut planner: Box<InterTreePlanner> = Box::new(|r, c, subsize, _s| {
+            assert_eq!(subsize, B32);
+            let tx = match (r, c) {
+                (0, 0) => 3,
+                (0, 4) => 2,
+                (4, 0) => 1,
+                _ => 0,
+            };
+            let mut leaf = skip_leaf(subsize, TxMode::TxModeSelect);
+            leaf.tx_size = tx;
+            leaf.skip = false;
+            leaf
+        });
+        // A DC token on every luma transform block, zero chroma.
+        let mut coeffs: Box<FrameCoefSource> =
+            Box::new(
+                |_r, _c, p, _sx, _sy, _b| {
+                    if p == 0 {
+                        vec![40i64]
+                    } else {
+                        Vec::new()
+                    }
+                },
+            );
+        let pf = assemble_inter_frame_tree(&p_hdr, &tree_plan, &mut *planner, &mut *coeffs)
+            .expect("tx-select p-frame");
+        let frames = decode_vp9_sequence(&[&kf, &pf]).expect("decode");
+        // Every 32x32 quadrant moved off the flat-128 reference (the DC
+        // residual covers each leaf at whatever tx size it coded).
+        for (qr, qc) in [(0usize, 0usize), (0, 32), (32, 0), (32, 32)] {
+            let touched =
+                (0..32).any(|i| (0..32).any(|j| frames[1].y[(qr + i) * 64 + qc + j] != 128));
+            assert!(touched, "quadrant ({qr},{qc}) untouched by its residual");
+        }
+        // Chroma is untouched (zero residual, ZEROMV copy).
+        assert_eq!(frames[1].u, frames[0].u);
+    }
+
+    /// The tree assembler validates leaf specs: a leaf `mi_size` that
+    /// disagrees with the partition tree, an over-large `tx_size`, a
+    /// non-inferred tx on a skip block under `TxModeSelect`, a compound
+    /// pair under `SingleReference`, and a `NEWMV` leaf on a
+    /// non-error-resilient header are all rejected.
+    #[test]
+    fn inter_tree_rejects_bad_leaves() {
+        let p_hdr = inter_header(64, 64);
+        let mk_plan = |tx_mode| InterFrameTreePlan {
+            tx_mode,
+            reference_mode: ReferenceMode::SingleReference,
+            partitions: HashMap::new(),
+        };
+
+        // Leaf size disagreeing with the tree's subsize.
+        let plan = mk_plan(TxMode::Only4x4);
+        let mut p: Box<InterTreePlanner> =
+            Box::new(|_r, _c, _sz, _s| skip_leaf(B16, TxMode::Only4x4));
+        assert_eq!(
+            assemble_inter_frame_tree(&p_hdr, &plan, &mut *p, &mut *no_coeffs()).unwrap_err(),
+            Error::Unsupported
+        );
+
+        // tx_size above the leaf's maximum.
+        let mut p: Box<InterTreePlanner> = Box::new(|_r, _c, sz, _s| {
+            let mut l = skip_leaf(sz, TxMode::Only4x4);
+            l.tx_size = 3;
+            l
+        });
+        assert_eq!(
+            assemble_inter_frame_tree(&p_hdr, &plan, &mut *p, &mut *no_coeffs()).unwrap_err(),
+            Error::Unsupported
+        );
+
+        // Skip block under TxModeSelect must carry the inferred size
+        // (read_tx_size codes nothing when allowSelect == 0).
+        let sel_plan = mk_plan(TxMode::TxModeSelect);
+        let mut p: Box<InterTreePlanner> = Box::new(|_r, _c, sz, _s| {
+            let mut l = skip_leaf(sz, TxMode::TxModeSelect);
+            l.tx_size = 0; // inferred for BLOCK_8X8 under SELECT is TX_8X8.
+            l
+        });
+        assert_eq!(
+            assemble_inter_frame_tree(&p_hdr, &sel_plan, &mut *p, &mut *no_coeffs()).unwrap_err(),
+            Error::Unsupported
+        );
+
+        // Compound pair under SingleReference.
+        let mut p: Box<InterTreePlanner> = Box::new(|_r, _c, sz, _s| {
+            let mut l = skip_leaf(sz, TxMode::Only4x4);
+            l.ref_frame = [crate::mode_info::LAST_FRAME, crate::mode_info::ALTREF_FRAME];
+            l
+        });
+        assert_eq!(
+            assemble_inter_frame_tree(&p_hdr, &plan, &mut *p, &mut *no_coeffs()).unwrap_err(),
+            Error::Unsupported
+        );
+
+        // NEWMV without error_resilient_mode.
+        let mut p: Box<InterTreePlanner> = Box::new(|_r, _c, sz, _s| {
+            let mut l = skip_leaf(sz, TxMode::Only4x4);
+            l.y_mode = crate::mode_info::NEWMV;
+            l.mv = [[8, 8], [0, 0]];
+            l
+        });
+        assert_eq!(
+            assemble_inter_frame_tree(&p_hdr, &plan, &mut *p, &mut *no_coeffs()).unwrap_err(),
+            Error::Unsupported
+        );
+    }
+
+    /// The tree assembler is byte-deterministic and byte-identical to the
+    /// legacy all-8x8 assembler when given the fallback (empty) partition
+    /// map — the delegation path is a strict generalisation.
+    #[test]
+    fn inter_tree_assembly_matches_all_8x8_and_is_deterministic() {
+        let h = inter_header(40, 24);
+        let legacy = assemble_inter_frame_all_skip_zeromv(&h).expect("legacy");
+        let plan = InterFrameTreePlan {
+            tx_mode: TxMode::Only4x4,
+            reference_mode: ReferenceMode::SingleReference,
+            partitions: HashMap::new(),
+        };
+        let mut p: Box<InterTreePlanner> =
+            Box::new(|_r, _c, sz, _s| skip_leaf(sz, TxMode::Only4x4));
+        let a = assemble_inter_frame_tree(&h, &plan, &mut *p, &mut *no_coeffs()).expect("a");
+        let b = assemble_inter_frame_tree(&h, &plan, &mut *p, &mut *no_coeffs()).expect("b");
+        assert_eq!(a, b, "tree assembly not byte-stable");
+        assert_eq!(a, legacy, "empty-map tree != all-8x8 layout");
     }
 }

@@ -723,7 +723,7 @@ fn truncated_buffer_returns_unexpected_eof() {
     let mut data = b.finish();
     // Trim away the trailing zero-padding so the reader runs out
     // before reaching show_existing_frame.
-    data.truncate(0);
+    data.clear();
     assert_eq!(
         parse_uncompressed_header(&data).unwrap_err(),
         Error::UnexpectedEof

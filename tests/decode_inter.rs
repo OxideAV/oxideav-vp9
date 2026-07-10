@@ -913,6 +913,15 @@ fn full_corpus_sequences_byte_exact() {
         // pinning the clipped §8.5.2 prediction store — plus long
         // multi-superblock-row motion under continuous zoom.
         "qcif-inter-gop",
+        // Round-409 corpus extension: the corpus's first
+        // `frame_parallel_decoding_mode=0` stream — every frame runs the
+        // full §6.1.2 refresh_probs( ) backward adaptation (§8.4.3
+        // adapt_coef_probs from the §9.3.4 counts incl. the errata-#249
+        // more_coefs special case, §8.4.4 adapt_noncoef_probs on the
+        // P-frames), so byte-exactness proves the whole counting +
+        // adaptation chain: any miscount desynchronises the next frame's
+        // entropy decode.
+        "backward-adaptation",
     ] {
         let base = root.join(name);
         let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");
@@ -940,6 +949,61 @@ fn full_corpus_sequences_byte_exact() {
             .count();
         assert_eq!(diffs, 0, "{name}: {diffs} differing bytes vs expected.yuv");
     }
+}
+
+/// §6.1.2 refresh_probs( ) backward adaptation, corpus-pinned: the
+/// `backward-adaptation` fixture is the corpus's only
+/// `frame_parallel_decoding_mode=0` stream. This test asserts the header
+/// flags that make it exercise the §8.4 path — every frame carries
+/// `error_resilient_mode=0`, `frame_parallel_decoding_mode=0` and
+/// `refresh_frame_context=1`, and the GOP has real P-frames — so the
+/// byte-exact sweep in `full_corpus_sequences_byte_exact` genuinely
+/// proves the §9.3.4 counting (incl. the errata-#249 `more_coefs`
+/// special case) and the §8.4.3 / §8.4.4 adaptation: each frame's
+/// entropy decode runs on probabilities adapted from the previous
+/// frame's counts, so any miscount desynchronises the §9.2 boolean
+/// decoder almost immediately.
+#[test]
+fn backward_adaptation_fixture_flags_pin_the_refresh_probs_path() {
+    let base = std::path::Path::new("../../docs/video/vp9/fixtures/backward-adaptation");
+    if !base.is_dir() {
+        eprintln!("docs corpus not present; docs-gated");
+        return;
+    }
+    let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");
+    let mut n_frames = 0usize;
+    let mut n_inter = 0usize;
+    let mut last_color: Option<oxideav_vp9::ColorConfig> = None;
+    for p in &ivf_chunks(&ivf) {
+        for f in split_superframe(p) {
+            let ref_dims = vec![(176u32, 144u32); 8];
+            let ref_state = last_color.map(|cc| oxideav_vp9::RefFrameState {
+                ref_dims: &ref_dims,
+                color_config: cc,
+            });
+            let hdr = oxideav_vp9::parse_uncompressed_header_with_refs(f, ref_state)
+                .expect("uncompressed header");
+            if hdr.show_existing_frame {
+                continue;
+            }
+            assert!(!hdr.error_resilient_mode, "error_resilient must be 0");
+            assert!(
+                !hdr.frame_parallel_decoding_mode,
+                "frame {n_frames}: frame_parallel_decoding_mode must be 0"
+            );
+            assert!(
+                hdr.refresh_frame_context,
+                "frame {n_frames}: refresh_frame_context must be 1"
+            );
+            if !matches!(hdr.frame_type, oxideav_vp9::FrameType::KeyFrame) && !hdr.intra_only {
+                n_inter += 1;
+            }
+            last_color = Some(hdr.color_config);
+            n_frames += 1;
+        }
+    }
+    assert!(n_frames >= 8, "GOP long enough to compound adaptation");
+    assert!(n_inter >= 7, "real P-frames present ({n_inter})");
 }
 
 /// §6.4.14 / §8.1 segment-map threading + §7.2.10 segmentation feature

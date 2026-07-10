@@ -1104,6 +1104,9 @@ struct FrameDecodeProducts {
     /// The §6.4.4 frame-wide state (carries `Mvs` / `RefFrames` /
     /// `SegmentIds` for the next frame's §6.5 / §6.4.14 reads).
     state: Vp9FrameState,
+    /// The §9.3.4 syntax-element count bank accumulated over the frame,
+    /// consumed by the §6.1.2 `refresh_probs( )` backward adaptation.
+    counts: Box<crate::prob_adapt::FrameCounts>,
 }
 
 /// The §6.3 compressed-header product threaded into [`decode_single_frame`]:
@@ -1246,7 +1249,8 @@ fn decode_single_frame(
     let mut pctx = PartitionContextState::new((sb64_cols * 8) as usize, (sb64_rows * 8) as usize);
     let mut token_cache = [0u8; 1024];
     let mut tok_buf = [0i64; 1024];
-    // §6.1 `clear_counts( )` — a fresh §9.3.4 count bank per frame.
+    // §6.1 `clear_counts( )` — a fresh §9.3.4 count bank per frame,
+    // returned in the products for §6.1.2 `refresh_probs( )`.
     let mut counts = crate::prob_adapt::FrameCounts::new_boxed();
 
     // Inter-frame scaffolding: the §6.4.11 segmentation-prediction
@@ -1525,6 +1529,7 @@ fn decode_single_frame(
         y_w,
         uv_w,
         state,
+        counts,
     })
 }
 
@@ -1568,6 +1573,13 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
     // the bank(s) again before the frame folds its own compressed-header
     // forward updates on top.
     let mut frame_contexts: [FrameContext; 4] = Default::default();
+
+    // §7.2 `LastFrameType` — the previous (non-show-existing) frame's
+    // `frame_type`, feeding the §8.4.3 `updateFactor` selection. The
+    // uncompressed-header listing sets `LastFrameType = frame_type`
+    // BEFORE reading the new `frame_type`, and a `show_existing_frame`
+    // packet returns earlier, leaving it untouched.
+    let mut last_frame_type_was_key = false;
 
     // §7.2.10 / §7.2 persistent segmentation feature table: per §7.2.10
     // "segmentation_update_data equal to 0 indicates that the
@@ -1746,17 +1758,50 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
         // defaults.
         let base_ctx = frame_contexts[frame_context_idx].clone();
 
+        // §6.1.2 refresh_probs( ) gate: with error_resilient_mode == 0
+        // and frame_parallel_decoding_mode == 0, the §8.4 backward
+        // adaptation runs after decode_tiles( ) — load_probs( idx )
+        // reloads the PRE-frame bank (discarding this frame's forward
+        // updates on every table except tx_probs / skip_prob, which
+        // load_probs( ) does not cover), the counts adapt it, and
+        // save_probs( idx ) persists the result. In parallel /
+        // error-resilient mode save_probs( ) persists the
+        // forward-updated working tables instead.
+        let non_parallel = !hdr.error_resilient_mode && !hdr.frame_parallel_decoding_mode;
+
         let products = if frame_is_intra {
             let chdr_parsed =
                 parse_compressed_header_with_ctx(&frame[ch_start..ch_end], lossless, &base_ctx)?;
-            // §6.1.2 save_probs( frame_context_idx ) (parallel-mode path:
-            // no backward adaptation, just persist the forward-updated
-            // tables).
-            if hdr.refresh_frame_context {
+            // The forward-updated tx_probs / skip_prob survive an intra
+            // frame's refresh_probs( ) (load_probs( ) skips them and
+            // FrameIsIntra bypasses load_probs2( )).
+            let fwd_tx_probs = chdr_parsed.tx_probs;
+            let fwd_skip_prob = chdr_parsed.skip_prob;
+            // §6.1.2 save_probs( frame_context_idx ) — parallel-mode
+            // path: no backward adaptation, persist the forward-updated
+            // tables directly.
+            if hdr.refresh_frame_context && !non_parallel {
                 frame_contexts[frame_context_idx].apply_intra(&chdr_parsed);
             }
             let chdr = ChdrKind::Intra(Box::new(chdr_parsed));
-            decode_single_frame(frame, &hdr, ch_end, chdr, Some(&bufs), prev)?
+            let products = decode_single_frame(frame, &hdr, ch_end, chdr, Some(&bufs), prev)?;
+            if hdr.refresh_frame_context && non_parallel {
+                // refresh_probs( ), FrameIsIntra == 1 arm:
+                //   load_probs( idx ) ; adapt_coef_probs( ) ;
+                //   save_probs( idx ).
+                let mut work = base_ctx.clone();
+                work.tx_probs = fwd_tx_probs;
+                work.skip_prob = fwd_skip_prob;
+                crate::prob_adapt::adapt_coef_probs(
+                    &mut work.coef_probs,
+                    &products.counts.token,
+                    &products.counts.more_coefs,
+                    true,
+                    last_frame_type_was_key,
+                );
+                frame_contexts[frame_context_idx] = work;
+            }
+            products
         } else {
             let inputs = Vp9CompressedHeaderInterInputs {
                 interpolation_filter_is_switchable: hdr.interpolation_filter == SWITCHABLE_FILTER,
@@ -1773,12 +1818,44 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
                 inputs,
                 &base_ctx,
             )?;
-            if hdr.refresh_frame_context {
+            let tx_mode_select =
+                chdr_parsed.intra.tx_mode == crate::compressed::TxMode::TxModeSelect;
+            if hdr.refresh_frame_context && !non_parallel {
                 frame_contexts[frame_context_idx].apply_inter(&chdr_parsed);
             }
             let chdr = ChdrKind::Inter(Box::new(chdr_parsed));
-            decode_single_frame(frame, &hdr, ch_end, chdr, Some(&bufs), prev)?
+            let products = decode_single_frame(frame, &hdr, ch_end, chdr, Some(&bufs), prev)?;
+            if hdr.refresh_frame_context && non_parallel {
+                // refresh_probs( ), FrameIsIntra == 0 arm:
+                //   load_probs( idx ) ; adapt_coef_probs( ) ;
+                //   load_probs2( idx ) ; adapt_noncoef_probs( ) ;
+                //   save_probs( idx ).
+                // load_probs( ) + load_probs2( ) together restore the
+                // whole pre-frame bank, so the frame's forward updates
+                // never persist on this path.
+                let mut work = base_ctx.clone();
+                crate::prob_adapt::adapt_coef_probs(
+                    &mut work.coef_probs,
+                    &products.counts.token,
+                    &products.counts.more_coefs,
+                    false,
+                    last_frame_type_was_key,
+                );
+                crate::prob_adapt::adapt_noncoef_probs(
+                    &mut work,
+                    &products.counts.noncoef,
+                    hdr.interpolation_filter == SWITCHABLE_FILTER,
+                    tx_mode_select,
+                    hdr.allow_high_precision_mv,
+                );
+                frame_contexts[frame_context_idx] = work;
+            }
+            products
         };
+
+        // §7.2: LastFrameType tracks the just-decoded frame's type for
+        // the next frame's §8.4.3 updateFactor selection.
+        last_frame_type_was_key = matches!(hdr.frame_type, FrameType::KeyFrame);
 
         // §8.10 reference frame update: store the (loop-filtered) working
         // planes into the slots `refresh_frame_flags` names.

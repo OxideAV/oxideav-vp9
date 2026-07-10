@@ -191,10 +191,17 @@ pub(crate) fn get_uv_tx_size(
     }
     // §6.4.22: Min(tx_size, max_txsize_lookup[ get_plane_block_size(MiSize, 1) ]).
     let plane_sz = get_plane_block_size(mi_size, 1, subsampling_x, subsampling_y);
-    debug_assert_ne!(
-        plane_sz, BLOCK_INVALID,
-        "chroma plane size invalid for this (mi_size, subsampling) combination"
-    );
+    // §7.4.3 conformance forbids a (MiSize, subsampling) pair whose
+    // chroma plane size is BLOCK_INVALID, but a malformed stream can
+    // still code one (fuzz-found: a header whose subsampling makes the
+    // half-width chroma shape of this block size nonexistent). Return
+    // the always-valid TX_4X4 instead of indexing the lookup out of
+    // range — the §6.4.21 residual walk re-derives the same plane size
+    // right after this call and rejects the block as InvalidBitstream
+    // before any token is parsed.
+    if plane_sz == BLOCK_INVALID {
+        return 0;
+    }
     tx_size.min(MAX_TXSIZE_LOOKUP[plane_sz as usize])
 }
 

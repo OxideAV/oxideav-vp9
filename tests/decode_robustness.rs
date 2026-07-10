@@ -223,3 +223,27 @@ fn oversized_frame_dimensions_are_rejected_before_allocation() {
     }
     assert!(oxideav_vp9::decode_vp9_sequence(&subs).is_err());
 }
+
+/// Fuzz regression (round 406): a keyframe whose color-config
+/// subsampling makes a coded block's chroma plane size `BLOCK_INVALID`
+/// (§6.4.23 `ss_size_lookup` has no half-width shape for it). §7.4.3
+/// conformance forbids the combination, but §6.4.22 `get_uv_tx_size( )`
+/// computed `max_txsize_lookup[ BLOCK_INVALID ]` before the residual
+/// walk's own INVALID check could reject the block — an out-of-range
+/// index (debug assert in test builds). The helper now returns TX_4X4
+/// for the malformed pair and the residual walk rejects the block as
+/// `InvalidBitstream`; decode must error, never panic.
+#[test]
+fn invalid_chroma_plane_size_is_rejected_not_panicking() {
+    // The minimised 20-byte fuzz artifact.
+    let crash: &[u8] = &[
+        0xa2, 0x49, 0x83, 0x42, 0x08, 0x00, 0x00, 0x00, 0x60, 0x01, 0x2b, 0x01, 0x00, 0x00, 0x02,
+        0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    assert!(oxideav_vp9::decode_vp9(crash).is_err());
+    let subs = oxideav_vp9::split_superframe(crash);
+    for sub in &subs {
+        assert!(oxideav_vp9::decode_vp9(sub).is_err());
+    }
+    assert!(oxideav_vp9::decode_vp9_sequence(&subs).is_err());
+}

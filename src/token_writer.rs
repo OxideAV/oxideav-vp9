@@ -509,6 +509,7 @@ mod tests {
         let mut dec = BoolCoder::init_bool(&buf, buf.len()).expect("init_bool");
         let mut dcache = vec![0u8; seg_eob];
         let mut out = vec![0i64; seg_eob];
+        let mut counts = crate::prob_adapt::FrameCounts::new_boxed();
         let dnz = tokens(
             &mut dec,
             &block,
@@ -518,6 +519,7 @@ mod tests {
             nz,
             &mut dcache,
             &mut out,
+            &mut counts,
         )
         .expect("decode tokens");
 

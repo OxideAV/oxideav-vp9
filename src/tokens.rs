@@ -705,6 +705,17 @@ pub(crate) struct TokenBlockCtx {
 /// `coef_probs[txSz][plane>0][is_inter][band][ctx][node]`. `scan` is the
 /// §6.4.25 scan slice for this block. `tokens` must have exactly
 /// `segEob` entries and is fully overwritten.
+///
+/// `counts` accumulates the §9.3.4 `counts_token` / `counts_more_coefs`
+/// arrays the §8.4.3 backward adaptation consumes. Per the §9.3.4
+/// special case for `more_coefs` (reconstructed in
+/// `docs/video/vp9/vp9-errata-and-clarifications.md` #249 part 1),
+/// `counts_more_coefs[…][value]` is incremented **only** when a
+/// `more_coefs` element is actually decoded — inside the `checkEob`
+/// branch, with the `band` / `ctx` in effect at that scan position — and
+/// never at `checkEob == 0` positions (immediately after a
+/// `ZERO_TOKEN`), where no `more_coefs` element is present in the
+/// bitstream.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn tokens(
     coder: &mut BoolCoder<'_>,
@@ -715,6 +726,7 @@ pub(crate) fn tokens(
     nz: &NonzeroContext,
     token_cache: &mut [u8],
     tokens: &mut [i64],
+    counts: &mut crate::prob_adapt::FrameCounts,
 ) -> Result<bool, Error> {
     let seg_eob = 16usize << (tx_sz << 1);
     debug_assert_eq!(scan.len(), seg_eob);
@@ -756,12 +768,23 @@ pub(crate) fn tokens(
 
         let cell = &tx_slab[band][ctx];
 
-        if check_eob && !read_more_coefs(coder, cell[0])? {
-            break;
+        if check_eob {
+            let more = read_more_coefs(coder, cell[0])?;
+            // §9.3.4 special case for `more_coefs` (errata #249 part 1):
+            // count exactly one `counts_more_coefs` event per decoded
+            // `more_coefs`, at this position's band/ctx. Positions with
+            // `checkEob == 0` never reach here and are never counted.
+            counts.more_coefs[tx_sz as usize][plane_gt0][is_inter][band][ctx][usize::from(more)] +=
+                1;
+            if !more {
+                break;
+            }
         }
 
         let token_probs = build_token_probs(cell);
         let token = read_token(coder, &token_probs)?;
+        // §9.3.4: counts_token[…][Min(2, syntax)] += 1.
+        counts.token[tx_sz as usize][plane_gt0][is_inter][band][ctx][(token as usize).min(2)] += 1;
         token_cache[pos] = ENERGY_CLASS[token as usize];
         if token == ZERO_TOKEN {
             tokens[pos] = 0;
@@ -1390,6 +1413,7 @@ mod tests {
         let mut cache = [0u8; 16];
         let mut tokens = [99i64; 16];
         let block = luma_block(DCT_DCT);
+        let mut counts = crate::prob_adapt::FrameCounts::new_boxed();
         let nonzero = super::tokens(
             &mut dec,
             &block,
@@ -1399,10 +1423,24 @@ mod tests {
             &nz,
             &mut cache,
             &mut tokens,
+            &mut counts,
         )
         .unwrap();
         assert!(!nonzero);
         assert!(tokens.iter().all(|&t| t == 0), "all tokens must be zeroed");
+        // §9.3.4 anchored: an immediate EOB decodes exactly one
+        // `more_coefs` (== 0) at band 0 / ctx 0, and no `token`.
+        assert_eq!(counts.more_coefs[0][0][0][0][0], [1, 0]);
+        let token_total: u32 = counts
+            .token
+            .iter()
+            .flatten()
+            .flatten()
+            .flatten()
+            .flatten()
+            .map(|cell| cell.iter().sum::<u32>())
+            .sum();
+        assert_eq!(token_total, 0, "no token decoded before the EOB");
     }
 
     #[test]
@@ -1423,6 +1461,7 @@ mod tests {
         let mut cache = [0u8; 16];
         let mut tokens = [7i64; 16];
         let block = luma_block(DCT_DCT);
+        let mut counts = crate::prob_adapt::FrameCounts::new_boxed();
         let nonzero = super::tokens(
             &mut dec,
             &block,
@@ -1432,6 +1471,7 @@ mod tests {
             &nz,
             &mut cache,
             &mut tokens,
+            &mut counts,
         )
         .unwrap();
         assert!(
@@ -1441,6 +1481,43 @@ mod tests {
         assert!(tokens.iter().all(|&t| t == 0));
         // TokenCache for DC was set to energy_class[ZERO_TOKEN] = 0.
         assert_eq!(cache[0], 0);
+        // §9.3.4 anchored (errata #249 part 1, the negative rule): the
+        // single `more_coefs == 1` at c == 0 is the ONLY more_coefs
+        // event. Every subsequent position follows a ZERO_TOKEN
+        // (checkEob == 0) — no more_coefs element is present there, so
+        // no count may be implied by the 15 further `token` reads.
+        let mc_total: u32 = counts
+            .more_coefs
+            .iter()
+            .flatten()
+            .flatten()
+            .flatten()
+            .flatten()
+            .map(|cell| cell.iter().sum::<u32>())
+            .sum();
+        assert_eq!(mc_total, 1, "exactly one bitstream-present more_coefs");
+        assert_eq!(counts.more_coefs[0][0][0][0][0], [0, 1]);
+        // All 16 scan positions decoded a ZERO_TOKEN.
+        let token_total: u32 = counts
+            .token
+            .iter()
+            .flatten()
+            .flatten()
+            .flatten()
+            .flatten()
+            .map(|cell| cell.iter().sum::<u32>())
+            .sum();
+        assert_eq!(token_total, 16);
+        let zero_total: u32 = counts
+            .token
+            .iter()
+            .flatten()
+            .flatten()
+            .flatten()
+            .flatten()
+            .map(|cell| cell[0])
+            .sum();
+        assert_eq!(zero_total, 16, "every decoded token was ZERO_TOKEN");
     }
 
     #[test]
@@ -1461,6 +1538,7 @@ mod tests {
         let mut dec_a = coder_zero(&bytes);
         let mut cache_a = [0u8; 16];
         let mut tokens_a = [0i64; 16];
+        let mut counts_a = crate::prob_adapt::FrameCounts::new_boxed();
         let nonzero_a = super::tokens(
             &mut dec_a,
             &block,
@@ -1470,6 +1548,7 @@ mod tests {
             &nz,
             &mut cache_a,
             &mut tokens_a,
+            &mut counts_a,
         )
         .unwrap();
 
@@ -1481,6 +1560,13 @@ mod tests {
         let mut check_eob = true;
         let seg_eob = 16usize << (tx_sz << 1);
         let mut c = 0usize;
+        // §9.3.4 tallies kept by the reference walk: the number of eob
+        // checks performed (positions where `more_coefs` is decoded),
+        // the number that terminated the block, and the number of
+        // decoded `token` elements.
+        let mut eob_checks = 0u32;
+        let mut eob_events = 0u32;
+        let mut token_reads = 0u32;
         while c < seg_eob {
             let pos = scan[c] as usize;
             let band = coef_band(c, tx_sz);
@@ -1492,6 +1578,9 @@ mod tests {
             };
             let cell = &tx_slab[band][ctx];
             let token_probs = build_token_probs(cell);
+            if check_eob {
+                eob_checks += 1;
+            }
             let step = read_coef_token(
                 &mut dec_b,
                 check_eob,
@@ -1501,8 +1590,12 @@ mod tests {
             )
             .unwrap();
             match step {
-                CoefStep::Eob => break,
+                CoefStep::Eob => {
+                    eob_events += 1;
+                    break;
+                }
                 CoefStep::Coef { token, value } => {
+                    token_reads += 1;
                     cache_b[pos] = ENERGY_CLASS[token as usize];
                     tokens_b[pos] = value as i64;
                     check_eob = token != ZERO_TOKEN;
@@ -1518,6 +1611,35 @@ mod tests {
         assert_eq!(nonzero_a, nonzero_b, "return value mismatch");
         assert_eq!(tokens_a, tokens_b, "Tokens array mismatch");
         assert_eq!(cache_a, cache_b, "TokenCache mismatch");
+
+        // §9.3.4 anchored (errata #249 part 1, the sum property): over
+        // every context, counts_more_coefs[…][0] + […][1] equals the
+        // total number of times the eob check was decoded; […][0] the
+        // decoded terminations; and counts_token totals one per decoded
+        // `token`, with no implied more_coefs count from token reads.
+        let mc_flat = |i: usize| -> u32 {
+            counts_a
+                .more_coefs
+                .iter()
+                .flatten()
+                .flatten()
+                .flatten()
+                .flatten()
+                .map(|cell| cell[i])
+                .sum()
+        };
+        assert_eq!(mc_flat(0) + mc_flat(1), eob_checks, "sum property");
+        assert_eq!(mc_flat(0), eob_events, "decoded eob terminations");
+        let token_total: u32 = counts_a
+            .token
+            .iter()
+            .flatten()
+            .flatten()
+            .flatten()
+            .flatten()
+            .map(|cell| cell.iter().sum::<u32>())
+            .sum();
+        assert_eq!(token_total, token_reads, "one count per decoded token");
     }
 
     #[test]
@@ -1548,6 +1670,7 @@ mod tests {
         // Zero buffer: read_bool(1) -> bit 0 -> EOB immediately.
         let bytes = [0u8; 8];
         let mut dec = coder_zero(&bytes);
+        let mut counts = crate::prob_adapt::FrameCounts::new_boxed();
         let nonzero = super::tokens(
             &mut dec,
             &block,
@@ -1557,10 +1680,16 @@ mod tests {
             &nz,
             &mut cache,
             &mut tokens,
+            &mut counts,
         )
         .unwrap();
         assert!(!nonzero, "ctx-2 low more_coefs prob routes to EOB");
         assert!(tokens.iter().all(|&t| t == 0));
+        // §9.3.4 anchored: the more_coefs count lands in the SAME cell
+        // the probability was selected from — band 0 / ctx 2 (the
+        // non-zero-neighbour DC context), not ctx 0.
+        assert_eq!(counts.more_coefs[0][0][0][0][2], [1, 0]);
+        assert_eq!(counts.more_coefs[0][0][0][0][0], [0, 0]);
     }
 
     #[test]
@@ -1575,6 +1704,7 @@ mod tests {
         let mut cache = [0u8; 64];
         let mut tokens = [-1i64; 64];
         let block = luma_block(DCT_DCT);
+        let mut counts = crate::prob_adapt::FrameCounts::new_boxed();
         let nonzero = super::tokens(
             &mut dec,
             &block,
@@ -1584,6 +1714,7 @@ mod tests {
             &nz,
             &mut cache,
             &mut tokens,
+            &mut counts,
         )
         .unwrap();
         assert!(!nonzero);

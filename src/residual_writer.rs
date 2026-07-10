@@ -458,6 +458,7 @@ mod tests {
                         };
                         cache[..seg_eob].fill(0);
                         let mut buf = vec![0i64; seg_eob];
+                        let mut counts = crate::prob_adapt::FrameCounts::new_boxed();
                         nonzero = tokens(
                             &mut coder,
                             &tbc,
@@ -467,6 +468,7 @@ mod tests {
                             &nz[plane],
                             &mut cache[..seg_eob],
                             &mut buf,
+                            &mut counts,
                         )
                         .unwrap();
                         out.push(((plane, start_x, start_y), buf));

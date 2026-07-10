@@ -4,6 +4,10 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- **§9.3.4 coefficient syntax-element counting** — the decode-side `tokens( )` driver now accumulates the `counts_token[txSz][plane>0][is_inter][band][ctx][Min(2,syntax)]` and `counts_more_coefs[…][syntax]` arrays the §8.4.3 backward adaptation consumes, in a new per-frame `FrameCounts` bank (§8.3 `clear_counts( )` = one fresh bank per decoded frame). The `more_coefs` counting implements the §9.3.4 special case that is **absent from the v0.7 spec text** and was reconstructed in `docs/video/vp9/vp9-errata-and-clarifications.md` (#249 part 1): a `counts_more_coefs` element is updated **only at scan positions where the `more_coefs` element is actually decoded** (inside the `checkEob` branch, at that position's band/ctx) — never implied at `checkEob == 0` positions following a `ZERO_TOKEN`, and no phantom end-of-block count is charged when a zero run reaches `segEob` (the §7.4.16 NOTE case). Anchored regression tests pin the positive rule, the negative rule, the ctx placement, and the sum property `counts[0] + counts[1] == #eob-checks` against an independent reference walk (round 409)
+
 ### Fixed
 
 - **fuzz-found: `get_uv_tx_size( )` out-of-range lookup on a §7.4.3-nonconformant (MiSize, subsampling) pair** — a malformed header whose subsampling leaves a coded block with no valid chroma plane shape (`ss_size_lookup` → `BLOCK_INVALID`) drove `max_txsize_lookup[ BLOCK_INVALID ]` before the §6.4.21 residual walk's own INVALID check could reject the block. The helper now returns TX_4X4 for the malformed pair and the block is rejected as `InvalidBitstream`; pinned with the minimised 20-byte artifact (`invalid_chroma_plane_size_is_rejected_not_panicking`), found and re-verified by a seeded 7-minute bounded fuzz of the decode surface over the corpus packets (round 406)

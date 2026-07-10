@@ -188,6 +188,40 @@ pub(crate) type CountsToken = [[[[[CountsTokenCell; 6]; 6]; 2]; 2]; 4];
 /// Shape of `counts_more_coefs` mirroring [`crate::coef_probs::CoefProbs`].
 pub(crate) type CountsMoreCoefs = [[[[[CountsMoreCoefsCell; 6]; 6]; 2]; 2]; 4];
 
+/// The complete per-frame syntax-element count bank of §9.3.4, cleared by
+/// the §8.3 `clear_counts( )` process at the start of every frame's
+/// compressed payload and consumed by the §6.1.2 `refresh_probs( )`
+/// backward adaptation (§8.4.3 [`adapt_coef_probs`] from `token` /
+/// `more_coefs`; §8.4.4 [`adapt_noncoef_probs`] from the rest).
+///
+/// The `more_coefs` counting follows the §9.3.4 special case documented
+/// in `docs/video/vp9/vp9-errata-and-clarifications.md` (#249 part 1):
+/// `counts_more_coefs[…]` is incremented **only at scan positions where
+/// the `more_coefs` syntax element is actually decoded** — i.e. inside
+/// the `checkEob` branch of the §6.4.24 `tokens( )` loop — never implied
+/// at `checkEob == 0` positions reached after a `ZERO_TOKEN`.
+pub(crate) struct FrameCounts {
+    /// `counts_token[txSz][plane>0][is_inter][band][ctx][Min(2,syntax)]`.
+    pub token: CountsToken,
+    /// `counts_more_coefs[txSz][plane>0][is_inter][band][ctx][syntax]`.
+    pub more_coefs: CountsMoreCoefs,
+    /// Every non-coefficient `counts_*` array of §8.3 / §9.3.4.
+    pub noncoef: CountsNonCoef,
+}
+
+impl FrameCounts {
+    /// §8.3 `clear_counts( )` — a fresh all-zero count bank. Boxed: the
+    /// coefficient tables alone are ~11 KiB and one bank lives per
+    /// decoded frame.
+    pub(crate) fn new_boxed() -> Box<Self> {
+        Box::new(Self {
+            token: [[[[[[0; 3]; 6]; 6]; 2]; 2]; 4],
+            more_coefs: [[[[[[0; 2]; 6]; 6]; 2]; 2]; 4],
+            noncoef: CountsNonCoef::default(),
+        })
+    }
+}
+
 /// §8.4.3 Coefficient probability adaption process.
 ///
 /// Updates `coef_probs` in place from the observed `counts_token` /

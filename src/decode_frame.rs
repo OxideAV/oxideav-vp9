@@ -146,6 +146,9 @@ struct BlockDecoder<'a> {
     nz: &'a mut [NonzeroContext; 3],
     token_cache: &'a mut [u8; 1024],
     tok_buf: &'a mut [i64; 1024],
+    /// §9.3.4 per-frame syntax-element count bank (cleared per frame by
+    /// §8.3 `clear_counts( )`; consumed by §6.1.2 `refresh_probs( )`).
+    counts: &'a mut crate::prob_adapt::FrameCounts,
     /// `Some(_)` on inter (non-intra-only) frames; `None` on keyframes /
     /// intra-only frames. Carries the §6.3 inter compressed-header tail,
     /// the §8.10 reference buffers, the §6.2 inter header flags, the
@@ -482,6 +485,7 @@ impl BlockDecoder<'_> {
                                 &self.nz[plane],
                                 &mut self.token_cache[..],
                                 &mut self.tok_buf[..seg_eob],
+                                self.counts,
                             )?;
                             // §6.4.24: EobTotal += nonzero.
                             eob_total += u32::from(nonzero);
@@ -970,6 +974,7 @@ impl BlockDecoder<'_> {
                                 &self.nz[plane],
                                 &mut self.token_cache[..],
                                 &mut self.tok_buf[..seg_eob],
+                                self.counts,
                             )?;
                             eob_total += u32::from(nonzero);
 
@@ -1235,6 +1240,8 @@ fn decode_single_frame(
     let mut pctx = PartitionContextState::new((sb64_cols * 8) as usize, (sb64_rows * 8) as usize);
     let mut token_cache = [0u8; 1024];
     let mut tok_buf = [0i64; 1024];
+    // §6.1 `clear_counts( )` — a fresh §9.3.4 count bank per frame.
+    let mut counts = crate::prob_adapt::FrameCounts::new_boxed();
 
     // Inter-frame scaffolding: the §6.4.11 segmentation-prediction
     // context, the §6.5 prev-MV / §6.4.14 prev-segment snapshots, and the
@@ -1360,6 +1367,7 @@ fn decode_single_frame(
                 nz: &mut nz,
                 token_cache: &mut token_cache,
                 tok_buf: &mut tok_buf,
+                counts: &mut counts,
                 inter: inter_ctx,
             };
 
@@ -1876,6 +1884,7 @@ pub(crate) fn decode_keyframe_blocks_for_test(
     ];
     let mut token_cache = [0u8; 1024];
     let mut tok_buf = [0i64; 1024];
+    let mut counts = crate::prob_adapt::FrameCounts::new_boxed();
 
     let mut results = Vec::with_capacity(blocks.len());
     {
@@ -1898,6 +1907,7 @@ pub(crate) fn decode_keyframe_blocks_for_test(
             nz: &mut nz,
             token_cache: &mut token_cache,
             tok_buf: &mut tok_buf,
+            counts: &mut counts,
             inter: None,
         };
         for &(r, c, subsize) in &blocks {
@@ -1989,6 +1999,7 @@ pub(crate) fn decode_inter_blocks_for_test(
     let prev_seg_ids = vec![0u8; (mi_rows * mi_cols) as usize];
 
     let mut coder = BoolCoder::init_bool(data, data.len())?;
+    let mut counts = crate::prob_adapt::FrameCounts::new_boxed();
     let mut results = Vec::with_capacity(blocks.len());
 
     for &(r, c, subsize) in &blocks {
@@ -2194,6 +2205,7 @@ pub(crate) fn decode_inter_blocks_for_test(
                             &nz[plane],
                             &mut token_cache[..seg_eob],
                             &mut tok_buf[..seg_eob],
+                            &mut counts,
                         )?;
                         eob_total += u32::from(nonzero);
                     }

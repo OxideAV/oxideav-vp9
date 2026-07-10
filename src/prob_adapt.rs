@@ -443,12 +443,13 @@ pub(crate) fn adapt_noncoef_probs(
     for i in 0..BLOCK_SIZE_GROUPS {
         adapt_probs(&INTRA_MODE_TREE, &mut fc.y_mode_probs[i], &counts.y_mode[i]);
     }
-    // §8.4.4 adapts the inter-frame `uv_mode_probs` table. It is not part
-    // of the persisted `FrameContext` bank (the inter decode uses the
-    // static §10.5 `DEFAULT_UV_MODE_PROBS`), so the spec's per-frame
-    // `uv_mode` adaptation has no persisted destination here; the counts
-    // are still accepted so a future wiring that threads a per-frame
-    // `uv_mode_probs` table can consume them.
+    for i in 0..INTRA_MODES {
+        adapt_probs(
+            &INTRA_MODE_TREE,
+            &mut fc.uv_mode_probs[i],
+            &counts.uv_mode[i],
+        );
+    }
     for i in 0..PARTITION_CONTEXTS {
         adapt_probs(
             &PARTITION_TREE,
@@ -871,6 +872,32 @@ mod tests {
         let mut efr = orig.mv_probs.fr_probs[1];
         adapt_probs(&MV_FR_TREE, &mut efr, &[1, 2, 3, 4]);
         assert_eq!(fc.mv_probs.fr_probs[1], efr);
+    }
+
+    // §8.4.4 uv_mode is tree-adapted per y-mode context row into the
+    // persisted `uv_mode_probs` bank table (one row per INTRA_MODES).
+    #[test]
+    fn adapt_noncoef_probs_uv_mode_rows() {
+        let orig = FrameContext::default();
+        let mut fc = orig.clone();
+        let mut counts = CountsNonCoef::default();
+        counts.uv_mode[3] = {
+            let mut row = [0u32; INTRA_MODES];
+            row[0] = 6;
+            row[7] = 9;
+            row
+        };
+        adapt_noncoef_probs(&mut fc, &counts, false, false, false);
+
+        let mut expect_row = orig.uv_mode_probs[3];
+        adapt_probs(&INTRA_MODE_TREE, &mut expect_row, &counts.uv_mode[3]);
+        assert_eq!(fc.uv_mode_probs[3], expect_row);
+        assert_ne!(fc.uv_mode_probs[3], orig.uv_mode_probs[3]);
+        for i in 0..INTRA_MODES {
+            if i != 3 {
+                assert_eq!(fc.uv_mode_probs[i], orig.uv_mode_probs[i]);
+            }
+        }
     }
 
     // §8.4.4 partition + skip + y_mode adapt unconditionally.

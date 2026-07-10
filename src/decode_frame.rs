@@ -705,7 +705,7 @@ impl BlockDecoder<'_> {
             use_prev_frame_mvs: use_prev,
             sign_bias: &sign_bias,
             y_mode_probs: &chdr_inter.y_mode_probs,
-            uv_mode_probs: &crate::mode_info::DEFAULT_UV_MODE_PROBS,
+            uv_mode_probs: &chdr_inter.uv_mode_probs,
         };
 
         let seg_pred_ctx = &mut self.inter.as_mut().unwrap().seg_pred_ctx;
@@ -2133,7 +2133,7 @@ pub(crate) fn decode_inter_blocks_for_test(
             use_prev_frame_mvs: false,
             sign_bias,
             y_mode_probs: &chdr_inter.y_mode_probs,
-            uv_mode_probs: &crate::mode_info::DEFAULT_UV_MODE_PROBS,
+            uv_mode_probs: &chdr_inter.uv_mode_probs,
         };
 
         let mi = inter_frame_mode_info(&mut coder, args, &mut seg_pred_ctx, r, c)?;
@@ -2294,6 +2294,7 @@ fn build_inter_chdr_for_test(
         single_ref_prob: ctx.single_ref_prob,
         comp_ref_prob: ctx.comp_ref_prob,
         y_mode_probs: ctx.y_mode_probs,
+        uv_mode_probs: ctx.uv_mode_probs,
         partition_probs: ctx.partition_probs,
         mv_probs: ctx.mv_probs.clone(),
     }

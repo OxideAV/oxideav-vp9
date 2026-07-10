@@ -281,6 +281,13 @@ pub struct FrameContext {
     pub comp_ref_prob: [u8; REF_CONTEXTS],
     /// `y_mode_probs[ BLOCK_SIZE_GROUPS ][ INTRA_MODES - 1 ]`.
     pub y_mode_probs: [[u8; INTRA_MODES - 1]; BLOCK_SIZE_GROUPS],
+    /// `uv_mode_probs[ INTRA_MODES ][ INTRA_MODES - 1 ]` — the
+    /// inter-frame `uv_mode` table (§9.3.2: `ctx = y_mode`). §6.3 has
+    /// no forward update for it, but §8.4.4 `adapt_noncoef_probs( )`
+    /// adapts it and §7.1.2 `save_probs( )` persists "each probability
+    /// table", so it is part of the bank a non-parallel stream threads
+    /// across frames.
+    pub uv_mode_probs: [[u8; INTRA_MODES - 1]; INTRA_MODES],
     /// `partition_probs[ PARTITION_CONTEXTS ][ PARTITION_TYPES - 1 ]`.
     pub partition_probs: [[u8; PARTITION_TYPES - 1]; PARTITION_CONTEXTS],
     /// The §6.3.16 MV probability bundle.
@@ -302,6 +309,7 @@ impl Default for FrameContext {
             single_ref_prob: DEFAULT_SINGLE_REF_PROB_TABLE,
             comp_ref_prob: DEFAULT_COMP_REF_PROB_TABLE,
             y_mode_probs: DEFAULT_Y_MODE_PROBS_TABLE,
+            uv_mode_probs: crate::mode_info::DEFAULT_UV_MODE_PROBS,
             partition_probs: DEFAULT_PARTITION_PROBS_TABLE,
             mv_probs: MvProbs::defaults(),
         }
@@ -335,6 +343,7 @@ impl FrameContext {
         self.single_ref_prob = chdr.single_ref_prob;
         self.comp_ref_prob = chdr.comp_ref_prob;
         self.y_mode_probs = chdr.y_mode_probs;
+        self.uv_mode_probs = chdr.uv_mode_probs;
         self.partition_probs = chdr.partition_probs;
         self.mv_probs = chdr.mv_probs.clone();
     }
@@ -510,6 +519,13 @@ pub struct Vp9CompressedHeaderInter {
     /// the §6.3.14 sweep. Initial values come from the §10.5
     /// `default_y_mode_probs` listing.
     pub y_mode_probs: [[u8; INTRA_MODES - 1]; BLOCK_SIZE_GROUPS],
+    /// `uv_mode_probs[ INTRA_MODES ][ INTRA_MODES - 1 ]` — carried
+    /// verbatim from the loaded frame context (`load_probs( )`): the
+    /// §6.3 compressed header has **no** forward-update sweep for the
+    /// inter-frame `uv_mode` table, but the §6.4.15 intra-block-in-
+    /// inter-frame decode reads it, and under §8.4 backward adaptation
+    /// the bank's copy drifts from the §10.5 defaults.
+    pub uv_mode_probs: [[u8; INTRA_MODES - 1]; INTRA_MODES],
     /// `partition_probs[ PARTITION_CONTEXTS ][ PARTITION_TYPES - 1 ]`
     /// after the §6.3.15 sweep. Initial values come from the §10.5
     /// `default_partition_probs` listing.
@@ -652,6 +668,9 @@ pub fn parse_compressed_header_inter_with_ctx(
         single_ref_prob,
         comp_ref_prob,
         y_mode_probs,
+        // §6.3 carries no uv_mode update; the working table is the
+        // loaded bank's copy.
+        uv_mode_probs: base.uv_mode_probs,
         partition_probs,
         mv_probs: mv_probs_table,
     })

@@ -51,7 +51,8 @@ use crate::dequant::{get_ac_quant, get_dc_quant, seg_feature_active};
 use crate::frame_loop_filter::{frame_loop_filter, CurrFrame};
 use crate::header::{
     parse_uncompressed_header, parse_uncompressed_header_with_refs, ColorConfig, FrameType,
-    QuantizationParams, RefFrameState, SegmentationParams, Vp9FrameHeader,
+    QuantizationParams, RefFrameState, SegmentationParams, Vp9FrameHeader, MAX_SEGMENTS,
+    SEG_LVL_MAX,
 };
 use crate::inter_decode::{build_ref_planes, FrameStateMvSource, PrevFrameMvs};
 use crate::inter_mv::{BlockGrid, ScaleGeom};
@@ -1548,6 +1549,26 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
     // forward updates on top.
     let mut frame_contexts: [FrameContext; 4] = Default::default();
 
+    // §7.2.10 / §7.2 persistent segmentation feature table: per §7.2.10
+    // "segmentation_update_data equal to 0 indicates that the
+    // segmentation parameters should keep their existing values", so
+    // `FeatureEnabled` / `FeatureData` / `abs_or_delta_update` carry
+    // across frames until a `segmentation_update_data == 1` frame
+    // rewrites them or §7.2 `setup_past_independence( )` (key /
+    // intra-only / error-resilient frame) clears them to zero. The
+    // per-frame header parse alone cannot see this state, so it is
+    // threaded here and substituted into the parsed header below.
+    let mut persist_feature_enabled = [[false; SEG_LVL_MAX]; MAX_SEGMENTS];
+    let mut persist_feature_data = [[0i16; SEG_LVL_MAX]; MAX_SEGMENTS];
+    let mut persist_abs_or_delta = false;
+
+    // §7.2.8 persistent loop-filter deltas: `loop_filter_delta_update ==
+    // 0` (or an individual update flag of 0) keeps the existing
+    // `loop_filter_ref_deltas` / `loop_filter_mode_deltas`; §7.2
+    // `setup_past_independence( )` resets them to the defaults.
+    let mut persist_ref_deltas = DEFAULT_LOOP_FILTER_REF_DELTAS;
+    let mut persist_mode_deltas = DEFAULT_LOOP_FILTER_MODE_DELTAS;
+
     // §6.4.14 `PrevSegmentIds[ ][ ]` — the persistent segmentation map a
     // §6.4.12 `temporal_update` / `update_map == 0` frame predicts from.
     // §8.1 step 3 only refreshes it after a frame with
@@ -1568,7 +1589,7 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
             ref_dims: &ref_dims,
             color_config: cc,
         });
-        let hdr = parse_uncompressed_header_with_refs(frame, ref_state)?;
+        let mut hdr = parse_uncompressed_header_with_refs(frame, ref_state)?;
 
         if hdr.show_existing_frame {
             // §8.9: output `FrameStore[ frame_to_show_map_idx ]` verbatim.
@@ -1588,6 +1609,56 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
         }
 
         let frame_is_intra = matches!(hdr.frame_type, FrameType::KeyFrame) || hdr.intra_only;
+
+        // §7.2 setup_past_independence( ): a key / intra-only /
+        // error-resilient frame clears the persistent segmentation
+        // feature table and resets the loop-filter deltas to the
+        // defaults BEFORE its own loop_filter_params( ) /
+        // segmentation_params( ) apply on top.
+        if frame_is_intra || hdr.error_resilient_mode {
+            persist_feature_enabled = [[false; SEG_LVL_MAX]; MAX_SEGMENTS];
+            persist_feature_data = [[0i16; SEG_LVL_MAX]; MAX_SEGMENTS];
+            persist_abs_or_delta = false;
+            persist_ref_deltas = DEFAULT_LOOP_FILTER_REF_DELTAS;
+            persist_mode_deltas = DEFAULT_LOOP_FILTER_MODE_DELTAS;
+        }
+
+        // §7.2.8: a `loop_filter_delta_update == 1` frame folds the
+        // per-delta updates it carries into the persistent deltas (an
+        // individual absent update keeps the prior value); every frame
+        // then decodes with the fully-resolved persistent values.
+        for (slot, delta) in persist_ref_deltas
+            .iter_mut()
+            .zip(hdr.loop_filter.ref_deltas)
+        {
+            if let Some(d) = delta {
+                *slot = d;
+            }
+        }
+        for (slot, delta) in persist_mode_deltas
+            .iter_mut()
+            .zip(hdr.loop_filter.mode_deltas)
+        {
+            if let Some(d) = delta {
+                *slot = d;
+            }
+        }
+        hdr.loop_filter.ref_deltas = persist_ref_deltas.map(Some);
+        hdr.loop_filter.mode_deltas = persist_mode_deltas.map(Some);
+
+        // §7.2.10: `segmentation_update_data == 0` keeps the existing
+        // feature table (even across `segmentation_enabled == 0`
+        // frames); `segmentation_update_data == 1` rewrites it.
+        if hdr.segmentation.update_data {
+            persist_feature_enabled = hdr.segmentation.feature_enabled;
+            persist_feature_data = hdr.segmentation.feature_data;
+            persist_abs_or_delta = hdr.segmentation.abs_or_delta_update;
+        } else {
+            hdr.segmentation.feature_enabled = persist_feature_enabled;
+            hdr.segmentation.feature_data = persist_feature_data;
+            hdr.segmentation.abs_or_delta_update = persist_abs_or_delta;
+        }
+
         let lossless = hdr.quantization.lossless;
         let ch_start = hdr.uncompressed_header_size_bytes;
         let ch_size = hdr.header_size_in_bytes as usize;

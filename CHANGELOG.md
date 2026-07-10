@@ -4,6 +4,11 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **§7.2.10 segmentation feature persistence across frames** — `decode_vp9_sequence` parsed every uncompressed header independently, so an inter frame with `segmentation_update_data = 0` decoded with an all-zero `FeatureEnabled` / `FeatureData` table instead of keeping the previous frame's values (§7.2.10: "the segmentation parameters should keep their existing values"). Skip=0 blocks on such frames dequantized at `base_q_idx` instead of the segment-adjusted qindex (`SEG_LVL_ALT_Q`), and the `SEG_LVL_SKIP` / `SEG_LVL_REF_FRAME` / `SEG_LVL_ALT_L` features were likewise lost. The feature table (+ `abs_or_delta_update`) now persists across the sequence, cleared by §7.2 `setup_past_independence( )` on key / intra-only / error-resilient frames and rewritten by `update_data = 1` frames. The `segments-aq-mode` corpus fixture — whose P-frames all carry `update_data = 0` — goes from 524/1224 differing bytes on frames 2/3 (max |delta| 26) to **byte-exact across all four frames**; the divergence-bound regression test is replaced by full-sequence exactness (round 406)
+- **§7.2.8 loop-filter delta persistence across frames** — same family: `loop_filter_ref_deltas` / `loop_filter_mode_deltas` from a `loop_filter_delta_update = 1` frame now persist into later `delta_update = 0` frames (per-delta: an individually absent update keeps the prior value), reset to the `[1, 0, -1, -1]` / `[0, 0]` defaults by `setup_past_independence( )`. Previously every frame resolved absent deltas against the past-independence defaults, which is only correct for intra frames or when no prior frame ever updated them (round 406)
+
 ### Other
 
 - **NEARESTMV / NEARMV mode mapping** — both P-frame encoders map a searched vector that equals a §6.5 predictor onto the predictor-referencing §6.4.16 mode instead of `NEWMV`: `NEARESTMV` / `NEARMV` code **no** §6.4.20 mv-diff bits (the decoder recovers the vector from the same shared `find_mv_refs` / `find_best_ref_mvs` scan the writer verifies against), so uniform-motion regions pay the MV syntax once and reference it thereafter; compound blocks map only when **both** lists match. Pinned at the assembler level: a multi-leaf frame coding the established vector as `NEARESTMV` is strictly smaller than the all-`NEWMV` equivalent (round 391)

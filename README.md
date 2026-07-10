@@ -30,8 +30,12 @@ segmentation AQ, lossless, and both quantizer extremes.
 by P-frames), threading the §8.10 reference buffers, the §6.5 previous-frame
 motion field, the §6.1.2 / §7.2 `FrameContext[ 4 ]` entropy probability
 banks (`load_probs( )` / `save_probs( )`), and the §6.4.14 PrevSegmentIds
-map across frames. **Every multi-frame corpus fixture reconstructs
-byte-exact against its `expected.yuv`**: `i-frame-then-p-frame-64x64`
+map across frames. **All 16 staged corpus fixtures reconstruct fully
+byte-exact against their `expected.yuv` through `decode_vp9_sequence`**
+(pinned by `full_corpus_sequences_byte_exact`), including the
+profile-1/2/3 P-frames (§8.5.2 motion compensation at 4:4:4 chroma and
+10/12-bit depth) and 181 real compound blocks across the two
+`auto-alt-ref` streams. Highlights: `i-frame-then-p-frame-64x64`
 (keyframe + single-reference LAST P-frame, high-precision MVs,
 8-tap-smooth filter), `frame-parallel-mode` (keyframe + three
 single-reference P-frames at 64x64, `error_resilient=1` so no entropy
@@ -305,12 +309,16 @@ encode test validates end-to-end through the in-crate decoder.
 
 ### Not yet supported
 
-* Compound + scaled-reference inter prediction are wired and unit-tested
-  against an independent spec re-derivation of the §8.5.2.3 scaling +
-  §8.5.2.4 convolution (half-size reference, and compound over two
-  distinct per-list-scaled references), but not yet *corpus*-validated
-  end-to-end (the corpus inter fixtures are single-reference, same-size
-  LAST); broader inter fixtures land in later rounds.
+* Scaled-reference inter prediction (§8.5.2.3 with a reference whose
+  dimensions differ from the current frame) is wired and unit-tested
+  against an independent spec re-derivation (half-size reference, and
+  compound over two distinct per-list-scaled references), but not yet
+  *corpus*-validated end-to-end — every staged stream codes
+  same-size references, and the black-box encoder wrapper exposes no
+  mid-stream resize knob, so a scaled-reference fixture is a staging
+  ask. (Compound prediction itself IS corpus-validated as of round 406:
+  `superframe-2` and `show-existing-frame` carry 64 + 117 compound
+  blocks and both decode byte-exact.)
 * ~~Corpus divergences~~ — none left: as of round 406 **all 16 staged
   corpus fixtures decode byte-exact**, including the two historic
   divergers. `segments-aq-mode` frames 2-3 were the §7.2.10 segmentation

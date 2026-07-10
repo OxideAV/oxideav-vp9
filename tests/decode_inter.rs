@@ -864,6 +864,70 @@ fn superframe2_sequence_byte_exact() {
     }
 }
 
+/// Whole-corpus sweep: every staged fixture — single-frame and
+/// multi-frame alike — decodes **fully byte-exact** through
+/// [`decode_vp9_sequence`] (IVF demux → Annex B superframe split →
+/// sequence decode → planar packing). Beyond the per-fixture tests, this
+/// pins the corpus inter paths that only appear here: the profile-1/2/3
+/// P-frames run §8.5.2 motion compensation at 4:4:4 chroma (no MV
+/// averaging) and 10/12-bit sample depth (bit-depth-scaled convolution
+/// clamps), and the two `auto-alt-ref` streams carry real compound
+/// (`ref_frame[1] > NONE`) blocks — 64 in `superframe-2`, 117 in
+/// `show-existing-frame` — so §8.5.2's `Round2( p0 + p1, 1 )` compound
+/// average is corpus-validated, not just unit-tested.
+#[test]
+fn full_corpus_sequences_byte_exact() {
+    let root = std::path::Path::new("../../docs/video/vp9/fixtures");
+    if !root.is_dir() {
+        eprintln!("docs corpus not present; docs-gated");
+        return;
+    }
+    for name in [
+        "tiny-i-only-16x16",
+        "i-frame-then-p-frame-64x64",
+        "profile-0-yuv420-8bit",
+        "profile-1-yuv444-8bit",
+        "profile-2-yuv420-10bit",
+        "profile-3-yuv444-10bit",
+        "profile-3-yuv444-12bit",
+        "lossless-i-only",
+        "tile-cols-2",
+        "frame-parallel-mode",
+        "superframe-2",
+        "show-existing-frame",
+        "segments-aq-mode",
+        "q-low",
+        "q-high",
+        "bit-depth-10-rgb",
+    ] {
+        let base = root.join(name);
+        let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");
+        let expected = std::fs::read(base.join("expected.yuv")).expect("expected.yuv");
+
+        let mut sub: Vec<Vec<u8>> = Vec::new();
+        for p in &ivf_chunks(&ivf) {
+            for f in split_superframe(p) {
+                sub.push(f.to_vec());
+            }
+        }
+        let refs: Vec<&[u8]> = sub.iter().map(|p| p.as_slice()).collect();
+        let frames =
+            decode_vp9_sequence(&refs).unwrap_or_else(|e| panic!("{name}: decode error {e:?}"));
+
+        let mut got = Vec::new();
+        for f in &frames {
+            got.extend(f.to_planar_bytes());
+        }
+        assert_eq!(got.len(), expected.len(), "{name}: planar length");
+        let diffs = got
+            .iter()
+            .zip(expected.iter())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(diffs, 0, "{name}: {diffs} differing bytes vs expected.yuv");
+    }
+}
+
 /// §6.4.14 / §8.1 segment-map threading + §7.2.10 segmentation feature
 /// persistence: the `segments-aq-mode` fixture (per-segment AQ, 4 frames
 /// at 128x128, `frame_parallel_decoding_mode=1` throughout) reconstructs

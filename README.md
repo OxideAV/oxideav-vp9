@@ -30,12 +30,17 @@ segmentation AQ, lossless, and both quantizer extremes.
 by P-frames), threading the §8.10 reference buffers, the §6.5 previous-frame
 motion field, the §6.1.2 / §7.2 `FrameContext[ 4 ]` entropy probability
 banks (`load_probs( )` / `save_probs( )`), and the §6.4.14 PrevSegmentIds
-map across frames. **All 16 staged corpus fixtures reconstruct fully
+map across frames. **All 18 staged corpus fixtures reconstruct fully
 byte-exact against their `expected.yuv` through `decode_vp9_sequence`**
 (pinned by `full_corpus_sequences_byte_exact`), including the
 profile-1/2/3 P-frames (§8.5.2 motion compensation at 4:4:4 chroma and
-10/12-bit depth) and 181 real compound blocks across the two
-`auto-alt-ref` streams. Highlights: `i-frame-then-p-frame-64x64`
+10/12-bit depth), 181 real compound blocks across the two
+`auto-alt-ref` streams, and the two round-406 corpus extensions —
+`profile-1-yuv422-8bit-inter` (4:2:2 chroma inter: half-width /
+full-height planes through the whole §8.5.2 + §8.8 chain) and
+`intra-blocks-in-inter` (a mid-GOP scene cut coding 62 intra blocks
+inside P-frames: the §6.4.13 `is_inter=0` arm + §8.5.1 intra prediction
+on an inter frame). Highlights: `i-frame-then-p-frame-64x64`
 (keyframe + single-reference LAST P-frame, high-precision MVs,
 8-tap-smooth filter), `frame-parallel-mode` (keyframe + three
 single-reference P-frames at 64x64, `error_resilient=1` so no entropy

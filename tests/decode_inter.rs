@@ -899,6 +899,14 @@ fn full_corpus_sequences_byte_exact() {
         "q-low",
         "q-high",
         "bit-depth-10-rgb",
+        // Round-406 corpus extensions (black-box validator generation;
+        // see each fixture's notes.md): 4:2:2 inter (profile 1,
+        // subsampling_x=1 / subsampling_y=0 chroma geometry through the
+        // whole §8.5.2 + §8.8 chain) and a mid-GOP scene cut that codes
+        // 62 intra blocks inside P-frames (the §6.4.13 is_inter=0 arm +
+        // §8.5.1 intra prediction inside an inter frame).
+        "profile-1-yuv422-8bit-inter",
+        "intra-blocks-in-inter",
     ] {
         let base = root.join(name);
         let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");

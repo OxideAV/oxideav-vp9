@@ -930,6 +930,17 @@ fn full_corpus_sequences_byte_exact() {
         // in-crate writers (deterministic; see notes.md), expected.yuv is
         // a black-box reference decode.
         "scaled-reference",
+        // Round-409 corpus extensions (black-box generation, notes.md in
+        // each dir): lossless INTER (the §8.7.2 WHT on inter residuals —
+        // the corpus's lossless coverage was keyframe-only), a two-tile-
+        // column inter GOP (the existing tile fixture is intra-only;
+        // this one runs per-tile §9.2 coder brackets + tile-boundary
+        // context resets on real P-frames), and a 10-bit profile-2 GOP
+        // with frame_parallel_decoding_mode=0 (§8.4 backward adaptation
+        // over high-bit-depth CAT6 token counts).
+        "lossless-inter",
+        "tiles-2col-inter",
+        "hbd-backward-adaptation",
     ] {
         let base = root.join(name);
         let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");
@@ -1012,6 +1023,75 @@ fn backward_adaptation_fixture_flags_pin_the_refresh_probs_path() {
     }
     assert!(n_frames >= 8, "GOP long enough to compound adaptation");
     assert!(n_inter >= 7, "real P-frames present ({n_inter})");
+}
+
+/// Round-409 corpus extensions: assert each new fixture's headers carry
+/// the flags that make it exercise its target feature class, so the
+/// byte-exact sweep can't silently degrade into re-testing an existing
+/// path (e.g. if a regenerated stream lost its tiling or lossless
+/// flag).
+#[test]
+fn round_409_fixture_flags_pin_their_feature_classes() {
+    let root = std::path::Path::new("../../docs/video/vp9/fixtures");
+    if !root.is_dir() {
+        eprintln!("docs corpus not present; docs-gated");
+        return;
+    }
+    // Per-fixture predicate over every non-show-existing frame header:
+    // (name, check(frame_index, hdr)).
+    type Check = fn(usize, &oxideav_vp9::Vp9FrameHeader);
+    let cases: [(&str, Check); 3] = [
+        ("lossless-inter", |i, hdr| {
+            assert!(hdr.quantization.lossless, "frame {i}: lossless=1");
+        }),
+        ("tiles-2col-inter", |i, hdr| {
+            // NOTE: tile ROWS on inter frames remain an encoder-tooling
+            // gap — the black-box wrapper exposes a tile-rows knob but
+            // emits tile_rows_log2 = 0 regardless (verified with row-mt
+            // and realtime deadlines); a tile-rows fixture needs custom
+            // encoder tooling, like the scaled-reference one did.
+            assert_eq!(hdr.tile_info.tile_cols_log2, 1, "frame {i}: tile cols");
+        }),
+        ("hbd-backward-adaptation", |i, hdr| {
+            assert_eq!(hdr.profile, 2, "frame {i}: profile 2");
+            assert_eq!(hdr.color_config.bit_depth, 10, "frame {i}: 10-bit");
+            assert!(!hdr.error_resilient_mode, "frame {i}");
+            assert!(
+                !hdr.frame_parallel_decoding_mode,
+                "frame {i}: frame_parallel_decoding_mode must be 0"
+            );
+            assert!(hdr.refresh_frame_context, "frame {i}");
+        }),
+    ];
+    for (name, check) in cases {
+        let ivf = std::fs::read(root.join(name).join("input.ivf")).expect("input.ivf");
+        let mut i = 0usize;
+        let mut n_inter = 0usize;
+        let mut last_color: Option<oxideav_vp9::ColorConfig> = None;
+        let mut dims = (0u32, 0u32);
+        for p in &ivf_chunks(&ivf) {
+            for f in split_superframe(p) {
+                let ref_dims = vec![dims; 8];
+                let ref_state = last_color.map(|cc| oxideav_vp9::RefFrameState {
+                    ref_dims: &ref_dims,
+                    color_config: cc,
+                });
+                let hdr = oxideav_vp9::parse_uncompressed_header_with_refs(f, ref_state)
+                    .unwrap_or_else(|e| panic!("{name} frame {i}: header parse {e:?}"));
+                if hdr.show_existing_frame {
+                    continue;
+                }
+                check(i, &hdr);
+                if !matches!(hdr.frame_type, oxideav_vp9::FrameType::KeyFrame) && !hdr.intra_only {
+                    n_inter += 1;
+                }
+                dims = (hdr.frame_width, hdr.frame_height);
+                last_color = Some(hdr.color_config);
+                i += 1;
+            }
+        }
+        assert!(n_inter >= 3, "{name}: real P-frames present ({n_inter})");
+    }
 }
 
 /// §6.4.14 / §8.1 segment-map threading + §7.2.10 segmentation feature

@@ -4,20 +4,16 @@
 //! This module transcribes the §8.4.1 `merge_prob` and §8.4.2
 //! `merge_probs` processes plus the §8.4 `adapt_prob` / `adapt_probs`
 //! wrappers from the VP9 Bitstream & Decoding Process Specification
-//! v0.7. These are pure-compute helpers shared by the §8.4.3
-//! coefficient adaptation and §8.4.4 non-coefficient adaptation
-//! processes (wired in later commits).
+//! v0.7, the §8.4.3 / §8.4.4 adaptation transforms built on them, and
+//! the per-frame [`FrameCounts`] bank the §9.3.4 counting process
+//! fills. The §6.1.2 `refresh_probs( )` driver in
+//! [`crate::decode_frame`] consumes all of it on
+//! non-frame-parallel streams.
 //!
 //! All truth is the spec: §8.4 (`vp9-spec.txt` lines 4193-4356) and the
 //! `MAX_UPDATE_FACTOR = 128` / `COUNT_SAT = 20` constants (§3, lines
 //! 523-524).
 //!
-// The §8.4.3 / §8.4.4 callers that consume `merge_probs` / `adapt_prob`
-// / `adapt_probs` land in follow-up commits of this milestone; the
-// primitives are fully exercised by the unit tests below in the
-// meantime.
-#![allow(dead_code)]
-
 /// `MAX_UPDATE_FACTOR = 128` per §3 — the default maximum adaption
 /// factor passed to `adapt_prob` / `adapt_probs`.
 pub(crate) const MAX_UPDATE_FACTOR: u32 = 128;

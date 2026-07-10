@@ -29,20 +29,27 @@ segmentation AQ, lossless, and both quantizer extremes.
 [`decode_vp9_sequence`] decodes a multi-frame stream (keyframe followed
 by P-frames), threading the §8.10 reference buffers, the §6.5 previous-frame
 motion field, the §6.1.2 / §7.2 `FrameContext[ 4 ]` entropy probability
-banks (`load_probs( )` / `save_probs( )`), and the §6.4.14 PrevSegmentIds
-map across frames. **All 19 staged corpus fixtures reconstruct fully
+banks (`load_probs( )` / `save_probs( )` — **including the full §6.1.2
+`refresh_probs( )` backward adaptation on non-frame-parallel streams**,
+see below), and the §6.4.14 PrevSegmentIds
+map across frames. **All 24 staged corpus fixtures reconstruct fully
 byte-exact against their `expected.yuv` through `decode_vp9_sequence`**
 (pinned by `full_corpus_sequences_byte_exact`), including the
 profile-1/2/3 P-frames (§8.5.2 motion compensation at 4:4:4 chroma and
 10/12-bit depth), 181 real compound blocks across the two
-`auto-alt-ref` streams, and the two round-406 corpus extensions —
-`profile-1-yuv422-8bit-inter` (4:2:2 chroma inter: half-width /
-full-height planes through the whole §8.5.2 + §8.8 chain) and
+`auto-alt-ref` streams, the round-406 extensions —
+`profile-1-yuv422-8bit-inter` (4:2:2 chroma inter),
 `intra-blocks-in-inter` (a mid-GOP scene cut coding 62 intra blocks
-inside P-frames: the §6.4.13 `is_inter=0` arm + §8.5.1 intra prediction
-on an inter frame), and `qcif-inter-gop` (176x144, 12 frames: partial
-superblocks whose frame-edge inter leaves pin the clipped §8.5.2
-prediction store, plus long multi-superblock motion).
+inside P-frames), `qcif-inter-gop` (176x144: partial superblocks with
+frame-edge inter leaves) — and the five round-409 extensions:
+`backward-adaptation` (the corpus's first
+`frame_parallel_decoding_mode=0` stream: every frame's entropy decode
+runs on §8.4-adapted probabilities), `scaled-reference` (mid-GOP coded
+size changes 128→64→128→96→64: §8.5.2.3 reference scaling at the 2x
+conformance extreme, a 1/2x upscale, the fractional 4/3 ratio, and a
+scaled `NEWMV`), `lossless-inter` (§8.7.2 WHT on inter residuals),
+`tiles-2col-inter` (two tile columns on P-frames), and
+`hbd-backward-adaptation` (profile-2 10-bit + backward adaptation).
 Highlights: `i-frame-then-p-frame-64x64`
 (keyframe + single-reference LAST P-frame, high-precision MVs,
 8-tap-smooth filter), `frame-parallel-mode` (keyframe + three
@@ -315,50 +322,46 @@ integer motion search with per-block skip election, and per-frame
 quantizer rate control. Everything is byte-deterministic, and every
 encode test validates end-to-end through the in-crate decoder.
 
+### §8.4 backward adaptation (round 409)
+
+The full §6.1.2 `refresh_probs( )` process is wired: on streams with
+`error_resilient_mode == 0 && frame_parallel_decoding_mode == 0`, every
+decoded frame accumulates the complete §9.3.4 syntax-element count bank
+(`FrameCounts`: `counts_token` / `counts_more_coefs` plus every
+non-coefficient array down to the mv family) and folds it back into the
+`FrameContext` bank — `load_probs( )` per its §7.1.2 definition (all
+tables *except* `tx_probs` / `skip_prob`), §8.4.3 `adapt_coef_probs( )`
+with the `LastFrameType`-driven updateFactor, `load_probs2( )` + §8.4.4
+`adapt_noncoef_probs( )` on inter frames, `save_probs( )`. The
+`more_coefs` counting implements the §9.3.4 special case **absent from
+the v0.7 spec text**, reconstructed in
+`docs/video/vp9/vp9-errata-and-clarifications.md` (#249 part 1): count
+only where the element is decoded (the `checkEob` branch), never
+implied after a `ZERO_TOKEN`. Two further §9.3 step-2 subtleties are
+implemented and pinned: the corner-inferred `PARTITION_SPLIT` and the
+absent `mv_hp` / `mv_class0_hp` bit are both *counted* even though no
+bit is read (§9.3.1 integer-return arms). Corpus proof: the
+`backward-adaptation` and `hbd-backward-adaptation` fixtures decode
+byte-exact — with adaptation disabled they fail outright, so the pin
+covers the whole counting + adaptation chain. The inter-frame
+`uv_mode_probs` table joined the persisted bank (§8.4.4 adapts it; §6.3
+carries no forward update for it).
+
 ### Not yet supported
 
-* Scaled-reference inter prediction (§8.5.2.3 with a reference whose
-  dimensions differ from the current frame) is wired and unit-tested
-  against an independent spec re-derivation (half-size reference, and
-  compound over two distinct per-list-scaled references), but not yet
-  *corpus*-validated end-to-end — every staged stream codes
-  same-size references, and the black-box encoder wrapper exposes no
-  mid-stream resize knob, so a scaled-reference fixture is a staging
-  ask. (Compound prediction itself IS corpus-validated as of round 406:
-  `superframe-2` and `show-existing-frame` carry 64 + 117 compound
-  blocks and both decode byte-exact.)
-* ~~Corpus divergences~~ — none left: as of round 406 **all 16 staged
-  corpus fixtures decode byte-exact**, including the two historic
-  divergers. `segments-aq-mode` frames 2-3 were the §7.2.10 segmentation
-  feature persistence bug (P-frames with `segmentation_update_data=0`
-  dequantized at `base_q_idx` instead of the persisted per-segment
-  qindex); `superframe-2`'s ±1-per-frame profile was the missing §8.1
-  step-2 gate (the whole §8.8 loop filter runs only when
-  `loop_filter_level != 0` — with `lf_delta_enabled=1` the +1 INTRA
-  ref-delta otherwise lifts intra edges to `lvl=1` and filters them even
-  at frame level 0). Both are pinned by full-sequence byte-exact tests.
-* §8.4 probability adaptation / §6.1.2 `refresh_probs( )` — the complete
-  §8.4 backward-adaptation transform set is implemented and unit-tested in
-  the `prob_adapt` module: the §8.4.1/§8.4.2 `merge_prob` / `merge_probs`
-  primitives, the §8.4.3 `adapt_coef_probs` coefficient-adaption transform
-  (with `CountsToken` / `CountsMoreCoefs` accumulators), and the §8.4.4
-  `adapt_noncoef_probs` non-coefficient-adaption transform (with the
-  `CountsNonCoef` / `CountsMvComponent` accumulators mirroring the §9.3.4
-  counting table, and the three §8.4.4 conditional gates on
-  `SWITCHABLE` interp-filter / `TX_MODE_SELECT` / `allow_high_precision_mv`).
-  None are yet wired into the decode loop's `refresh_probs( )`.
-  Note that **every fixture in the staged corpus carries
-  `frame_parallel_decoding_mode = 1`**, for which §6.1.2 `refresh_probs( )`
-  skips the entire adaptation branch (`adapt_coef_probs` /
-  `adapt_noncoef_probs`) and only runs `save_probs`; the current
-  forward-updated-bank `save_probs` path is therefore already correct for
-  the corpus, and the two divergences above are *not* attributable to
-  missing backward adaptation. Wiring §8.4 fully (for non-parallel
-  streams) is additionally blocked on a v0.7 docs gap: the §9.3.4
-  "special case (for more_coefs)" the spec references is absent from the
-  PDF (page 126 ends at the `more_coefs` counting-table row; the promised
-  end-of-section paragraph is blank). Contexts are reset to §10 defaults
-  per frame meanwhile, which is exact for the all-parallel-mode corpus.
+* ~~Scaled-reference inter prediction~~ — **corpus-validated as of
+  round 409**: the `scaled-reference` fixture (self-encoded per the
+  #249-part-2 tooling-gap workaround — no black-box encoder CLI mints
+  mid-stream coded-size changes) decodes byte-exact against a black-box
+  reference decode, covering the 2x conformance extreme, a 1/2x
+  upscale, the fractional 4/3 ratio, and a scaled `NEWMV`; two
+  closed-form §8.5.2.3 phase-0 identities are pinned in-crate.
+* Tile **rows** (`tile_rows_log2 >= 1`) remain fixture-less: the
+  black-box encoder wrapper emits `tile_rows_log2 = 0` regardless of
+  its tile-rows knob (verified with row-mt / realtime deadlines), so a
+  tile-rows stream needs custom encoder tooling — recorded in
+  `docs/video/vp9/fixtures/tiles-2col-inter/notes.md`. The decode-side
+  tile-row walk itself is exercised by the §6.4 offset unit tests.
 * §9.2.4 multi-coder tile parallelism (tiles decode sequentially).
 * Encoder depth beyond the planner-driven baseline. Keyframes **and
   P-frames** plan partitions `BLOCK_8X8`..`BLOCK_64X64` with
@@ -376,7 +379,7 @@ encode test validates end-to-end through the in-crate decoder.
 
 ## Testing
 
-The crate carries 985+ lib unit tests plus integration suites in
+The crate carries 995+ lib unit tests plus integration suites in
 `tests/` (including the keyframe **and inter** encoder writers, each
 round-tripped back through the in-crate decoder; `encode_keyframe`
 exercising the public `encode_vp9` → decode **byte-exact lossless**

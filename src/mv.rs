@@ -35,13 +35,6 @@
 //! `UseHp == 0` the bit is not present in the bitstream and the decoded
 //! value is fixed to `1` (§9.3.3 listing, `vp9-spec.txt` lines 6214-6216).
 
-// The §6.4.16 `inter_block_mode_info( )` driver that calls the §6.4.18
-// [`assign_mv`] step (and through it [`read_mv`]) lands on top of this
-// leaf layer in a later round; until then these primitives are reachable
-// only from the unit tests, so the crate-internal `dead_code` lint is
-// silenced module-wide (mirrors `mode_info`'s deferred-inter primitives).
-#![allow(dead_code)]
-
 use crate::adaptive_filter_strength::{NEARESTMV, NEARMV, NEWMV};
 use crate::bool_coder::BoolCoder;
 use crate::compressed::MvProbs;

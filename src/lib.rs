@@ -917,4 +917,190 @@ mod encode_roundtrip_tests {
             Error::Unsupported
         );
     }
+
+    // ----- §8.5.2.3 scaled-reference sequence (round 409) -----
+
+    /// Build the round-409 **scaled-reference** stream: a 128x128
+    /// lossless keyframe followed by inter frames whose coded size
+    /// differs from their live reference's, forcing the §8.5.2.3 scaled
+    /// motion-compensation sampler (`stepX` / `stepY != 16`) on every
+    /// inter block:
+    ///
+    /// * F1 — 64x64 all-skip `ZEROMV` over the 128x128 keyframe in slot
+    ///   0: both dimensions at the `2 * FrameWidth >= RefFrameWidth`
+    ///   conformance **extreme** (ref = exactly 2x), `xScale = yScale =
+    ///   32768`, `stepX = stepY = 32`. Refreshes slot 1.
+    /// * F2 — 128x128 over slot 1 (F1's 64x64 reconstruction): 1/2x
+    ///   reference (upscale), `xScale = 8192`, `stepX = 8` — half-pel
+    ///   interpolation phases from pure scaling.
+    /// * F3 — 96x96 over slot 0 (128x128): the fractional 4/3 ratio,
+    ///   `xScale = (128 << 14) / 96 = 21845` — non-power-of-two
+    ///   `fracX` / `fracY` arithmetic (§8.5.2.3 lines 4667-4668).
+    /// * F4 — 64x64 **error-resilient** `NEWMV [8, 16]` (eighth-pel;
+    ///   1 px down, 2 px right in current-frame units) over slot 0
+    ///   (2x ref): the §8.5.2.1-§8.5.2.3 motion-vector scaling path
+    ///   with a non-zero vector on a scaled reference.
+    ///
+    /// Every inter block is skip (no residual), so each frame's
+    /// reconstruction IS the scaled §8.5.2 prediction — the sampler's
+    /// output is observable directly.
+    fn build_scaled_reference_stream() -> Vec<Vec<u8>> {
+        use crate::compressed::TxMode;
+        use crate::frame_writer::{
+            assemble_inter_frame_all_skip_zeromv, assemble_inter_frame_planned,
+            inter_pframe_header, FrameCoefSource, InterBlockPlanner,
+        };
+
+        // Keyframe: a deterministic high-detail pattern (diagonal
+        // gradients + per-plane offsets) so scaling artifacts are
+        // position-sensitive.
+        let (w, h) = (128u32, 128u32);
+        let (cw, ch) = (64usize, 64usize);
+        let mut pixels = Vec::with_capacity((w * h) as usize + 2 * cw * ch);
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                pixels.push(((x * 2 + y * 3) ^ (x >> 2)) as u8);
+            }
+        }
+        for plane in 0..2usize {
+            for y in 0..ch {
+                for x in 0..cw {
+                    pixels.push(((x * 5 + y * 7 + plane * 64) % 251) as u8);
+                }
+            }
+        }
+        let kf = encode_vp9(&pixels, w, h).expect("keyframe");
+
+        // F1: 64x64 all-skip ZEROMV over slot 0 (128x128 keyframe).
+        // inter_pframe_header refs slot 0 and refreshes slot 1.
+        let hdr1 = inter_pframe_header(64, 64);
+        let f1 = assemble_inter_frame_all_skip_zeromv(&hdr1).expect("f1");
+
+        // F2: 128x128 over slot 1 (the 64x64 F1 recon) — upscale.
+        let mut hdr2 = inter_pframe_header(128, 128);
+        hdr2.ref_frame_idx = Some([1, 1, 1]);
+        hdr2.refresh_frame_flags = 0x04;
+        let f2 = assemble_inter_frame_all_skip_zeromv(&hdr2).expect("f2");
+
+        // F3: 96x96 over slot 0 (128x128) — fractional 4/3 downscale.
+        let mut hdr3 = inter_pframe_header(96, 96);
+        hdr3.refresh_frame_flags = 0x08;
+        let f3 = assemble_inter_frame_all_skip_zeromv(&hdr3).expect("f3");
+
+        // F4: 64x64 error-resilient NEWMV [8, 16] over slot 0 (2x ref).
+        // Error-resilient framing pins §7.2.6 UsePrevFrameMvs == 0 on
+        // both sides (the writer holds no previous-frame motion field);
+        // the MV difference stays even-magnitude for the no-hp §6.4.20
+        // decomposition.
+        let mut hdr4 = inter_pframe_header(64, 64);
+        hdr4.error_resilient_mode = true;
+        hdr4.refresh_frame_context = false;
+        hdr4.frame_parallel_decoding_mode = true;
+        hdr4.refresh_frame_flags = 0x10;
+        let mut planner: Box<InterBlockPlanner<'_>> =
+            Box::new(|_r, _c, _state| (crate::mode_info::NEWMV, [8, 16], true));
+        let mut coeffs: Box<FrameCoefSource<'_>> = Box::new(|_r, _c, _p, _x, _y, _b| Vec::new());
+        let f4 =
+            assemble_inter_frame_planned(&hdr4, TxMode::Only4x4, true, &mut *planner, &mut *coeffs)
+                .expect("f4");
+
+        vec![kf, f1, f2, f3, f4]
+    }
+
+    /// The scaled-reference stream decodes end-to-end, every frame at
+    /// its declared size, and the exact-2x downscale frame satisfies the
+    /// §8.5.2.3 **phase-0 identity**: with `xScale = 32768` and a zero
+    /// MV, every sample position lands on an integer reference sample
+    /// (`fracX = fracY = 0`), where the 8-tap `subpel_filters` row is
+    /// the identity tap — so F1 must equal the keyframe reconstruction
+    /// decimated 2:1 in both dimensions. This is an independent
+    /// closed-form derivation of the sampler's output, not a replay of
+    /// the implementation.
+    #[test]
+    fn scaled_reference_sequence_decodes_with_2x_phase0_identity() {
+        let frames = build_scaled_reference_stream();
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        let out = decode_vp9_sequence(&refs).expect("scaled-ref sequence");
+        assert_eq!(out.len(), 5);
+        let dims: Vec<(u32, u32)> = out.iter().map(|f| (f.width, f.height)).collect();
+        assert_eq!(
+            dims,
+            vec![(128, 128), (64, 64), (128, 128), (96, 96), (64, 64)]
+        );
+
+        // Phase-0 identity at exact 2x (F1 vs the keyframe recon).
+        let kf = &out[0];
+        let f1 = &out[1];
+        for y in 0..64usize {
+            for x in 0..64usize {
+                assert_eq!(
+                    f1.y[y * 64 + x],
+                    kf.y[(2 * y) * 128 + 2 * x],
+                    "luma ({x},{y}): 2x scaled ZEROMV must decimate the reference"
+                );
+            }
+        }
+        for y in 0..32usize {
+            for x in 0..32usize {
+                assert_eq!(f1.u[y * 32 + x], kf.u[(2 * y) * 64 + 2 * x], "U ({x},{y})");
+                assert_eq!(f1.v[y * 32 + x], kf.v[(2 * y) * 64 + 2 * x], "V ({x},{y})");
+            }
+        }
+
+        // F4: the scaled NEWMV [8, 16] (1 px down, 2 px right in
+        // current-frame eighth-pel units) over the 2x reference —
+        // §8.5.2.3 scales the vector into reference units (2 px down,
+        // 4 px right), keeping every phase at 0: F4[y][x] must equal
+        // K[2y + 2][2x + 4] where in range.
+        let f4 = &out[4];
+        for y in 0..48usize {
+            for x in 0..48usize {
+                assert_eq!(
+                    f4.y[y * 64 + x],
+                    kf.y[(2 * y + 2) * 128 + 2 * x + 4],
+                    "luma ({x},{y}): scaled NEWMV phase-0 identity"
+                );
+            }
+        }
+
+        // Byte-determinism (fixture staging relies on it).
+        let again = build_scaled_reference_stream();
+        assert_eq!(frames, again);
+    }
+
+    /// Fixture-staging generator (round 409): when `OXIDEAV_VP9_STAGE_DIR`
+    /// is set, writes the scaled-reference stream as `input.ivf` into that
+    /// directory, for staging under `docs/video/vp9/fixtures/
+    /// scaled-reference/` alongside a black-box reference decode
+    /// (`expected.yuv`). A no-op otherwise — the stream itself is
+    /// byte-deterministic and pinned by
+    /// [`scaled_reference_sequence_decodes_with_2x_phase0_identity`].
+    #[test]
+    fn stage_scaled_reference_fixture_when_requested() {
+        let Some(dir) = std::env::var_os("OXIDEAV_VP9_STAGE_DIR") else {
+            return;
+        };
+        let frames = build_scaled_reference_stream();
+        // IVF: 32-byte file header + 12-byte per-frame headers. The
+        // file-header dimensions carry the first frame's size; each VP9
+        // frame self-describes its own coded size.
+        let mut ivf = Vec::new();
+        ivf.extend_from_slice(b"DKIF");
+        ivf.extend_from_slice(&0u16.to_le_bytes()); // version
+        ivf.extend_from_slice(&32u16.to_le_bytes()); // header length
+        ivf.extend_from_slice(b"VP90");
+        ivf.extend_from_slice(&128u16.to_le_bytes()); // width
+        ivf.extend_from_slice(&128u16.to_le_bytes()); // height
+        ivf.extend_from_slice(&25u32.to_le_bytes()); // timebase denominator
+        ivf.extend_from_slice(&1u32.to_le_bytes()); // timebase numerator
+        ivf.extend_from_slice(&(frames.len() as u32).to_le_bytes());
+        ivf.extend_from_slice(&0u32.to_le_bytes()); // unused
+        for (i, f) in frames.iter().enumerate() {
+            ivf.extend_from_slice(&(f.len() as u32).to_le_bytes());
+            ivf.extend_from_slice(&(i as u64).to_le_bytes());
+            ivf.extend_from_slice(f);
+        }
+        let path = std::path::Path::new(&dir).join("input.ivf");
+        std::fs::write(&path, &ivf).expect("write input.ivf");
+    }
 }

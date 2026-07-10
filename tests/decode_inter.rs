@@ -922,6 +922,14 @@ fn full_corpus_sequences_byte_exact() {
         // adaptation chain: any miscount desynchronises the next frame's
         // entropy decode.
         "backward-adaptation",
+        // Round-409 corpus extension: the corpus's first SCALED-reference
+        // stream (mid-GOP coded-size changes: 128 → 64 → 128 → 96 → 64,
+        // every inter frame §8.5.2.3-sampling a differently-sized live
+        // reference — the 2x conformance extreme, a 1/2x upscale, the
+        // fractional 4/3 ratio, and a scaled NEWMV). Self-encoded by the
+        // in-crate writers (deterministic; see notes.md), expected.yuv is
+        // a black-box reference decode.
+        "scaled-reference",
     ] {
         let base = root.join(name);
         let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");

@@ -262,7 +262,9 @@ mod tests {
                     let mut enc = BoolEncoder::new();
                     write_mv_component(&mut enc, &probs, comp, v, use_hp).unwrap();
                     let mut dec = enc_to_dec(enc);
-                    let got = read_mv_component(&mut dec, &probs, comp, use_hp).unwrap();
+                    let got =
+                        read_mv_component(&mut dec, &probs, comp, use_hp, &mut Default::default())
+                            .unwrap();
                     assert_eq!(got, v, "comp {comp} hp {use_hp} v {v}");
                 }
             }
@@ -279,7 +281,8 @@ mod tests {
                 let mut enc = BoolEncoder::new();
                 write_mv_component(&mut enc, &probs, comp, v, true).unwrap();
                 let mut dec = enc_to_dec(enc);
-                let got = read_mv_component(&mut dec, &probs, comp, true).unwrap();
+                let got = read_mv_component(&mut dec, &probs, comp, true, &mut Default::default())
+                    .unwrap();
                 assert_eq!(got, v, "comp {comp} v {v}");
             }
         }
@@ -296,7 +299,7 @@ mod tests {
             let mut enc = BoolEncoder::new();
             write_mv(&mut enc, &probs, mv, best, true).unwrap();
             let mut dec = enc_to_dec(enc);
-            let got = read_mv(&mut dec, &probs, best, true).unwrap();
+            let got = read_mv(&mut dec, &probs, best, true, &mut Default::default()).unwrap();
             assert_eq!(got, mv, "diff {d:?}");
         }
     }
@@ -314,7 +317,7 @@ mod tests {
         let mut enc = BoolEncoder::new();
         write_mv(&mut enc, &probs, mv, best, true).unwrap();
         let mut dec = enc_to_dec(enc);
-        let got = read_mv(&mut dec, &probs, best, true).unwrap();
+        let got = read_mv(&mut dec, &probs, best, true, &mut Default::default()).unwrap();
         assert_eq!(got, mv);
     }
 
@@ -337,7 +340,16 @@ mod tests {
         let mut enc = BoolEncoder::new();
         write_assign_mv(&mut enc, &probs, NEWMV, true, &preds, &mv, true).unwrap();
         let mut dec = enc_to_dec(enc);
-        let got = assign_mv(&mut dec, &probs, NEWMV, true, &preds, true).unwrap();
+        let got = assign_mv(
+            &mut dec,
+            &probs,
+            NEWMV,
+            true,
+            &preds,
+            true,
+            &mut Default::default(),
+        )
+        .unwrap();
         assert_eq!(got, mv);
     }
 
@@ -357,7 +369,16 @@ mod tests {
         let mut enc = BoolEncoder::new();
         write_assign_mv(&mut enc, &probs, NEARESTMV, false, &preds, &mv, true).unwrap();
         let mut dec = enc_to_dec(enc);
-        let got = assign_mv(&mut dec, &probs, NEARESTMV, false, &preds, true).unwrap();
+        let got = assign_mv(
+            &mut dec,
+            &probs,
+            NEARESTMV,
+            false,
+            &preds,
+            true,
+            &mut Default::default(),
+        )
+        .unwrap();
         assert_eq!(got, mv);
     }
 

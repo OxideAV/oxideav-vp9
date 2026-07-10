@@ -299,12 +299,17 @@ pub(crate) fn read_skip(
     seg_feature_skip_active: bool,
     skip_prob: &[u8; 3],
     nb: NeighbourSkips,
+    counts: &mut crate::prob_adapt::CountsNonCoef,
 ) -> Result<bool, Error> {
     if seg_feature_skip_active {
+        // §6.4.8 hardwired arm — the `Skip` element is not present in
+        // the syntax table on this path, so no §9.3.4 count.
         return Ok(true);
     }
     let ctx = skip_context(nb);
     let value = tree_decode(coder, &BINARY_TREE, |_| skip_prob[ctx])?;
+    // §9.3.4: counts_skip[ ctx ][ syntax ] += 1.
+    counts.skip[ctx][value as usize] += 1;
     Ok(value != 0)
 }
 
@@ -407,6 +412,7 @@ pub(crate) fn read_tx_size(
     mi_size: u8,
     tx_probs: &[[[u8; 3]; 2]; 4],
     nb: NeighbourTxSizes,
+    counts: &mut crate::prob_adapt::CountsNonCoef,
 ) -> Result<u32, Error> {
     let max_tx_size = MAX_TXSIZE_LOOKUP[mi_size as usize];
     if allow_select && tx_mode == TxMode::TxModeSelect && mi_size >= BLOCK_8X8 {
@@ -418,8 +424,12 @@ pub(crate) fn read_tx_size(
             _ => &TX_SIZE_8_TREE,
         };
         let value = tree_decode(coder, tree, |node| probs_row[node])?;
+        // §9.3.4: counts_tx_size[ maxTxSize ][ ctx ][ syntax ] += 1.
+        counts.tx_size[max_tx_size as usize][ctx][value as usize] += 1;
         Ok(value as u32)
     } else {
+        // §6.4.10 else arm — no `tx_size` element in the syntax table,
+        // so no §9.3.4 count.
         Ok(max_tx_size.min(tx_mode_to_biggest_tx_size(tx_mode) as u32))
     }
 }
@@ -994,14 +1004,17 @@ pub(crate) fn intra_frame_mode_info(
     nb_skip: NeighbourSkips,
     nb_tx: NeighbourTxSizes,
     nb_intra: IntraFrameNeighbours,
+    counts: &mut crate::prob_adapt::CountsNonCoef,
 ) -> Result<Vp9IntraMiBlock, Error> {
     // §6.4.6 line-by-line:
     //   intra_segment_id( )
     let segment_id = intra_segment_id(coder, seg_enabled, seg_update_map, seg_tree_probs)?;
-    //   read_skip( )
-    let skip = read_skip(coder, seg_feature_skip_active, skip_prob, nb_skip)?;
+    //   read_skip( ) — the §9.3.4 skip/tx counts are collected on intra
+    //   frames too (the §6.1.2 adaptation simply never consumes them:
+    //   adapt_noncoef_probs only runs when FrameIsIntra == 0).
+    let skip = read_skip(coder, seg_feature_skip_active, skip_prob, nb_skip, counts)?;
     //   read_tx_size( 1 )
-    let tx_size = read_tx_size(coder, true, tx_mode, mi_size, tx_probs, nb_tx)?;
+    let tx_size = read_tx_size(coder, true, tx_mode, mi_size, tx_probs, nb_tx, counts)?;
     //   ref_frame[ 0 ] = INTRA_FRAME ; ref_frame[ 1 ] = NONE ; is_inter = 0
 
     // §6.4.6 luma-mode arm split on MiSize.
@@ -1125,11 +1138,14 @@ pub(crate) fn intra_mode(
     coder: &mut BoolCoder<'_>,
     y_mode_probs: &[[u8; INTRA_MODES - 1]; BLOCK_SIZE_GROUPS],
     mi_size: u8,
+    counts: &mut crate::prob_adapt::CountsNonCoef,
 ) -> Result<u8, Error> {
     debug_assert!((mi_size as usize) < BLOCK_SIZES);
     let ctx = SIZE_GROUP_LOOKUP[mi_size as usize] as usize;
     let row = &y_mode_probs[ctx];
     let value = tree_decode(coder, &INTRA_MODE_TREE, |node| row[node])?;
+    // §9.3.4: counts_intra_mode[ ctx ][ syntax ] += 1.
+    counts.y_mode[ctx][value as usize] += 1;
     Ok(value as u8)
 }
 
@@ -1142,9 +1158,14 @@ pub(crate) fn intra_mode(
 pub(crate) fn sub_intra_mode(
     coder: &mut BoolCoder<'_>,
     y_mode_probs: &[[u8; INTRA_MODES - 1]; BLOCK_SIZE_GROUPS],
+    counts: &mut crate::prob_adapt::CountsNonCoef,
 ) -> Result<u8, Error> {
     let row = &y_mode_probs[0];
     let value = tree_decode(coder, &INTRA_MODE_TREE, |node| row[node])?;
+    // §9.3.4: counts_intra_mode[ ctx ][ syntax ] += 1 — `sub_intra_mode`
+    // shares the `counts_intra_mode` array with `intra_mode`, at the
+    // same ctx (0) its §9.3.2 probability row uses.
+    counts.y_mode[0][value as usize] += 1;
     Ok(value as u8)
 }
 
@@ -1160,10 +1181,13 @@ pub(crate) fn uv_mode(
     coder: &mut BoolCoder<'_>,
     uv_mode_probs: &[[u8; INTRA_MODES - 1]; INTRA_MODES],
     y_mode: u8,
+    counts: &mut crate::prob_adapt::CountsNonCoef,
 ) -> Result<u8, Error> {
     debug_assert!((y_mode as usize) < INTRA_MODES);
     let row = &uv_mode_probs[y_mode as usize];
     let value = tree_decode(coder, &INTRA_MODE_TREE, |node| row[node])?;
+    // §9.3.4: counts_uv_mode[ ctx ][ syntax ] += 1 (ctx = y_mode).
+    counts.uv_mode[y_mode as usize][value as usize] += 1;
     Ok(value as u8)
 }
 
@@ -1255,6 +1279,7 @@ pub(crate) fn intra_block_mode_info(
     mi_size: u8,
     y_mode_probs: &[[u8; INTRA_MODES - 1]; BLOCK_SIZE_GROUPS],
     uv_mode_probs: &[[u8; INTRA_MODES - 1]; INTRA_MODES],
+    counts: &mut crate::prob_adapt::CountsNonCoef,
 ) -> Result<Vp9IntraBlockModeInfo, Error> {
     // §6.4.15: ref_frame[ 0 ] = INTRA_FRAME ; ref_frame[ 1 ] = NONE
     let mut sub_modes = [DC_PRED; 4];
@@ -1262,7 +1287,7 @@ pub(crate) fn intra_block_mode_info(
     if mi_size >= BLOCK_8X8 {
         // §6.4.15 `MiSize >= BLOCK_8X8` arm:
         //   intra_mode ; y_mode = intra_mode ; sub_modes[ b ] = y_mode
-        let mode = intra_mode(coder, y_mode_probs, mi_size)?;
+        let mode = intra_mode(coder, y_mode_probs, mi_size, counts)?;
         y_mode = mode;
         sub_modes = [mode; 4];
     } else {
@@ -1282,7 +1307,7 @@ pub(crate) fn intra_block_mode_info(
             while idx < 2 {
                 // §9.3.2 `sub_intra_mode` uses y_mode_probs[ 0 ] — no
                 // neighbour derivation.
-                let mode = sub_intra_mode(coder, y_mode_probs)?;
+                let mode = sub_intra_mode(coder, y_mode_probs, counts)?;
                 last_mode = mode;
                 for y2 in 0..num4x4h {
                     for x2 in 0..num4x4w {
@@ -1297,7 +1322,7 @@ pub(crate) fn intra_block_mode_info(
     }
 
     // §6.4.15 final line: uv_mode (context = y_mode).
-    let uv = uv_mode(coder, uv_mode_probs, y_mode)?;
+    let uv = uv_mode(coder, uv_mode_probs, y_mode, counts)?;
 
     Ok(Vp9IntraBlockModeInfo {
         ref_frame_0: INTRA_FRAME,
@@ -1358,8 +1383,9 @@ pub(crate) fn inter_frame_intra_block_mode_info(
     mi_size: u8,
     y_mode_probs: &[[u8; INTRA_MODES - 1]; BLOCK_SIZE_GROUPS],
     uv_mode_probs: &[[u8; INTRA_MODES - 1]; INTRA_MODES],
+    counts: &mut crate::prob_adapt::CountsNonCoef,
 ) -> Result<Vp9ModeInfo, Error> {
-    let block = intra_block_mode_info(coder, mi_size, y_mode_probs, uv_mode_probs)?;
+    let block = intra_block_mode_info(coder, mi_size, y_mode_probs, uv_mode_probs, counts)?;
     Ok(Vp9ModeInfo::InterFrameIntraBlock(block))
 }
 
@@ -2456,8 +2482,11 @@ pub(crate) fn read_ref_frames(
     comp_mode_prob: &[u8; COMP_MODE_CONTEXTS],
     single_ref_prob: &[[u8; 2]; REF_CONTEXTS],
     comp_ref_prob: &[u8; REF_CONTEXTS],
+    counts: &mut crate::prob_adapt::CountsNonCoef,
 ) -> Result<RefFramePair, Error> {
     if seg_feature_ref_frame_active {
+        // §6.4.17 override arm — no reference syntax elements present,
+        // no §9.3.4 counts.
         return Ok(RefFramePair {
             ref_frame_0: i32::from(segment_ref_frame_data),
             ref_frame_1: NONE_REF_FRAME,
@@ -2476,7 +2505,10 @@ pub(crate) fn read_ref_frames(
                 },
                 comp_config.fixed_ref,
             );
-            tree_decode(coder, &BINARY_TREE, |_| comp_mode_prob[ctx])? != 0
+            let value = tree_decode(coder, &BINARY_TREE, |_| comp_mode_prob[ctx])?;
+            // §9.3.4: counts_comp_mode[ ctx ][ syntax ] += 1.
+            counts.comp_mode[ctx][value as usize] += 1;
+            value != 0
         }
         ReferenceMode::CompoundReference => true,
         ReferenceMode::SingleReference => false,
@@ -2488,6 +2520,8 @@ pub(crate) fn read_ref_frames(
         let idx = usize::from(fix_ref_idx);
         let ctx = comp_ref_context(nb, comp_config.var_ref, fix_ref_idx);
         let comp_ref = tree_decode(coder, &BINARY_TREE, |_| comp_ref_prob[ctx])?;
+        // §9.3.4: counts_comp_ref[ ctx ][ syntax ] += 1.
+        counts.comp_ref[ctx][comp_ref as usize] += 1;
         let mut ref_frame = [NONE_REF_FRAME; 2];
         ref_frame[idx] = comp_config.fixed_ref;
         ref_frame[1 - idx] = comp_config.var_ref[comp_ref as usize];
@@ -2499,9 +2533,13 @@ pub(crate) fn read_ref_frames(
     } else {
         let ctx1 = single_ref_p1_context(nb);
         let single_ref_p1 = tree_decode(coder, &BINARY_TREE, |_| single_ref_prob[ctx1][0])?;
+        // §9.3.4: counts_single_ref[ ctx ][ 0 ][ syntax ] += 1.
+        counts.single_ref[ctx1][0][single_ref_p1 as usize] += 1;
         let ref_frame_0 = if single_ref_p1 != 0 {
             let ctx2 = single_ref_p2_context(nb);
             let single_ref_p2 = tree_decode(coder, &BINARY_TREE, |_| single_ref_prob[ctx2][1])?;
+            // §9.3.4: counts_single_ref[ ctx ][ 1 ][ syntax ] += 1.
+            counts.single_ref[ctx2][1][single_ref_p2 as usize] += 1;
             if single_ref_p2 != 0 {
                 ALTREF_FRAME
             } else {
@@ -2557,12 +2595,16 @@ pub(crate) fn read_is_inter(
     segment_ref_frame_data: i16,
     is_inter_prob: &[u8; IS_INTER_CONTEXTS],
     nb: IsInterNeighbours,
+    counts: &mut crate::prob_adapt::CountsNonCoef,
 ) -> Result<bool, Error> {
     if seg_feature_ref_frame_active {
+        // §6.4.13 override arm — no `is_inter` element present, no count.
         return Ok(i32::from(segment_ref_frame_data) != INTRA_FRAME);
     }
     let ctx = is_inter_context(nb);
     let value = tree_decode(coder, &BINARY_TREE, |_| is_inter_prob[ctx])?;
+    // §9.3.4: counts_is_inter[ ctx ][ syntax ] += 1.
+    counts.is_inter[ctx][value as usize] += 1;
     Ok(value != 0)
 }
 
@@ -2797,6 +2839,7 @@ pub(crate) fn inter_block_mode_info<S: crate::mv_ref::MvCandidateSource>(
     use_prev_frame_mvs: bool,
     sign_bias: &[bool; 4],
     seg_feature_skip_active: bool,
+    counts: &mut crate::prob_adapt::CountsNonCoef,
 ) -> Result<Vp9InterBlockModeInfo, Error> {
     use crate::mv::{assign_mv, MvPredictors};
 
@@ -2814,6 +2857,7 @@ pub(crate) fn inter_block_mode_info<S: crate::mv_ref::MvCandidateSource>(
         ref_frame_args.comp_mode_prob,
         ref_frame_args.single_ref_prob,
         ref_frame_args.comp_ref_prob,
+        counts,
     )?;
     let ref_frame = [refs.ref_frame_0, refs.ref_frame_1];
     let is_compound = refs.ref_frame_1 > INTRA_FRAME;
@@ -2852,6 +2896,8 @@ pub(crate) fn inter_block_mode_info<S: crate::mv_ref::MvCandidateSource>(
         let inter_mode = tree_decode(coder, &INTER_MODE_TREE, |node| {
             inter_mode_probs[mode_ctx][node]
         })?;
+        // §9.3.4: counts_inter_mode[ ctx ][ syntax ] += 1.
+        counts.inter_mode[mode_ctx][inter_mode as usize] += 1;
         NEARESTMV + inter_mode as u8
     } else {
         // Placeholder; the sub-8x8 walk overwrites this with the last
@@ -2862,9 +2908,12 @@ pub(crate) fn inter_block_mode_info<S: crate::mv_ref::MvCandidateSource>(
     // interp_filter: switchable ⇒ tree read; else the frame-level value.
     let interp_filter = if interpolation_filter == SWITCHABLE {
         let ctx = interp_filter_context(interp_nb);
-        tree_decode(coder, &INTERP_FILTER_TREE, |node| {
+        let value = tree_decode(coder, &INTERP_FILTER_TREE, |node| {
             interp_filter_probs[ctx][node]
-        })? as u8
+        })?;
+        // §9.3.4: counts_interp_filter[ ctx ][ syntax ] += 1.
+        counts.interp_filter[ctx][value as usize] += 1;
+        value as u8
     } else {
         interpolation_filter
     };
@@ -2891,6 +2940,9 @@ pub(crate) fn inter_block_mode_info<S: crate::mv_ref::MvCandidateSource>(
                 let inter_mode = tree_decode(coder, &INTER_MODE_TREE, |node| {
                     inter_mode_probs[mode_ctx][node]
                 })?;
+                // §9.3.4: one counts_inter_mode event per decoded
+                // sub-block inter_mode.
+                counts.inter_mode[mode_ctx][inter_mode as usize] += 1;
                 y_mode = NEARESTMV + inter_mode as u8;
 
                 // append_sub8x8_mvs for NEARESTMV / NEARMV, per reference
@@ -2918,6 +2970,7 @@ pub(crate) fn inter_block_mode_info<S: crate::mv_ref::MvCandidateSource>(
                     is_compound,
                     &sub_preds,
                     allow_high_precision_mv,
+                    counts,
                 )?;
 
                 for y2 in 0..num4x4h {
@@ -2941,6 +2994,7 @@ pub(crate) fn inter_block_mode_info<S: crate::mv_ref::MvCandidateSource>(
             is_compound,
             &preds,
             allow_high_precision_mv,
+            counts,
         )?;
         let ref_count = 1 + usize::from(is_compound);
         for (ref_list, mv_ref) in mv.iter().enumerate().take(ref_count) {
@@ -3180,6 +3234,7 @@ pub(crate) fn inter_frame_mode_info<S: crate::mv_ref::MvCandidateSource>(
     seg_pred_ctx: &mut SegPredContextState,
     mi_row: u32,
     mi_col: u32,
+    counts: &mut crate::prob_adapt::CountsNonCoef,
 ) -> Result<Vp9InterFrameModeInfo, Error> {
     let mi_size = args.geom.mi_size as u8;
 
@@ -3204,7 +3259,7 @@ pub(crate) fn inter_frame_mode_info<S: crate::mv_ref::MvCandidateSource>(
     let segment_ref_frame_data = args.seg.data(segment_id, SEG_LVL_REF_FRAME);
 
     // read_skip( ) — §6.4.8.
-    let skip = read_skip(coder, seg_skip_active, args.skip_prob, args.skip_nb)?;
+    let skip = read_skip(coder, seg_skip_active, args.skip_prob, args.skip_nb, counts)?;
 
     // read_is_inter( ) — §6.4.13.
     let is_inter = read_is_inter(
@@ -3213,6 +3268,7 @@ pub(crate) fn inter_frame_mode_info<S: crate::mv_ref::MvCandidateSource>(
         segment_ref_frame_data,
         args.is_inter_prob,
         args.is_inter_nb,
+        counts,
     )?;
 
     // read_tx_size( !skip || !is_inter ) — §6.4.10.
@@ -3223,6 +3279,7 @@ pub(crate) fn inter_frame_mode_info<S: crate::mv_ref::MvCandidateSource>(
         mi_size,
         args.tx_probs,
         args.tx_nb,
+        counts,
     )?;
 
     // §6.4.5 dispatch: inter_block_mode_info( ) vs intra_block_mode_info( ).
@@ -3249,10 +3306,17 @@ pub(crate) fn inter_frame_mode_info<S: crate::mv_ref::MvCandidateSource>(
             args.use_prev_frame_mvs,
             args.sign_bias,
             seg_skip_active,
+            counts,
         )?;
         Vp9InterFrameBlock::Inter(inter)
     } else {
-        let intra = intra_block_mode_info(coder, mi_size, args.y_mode_probs, args.uv_mode_probs)?;
+        let intra = intra_block_mode_info(
+            coder,
+            mi_size,
+            args.y_mode_probs,
+            args.uv_mode_probs,
+            counts,
+        )?;
         Vp9InterFrameBlock::Intra(intra)
     };
 
@@ -3566,6 +3630,7 @@ mod tests {
             true,
             &[128, 128, 128],
             NeighbourSkips::default(),
+            &mut Default::default(),
         )
         .unwrap();
         assert!(skip);
@@ -3581,6 +3646,7 @@ mod tests {
             false,
             &[128, 128, 128],
             NeighbourSkips::default(),
+            &mut Default::default(),
         )
         .unwrap();
         assert!(!skip);
@@ -3597,6 +3663,7 @@ mod tests {
             false,
             &[255, 128, 64], // ctx=0 row picks 255
             NeighbourSkips::default(),
+            &mut Default::default(),
         )
         .unwrap();
         assert!(skip);
@@ -3627,6 +3694,7 @@ mod tests {
                 above: Some(1),
                 left: Some(1),
             },
+            &mut Default::default(),
         )
         .unwrap();
         assert!(!skip);
@@ -3642,6 +3710,80 @@ mod tests {
             }),
             2,
         );
+    }
+
+    // ----- §9.3.4 skip / tx_size counting -----
+
+    #[test]
+    fn read_skip_counts_at_decode_ctx_and_not_on_seg_override() {
+        use crate::prob_adapt::CountsNonCoef;
+        // Decoded path: ctx = 2 (both neighbours skip), zero coder →
+        // skip = 0 → counts_skip[2][0] += 1.
+        let mut coder = zero_coder();
+        let mut counts = CountsNonCoef::default();
+        let nb = NeighbourSkips {
+            above: Some(1),
+            left: Some(1),
+        };
+        read_skip(&mut coder, false, &[128, 128, 128], nb, &mut counts).unwrap();
+        assert_eq!(counts.skip[2], [1, 0]);
+        assert_eq!(counts.skip[0], [0, 0]);
+        assert_eq!(counts.skip[1], [0, 0]);
+
+        // SEG_LVL_SKIP hardwired arm: no `Skip` element in the syntax
+        // table on this path → no count.
+        let mut coder = zero_coder();
+        let mut counts = CountsNonCoef::default();
+        read_skip(&mut coder, true, &[128, 128, 128], nb, &mut counts).unwrap();
+        assert_eq!(counts.skip, [[0, 0]; 3]);
+    }
+
+    #[test]
+    fn read_tx_size_counts_only_on_tree_decode() {
+        use crate::compressed::DEFAULT_TX_PROBS;
+        use crate::prob_adapt::CountsNonCoef;
+        let nb = NeighbourTxSizes {
+            avail_u: false,
+            avail_l: false,
+            skip_above: 0,
+            skip_left: 0,
+            tx_above: 0,
+            tx_left: 0,
+        };
+        // Tree path: TX_MODE_SELECT + allow_select at BLOCK_64X64
+        // (maxTxSize = TX_32X32). Zero coder walks to TX_4X4.
+        let mut coder = zero_coder();
+        let mut counts = CountsNonCoef::default();
+        let ctx = tx_size_context(nb, 3);
+        let v = read_tx_size(
+            &mut coder,
+            true,
+            TxMode::TxModeSelect,
+            BLOCK_64X64,
+            &DEFAULT_TX_PROBS,
+            nb,
+            &mut counts,
+        )
+        .unwrap();
+        assert_eq!(counts.tx_size[3][ctx][v as usize], 1);
+        let total: u32 = counts.tx_size.iter().flatten().flatten().sum();
+        assert_eq!(total, 1);
+
+        // Inferred path (§6.4.10 else arm): no element, no count.
+        let mut coder = zero_coder();
+        let mut counts = CountsNonCoef::default();
+        read_tx_size(
+            &mut coder,
+            false,
+            TxMode::TxModeSelect,
+            BLOCK_64X64,
+            &DEFAULT_TX_PROBS,
+            nb,
+            &mut counts,
+        )
+        .unwrap();
+        let total: u32 = counts.tx_size.iter().flatten().flatten().sum();
+        assert_eq!(total, 0);
     }
 
     // ----- segment_tree / read_segment_id / intra_segment_id -----
@@ -3791,6 +3933,7 @@ mod tests {
             BLOCK_64X64,
             &make_tx_probs(128),
             NeighbourTxSizes::default(),
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(tx_size, 2);
@@ -3809,6 +3952,7 @@ mod tests {
             BLOCK_64X64,
             &make_tx_probs(255),
             NeighbourTxSizes::default(),
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(tx_size, 3);
@@ -3826,6 +3970,7 @@ mod tests {
             BLOCK_4X4,
             &make_tx_probs(255),
             NeighbourTxSizes::default(),
+            &mut Default::default(),
         )
         .unwrap();
         // max_txsize_lookup[BLOCK_4X4] = 0 (TX_4X4); biggest for
@@ -3846,6 +3991,7 @@ mod tests {
             BLOCK_8X8,
             &make_tx_probs(128),
             NeighbourTxSizes::default(),
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(tx_size, 0);
@@ -3865,6 +4011,7 @@ mod tests {
             BLOCK_8X8,
             &make_tx_probs(255),
             NeighbourTxSizes::default(),
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(tx_size, 1);
@@ -3884,6 +4031,7 @@ mod tests {
             BLOCK_16X16,
             &make_tx_probs(255),
             NeighbourTxSizes::default(),
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(tx_size, 1);
@@ -3901,6 +4049,7 @@ mod tests {
             BLOCK_32X32,
             &make_tx_probs(128),
             NeighbourTxSizes::default(),
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(tx_size, 0);
@@ -3942,6 +4091,7 @@ mod tests {
             BLOCK_8X8,
             &probs,
             nb_ctx0,
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(tx_size, 0);
@@ -3964,6 +4114,7 @@ mod tests {
             BLOCK_8X8,
             &probs,
             nb_ctx1,
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(tx_size, 0);
@@ -4244,6 +4395,7 @@ mod tests {
             NeighbourSkips::default(),
             NeighbourTxSizes::default(),
             default_intra_nb(),
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(block.segment_id, 0);
@@ -4276,6 +4428,7 @@ mod tests {
             NeighbourSkips::default(),
             NeighbourTxSizes::default(),
             default_intra_nb(),
+            &mut Default::default(),
         )
         .unwrap();
         for cell in block.sub_modes.iter() {
@@ -4307,6 +4460,7 @@ mod tests {
             NeighbourSkips::default(),
             NeighbourTxSizes::default(),
             default_intra_nb(),
+            &mut Default::default(),
         )
         .unwrap();
         // For sub-8x8 blocks read_tx_size's `MiSize >= BLOCK_8X8` guard
@@ -4344,6 +4498,7 @@ mod tests {
             NeighbourSkips::default(),
             NeighbourTxSizes::default(),
             default_intra_nb(),
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(block.sub_modes, [DC_PRED; 4]);
@@ -4362,6 +4517,7 @@ mod tests {
             NeighbourSkips::default(),
             NeighbourTxSizes::default(),
             default_intra_nb(),
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(block.sub_modes, [DC_PRED; 4]);
@@ -4396,6 +4552,7 @@ mod tests {
             NeighbourSkips::default(),
             NeighbourTxSizes::default(),
             nb_intra,
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(block.y_mode, DC_PRED);
@@ -4419,6 +4576,7 @@ mod tests {
             NeighbourSkips::default(),
             NeighbourTxSizes::default(),
             default_intra_nb(),
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(block.segment_id, 0);
@@ -4445,6 +4603,7 @@ mod tests {
             NeighbourSkips::default(),
             NeighbourTxSizes::default(),
             default_intra_nb(),
+            &mut Default::default(),
         )
         .unwrap();
         assert!(block.skip);
@@ -4475,6 +4634,7 @@ mod tests {
                 NeighbourSkips::default(),
                 NeighbourTxSizes::default(),
                 default_intra_nb(),
+                &mut Default::default(),
             )
             .unwrap();
             assert_eq!(block.ref_frame_0, INTRA_FRAME);
@@ -4594,7 +4754,13 @@ mod tests {
     fn intra_mode_zero_buffer_picks_dc_pred() {
         // Zero coder pins every bit to 0; INTRA_MODE_TREE[0] = 0 = DC_PRED.
         let mut coder = zero_coder();
-        let mode = intra_mode(&mut coder, &DEFAULT_Y_MODE_PROBS, BLOCK_16X16).unwrap();
+        let mode = intra_mode(
+            &mut coder,
+            &DEFAULT_Y_MODE_PROBS,
+            BLOCK_16X16,
+            &mut Default::default(),
+        )
+        .unwrap();
         assert_eq!(mode, DC_PRED);
     }
 
@@ -4631,7 +4797,13 @@ mod tests {
         // stepping over the crate's own BoolCoder.
         let bytes = make_bias_buffer(0x7F);
         let mut coder = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
-        let mode = intra_mode(&mut coder, &DEFAULT_Y_MODE_PROBS, BLOCK_4X4).unwrap();
+        let mode = intra_mode(
+            &mut coder,
+            &DEFAULT_Y_MODE_PROBS,
+            BLOCK_4X4,
+            &mut Default::default(),
+        )
+        .unwrap();
         assert_eq!(mode, D207_PRED);
     }
 
@@ -4654,7 +4826,7 @@ mod tests {
         // And the real reader picks DC_PRED on the zero buffer.
         let mut coder = zero_coder();
         assert_eq!(
-            sub_intra_mode(&mut coder, &DEFAULT_Y_MODE_PROBS).unwrap(),
+            sub_intra_mode(&mut coder, &DEFAULT_Y_MODE_PROBS, &mut Default::default()).unwrap(),
             DC_PRED
         );
     }
@@ -4663,7 +4835,13 @@ mod tests {
     fn uv_mode_zero_buffer_picks_dc_pred() {
         // Zero coder -> first leaf DC_PRED, regardless of y_mode ctx.
         let mut coder = zero_coder();
-        let uv = uv_mode(&mut coder, &DEFAULT_UV_MODE_PROBS, V_PRED).unwrap();
+        let uv = uv_mode(
+            &mut coder,
+            &DEFAULT_UV_MODE_PROBS,
+            V_PRED,
+            &mut Default::default(),
+        )
+        .unwrap();
         assert_eq!(uv, DC_PRED);
     }
 
@@ -4693,7 +4871,13 @@ mod tests {
         // §9.2.2 stepping over the crate's BoolCoder.
         let bytes = make_bias_buffer(0x7F);
         let mut coder = BoolCoder::init_bool(&bytes, bytes.len()).unwrap();
-        let uv = uv_mode(&mut coder, &DEFAULT_UV_MODE_PROBS, DC_PRED).unwrap();
+        let uv = uv_mode(
+            &mut coder,
+            &DEFAULT_UV_MODE_PROBS,
+            DC_PRED,
+            &mut Default::default(),
+        )
+        .unwrap();
         assert_eq!(uv, D207_PRED);
     }
 
@@ -4711,6 +4895,7 @@ mod tests {
             BLOCK_8X8,
             &DEFAULT_Y_MODE_PROBS,
             &DEFAULT_UV_MODE_PROBS,
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(block.ref_frame_0, INTRA_FRAME);
@@ -4731,6 +4916,7 @@ mod tests {
             BLOCK_64X64,
             &DEFAULT_Y_MODE_PROBS,
             &DEFAULT_UV_MODE_PROBS,
+            &mut Default::default(),
         )
         .unwrap();
         for cell in block.sub_modes.iter() {
@@ -4762,6 +4948,7 @@ mod tests {
             BLOCK_8X8,
             &DEFAULT_Y_MODE_PROBS,
             &DEFAULT_UV_MODE_PROBS,
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(block.y_mode, D207_PRED);
@@ -4779,6 +4966,7 @@ mod tests {
             BLOCK_4X4,
             &DEFAULT_Y_MODE_PROBS,
             &DEFAULT_UV_MODE_PROBS,
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(block.sub_modes, [DC_PRED; 4]);
@@ -4797,6 +4985,7 @@ mod tests {
             BLOCK_4X8,
             &DEFAULT_Y_MODE_PROBS,
             &DEFAULT_UV_MODE_PROBS,
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(block.sub_modes, [DC_PRED; 4]);
@@ -4814,6 +5003,7 @@ mod tests {
             BLOCK_32X32,
             &DEFAULT_Y_MODE_PROBS,
             &DEFAULT_UV_MODE_PROBS,
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(block.ref_frame_0, INTRA_FRAME);
@@ -4833,6 +5023,7 @@ mod tests {
             BLOCK_8X8,
             &DEFAULT_Y_MODE_PROBS,
             &DEFAULT_UV_MODE_PROBS,
+            &mut Default::default(),
         )
         .unwrap();
         match mi {
@@ -4864,6 +5055,7 @@ mod tests {
             NeighbourSkips::default(),
             NeighbourTxSizes::default(),
             default_intra_nb(),
+            &mut Default::default(),
         )
         .unwrap();
         let mi = Vp9ModeInfo::IntraFrame(block);
@@ -5730,6 +5922,7 @@ mod tests {
             &[128; COMP_MODE_CONTEXTS],
             &[[128; 2]; REF_CONTEXTS],
             &[128; REF_CONTEXTS],
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(
@@ -5758,6 +5951,7 @@ mod tests {
             &[128; COMP_MODE_CONTEXTS],
             &[[128; 2]; REF_CONTEXTS],
             &[128; REF_CONTEXTS],
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(
@@ -5794,6 +5988,7 @@ mod tests {
             &[128; COMP_MODE_CONTEXTS],
             &single,
             &[128; REF_CONTEXTS],
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(out.ref_frame_0, GOLDEN_FRAME);
@@ -5818,6 +6013,7 @@ mod tests {
             &[128; COMP_MODE_CONTEXTS],
             &[[128; 2]; REF_CONTEXTS],
             &[128; REF_CONTEXTS],
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(
@@ -5847,6 +6043,7 @@ mod tests {
             &[128; COMP_MODE_CONTEXTS],
             &[[128; 2]; REF_CONTEXTS],
             &[128; REF_CONTEXTS],
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(out.ref_frame_0, LAST_FRAME);
@@ -5870,6 +6067,7 @@ mod tests {
             &[128; COMP_MODE_CONTEXTS],
             &[[128; 2]; REF_CONTEXTS],
             &[128; REF_CONTEXTS],
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(out.ref_frame_0, LAST_FRAME);
@@ -5892,6 +6090,7 @@ mod tests {
             &[255; COMP_MODE_CONTEXTS],
             &[[128; 2]; REF_CONTEXTS],
             &[1; REF_CONTEXTS],
+            &mut Default::default(),
         )
         .unwrap();
         // comp_ref (prob 1) stays 0 after the comp_mode flip consumed
@@ -5913,6 +6112,7 @@ mod tests {
             INTRA_FRAME as i16,
             &DEFAULT_IS_INTER_PROB,
             IsInterNeighbours::default(),
+            &mut Default::default(),
         )
         .unwrap();
         assert!(!is_inter);
@@ -5931,6 +6131,7 @@ mod tests {
                 rf as i16,
                 &DEFAULT_IS_INTER_PROB,
                 IsInterNeighbours::default(),
+                &mut Default::default(),
             )
             .unwrap();
             assert!(is_inter, "ref_frame {rf} must derive is_inter=true");
@@ -5948,6 +6149,7 @@ mod tests {
             0, // seg ref-frame data irrelevant when feature inactive
             &DEFAULT_IS_INTER_PROB,
             IsInterNeighbours::default(),
+            &mut Default::default(),
         )
         .unwrap();
         assert!(!is_inter);
@@ -5968,7 +6170,8 @@ mod tests {
             above: Some(INTRA_FRAME),
             left: Some(INTRA_FRAME),
         };
-        let is_inter = read_is_inter(&mut coder, false, 0, &probs, nb).unwrap();
+        let is_inter =
+            read_is_inter(&mut coder, false, 0, &probs, nb, &mut Default::default()).unwrap();
         assert!(is_inter);
     }
 
@@ -6009,7 +6212,8 @@ mod tests {
             // Distinct prob per slot to confirm none aliases another.
             let probs = [10u8, 60, 130, 200];
             let mut coder = zero_coder();
-            let is_inter = read_is_inter(&mut coder, false, 0, &probs, *nb).unwrap();
+            let is_inter =
+                read_is_inter(&mut coder, false, 0, &probs, *nb, &mut Default::default()).unwrap();
             assert!(
                 !is_inter,
                 "zero coder must pin bit=0 for ctx={ix} regardless of probs"
@@ -6040,6 +6244,7 @@ mod tests {
                 LAST_FRAME as i16,
                 &DEFAULT_IS_INTER_PROB,
                 nb,
+                &mut Default::default(),
             )
             .unwrap();
             assert!(is_inter);
@@ -6210,6 +6415,7 @@ mod tests {
             false,
             &[false; 4],
             false,
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(out.ref_frame_0, LAST_FRAME);
@@ -6250,6 +6456,7 @@ mod tests {
             false,
             &[false; 4],
             true, // SEG_LVL_SKIP active.
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(out.y_mode, ZEROMV);
@@ -6283,6 +6490,7 @@ mod tests {
             false,
             &[false; 4],
             false,
+            &mut Default::default(),
         )
         .unwrap();
         // Switchable -> per-block read -> zero coder picks EIGHTTAP.
@@ -6316,6 +6524,7 @@ mod tests {
             false,
             &[false; 4],
             false,
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(out.y_mode, ZEROMV);
@@ -6419,7 +6628,15 @@ mod tests {
             &comp_ref_prob,
         );
         let mut seg_ctx = SegPredContextState::new(geom.mi_cols as u32, geom.mi_rows as u32);
-        let out = inter_frame_mode_info(&mut coder, args, &mut seg_ctx, 8, 8).unwrap();
+        let out = inter_frame_mode_info(
+            &mut coder,
+            args,
+            &mut seg_ctx,
+            8,
+            8,
+            &mut Default::default(),
+        )
+        .unwrap();
 
         assert_eq!(out.segment_id, 0);
         assert!(!out.skip);
@@ -6477,7 +6694,15 @@ mod tests {
             &comp_ref_prob,
         );
         let mut seg_ctx = SegPredContextState::new(geom.mi_cols as u32, geom.mi_rows as u32);
-        let out = inter_frame_mode_info(&mut coder, args, &mut seg_ctx, 8, 8).unwrap();
+        let out = inter_frame_mode_info(
+            &mut coder,
+            args,
+            &mut seg_ctx,
+            8,
+            8,
+            &mut Default::default(),
+        )
+        .unwrap();
 
         assert_eq!(out.segment_id, 0);
         // read_skip: seg SKIP not active -> zero coder -> false.
@@ -6535,7 +6760,15 @@ mod tests {
             &comp_ref_prob,
         );
         let mut seg_ctx = SegPredContextState::new(geom.mi_cols as u32, geom.mi_rows as u32);
-        let out = inter_frame_mode_info(&mut coder, args, &mut seg_ctx, 8, 8).unwrap();
+        let out = inter_frame_mode_info(
+            &mut coder,
+            args,
+            &mut seg_ctx,
+            8,
+            8,
+            &mut Default::default(),
+        )
+        .unwrap();
 
         assert!(out.skip);
         assert!(out.is_inter);

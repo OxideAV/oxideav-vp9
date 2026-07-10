@@ -673,6 +673,16 @@ pub(crate) trait LeafSink {
     /// Handle one §6.4.4 `decode_block( r, c, subsize )` call site.
     fn leaf(&mut self, coder: &mut BoolCoder<'_>, r: u32, c: u32, subsize: u8)
         -> Result<(), Error>;
+
+    /// §9.3.4 counting hook: one `partition` syntax element was parsed
+    /// with context `ctx` and value `partition` (`counts_partition[ ctx ]
+    /// [ syntax ] += 1`). Fired for **every** §9.3 parse of `partition` —
+    /// including the §9.3.1 corner arm (`hasRows == 0 && hasCols == 0`)
+    /// where the tree-selection process returns `PARTITION_SPLIT` as an
+    /// integer without reading bits: §9.3 step 2 (the counting process)
+    /// still runs on that arm. Default is a no-op for sinks that don't
+    /// accumulate counts (leaf-log test sinks).
+    fn record_partition(&mut self, _ctx: usize, _partition: u8) {}
 }
 
 impl LeafSink for Vec<LeafBlock> {
@@ -827,6 +837,9 @@ pub(crate) fn decode_partition(
 
     // §6.4.3 line 2360: read the partition syntax element.
     let partition = decode_partition_type(coder, has_rows, has_cols, &probs_row)?;
+    // §9.3 step 2: the counting process runs for every parsed
+    // `partition` element, the bit-free corner-inferred SPLIT included.
+    on_leaf.record_partition(ctx, partition);
     // §6.4.3 line 2361: child block size.
     let subsize = SUBSIZE_LOOKUP[partition as usize][bsize as usize];
 
@@ -3651,5 +3664,86 @@ mod tests {
             }
             assert_eq!(col_tiles.last().unwrap().mi_row_end, mi_rows);
         }
+    }
+
+    // ----- §9.3.4 partition counting through the LeafSink hook -----
+
+    /// A sink that logs both leaves and the §9.3.4 partition-count
+    /// events the decoder fires through [`LeafSink::record_partition`].
+    struct CountingSink {
+        leaves: Vec<LeafBlock>,
+        partition_events: Vec<(usize, u8)>,
+    }
+
+    impl LeafSink for CountingSink {
+        fn leaf(
+            &mut self,
+            _coder: &mut BoolCoder<'_>,
+            r: u32,
+            c: u32,
+            subsize: u8,
+        ) -> Result<(), Error> {
+            self.leaves.push(LeafBlock { r, c, subsize });
+            Ok(())
+        }
+
+        fn record_partition(&mut self, ctx: usize, partition: u8) {
+            self.partition_events.push((ctx, partition));
+        }
+    }
+
+    /// §9.3 step 2 anchored: the corner arm (`hasRows == 0 && hasCols ==
+    /// 0`) sets `partition = PARTITION_SPLIT` WITHOUT reading a bit, and
+    /// the counting process still runs for it. An 8x8 frame (MiRows =
+    /// MiCols = 1) walked from BLOCK_64X64 infers SPLIT at the 64/32/16
+    /// levels (three bit-free counting events) and only READS a
+    /// partition element at BLOCK_8X8 (where half = 0 makes
+    /// hasRows/hasCols true); the zero coder decodes PARTITION_NONE
+    /// there. Out-of-frame quadrants short-circuit BEFORE the partition
+    /// parse and must produce no counting event.
+    #[test]
+    fn decode_partition_counts_corner_inferred_splits() {
+        let buf = [0u8; 8];
+        let mut coder = BoolCoder::init_bool(&buf, buf.len()).unwrap();
+        let mut state = PartitionContextState::new(8, 8);
+        let mut sink = CountingSink {
+            leaves: Vec::new(),
+            partition_events: Vec::new(),
+        };
+        decode_partition(
+            &mut coder,
+            0,
+            0,
+            BLOCK_64X64,
+            1,
+            1,
+            &mut state,
+            PartitionProbsKind::Keyframe,
+            &mut sink,
+        )
+        .unwrap();
+
+        // One 8x8 leaf.
+        assert_eq!(
+            sink.leaves,
+            vec![LeafBlock {
+                r: 0,
+                c: 0,
+                subsize: BLOCK_8X8
+            }]
+        );
+        // Exactly four counting events: three inferred SPLITs (64 -> 32
+        // -> 16) plus the decoded NONE at 8x8. The 3 out-of-frame
+        // quadrants at each SPLIT level contribute nothing.
+        assert_eq!(sink.partition_events.len(), 4);
+        assert_eq!(
+            sink.partition_events[..3]
+                .iter()
+                .map(|&(_, p)| p)
+                .collect::<Vec<_>>(),
+            vec![PARTITION_SPLIT; 3],
+            "corner-inferred SPLITs are counted bit-free"
+        );
+        assert_eq!(sink.partition_events[3].1, PARTITION_NONE);
     }
 }

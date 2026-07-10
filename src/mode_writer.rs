@@ -210,7 +210,8 @@ mod tests {
                         left: Some(1),
                     },
                 };
-                let got = read_skip(&mut dec, false, &skip_prob, nb).unwrap();
+                let got =
+                    read_skip(&mut dec, false, &skip_prob, nb, &mut Default::default()).unwrap();
                 assert_eq!(got, skip, "skip {skip} ctx {ctx}");
             }
         }
@@ -225,7 +226,14 @@ mod tests {
         // Only the marker + flush — decoding read_skip with
         // seg_feature_active short-circuits to 1 reading nothing.
         let mut dec = BoolCoder::init_bool(&buf, buf.len()).unwrap();
-        assert!(read_skip(&mut dec, true, &skip_prob, NeighbourSkips::default()).unwrap());
+        assert!(read_skip(
+            &mut dec,
+            true,
+            &skip_prob,
+            NeighbourSkips::default(),
+            &mut Default::default()
+        )
+        .unwrap());
     }
 
     #[test]
@@ -300,9 +308,16 @@ mod tests {
                 write_tx_size(&mut enc, tx, true, max_tx, row).unwrap();
                 let buf = enc.finish();
                 let mut dec = BoolCoder::init_bool(&buf, buf.len()).unwrap();
-                let got =
-                    read_tx_size(&mut dec, true, TxMode::TxModeSelect, mi_size, &tx_probs, nb)
-                        .unwrap();
+                let got = read_tx_size(
+                    &mut dec,
+                    true,
+                    TxMode::TxModeSelect,
+                    mi_size,
+                    &tx_probs,
+                    nb,
+                    &mut Default::default(),
+                )
+                .unwrap();
                 assert_eq!(got, tx, "tx {tx} max {max_tx}");
             }
         }
@@ -327,7 +342,16 @@ mod tests {
             tx_left: 0,
         };
         // ONLY_4X4 inferred → 0.
-        let got = read_tx_size(&mut dec, true, TxMode::Only4x4, BLOCK_8X8, &tx_probs, nb).unwrap();
+        let got = read_tx_size(
+            &mut dec,
+            true,
+            TxMode::Only4x4,
+            BLOCK_8X8,
+            &tx_probs,
+            nb,
+            &mut Default::default(),
+        )
+        .unwrap();
         assert_eq!(got, 0);
     }
 

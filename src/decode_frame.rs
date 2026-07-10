@@ -207,6 +207,11 @@ impl LeafSink for BlockDecoder<'_> {
     ) -> Result<(), Error> {
         self.decode_block(coder, r, c, subsize)
     }
+
+    fn record_partition(&mut self, ctx: usize, partition: u8) {
+        // §9.3.4: counts_partition[ ctx ][ syntax ] += 1.
+        self.counts.noncoef.partition[ctx][partition as usize] += 1;
+    }
 }
 
 impl BlockDecoder<'_> {
@@ -319,6 +324,7 @@ impl BlockDecoder<'_> {
             nb_skip,
             nb_tx,
             nb_intra,
+            &mut self.counts.noncoef,
         )?;
         mi.segment_id = segment_id;
 
@@ -709,7 +715,7 @@ impl BlockDecoder<'_> {
         };
 
         let seg_pred_ctx = &mut self.inter.as_mut().unwrap().seg_pred_ctx;
-        let mi = inter_frame_mode_info(coder, args, seg_pred_ctx, r, c)?;
+        let mi = inter_frame_mode_info(coder, args, seg_pred_ctx, r, c, &mut self.counts.noncoef)?;
 
         // Map the §6.4.11 products into the §6.4.4 fan-out + residual.
         let (ref_frame, is_inter, y_mode, interp_filter, block_mvs, sub_modes, uv_mode) =
@@ -2136,7 +2142,14 @@ pub(crate) fn decode_inter_blocks_for_test(
             uv_mode_probs: &chdr_inter.uv_mode_probs,
         };
 
-        let mi = inter_frame_mode_info(&mut coder, args, &mut seg_pred_ctx, r, c)?;
+        let mi = inter_frame_mode_info(
+            &mut coder,
+            args,
+            &mut seg_pred_ctx,
+            r,
+            c,
+            &mut counts.noncoef,
+        )?;
         let (ref_frame, y_mode, interp_filter, block_mvs) = match mi.block {
             Vp9InterFrameBlock::Inter(b) => (
                 [b.ref_frame_0, b.ref_frame_1],

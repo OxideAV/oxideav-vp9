@@ -46,6 +46,7 @@ use crate::adaptive_filter_strength::{NEARESTMV, NEARMV, NEWMV};
 use crate::bool_coder::BoolCoder;
 use crate::compressed::MvProbs;
 use crate::mode_info::{tree_decode, BINARY_TREE};
+use crate::prob_adapt::CountsNonCoef;
 use crate::Error;
 
 /// `MV_JOINT_ZERO = 0` per §7.4.13 (`vp9-spec.txt` line 4014). Neither
@@ -160,22 +161,33 @@ pub(crate) fn read_mv_component(
     probs: &MvProbs,
     comp: usize,
     use_hp: bool,
+    counts: &mut CountsNonCoef,
 ) -> Result<i32, Error> {
+    let mc = &mut counts.mv_comp[comp];
+
     // mv_sign: mv_sign_prob[ comp ].
     let mv_sign = coder.read_bool(u32::from(probs.sign_prob[comp]))?;
+    mc.sign[mv_sign as usize] += 1;
 
     // mv_class: mv_class_probs[ comp ] over mv_class_tree.
     let class_probs = &probs.class_probs[comp];
     let mv_class = tree_decode(coder, &MV_CLASS_TREE, |node| class_probs[node])?;
+    mc.class[mv_class as usize] += 1;
 
     let mag = if mv_class == MV_CLASS_0 {
         // mv_class0_bit: mv_class0_bit_prob[ comp ].
         let mv_class0_bit = coder.read_bool(u32::from(probs.class0_bit_prob[comp]))?;
+        mc.class0_bit[mv_class0_bit as usize] += 1;
         // mv_class0_fr: mv_class0_fr_probs[ comp ][ mv_class0_bit ][ node ].
         let fr_probs = &probs.class0_fr_probs[comp][mv_class0_bit as usize];
         let mv_class0_fr = tree_decode(coder, &MV_FR_TREE, |node| fr_probs[node])?;
+        mc.class0_fr[mv_class0_bit as usize][mv_class0_fr as usize] += 1;
         // mv_class0_hp: mv_class0_hp_prob[ comp ]; fixed to 1 when !UseHp.
         let mv_class0_hp = read_hp(coder, probs.class0_hp_prob[comp], use_hp)?;
+        // §9.3 step 2 runs even on the §9.3.1 integer-return arm
+        // (UseHp == 0 → value fixed to 1 with no bit read), so the
+        // count is unconditional.
+        mc.class0_hp[mv_class0_hp as usize] += 1;
         ((mv_class0_bit << 3) | ((mv_class0_fr as u32) << 1) | mv_class0_hp) as i32 + 1
     } else {
         // d = sum over i in [0, mv_class) of (mv_bit << i).
@@ -183,6 +195,7 @@ pub(crate) fn read_mv_component(
         let mut d: u32 = 0;
         for i in 0..mv_class as usize {
             let mv_bit = coder.read_bool(u32::from(probs.bits_prob[comp][i]))?;
+            mc.bits[i][mv_bit as usize] += 1;
             d |= mv_bit << i;
         }
         // mag = CLASS0_SIZE << ( mv_class + 2 ).
@@ -190,8 +203,11 @@ pub(crate) fn read_mv_component(
         // mv_fr: mv_fr_probs[ comp ][ node ].
         let fr_probs = &probs.fr_probs[comp];
         let mv_fr = tree_decode(coder, &MV_FR_TREE, |node| fr_probs[node])?;
-        // mv_hp: mv_hp_prob[ comp ]; fixed to 1 when !UseHp.
+        mc.fr[mv_fr as usize] += 1;
+        // mv_hp: mv_hp_prob[ comp ]; fixed to 1 when !UseHp. Counted
+        // unconditionally (§9.3 step 2 on the integer-return arm).
         let mv_hp = read_hp(coder, probs.hp_prob[comp], use_hp)?;
+        mc.hp[mv_hp as usize] += 1;
         mag += ((d << 3) | ((mv_fr as u32) << 1) | mv_hp) as i32 + 1;
         mag
     };
@@ -238,18 +254,20 @@ pub(crate) fn read_mv(
     probs: &MvProbs,
     best_mv: [i32; 2],
     allow_hp: bool,
+    counts: &mut CountsNonCoef,
 ) -> Result<[i32; 2], Error> {
     let use_hp = allow_hp && use_mv_hp(best_mv);
 
     // mv_joint: mv_joint_probs[ node ].
     let joint = tree_decode(coder, &MV_JOINT_TREE, |node| probs.joint_probs[node])?;
+    counts.mv_joint[joint as usize] += 1;
 
     let mut diff = [0i32; 2];
     if joint == MV_JOINT_HZVNZ || joint == MV_JOINT_HNZVNZ {
-        diff[0] = read_mv_component(coder, probs, 0, use_hp)?;
+        diff[0] = read_mv_component(coder, probs, 0, use_hp, counts)?;
     }
     if joint == MV_JOINT_HNZVZ || joint == MV_JOINT_HNZVNZ {
-        diff[1] = read_mv_component(coder, probs, 1, use_hp)?;
+        diff[1] = read_mv_component(coder, probs, 1, use_hp, counts)?;
     }
 
     Ok([best_mv[0] + diff[0], best_mv[1] + diff[1]])
@@ -310,6 +328,7 @@ pub(crate) fn assign_mv(
     is_compound: bool,
     preds: &[MvPredictors; 2],
     allow_hp: bool,
+    counts: &mut CountsNonCoef,
 ) -> Result<[[i32; 2]; 2], Error> {
     // Mv[ 1 ] = ZeroMv (set before the loop so a non-compound block
     // leaves slot 1 zero regardless of y_mode).
@@ -318,7 +337,7 @@ pub(crate) fn assign_mv(
     let count = if is_compound { 2 } else { 1 };
     for i in 0..count {
         mv[i] = match y_mode {
-            NEWMV => read_mv(coder, probs, preds[i].best, allow_hp)?,
+            NEWMV => read_mv(coder, probs, preds[i].best, allow_hp, counts)?,
             NEARESTMV => preds[i].nearest,
             NEARMV => preds[i].near,
             // ZEROMV (and the §6.4.16 SEG_LVL_SKIP forced-ZEROMV case).
@@ -368,7 +387,7 @@ mod tests {
         let buf = [0u8; 16];
         let mut coder = zero_coder(&buf);
         let probs = MvProbs::defaults();
-        let mv = read_mv(&mut coder, &probs, [5, -9], true).unwrap();
+        let mv = read_mv(&mut coder, &probs, [5, -9], true, &mut Default::default()).unwrap();
         assert_eq!(mv, [5, -9]);
     }
 
@@ -380,7 +399,7 @@ mod tests {
         let buf = [0u8; 16];
         let mut coder = zero_coder(&buf);
         let probs = MvProbs::defaults();
-        let v = read_mv_component(&mut coder, &probs, 0, true).unwrap();
+        let v = read_mv_component(&mut coder, &probs, 0, true, &mut Default::default()).unwrap();
         assert_eq!(v, 1);
     }
 
@@ -391,8 +410,72 @@ mod tests {
         let buf = [0u8; 16];
         let mut coder = zero_coder(&buf);
         let probs = MvProbs::defaults();
-        let v = read_mv_component(&mut coder, &probs, 0, false).unwrap();
+        let v = read_mv_component(&mut coder, &probs, 0, false, &mut Default::default()).unwrap();
         assert_eq!(v, 2);
+    }
+
+    // ----- §9.3.4 mv counting -----
+
+    #[test]
+    fn read_mv_component_counts_every_decoded_element() {
+        use crate::mode_info::MV_OFFSET_BITS;
+        use crate::prob_adapt::CountsMvComponent;
+        // Zero coder, use_hp = true, comp = 1: mv_sign=0, mv_class=0,
+        // mv_class0_bit=0, mv_class0_fr=0 (under bit 0), mv_class0_hp=0.
+        // Each decoded element charges exactly one §9.3.4 count in the
+        // matching per-component array.
+        let buf = [0u8; 16];
+        let mut coder = zero_coder(&buf);
+        let probs = MvProbs::defaults();
+        let mut counts = CountsNonCoef::default();
+        read_mv_component(&mut coder, &probs, 1, true, &mut counts).unwrap();
+        let mc = &counts.mv_comp[1];
+        assert_eq!(mc.sign, [1, 0]);
+        assert_eq!(mc.class[0], 1);
+        assert_eq!(mc.class.iter().sum::<u32>(), 1);
+        assert_eq!(mc.class0_bit, [1, 0]);
+        assert_eq!(mc.class0_fr[0][0], 1, "fr counted under class0_bit row");
+        assert_eq!(mc.class0_fr[1], [0; 4]);
+        assert_eq!(mc.class0_hp, [1, 0]);
+        // The other component and the non-class0 arrays stay untouched.
+        assert_eq!(counts.mv_comp[0], CountsMvComponent::default());
+        assert_eq!(mc.fr, [0; 4]);
+        assert_eq!(mc.hp, [0, 0]);
+        assert_eq!(mc.bits, [[0; 2]; MV_OFFSET_BITS]);
+    }
+
+    #[test]
+    fn read_mv_component_counts_phantom_hp_when_use_hp_off() {
+        // §9.3 step 2 anchored: with UseHp == 0 the §9.3.1 tree selection
+        // for mv_class0_hp returns the integer 1 WITHOUT reading a bit,
+        // and the counting process still runs — counts_mv_class0_hp[comp]
+        // [1] += 1. A decoder that skips the count on the absent-bit arm
+        // drifts in §8.4.4 adaptation whenever allow_high_precision_mv
+        // is on but a large predictor suppresses the hp bit.
+        let buf = [0u8; 16];
+        let mut coder = zero_coder(&buf);
+        let probs = MvProbs::defaults();
+        let mut counts = CountsNonCoef::default();
+        read_mv_component(&mut coder, &probs, 0, false, &mut counts).unwrap();
+        assert_eq!(
+            counts.mv_comp[0].class0_hp,
+            [0, 1],
+            "absent hp bit still counts its fixed value 1"
+        );
+    }
+
+    #[test]
+    fn read_mv_counts_joint_only_on_zero_joint() {
+        use crate::prob_adapt::CountsMvComponent;
+        // MV_JOINT_ZERO: one counts_mv_joint event, no component counts.
+        let buf = [0u8; 16];
+        let mut coder = zero_coder(&buf);
+        let probs = MvProbs::defaults();
+        let mut counts = CountsNonCoef::default();
+        read_mv(&mut coder, &probs, [5, -9], true, &mut counts).unwrap();
+        assert_eq!(counts.mv_joint, [1, 0, 0, 0]);
+        assert_eq!(counts.mv_comp[0], CountsMvComponent::default());
+        assert_eq!(counts.mv_comp[1], CountsMvComponent::default());
     }
 
     #[test]
@@ -406,8 +489,14 @@ mod tests {
         let probs = MvProbs::defaults();
         let mut c0 = zero_coder(&buf);
         let mut c1 = zero_coder(&buf);
-        assert_eq!(read_mv(&mut c0, &probs, [3, 4], false).unwrap(), [3, 4]);
-        assert_eq!(read_mv(&mut c1, &probs, [3, 4], true).unwrap(), [3, 4]);
+        assert_eq!(
+            read_mv(&mut c0, &probs, [3, 4], false, &mut Default::default()).unwrap(),
+            [3, 4]
+        );
+        assert_eq!(
+            read_mv(&mut c1, &probs, [3, 4], true, &mut Default::default()).unwrap(),
+            [3, 4]
+        );
     }
 
     #[test]
@@ -460,7 +549,16 @@ mod tests {
         let buf = [0u8; 16];
         let mut coder = zero_coder(&buf);
         let preds = sample_preds();
-        let mv = assign_mv(&mut coder, &MvProbs::defaults(), ZEROMV, true, &preds, true).unwrap();
+        let mv = assign_mv(
+            &mut coder,
+            &MvProbs::defaults(),
+            ZEROMV,
+            true,
+            &preds,
+            true,
+            &mut Default::default(),
+        )
+        .unwrap();
         assert_eq!(mv, [[0, 0], [0, 0]]);
     }
 
@@ -476,6 +574,7 @@ mod tests {
             false,
             &preds,
             true,
+            &mut Default::default(),
         )
         .unwrap();
         // Non-compound: slot 0 = NearestMv[0]; slot 1 stays ZeroMv.
@@ -487,7 +586,16 @@ mod tests {
         let buf = [0u8; 16];
         let mut coder = zero_coder(&buf);
         let preds = sample_preds();
-        let mv = assign_mv(&mut coder, &MvProbs::defaults(), NEARMV, true, &preds, true).unwrap();
+        let mv = assign_mv(
+            &mut coder,
+            &MvProbs::defaults(),
+            NEARMV,
+            true,
+            &preds,
+            true,
+            &mut Default::default(),
+        )
+        .unwrap();
         assert_eq!(mv, [[5, 6], [12, -13]]);
     }
 
@@ -503,6 +611,7 @@ mod tests {
             true,
             &preds,
             true,
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(mv, [[3, -4], [-10, 11]]);
@@ -515,7 +624,16 @@ mod tests {
         let buf = [0u8; 16];
         let mut coder = zero_coder(&buf);
         let preds = sample_preds();
-        let mv = assign_mv(&mut coder, &MvProbs::defaults(), NEWMV, false, &preds, true).unwrap();
+        let mv = assign_mv(
+            &mut coder,
+            &MvProbs::defaults(),
+            NEWMV,
+            false,
+            &preds,
+            true,
+            &mut Default::default(),
+        )
+        .unwrap();
         // Slot 0 = BestMv[0] + 0; slot 1 untouched ZeroMv.
         assert_eq!(mv, [[7, 8], [0, 0]]);
     }
@@ -525,7 +643,16 @@ mod tests {
         let buf = [0u8; 16];
         let mut coder = zero_coder(&buf);
         let preds = sample_preds();
-        let mv = assign_mv(&mut coder, &MvProbs::defaults(), NEWMV, true, &preds, true).unwrap();
+        let mv = assign_mv(
+            &mut coder,
+            &MvProbs::defaults(),
+            NEWMV,
+            true,
+            &preds,
+            true,
+            &mut Default::default(),
+        )
+        .unwrap();
         assert_eq!(mv, [[7, 8], [14, 15]]);
     }
 
@@ -543,6 +670,7 @@ mod tests {
             false,
             &preds,
             true,
+            &mut Default::default(),
         )
         .unwrap();
         assert_eq!(mv[1], [0, 0]);

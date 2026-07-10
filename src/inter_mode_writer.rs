@@ -254,7 +254,8 @@ mod tests {
             let mut enc = BoolEncoder::new();
             write_is_inter(&mut enc, is_inter, false, &prob, nb).unwrap();
             let mut dec = enc_to_dec(enc);
-            let got = read_is_inter(&mut dec, false, 0, &prob, nb).unwrap();
+            let got =
+                read_is_inter(&mut dec, false, 0, &prob, nb, &mut Default::default()).unwrap();
             assert_eq!(got, is_inter);
         }
     }
@@ -270,7 +271,15 @@ mod tests {
         let mut enc = BoolEncoder::new();
         write_is_inter(&mut enc, true, true, &prob, nb).unwrap();
         let mut dec = enc_to_dec(enc);
-        let got = read_is_inter(&mut dec, true, LAST_FRAME as i16, &prob, nb).unwrap();
+        let got = read_is_inter(
+            &mut dec,
+            true,
+            LAST_FRAME as i16,
+            &prob,
+            nb,
+            &mut Default::default(),
+        )
+        .unwrap();
         assert!(got);
     }
 
@@ -308,6 +317,7 @@ mod tests {
             &chdr.comp_mode_prob,
             &chdr.single_ref_prob,
             &chdr.comp_ref_prob,
+            &mut Default::default(),
         )
         .unwrap();
         [pair.ref_frame_0, pair.ref_frame_1]

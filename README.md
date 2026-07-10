@@ -30,26 +30,24 @@ segmentation AQ, lossless, and both quantizer extremes.
 by P-frames), threading the §8.10 reference buffers, the §6.5 previous-frame
 motion field, the §6.1.2 / §7.2 `FrameContext[ 4 ]` entropy probability
 banks (`load_probs( )` / `save_probs( )`), and the §6.4.14 PrevSegmentIds
-map across frames. Five corpus fixtures reconstruct byte-exact against
-their `expected.yuv`: `i-frame-then-p-frame-64x64` (keyframe +
-single-reference LAST P-frame, high-precision MVs, 8-tap-smooth filter),
-`frame-parallel-mode` (keyframe + three single-reference P-frames at 64x64,
-`error_resilient=1` so no entropy threading), `profile-0-yuv420-8bit` (the
-common path: keyframe + three P-frames at **128x128** — a 2x2 superblock
-grid — with `tx_mode_select`, deep partitions to 4x4, sub-8x8 inter blocks,
-and `refresh_frame_context=1` so the per-frame `load_probs( ) / save_probs(
-)` entropy threading is exercised), the 24-frame `show-existing-frame`
+map across frames. **Every multi-frame corpus fixture reconstructs
+byte-exact against its `expected.yuv`**: `i-frame-then-p-frame-64x64`
+(keyframe + single-reference LAST P-frame, high-precision MVs,
+8-tap-smooth filter), `frame-parallel-mode` (keyframe + three
+single-reference P-frames at 64x64, `error_resilient=1` so no entropy
+threading), `profile-0-yuv420-8bit` (the common path: keyframe + three
+P-frames at **128x128** — a 2x2 superblock grid — with `tx_mode_select`,
+deep partitions to 4x4, sub-8x8 inter blocks, and
+`refresh_frame_context=1` so the per-frame `load_probs( ) / save_probs( )`
+entropy threading is exercised), the 24-frame `show-existing-frame`
 `auto-alt-ref=2` stream (hidden ARFs + `show_existing_frame` re-displays),
-and `segments-aq-mode` (per-segment AQ: its P-frames carry
+`segments-aq-mode` (per-segment AQ: its P-frames carry
 `segmentation_update_data=0`, pinning the §7.2.10 rule that the keyframe's
 per-segment `SEG_LVL_ALT_Q` feature table persists across frames instead
-of resetting to zero). `superframe-2` (hidden-ARF superframes) still
-diverges by ±1 in a handful of samples from the keyframe onward (a
-`TX_MODE_SELECT` small-transform / ADST reconstruction precision
-discrepancy at very low quantizer) — a reconstruction, not
-entropy-adaptation, discrepancy (the corpus is entirely
-`frame_parallel_decoding_mode=1`, so §8.4 adaptation never runs); see the
-"Not yet supported" section for the localised next-round target.
+of resetting to zero), and `superframe-2` (16 shown frames with hidden
+`show_frame=0` alt-refs in Annex B superframes, `loop_filter_level=0` with
+live deltas on every frame — pinning the §8.1 step-2 rule that the whole
+§8.8 loop filter is gated on `loop_filter_level != 0`).
 
 [`split_superframe`] implements the Annex B superframe split: it parses
 the §B.2.1 superframe index and returns the enclosed coded-frame slices in
@@ -313,22 +311,16 @@ encode test validates end-to-end through the in-crate decoder.
   distinct per-list-scaled references), but not yet *corpus*-validated
   end-to-end (the corpus inter fixtures are single-reference, same-size
   LAST); broader inter fixtures land in later rounds.
-* One corpus fixture still diverges from `expected.yuv`:
-  `superframe-2` (hidden-ARF superframes, 64x64, `yac_qi=4`) diverges
-  by ~13-23 bytes **per frame, starting at the keyframe** (frame 0,
-  23/6144 bytes). The keyframe runs with loop-filter `level=0`, so the
-  error is in the §8.6.2 reconstruction itself, not §8.8 deblocking. It
-  is `TX_MODE_SELECT`-specific: the otherwise-identical `q-low` fixture
-  (also 64x64, `yac_qi=4`, lossy) forces `tx_mode=ALLOW_32X32` and is
-  byte-exact, while `superframe-2`'s keyframe uses `TX_MODE_SELECT` and
-  mixes the smaller (4x4/8x8/16x16, ADST-eligible) transforms. The
-  errors are all ±1 — a rounding/precision discrepancy in the small-tx
-  or ADST reconstruct path at very low quantizer. The keyframe profile
-  (23 differing bytes, every `|delta| == 1`) is pinned as an upper
-  bound by `superframe2_keyframe_divergence_profile_is_bounded`, so any
-  future fix or regression is caught. (The former second divergence —
-  `segments-aq-mode` frames 2-3 — was the §7.2.10 segmentation feature
-  persistence bug, fixed in round 406; that fixture is now byte-exact.)
+* ~~Corpus divergences~~ — none left: as of round 406 **all 16 staged
+  corpus fixtures decode byte-exact**, including the two historic
+  divergers. `segments-aq-mode` frames 2-3 were the §7.2.10 segmentation
+  feature persistence bug (P-frames with `segmentation_update_data=0`
+  dequantized at `base_q_idx` instead of the persisted per-segment
+  qindex); `superframe-2`'s ±1-per-frame profile was the missing §8.1
+  step-2 gate (the whole §8.8 loop filter runs only when
+  `loop_filter_level != 0` — with `lf_delta_enabled=1` the +1 INTRA
+  ref-delta otherwise lifts intra edges to `lvl=1` and filters them even
+  at frame level 0). Both are pinned by full-sequence byte-exact tests.
 * §8.4 probability adaptation / §6.1.2 `refresh_probs( )` — the complete
   §8.4 backward-adaptation transform set is implemented and unit-tested in
   the `prob_adapt` module: the §8.4.1/§8.4.2 `merge_prob` / `merge_probs`

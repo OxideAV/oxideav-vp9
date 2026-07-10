@@ -810,6 +810,60 @@ fn show_existing_corpus_decodes_byte_exact() {
     assert_eq!(diffs, 0, "{diffs} differing bytes vs expected.yuv");
 }
 
+/// Hidden-ARF superframe corpus + the §8.1 step-2 loop-filter gate: the
+/// `superframe-2` fixture (16 shown frames at 64x64, `yac_qi≈4-15`,
+/// superframes carrying hidden `show_frame=0` alt-ref frames) decodes
+/// byte-exact end-to-end. Every frame codes `loop_filter_level=0` with
+/// `lf_delta_enabled=1` and the +1 INTRA ref-delta, so this pins §8.1
+/// step 2 ("if loop_filter_level is not equal to 0, the loop filter
+/// process ... is invoked") — without the frame-level gate the §8.8.1
+/// `LvlLookup` lifts intra edges to `lvl=1` and filters them, the
+/// historic ±1-per-frame divergence. Also exercises §8.10 hidden-frame
+/// reference updates and per-frame `frame_context_idx` switching.
+#[test]
+fn superframe2_sequence_byte_exact() {
+    let base = std::path::Path::new("../../docs/video/vp9/fixtures/superframe-2");
+    if !base.is_dir() {
+        eprintln!("docs corpus not present; docs-gated");
+        return;
+    }
+    let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");
+    let expected = std::fs::read(base.join("expected.yuv")).expect("expected.yuv");
+
+    let mut sub: Vec<Vec<u8>> = Vec::new();
+    for p in &ivf_chunks(&ivf) {
+        for f in split_superframe(p) {
+            sub.push(f.to_vec());
+        }
+    }
+    assert!(
+        sub.len() > 16,
+        "superframes carry hidden alt-ref sub-frames"
+    );
+
+    let refs: Vec<&[u8]> = sub.iter().map(|p| p.as_slice()).collect();
+    let frames = decode_vp9_sequence(&refs).expect("decode superframe-2 sequence");
+    assert_eq!(frames.len(), 16, "sixteen shown frames");
+
+    let mut got = Vec::new();
+    for f in &frames {
+        got.extend(f.to_planar_bytes());
+    }
+    assert_eq!(got.len(), expected.len(), "16-frame planar length");
+    // 64x64 4:2:0 => 6144 bytes per frame; report the first bad frame.
+    let frame_bytes = 64 * 64 * 3 / 2;
+    for k in 0..16usize {
+        let s = k * frame_bytes;
+        let e = s + frame_bytes;
+        let diffs = got[s..e]
+            .iter()
+            .zip(&expected[s..e])
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(diffs, 0, "frame {k}: {diffs} differing bytes");
+    }
+}
+
 /// §6.4.14 / §8.1 segment-map threading + §7.2.10 segmentation feature
 /// persistence: the `segments-aq-mode` fixture (per-segment AQ, 4 frames
 /// at 128x128, `frame_parallel_decoding_mode=1` throughout) reconstructs

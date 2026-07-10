@@ -1449,7 +1449,13 @@ fn decode_single_frame(
     let crop_h = hdr.frame_height as usize;
     let uv_crop_w = ((hdr.frame_width + u32::from(ssx)) >> u32::from(ssx)) as usize;
     let uv_crop_h = ((hdr.frame_height + u32::from(ssy)) >> u32::from(ssy)) as usize;
-    {
+    // §8.1 step 2: the §8.8 loop filter process runs only "if
+    // loop_filter_level is not equal to 0". The gate is on the frame
+    // header's `loop_filter_level` itself — with level 0 no edge is
+    // filtered even where the §8.8.1 deltas (e.g. the +1 INTRA
+    // ref-delta) or a SEG_LVL_ALT_L override would lift a LvlLookup
+    // entry above zero.
+    if hdr.loop_filter.level != 0 {
         let mut curr = CurrFrame {
             planes: [
                 SuperblockFilterPlane {

@@ -672,18 +672,16 @@ fn docs_corpus_intra_fixtures_decode_byte_exact() {
     }
 }
 
-/// Regression boundary for the known `superframe-2` keyframe divergence.
+/// §8.1 step 2: the §8.8 loop filter runs only when `loop_filter_level != 0`.
 ///
-/// `superframe-2`'s leading keyframe (64x64, `TX_MODE_SELECT`, `yac_qi=4`,
-/// loop-filter `level=0`) reconstructs with a small number of ±1 samples
-/// versus `expected.yuv` — a rounding/precision discrepancy in the small-tx /
-/// ADST reconstruct path at very low quantizer (see the crate README). Loop
-/// filter `level=0` means §8.8 deblocking is a no-op, so the error is purely
-/// in §8.6.2 reconstruction. This pins the *current* profile (23 differing
-/// bytes, all |delta| == 1) as an upper bound so a fix that drives it toward
-/// zero, or an accidental regression, is caught.
+/// `superframe-2`'s leading keyframe (64x64, `TX_MODE_SELECT`, `yac_qi=4`)
+/// codes `loop_filter_level=0` **with** `lf_delta_enabled=1` and the +1
+/// INTRA ref-delta — so a decoder that skips the frame-level gate and
+/// builds the §8.8.1 `LvlLookup` anyway filters intra edges at `lvl=1`,
+/// producing scattered ±1 errors (the historic 23-byte divergence). The
+/// keyframe must reconstruct byte-exact.
 #[test]
-fn superframe2_keyframe_divergence_profile_is_bounded() {
+fn superframe2_keyframe_byte_exact() {
     let base = std::path::Path::new("../../docs/video/vp9/fixtures/superframe-2");
     if !base.is_dir() {
         eprintln!("docs corpus not present; docs-gated");
@@ -699,19 +697,10 @@ fn superframe2_keyframe_divergence_profile_is_bounded() {
     // 64x64 4:2:0 => Y 4096 + U 1024 + V 1024 = 6144 bytes.
     let frame_bytes = 64 * 64 * 3 / 2;
     assert_eq!(out.len(), frame_bytes, "keyframe planar length");
-    let mut diffs = 0usize;
-    let mut maxd = 0i32;
-    for (a, b) in out.iter().zip(&expected[..frame_bytes]) {
-        if a != b {
-            diffs += 1;
-            maxd = maxd.max((*a as i32 - *b as i32).abs());
-        }
-    }
-    // Current measured profile: 23 differing bytes, every delta exactly ±1.
-    assert!(
-        diffs <= 23,
-        "{diffs} differing bytes exceeds pinned bound 23 \
-         (a regression — or, if improved, update the bound)"
-    );
-    assert!(maxd <= 1, "max |delta| {maxd} exceeds pinned bound 1");
+    let diffs = out
+        .iter()
+        .zip(&expected[..frame_bytes])
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(diffs, 0, "{diffs} differing bytes vs expected.yuv");
 }

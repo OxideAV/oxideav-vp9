@@ -228,9 +228,23 @@ pub(crate) fn predict_inter(
     }
 
     // §8.5.2 derivation of the inter predicted samples.
+    //
+    // The store is clipped at the allocated working extent for the same
+    // reason as the §8.5.1 / §8.6.2 stores (see `predict_intra` /
+    // `reconstruct_block`): a frame-edge block the §6.4.3 `hasRows` /
+    // `hasCols` rules admit may overhang the MiCols*8 x MiRows*8 working
+    // planes into (unobservable) superblock padding a spec CurrFrame
+    // would carry. Fuzz/corpus-found on a 176x144 stream whose bottom
+    // superblock row codes 64-tall inter leaves overhanging the frame.
     let (px, py) = (args.x as usize, args.y as usize);
     for i in 0..args.h {
+        if py + i >= dst.height() {
+            break;
+        }
         for j in 0..args.w {
+            if px + j >= dst.width() {
+                break;
+            }
             let value = if args.is_compound {
                 round2(preds[0][i * args.w + j] + preds[1][i * args.w + j], 1)
             } else {

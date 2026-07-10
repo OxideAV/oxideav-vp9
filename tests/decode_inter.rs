@@ -907,6 +907,12 @@ fn full_corpus_sequences_byte_exact() {
         // §8.5.1 intra prediction inside an inter frame).
         "profile-1-yuv422-8bit-inter",
         "intra-blocks-in-inter",
+        // 176x144 12-frame GOP: the corpus's first non-multiple-of-64
+        // dimensions (partial superblocks on the right column + bottom
+        // row) — §6.4.3-admitted inter leaves overhang the frame edge,
+        // pinning the clipped §8.5.2 prediction store — plus long
+        // multi-superblock-row motion under continuous zoom.
+        "qcif-inter-gop",
     ] {
         let base = root.join(name);
         let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");

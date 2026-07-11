@@ -2071,6 +2071,7 @@ pub(crate) fn decode_inter_blocks_for_test(
     sign_bias: &[bool; 4],
     interpolation_filter: u8,
     allow_high_precision_mv: bool,
+    seg: &SegmentationParams,
     blocks: Vec<(u32, u32, u8)>,
 ) -> Result<Vec<RecoveredInterBlock>, Error> {
     use crate::residual::{
@@ -2080,7 +2081,6 @@ pub(crate) fn decode_inter_blocks_for_test(
     use crate::tokens::{tokens, TokenBlockCtx};
 
     let chdr_inter = build_inter_chdr_for_test(ctx, tx_mode, reference_mode, comp_config);
-    let seg = SegmentationParams::default_disabled();
     let mut state = Vp9FrameState::new(mi_rows, mi_cols);
     let mut nz = [
         NonzeroContext::new((2 * mi_cols) as usize, (2 * mi_rows) as usize),
@@ -2192,10 +2192,10 @@ pub(crate) fn decode_inter_blocks_for_test(
                 feature_data: &seg.feature_data,
             },
             seg_id: InterSegmentIdArgs {
-                update_map: false,
-                temporal_update: false,
-                tree_probs: None,
-                pred_prob: None,
+                update_map: seg.update_map,
+                temporal_update: seg.temporal_update,
+                tree_probs: seg.tree_probs.as_ref(),
+                pred_prob: seg.pred_prob.as_ref(),
                 prev: prev_seg,
             },
             skip_prob: &chdr_inter.intra.skip_prob,

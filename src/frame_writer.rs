@@ -791,6 +791,7 @@ pub(crate) fn assemble_inter_frame_planned(
                 ref_frame: [LAST_FRAME, NONE_REF_FRAME],
                 mv: [mv, [0, 0]],
                 skip: skip_all || block_skip,
+                segment_id: 0,
             }
         });
     let mut src: Box<FrameCoefSource<'_>> =
@@ -830,6 +831,12 @@ pub(crate) struct InterTreeLeaf {
     pub mv: [[i32; 2]; 2],
     /// `skip` flag (true ⇒ no residual coded).
     pub skip: bool,
+    /// `segment_id` (0..=7) — coded by the §6.4.7 tree when the header
+    /// carries `segmentation_enabled && segmentation_update_map`; must
+    /// be 0 otherwise. Blocks on a `SEG_LVL_SKIP` segment must plan
+    /// `skip = true` + `ZEROMV`; blocks on a `SEG_LVL_REF_FRAME`
+    /// segment must plan the override's single reference.
+    pub segment_id: u8,
 }
 
 /// Per-leaf inter planner for [`assemble_inter_frame_tree`]: called once
@@ -979,8 +986,7 @@ pub(crate) fn assemble_inter_frame_tree(
         bit_depth,
         lossless: hdr.quantization.lossless,
         tx_mode,
-        seg_enabled: false,
-        seg_update_map: false,
+        seg: hdr.segmentation,
         reference_mode,
         comp_config,
         sign_bias: &sign_bias,
@@ -999,7 +1005,7 @@ pub(crate) fn assemble_inter_frame_tree(
         interp_filter_probs: &ctx.interp_filter_probs,
         mv_probs: &ctx.mv_probs,
         coef_probs: &ctx.coef_probs,
-        tree_probs: None,
+        tree_probs: hdr.segmentation.tree_probs.as_ref(),
     };
 
     pctx.clear_above();
@@ -1057,7 +1063,7 @@ pub(crate) fn assemble_inter_frame_tree(
                         mi_col_start: 0,
                         c: lc,
                         mi_size: subsize,
-                        segment_id: 0,
+                        segment_id: lp.segment_id,
                         skip: lp.skip,
                         tx_size: lp.tx_size,
                         ref_frame: lp.ref_frame,
@@ -1886,6 +1892,7 @@ mod tests {
             ref_frame: [crate::mode_info::LAST_FRAME, NONE_REF_FRAME],
             mv: [[0, 0], [0, 0]],
             skip: true,
+            segment_id: 0,
         }
     }
 

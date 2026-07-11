@@ -2905,6 +2905,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
                 ref_frame: choice.0,
                 mv: choice.2,
                 skip,
+                segment_id: 0,
             }
         });
 

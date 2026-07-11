@@ -25,10 +25,14 @@
 //!
 //! Scope: `MiSize >= BLOCK_8X8` inter blocks with segmentation either
 //! disabled or a non-temporal `update_map` (the per-block `segment_id`
-//! coded by the §6.4.7 tree). The sub-8x8 per-(idy, idx) MV walk
-//! (`MiSize < BLOCK_8X8`) and the §6.4.12 temporal-predicted segment-id
-//! branch are later milestones, mirroring how the keyframe block writer
-//! deferred sub-8x8 intra.
+//! coded by the §6.4.7 tree), including the §6.4.9 segment-feature
+//! no-bits arms — `SEG_LVL_SKIP` (§6.4.8 hardwires `skip = 1`, §6.4.16
+//! forces `y_mode = ZEROMV` with no `inter_mode` token) and
+//! `SEG_LVL_REF_FRAME` (§6.4.13 derives `is_inter` and §6.4.17 derives
+//! the reference pair from `FeatureData`, no bits for either). The
+//! sub-8x8 per-(idy, idx) MV walk (`MiSize < BLOCK_8X8`) and the
+//! §6.4.12 temporal-predicted segment-id branch are later milestones,
+//! mirroring how the keyframe block writer deferred sub-8x8 intra.
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7
 //! (`docs/video/vp9/vp9-spec.txt`) §6.4.11 / §6.4.13 / §6.4.16 / §6.4.17 /
@@ -105,8 +109,10 @@ pub(crate) struct InterBlockFrameCtx<'a> {
     pub bit_depth: u32,
     pub lossless: bool,
     pub tx_mode: TxMode,
-    pub seg_enabled: bool,
-    pub seg_update_map: bool,
+    /// §6.2.11 segmentation parameters — the §6.4.9 `seg_feature_active`
+    /// predicates (`SEG_LVL_SKIP` / `SEG_LVL_REF_FRAME`) and the
+    /// `enabled && update_map` segment-id-coding gate all read this.
+    pub seg: crate::header::SegmentationParams,
     /// §6.2.7 frame-level `reference_mode`.
     pub reference_mode: ReferenceMode,
     /// §6.2.7 compound-reference config.
@@ -243,7 +249,11 @@ pub(crate) fn write_inter_block(
 
     // §6.4.12 inter_segment_id( ): the non-temporal path. Coded by the
     // §6.4.7 tree only when seg enabled + update_map; otherwise no bits.
-    if fctx.seg_enabled && fctx.seg_update_map {
+    if fctx.seg.enabled && fctx.seg.update_map {
+        if fctx.seg.temporal_update {
+            // The §6.4.12 seg_id_predicted branch is a later milestone.
+            return Err(Error::Unsupported);
+        }
         let tp = probs.tree_probs.ok_or(Error::InvalidBitstream)?;
         crate::mode_writer::write_segment_id(enc, spec.segment_id, tp)?;
     } else if spec.segment_id != 0 {
@@ -251,13 +261,33 @@ pub(crate) fn write_inter_block(
         return Err(Error::Unsupported);
     }
 
-    // §6.4.8 read_skip( ). seg_feature_active(SKIP) is not modelled here
-    // (the writer targets non-forced skips).
-    let skip_ctx = usize::from(nb_skip.above.unwrap_or(0)) + usize::from(nb_skip.left.unwrap_or(0));
-    write_skip(enc, spec.skip, false, probs.skip_prob, skip_ctx)?;
+    // §6.4.9 seg_feature_active predicates for this block's segment.
+    let seg_id = usize::from(spec.segment_id);
+    let skip_active =
+        crate::dequant::seg_feature_active(&fctx.seg, seg_id, crate::mode_info::SEG_LVL_SKIP);
+    let ref_active =
+        crate::dequant::seg_feature_active(&fctx.seg, seg_id, crate::mode_info::SEG_LVL_REF_FRAME);
 
-    // §6.4.13 read_is_inter( ): always inter here.
-    write_is_inter(enc, true, false, probs.is_inter_prob, is_inter_nb)?;
+    // §6.4.8 read_skip( ): seg_feature_active(SKIP) hardwires skip = 1
+    // reading no bits — the spec forces it, so a non-skip plan on a
+    // SKIP segment is uncodeable.
+    if skip_active && !spec.skip {
+        return Err(Error::Unsupported);
+    }
+    let skip_ctx = usize::from(nb_skip.above.unwrap_or(0)) + usize::from(nb_skip.left.unwrap_or(0));
+    write_skip(enc, spec.skip, skip_active, probs.skip_prob, skip_ctx)?;
+
+    // §6.4.13 read_is_inter( ): on a SEG_LVL_REF_FRAME segment the flag
+    // is derived from FeatureData (no bits) — this writer targets inter
+    // blocks, so the override must name a real (non-INTRA) reference and
+    // the block's ref_frame[ 0 ] must equal it.
+    if ref_active {
+        let feature = i32::from(fctx.seg.feature_data[seg_id][crate::mode_info::SEG_LVL_REF_FRAME]);
+        if feature <= INTRA_FRAME || spec.ref_frame[0] != feature {
+            return Err(Error::Unsupported);
+        }
+    }
+    write_is_inter(enc, true, ref_active, probs.is_inter_prob, is_inter_nb)?;
 
     // §6.4.10 read_tx_size( !skip || !is_inter ): allow_select = !skip
     // (is_inter is true). Coded only under TX_MODE_SELECT for >= 8x8.
@@ -272,7 +302,7 @@ pub(crate) fn write_inter_block(
 
     // §6.4.17 read_ref_frames( ).
     let ref_args = RefFramesWriteArgs {
-        seg_feature_ref_frame_active: false,
+        seg_feature_ref_frame_active: ref_active,
         reference_mode: fctx.reference_mode,
         comp_config: fctx.comp_config,
         fix_ref_idx: fctx.sign_bias[fctx.comp_config.fixed_ref as usize] as u8,
@@ -319,8 +349,15 @@ pub(crate) fn write_inter_block(
     }
     let mode_ctx = usize::from(mode_context);
 
-    // §6.4.16 inter_mode token (>= BLOCK_8X8 arm).
-    write_inter_mode(enc, spec.y_mode, mode_ctx, probs.inter_mode_probs)?;
+    // §6.4.16: on a SEG_LVL_SKIP segment y_mode = ZEROMV with no
+    // inter_mode token; otherwise the >= BLOCK_8X8 token is coded.
+    if skip_active {
+        if spec.y_mode != crate::mode_info::ZEROMV {
+            return Err(Error::Unsupported);
+        }
+    } else {
+        write_inter_mode(enc, spec.y_mode, mode_ctx, probs.inter_mode_probs)?;
+    }
 
     // §6.4.16 switchable interp_filter.
     write_interp_filter(
@@ -438,8 +475,7 @@ mod tests {
             bit_depth: 8,
             lossless: false,
             tx_mode,
-            seg_enabled: false,
-            seg_update_map: false,
+            seg: crate::header::SegmentationParams::default_disabled(),
             reference_mode,
             comp_config: CompoundReferenceConfig {
                 fixed_ref: ALTREF_FRAME,
@@ -483,7 +519,8 @@ mod tests {
         ctx: &FrameContext,
         specs: &[InterBlockSpec],
     ) -> Vec<crate::decode_frame::RecoveredInterBlock> {
-        let probs = probs_view(ctx);
+        let mut probs = probs_view(ctx);
+        probs.tree_probs = fc.seg.tree_probs.as_ref();
         let mut state = Vp9FrameState::new(fc.mi_rows, fc.mi_cols);
         let mut nz = fresh_nz();
         let mut cache = vec![0u8; 4096];
@@ -507,6 +544,7 @@ mod tests {
             fc.sign_bias,
             fc.interpolation_filter,
             fc.allow_high_precision_mv,
+            &fc.seg,
             specs.iter().map(|s| (s.r, s.c, s.mi_size)).collect(),
         )
         .unwrap()
@@ -665,6 +703,7 @@ mod tests {
             fc.sign_bias,
             fc.interpolation_filter,
             fc.allow_high_precision_mv,
+            &fc.seg,
             vec![(0, 0, BLOCK_8X8)],
         )
         .unwrap();
@@ -706,6 +745,109 @@ mod tests {
         let mut cache = vec![0u8; 4096];
         let mut enc = BoolEncoder::new();
         let s = base_spec(0, 0, crate::residual::BLOCK_4X4);
+        let mut src = no_coeffs();
+        let r = write_inter_block(
+            &mut enc, &fc, &s, &probs, &mut state, &mut nz, &mut cache, &mut src,
+        );
+        assert_eq!(r.unwrap_err(), Error::Unsupported);
+    }
+
+    /// A live segmentation map with feature segments: seg 1 carries
+    /// SEG_LVL_SKIP, seg 2 SEG_LVL_REF_FRAME = GOLDEN. The tree probs
+    /// gate the §6.4.7 segment-id coding; the no-bits feature arms
+    /// (§6.4.8 forced skip, §6.4.13/§6.4.17 derived is_inter + refs,
+    /// §6.4.16 forced ZEROMV) must round-trip through the real decoder.
+    fn seg_feature_ctx<'a>(sign_bias: &'a [bool; 4]) -> InterBlockFrameCtx<'a> {
+        let mut fc = frame_ctx(
+            sign_bias,
+            TxMode::Only4x4,
+            ReferenceMode::SingleReference,
+            0,
+            false,
+        );
+        let mut seg = crate::header::SegmentationParams::default_disabled();
+        seg.enabled = true;
+        seg.update_map = true;
+        seg.tree_probs = Some([128; 7]);
+        seg.update_data = true;
+        seg.feature_enabled[1][crate::mode_info::SEG_LVL_SKIP] = true;
+        seg.feature_enabled[2][crate::mode_info::SEG_LVL_REF_FRAME] = true;
+        seg.feature_data[2][crate::mode_info::SEG_LVL_REF_FRAME] = GOLDEN_FRAME as i16;
+        fc.seg = seg;
+        fc
+    }
+
+    #[test]
+    fn seg_skip_segment_roundtrips_with_no_skip_or_mode_bits() {
+        let sb = [false; 4];
+        let fc = seg_feature_ctx(&sb);
+        let ctx = FrameContext::default();
+        // Block 0: plain segment 0 ZEROMV skip. Block 1: SEG_LVL_SKIP
+        // segment — forced skip + ZEROMV, no skip / inter_mode bits.
+        let mut s0 = base_spec(0, 0, BLOCK_16X16);
+        s0.segment_id = 0;
+        let mut s1 = base_spec(0, 2, BLOCK_16X16);
+        s1.segment_id = 1;
+        let got = roundtrip(&fc, &ctx, &[s0, s1]);
+        assert_eq!(got[0].segment_id, 0);
+        assert_eq!(got[1].segment_id, 1);
+        assert!(got[1].skip, "SEG_LVL_SKIP forces skip = 1");
+        assert_eq!(got[1].y_mode, ZEROMV, "SEG_LVL_SKIP forces ZEROMV");
+        assert_eq!(got[1].mv[0], [0, 0]);
+    }
+
+    #[test]
+    fn seg_ref_frame_segment_roundtrips_with_no_ref_bits() {
+        let sb = [false; 4];
+        let fc = seg_feature_ctx(&sb);
+        let ctx = FrameContext::default();
+        let mut s = base_spec(0, 0, BLOCK_16X16);
+        s.segment_id = 2;
+        s.ref_frame = [GOLDEN_FRAME, NONE_REF_FRAME];
+        let got = roundtrip(&fc, &ctx, &[s]);
+        assert_eq!(got[0].segment_id, 2);
+        assert_eq!(
+            got[0].ref_frame,
+            [GOLDEN_FRAME, NONE_REF_FRAME],
+            "\u{a7}6.4.17 derives the pair from FeatureData"
+        );
+    }
+
+    #[test]
+    fn seg_skip_segment_rejects_non_skip_plan() {
+        let sb = [false; 4];
+        let fc = seg_feature_ctx(&sb);
+        let ctx = FrameContext::default();
+        let mut probs = probs_view(&ctx);
+        probs.tree_probs = fc.seg.tree_probs.as_ref();
+        let mut state = Vp9FrameState::new(fc.mi_rows, fc.mi_cols);
+        let mut nz = fresh_nz();
+        let mut cache = vec![0u8; 4096];
+        let mut enc = BoolEncoder::new();
+        let mut s = base_spec(0, 0, BLOCK_16X16);
+        s.segment_id = 1;
+        s.skip = false;
+        let mut src = no_coeffs();
+        let r = write_inter_block(
+            &mut enc, &fc, &s, &probs, &mut state, &mut nz, &mut cache, &mut src,
+        );
+        assert_eq!(r.unwrap_err(), Error::Unsupported);
+    }
+
+    #[test]
+    fn seg_ref_frame_segment_rejects_mismatched_reference() {
+        let sb = [false; 4];
+        let fc = seg_feature_ctx(&sb);
+        let ctx = FrameContext::default();
+        let mut probs = probs_view(&ctx);
+        probs.tree_probs = fc.seg.tree_probs.as_ref();
+        let mut state = Vp9FrameState::new(fc.mi_rows, fc.mi_cols);
+        let mut nz = fresh_nz();
+        let mut cache = vec![0u8; 4096];
+        let mut enc = BoolEncoder::new();
+        let mut s = base_spec(0, 0, BLOCK_16X16);
+        s.segment_id = 2;
+        s.ref_frame = [LAST_FRAME, NONE_REF_FRAME]; // override says GOLDEN
         let mut src = no_coeffs();
         let r = write_inter_block(
             &mut enc, &fc, &s, &probs, &mut state, &mut nz, &mut cache, &mut src,

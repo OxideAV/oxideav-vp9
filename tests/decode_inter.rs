@@ -955,6 +955,36 @@ fn full_corpus_sequences_byte_exact() {
         // diverges on the bottom visible row).
         "partial-mi-58x36-yuv420",
         "partial-mi-58x36-yuv444",
+        // Round-412 corpus extensions, continued (notes.md in each dir):
+        //
+        // * odd-dims-59x37 — truly odd luma both axes (chroma 30x19);
+        //   self-encoded, the black-box encoder pipelines round to even.
+        // * profile-1-yuv440-8bit-inter — 4:4:0 (ssx=0, ssy=1): the §8.5.2
+        //   y-only chroma MV rounding + §6.4.22/§8.8 subY-only chroma
+        //   geometry, previously untested in any fixture.
+        // * profile-2-yuv420-12bit-inter / profile-3-yuv422-12bit-inter —
+        //   12-bit INTER (CAT6 18-bit tokens through §8.5.2 + §8.4
+        //   adaptation; prior 12-bit coverage was one 4:4:4 keyframe),
+        //   closing the HBD x chroma-geometry matrix.
+        // * cyclic-refresh-aq — segmentation_temporal_update=1 P-frames:
+        //   the §6.4.12 seg_id_predicted branch over §6.4.14
+        //   PrevSegmentIds, plus inter-frame SEG_LVL_ALT_Q updates.
+        // * tiles-4col-inter — tile_cols_log2=2 (four §9.2 coder brackets
+        //   + three interior boundary context resets per frame).
+        // * color-bt709-full-range / rgb-8bit-inter — CS_BT_709 +
+        //   full-swing range signalling, and CS_RGB on an inter GOP.
+        // * intra-only — hidden intra-only frame (reset_frame_context=3)
+        //   + show_existing + inter prediction over the intra-only slot;
+        //   self-encoded.
+        "odd-dims-59x37",
+        "profile-1-yuv440-8bit-inter",
+        "profile-2-yuv420-12bit-inter",
+        "profile-3-yuv422-12bit-inter",
+        "cyclic-refresh-aq",
+        "tiles-4col-inter",
+        "color-bt709-full-range",
+        "rgb-8bit-inter",
+        "intra-only",
     ] {
         let base = root.join(name);
         let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");
@@ -1105,6 +1135,217 @@ fn round_409_fixture_flags_pin_their_feature_classes() {
             }
         }
         assert!(n_inter >= 3, "{name}: real P-frames present ({n_inter})");
+    }
+}
+
+/// Round-412 corpus extensions: assert each new fixture's headers carry
+/// the flags that make it exercise its target feature class, so the
+/// byte-exact sweep can't silently degrade into re-testing an existing
+/// path (e.g. if a regenerated stream lost its chroma geometry, bit
+/// depth, tiling, color signalling, or segmentation mode).
+#[test]
+fn round_412_fixture_flags_pin_their_feature_classes() {
+    let root = std::path::Path::new("../../docs/video/vp9/fixtures");
+    if !root.is_dir() {
+        eprintln!("docs corpus not present; docs-gated");
+        return;
+    }
+
+    // Per-frame invariants (every non-show-existing frame).
+    type Check = fn(usize, &oxideav_vp9::Vp9FrameHeader);
+    let cases: [(&str, Check); 8] = [
+        ("odd-dims-59x37", |i, hdr| {
+            assert_eq!(
+                (hdr.frame_width, hdr.frame_height),
+                (59, 37),
+                "frame {i}: truly odd luma dimensions"
+            );
+        }),
+        ("partial-mi-58x36-yuv420", |i, hdr| {
+            assert_eq!((hdr.frame_width, hdr.frame_height), (58, 36), "frame {i}");
+            assert!(
+                hdr.color_config.subsampling_x && hdr.color_config.subsampling_y,
+                "frame {i}: 4:2:0 (odd 29-wide chroma)"
+            );
+        }),
+        ("partial-mi-58x36-yuv444", |i, hdr| {
+            assert_eq!((hdr.frame_width, hdr.frame_height), (58, 36), "frame {i}");
+            assert!(
+                !hdr.color_config.subsampling_x && !hdr.color_config.subsampling_y,
+                "frame {i}: 4:4:4"
+            );
+        }),
+        ("profile-1-yuv440-8bit-inter", |i, hdr| {
+            assert_eq!(hdr.profile, 1, "frame {i}");
+            assert!(
+                !hdr.color_config.subsampling_x && hdr.color_config.subsampling_y,
+                "frame {i}: 4:4:0 (ssx=0, ssy=1)"
+            );
+        }),
+        ("profile-2-yuv420-12bit-inter", |i, hdr| {
+            assert_eq!(hdr.profile, 2, "frame {i}");
+            assert_eq!(hdr.color_config.bit_depth, 12, "frame {i}: 12-bit");
+            assert!(
+                hdr.color_config.subsampling_x && hdr.color_config.subsampling_y,
+                "frame {i}: 4:2:0"
+            );
+        }),
+        ("profile-3-yuv422-12bit-inter", |i, hdr| {
+            assert_eq!(hdr.profile, 3, "frame {i}");
+            assert_eq!(hdr.color_config.bit_depth, 12, "frame {i}: 12-bit");
+            assert!(
+                hdr.color_config.subsampling_x && !hdr.color_config.subsampling_y,
+                "frame {i}: 4:2:2 (ssx=1, ssy=0)"
+            );
+        }),
+        ("tiles-4col-inter", |i, hdr| {
+            assert_eq!(
+                hdr.tile_info.tile_cols_log2, 2,
+                "frame {i}: four tile columns"
+            );
+        }),
+        ("rgb-8bit-inter", |i, hdr| {
+            assert_eq!(hdr.profile, 1, "frame {i}");
+            assert_eq!(
+                hdr.color_config.color_space,
+                oxideav_vp9::ColorSpace::Rgb,
+                "frame {i}: CS_RGB"
+            );
+            assert!(hdr.color_config.color_range_full, "frame {i}: full range");
+        }),
+    ];
+    for (name, check) in cases {
+        let ivf = std::fs::read(root.join(name).join("input.ivf")).expect("input.ivf");
+        let mut i = 0usize;
+        let mut n_inter = 0usize;
+        let mut last_color: Option<oxideav_vp9::ColorConfig> = None;
+        let mut dims = (0u32, 0u32);
+        for p in &ivf_chunks(&ivf) {
+            for f in split_superframe(p) {
+                let ref_dims = vec![dims; 8];
+                let ref_state = last_color.map(|cc| oxideav_vp9::RefFrameState {
+                    ref_dims: &ref_dims,
+                    color_config: cc,
+                });
+                let hdr = oxideav_vp9::parse_uncompressed_header_with_refs(f, ref_state)
+                    .unwrap_or_else(|e| panic!("{name} frame {i}: header parse {e:?}"));
+                if hdr.show_existing_frame {
+                    continue;
+                }
+                check(i, &hdr);
+                if !matches!(hdr.frame_type, oxideav_vp9::FrameType::KeyFrame) && !hdr.intra_only {
+                    n_inter += 1;
+                }
+                dims = (hdr.frame_width, hdr.frame_height);
+                last_color = Some(hdr.color_config);
+                i += 1;
+            }
+        }
+        assert!(n_inter >= 3, "{name}: real P-frames present ({n_inter})");
+    }
+
+    // color-bt709-full-range: BT.709 + full-swing on every frame (the
+    // range bit is only re-coded on the keyframe; inter frames inherit).
+    {
+        let ivf =
+            std::fs::read(root.join("color-bt709-full-range").join("input.ivf")).expect("ivf");
+        let chunks = ivf_chunks(&ivf);
+        let kf_hdr = oxideav_vp9::parse_uncompressed_header(&chunks[0]).expect("keyframe header");
+        assert_eq!(
+            kf_hdr.color_config.color_space,
+            oxideav_vp9::ColorSpace::Bt709
+        );
+        assert!(kf_hdr.color_config.color_range_full, "full-swing range bit");
+        assert!(chunks.len() >= 4, "keyframe + 3 P-frames");
+    }
+
+    // cyclic-refresh-aq: every P-frame runs live segmentation with a map
+    // update; at least one codes the map with TEMPORAL prediction
+    // (§6.4.12 seg_id_predicted), and the ALT_Q feature is rewritten on
+    // update_data frames.
+    {
+        let ivf = std::fs::read(root.join("cyclic-refresh-aq").join("input.ivf")).expect("ivf");
+        let mut last_color: Option<oxideav_vp9::ColorConfig> = None;
+        let mut n_temporal = 0usize;
+        let mut n_alt_q = 0usize;
+        let mut n_inter = 0usize;
+        for p in &ivf_chunks(&ivf) {
+            for f in split_superframe(p) {
+                let ref_dims = vec![(176u32, 144u32); 8];
+                let ref_state = last_color.map(|cc| oxideav_vp9::RefFrameState {
+                    ref_dims: &ref_dims,
+                    color_config: cc,
+                });
+                let hdr =
+                    oxideav_vp9::parse_uncompressed_header_with_refs(f, ref_state).expect("header");
+                last_color = Some(hdr.color_config);
+                if matches!(hdr.frame_type, oxideav_vp9::FrameType::KeyFrame) {
+                    continue;
+                }
+                n_inter += 1;
+                assert!(hdr.segmentation.enabled, "P-frames carry live segmentation");
+                assert!(hdr.segmentation.update_map, "P-frames re-code the map");
+                if hdr.segmentation.temporal_update {
+                    n_temporal += 1;
+                    assert!(
+                        hdr.segmentation.pred_prob.is_some(),
+                        "temporal frames carry segmentation_pred_prob"
+                    );
+                }
+                if hdr.segmentation.update_data {
+                    // SEG_LVL_ALT_Q is feature index 0.
+                    if (1..oxideav_vp9::MAX_SEGMENTS)
+                        .any(|s| hdr.segmentation.feature_enabled[s][0])
+                    {
+                        n_alt_q += 1;
+                    }
+                }
+            }
+        }
+        assert!(n_inter >= 8, "long enough GOP ({n_inter})");
+        assert!(
+            n_temporal >= 1,
+            "at least one temporally-predicted segment map ({n_temporal})"
+        );
+        assert!(
+            n_alt_q >= 8,
+            "per-segment ALT_Q rewritten on P-frames ({n_alt_q})"
+        );
+    }
+
+    // intra-only: one hidden intra-only frame with reset_frame_context=3
+    // refreshing slot 1, one show-existing packet for slot 1, and one
+    // shown inter frame drawing every reference from slot 1.
+    {
+        let ivf = std::fs::read(root.join("intra-only").join("input.ivf")).expect("ivf");
+        let chunks = ivf_chunks(&ivf);
+        assert_eq!(chunks.len(), 4, "4 coded packets");
+        let cc0 = oxideav_vp9::parse_uncompressed_header(&chunks[0])
+            .expect("keyframe")
+            .color_config;
+        let h1 = oxideav_vp9::parse_uncompressed_header(&chunks[1]).expect("intra-only header");
+        assert_eq!(h1.frame_type, oxideav_vp9::FrameType::NonKeyFrame);
+        assert!(h1.intra_only && !h1.show_frame, "hidden intra-only frame");
+        assert_eq!(h1.reset_frame_context, 3, "all-bank reset");
+        assert_eq!(h1.refresh_frame_flags, 0x02, "slot 1 only");
+        let h2 = oxideav_vp9::parse_uncompressed_header(&chunks[2]).expect("show-existing");
+        assert!(h2.show_existing_frame);
+        assert_eq!(h2.frame_to_show_map_idx, Some(1));
+        let ref_dims = vec![(64u32, 64u32); 8];
+        let h3 = oxideav_vp9::parse_uncompressed_header_with_refs(
+            &chunks[3],
+            Some(oxideav_vp9::RefFrameState {
+                ref_dims: &ref_dims,
+                color_config: cc0,
+            }),
+        )
+        .expect("inter header");
+        assert!(!h3.intra_only && h3.show_frame);
+        assert_eq!(
+            h3.ref_frame_idx,
+            Some([1, 1, 1]),
+            "every reference list draws from the intra-only slot"
+        );
     }
 }
 

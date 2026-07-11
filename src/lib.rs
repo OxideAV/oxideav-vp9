@@ -1257,4 +1257,86 @@ mod encode_roundtrip_tests {
         std::fs::create_dir_all(&subdir).expect("create stage dir");
         std::fs::write(subdir.join("input.ivf"), &ivf).expect("write input.ivf");
     }
+
+    // ----- truly-odd luma dimensions (round 412) -----
+
+    /// Build the round-412 **odd-dimensions** stream: 59x37 8-bit 4:2:0
+    /// (chroma 30x19 — both luma dimensions odd, so the §8.10 output
+    /// crops mid-MI on both axes and chroma rounds up per
+    /// `(w + 1) >> 1`), a lossless keyframe + 3 lossless P-frames of
+    /// diagonally-translating deterministic content (real `NEWMV`
+    /// motion at the odd frame edges). The common black-box encoder
+    /// pipelines round input dimensions to even, so odd-luma streams
+    /// are only mintable by the in-crate writers.
+    fn build_odd_dims_stream() -> Vec<Vec<u8>> {
+        let (w, h) = (59u32, 37u32);
+        let (cw, ch) = (30usize, 19usize);
+        let n = (w * h) as usize + 2 * cw * ch;
+        let frame_at = |shift: usize| -> Vec<u8> {
+            let mut pixels = Vec::with_capacity(n);
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let sx = x + 2 * shift;
+                    let sy = y + shift;
+                    pixels.push(((sx * 5 + sy * 3) ^ (sy & 7)) as u8);
+                }
+            }
+            for plane in 0..2usize {
+                for y in 0..ch {
+                    for x in 0..cw {
+                        pixels.push(((x + shift) * 4 + (y + shift) * 6 + plane * 96) as u8);
+                    }
+                }
+            }
+            pixels
+        };
+        let content: Vec<Vec<u8>> = (0..4).map(frame_at).collect();
+        let refs: Vec<&[u8]> = content.iter().map(|f| f.as_slice()).collect();
+        encode_vp9_lossless_sequence(&refs, w, h).expect("odd-dims lossless sequence")
+    }
+
+    /// The odd-dimensions stream decodes byte-exact back to its source
+    /// content (lossless), at the exact odd geometry, and is
+    /// byte-deterministic.
+    #[test]
+    fn odd_dims_59x37_sequence_decodes_byte_exact() {
+        let frames = build_odd_dims_stream();
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        let out = decode_vp9_sequence(&refs).expect("odd-dims sequence");
+        assert_eq!(out.len(), 4);
+        for (k, f) in out.iter().enumerate() {
+            assert_eq!((f.width, f.height), (59, 37), "frame {k} geometry");
+            assert_eq!(f.u.len(), 30 * 19, "frame {k} chroma extent");
+        }
+        assert_eq!(frames, build_odd_dims_stream());
+    }
+
+    /// Fixture-staging generator (round 412): stages the odd-dimensions
+    /// stream as `odd-dims-59x37/input.ivf` under `OXIDEAV_VP9_STAGE_DIR`.
+    #[test]
+    fn stage_odd_dims_fixture_when_requested() {
+        let Some(dir) = std::env::var_os("OXIDEAV_VP9_STAGE_DIR") else {
+            return;
+        };
+        let frames = build_odd_dims_stream();
+        let mut ivf = Vec::new();
+        ivf.extend_from_slice(b"DKIF");
+        ivf.extend_from_slice(&0u16.to_le_bytes());
+        ivf.extend_from_slice(&32u16.to_le_bytes());
+        ivf.extend_from_slice(b"VP90");
+        ivf.extend_from_slice(&59u16.to_le_bytes());
+        ivf.extend_from_slice(&37u16.to_le_bytes());
+        ivf.extend_from_slice(&25u32.to_le_bytes());
+        ivf.extend_from_slice(&1u32.to_le_bytes());
+        ivf.extend_from_slice(&(frames.len() as u32).to_le_bytes());
+        ivf.extend_from_slice(&0u32.to_le_bytes());
+        for (i, f) in frames.iter().enumerate() {
+            ivf.extend_from_slice(&(f.len() as u32).to_le_bytes());
+            ivf.extend_from_slice(&(i as u64).to_le_bytes());
+            ivf.extend_from_slice(f);
+        }
+        let subdir = std::path::Path::new(&dir).join("odd-dims-59x37");
+        std::fs::create_dir_all(&subdir).expect("create stage dir");
+        std::fs::write(subdir.join("input.ivf"), &ivf).expect("write input.ivf");
+    }
 }

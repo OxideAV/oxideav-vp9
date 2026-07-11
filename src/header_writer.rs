@@ -11,21 +11,26 @@
 //! back to an equivalent [`Vp9FrameHeader`].
 //!
 //! Scope: the **key-frame** branch (and the `show_existing_frame`
-//! sentinel) plus the **inter** (non-intra-only, shown) branch —
+//! sentinel), the **inter** branch — shown or hidden (a hidden inter
+//! frame codes an explicit `intra_only = 0` flag) —
 //! `reset_frame_context` / `refresh_frame_flags` / `ref_frame_idx` +
 //! `ref_frame_sign_bias`, the §6.2.5 explicit-`frame_size` path
 //! (`found_ref = 0` for all references), `allow_high_precision_mv`, and
-//! the §6.2.7 `interpolation_filter`. The intra-only inter branch
-//! (`show_frame == 0` ⇒ `intra_only` flag) is not yet written; such a
-//! header returns [`Error::Unsupported`].
+//! the §6.2.7 `interpolation_filter` — plus the **intra-only** branch
+//! (`show_frame == 0`, `intra_only = 1`: `reset_frame_context`,
+//! `frame_sync_code`, the `Profile > 0` `color_config( )`,
+//! `refresh_frame_flags`, explicit `frame_size` / `render_size`). A
+//! *shown* header claiming `intra_only = 1` is uncodeable (§6.2 only
+//! reads the flag when `show_frame == 0`) and returns
+//! [`Error::Unsupported`].
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7
 //! (`docs/video/vp9/vp9-spec.txt`) §6.2; the field order mirrors the
 //! in-crate parser exactly.
 
 use crate::header::{
-    ColorConfig, FrameType, LoopFilterParams, QuantizationParams, SegmentationParams, TileInfo,
-    Vp9FrameHeader, MAX_SEGMENTS, SEGMENTATION_FEATURE_BITS, SEGMENTATION_FEATURE_SIGNED,
+    ColorConfig, ColorSpace, FrameType, LoopFilterParams, QuantizationParams, SegmentationParams,
+    TileInfo, Vp9FrameHeader, MAX_SEGMENTS, SEGMENTATION_FEATURE_BITS, SEGMENTATION_FEATURE_SIGNED,
     SEG_LVL_MAX,
 };
 use crate::Error;
@@ -390,20 +395,15 @@ pub(crate) fn write_uncompressed_header(hdr: &Vp9FrameHeader) -> Result<Vec<u8>,
         return Ok(w.into_bytes());
     }
 
-    // Intra-only inter frames are not yet written.
-    if hdr.frame_type == FrameType::NonKeyFrame && hdr.intra_only {
-        return Err(Error::Unsupported);
-    }
-
-    let frame_is_intra = hdr.frame_type == FrameType::KeyFrame;
+    let frame_is_key = hdr.frame_type == FrameType::KeyFrame;
 
     // frame_type f(1) (0 = key / 1 = non-key), show_frame f(1),
     // error_resilient_mode f(1).
-    w.write_bits(u32::from(!frame_is_intra), 1);
+    w.write_bits(u32::from(!frame_is_key), 1);
     w.write_flag(hdr.show_frame);
     w.write_flag(hdr.error_resilient_mode);
 
-    if frame_is_intra {
+    if frame_is_key {
         // Key-frame body: frame_sync_code, color_config, frame_size,
         // render_size. (refresh_frame_flags = 0xFF, reset_frame_context =
         // 0, FrameIsIntra = 1 are all implicit — not coded.)
@@ -417,12 +417,54 @@ pub(crate) fn write_uncompressed_header(hdr: &Vp9FrameHeader) -> Result<Vec<u8>,
             hdr.render_width,
             hdr.render_height,
         )?;
-    } else {
-        // §6.2 inter (non-intra-only) branch. show_frame == 0 would read
-        // an intra_only flag the writer doesn't support yet; require a
-        // shown inter frame so the flag is inferred 0.
-        if !hdr.show_frame {
+    } else if hdr.intra_only {
+        // §6.2 intra-only branch. The intra_only flag is only *read*
+        // when show_frame == 0, so a shown intra-only header is
+        // uncodeable (§6.2 infers intra_only = 0 for shown frames).
+        if hdr.show_frame {
             return Err(Error::Unsupported);
+        }
+        // intra_only f(1) = 1.
+        w.write_flag(true);
+        // reset_frame_context f(2) — absent when error-resilient.
+        if !hdr.error_resilient_mode {
+            w.write_bits(u32::from(hdr.reset_frame_context & 3), 2);
+        }
+        write_frame_sync_code(&mut w);
+        if hdr.profile > 0 {
+            write_color_config(&mut w, hdr.profile, &hdr.color_config)?;
+        } else {
+            // §6.2: a profile-0 intra-only frame codes no color_config( )
+            // — the parser installs CS_BT_601 / 4:2:0 / 8-bit. Reject a
+            // header claiming anything else, so the written bytes parse
+            // back to an equivalent header.
+            let cc = &hdr.color_config;
+            if cc.bit_depth != 8
+                || cc.color_space != ColorSpace::Bt601
+                || cc.color_range_full
+                || !cc.subsampling_x
+                || !cc.subsampling_y
+            {
+                return Err(Error::Unsupported);
+            }
+        }
+        // refresh_frame_flags f(8), then explicit frame_size + render_size
+        // (an intra-only frame never sizes from its references).
+        w.write_bits(u32::from(hdr.refresh_frame_flags), 8);
+        write_frame_size(&mut w, hdr.frame_width, hdr.frame_height)?;
+        write_render_size(
+            &mut w,
+            hdr.frame_width,
+            hdr.frame_height,
+            hdr.render_width,
+            hdr.render_height,
+        )?;
+    } else {
+        // §6.2 inter (non-intra-only) branch. A hidden inter frame
+        // (show_frame == 0) codes an explicit intra_only = 0 flag; a
+        // shown one infers it.
+        if !hdr.show_frame {
+            w.write_flag(false); // intra_only
         }
         // reset_frame_context f(2) — only present when not error-resilient.
         if !hdr.error_resilient_mode {
@@ -811,14 +853,107 @@ mod tests {
         assert_inter_roundtrips(&h);
     }
 
-    #[test]
-    fn inter_intra_only_is_unsupported() {
-        let mut h = minimal_inter_header();
+    /// A minimal §6.2 intra-only header: hidden (`show_frame = 0`),
+    /// profile 0 (color config uncoded — BT.601 / 4:2:0 / 8-bit
+    /// installed by the parser), explicit refresh mask.
+    fn minimal_intra_only_header() -> Vp9FrameHeader {
+        let mut h = minimal_keyframe_header();
+        h.frame_type = FrameType::NonKeyFrame;
         h.intra_only = true;
         h.show_frame = false;
+        h.refresh_frame_flags = 0x02;
+        h
+    }
+
+    fn assert_intra_only_roundtrips(h: &Vp9FrameHeader) {
+        let bytes = write_uncompressed_header(h).expect("write intra-only");
+        let parsed = parse_uncompressed_header(&bytes).expect("parse intra-only");
+        assert_eq!(parsed.frame_type, FrameType::NonKeyFrame);
+        assert!(parsed.intra_only);
+        assert!(!parsed.show_frame);
+        assert_eq!(parsed.frame_width, h.frame_width);
+        assert_eq!(parsed.frame_height, h.frame_height);
+        assert_eq!(parsed.refresh_frame_flags, h.refresh_frame_flags);
+        assert_eq!(parsed.reset_frame_context, h.reset_frame_context);
+        assert_eq!(parsed.error_resilient_mode, h.error_resilient_mode);
+        assert_eq!(parsed.color_config, h.color_config);
+        // §6.2: FrameIsIntra forces frame_context_idx to 0 in the parser.
+        assert_eq!(parsed.frame_context_idx, 0);
+        // Intra-only frames carry no reference syntax.
+        assert_eq!(parsed.ref_frame_idx, None);
+    }
+
+    #[test]
+    fn intra_only_profile0_roundtrips() {
+        assert_intra_only_roundtrips(&minimal_intra_only_header());
+    }
+
+    #[test]
+    fn intra_only_error_resilient_roundtrips() {
+        let mut h = minimal_intra_only_header();
+        h.error_resilient_mode = true;
+        assert_intra_only_roundtrips(&h);
+    }
+
+    #[test]
+    fn intra_only_reset_frame_context_roundtrips() {
+        let mut h = minimal_intra_only_header();
+        h.reset_frame_context = 3;
+        assert_intra_only_roundtrips(&h);
+    }
+
+    #[test]
+    fn intra_only_profile1_color_config_roundtrips() {
+        let mut h = minimal_intra_only_header();
+        h.profile = 1;
+        h.color_config.subsampling_x = false;
+        h.color_config.subsampling_y = false;
+        assert_intra_only_roundtrips(&h);
+    }
+
+    /// §6.2 reads the intra_only flag only when show_frame == 0: a
+    /// *shown* header claiming intra_only cannot be coded.
+    #[test]
+    fn shown_intra_only_is_unsupported() {
+        let mut h = minimal_intra_only_header();
+        h.show_frame = true;
         assert_eq!(
             write_uncompressed_header(&h).unwrap_err(),
             Error::Unsupported
         );
+    }
+
+    /// §6.2: a profile-0 intra-only frame codes no color_config( ), so a
+    /// header claiming a non-default config is uncodeable.
+    #[test]
+    fn intra_only_profile0_nondefault_color_is_unsupported() {
+        let mut h = minimal_intra_only_header();
+        h.color_config.bit_depth = 10;
+        assert_eq!(
+            write_uncompressed_header(&h).unwrap_err(),
+            Error::Unsupported
+        );
+    }
+
+    /// A hidden (`show_frame == 0`) inter frame codes an explicit
+    /// `intra_only = 0` flag and then the normal inter tail.
+    #[test]
+    fn hidden_inter_frame_roundtrips() {
+        use crate::header::{parse_uncompressed_header_with_refs, RefFrameState};
+        let mut h = minimal_inter_header();
+        h.show_frame = false;
+        let bytes = write_uncompressed_header(&h).expect("write hidden inter");
+        let dims = [(h.frame_width, h.frame_height); 8];
+        let state = RefFrameState {
+            ref_dims: &dims,
+            color_config: h.color_config,
+        };
+        let parsed =
+            parse_uncompressed_header_with_refs(&bytes, Some(state)).expect("parse hidden inter");
+        assert_eq!(parsed.frame_type, FrameType::NonKeyFrame);
+        assert!(!parsed.intra_only);
+        assert!(!parsed.show_frame);
+        assert_eq!(parsed.ref_frame_idx, h.ref_frame_idx);
+        assert_eq!(parsed.refresh_frame_flags, h.refresh_frame_flags);
     }
 }

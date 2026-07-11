@@ -226,12 +226,26 @@ impl KeyframeTreePlan {
 /// `TxModeSelect`, or validated against the inferred
 /// `Min( maxTxSize, tx_mode_to_biggest_tx_size )` otherwise (a mismatch
 /// would silently desync the reconstruction, so it is rejected).
+/// §6.2 `FrameIsIntra` over a *writable* header: a key frame, or a
+/// hidden intra-only frame (§6.2 codes the `intra_only` flag only when
+/// `show_frame == 0`). Both frame classes code the identical §6.3
+/// intra compressed header and §6.4 intra body (mode_info( ) dispatches
+/// on FrameIsIntra, and the §9.3.2 partition / §6.4.6 mode probabilities
+/// key on FrameIsIntra, not on frame_type), so the keyframe assemblers
+/// accept either.
+fn header_is_intra_frame(hdr: &Vp9FrameHeader) -> bool {
+    match hdr.frame_type {
+        FrameType::KeyFrame => !hdr.intra_only,
+        FrameType::NonKeyFrame => hdr.intra_only && !hdr.show_frame,
+    }
+}
+
 pub(crate) fn assemble_keyframe_tree(
     hdr: &Vp9FrameHeader,
     plan: &KeyframeTreePlan,
     coeffs: &mut FrameCoefSource<'_>,
 ) -> Result<Vec<u8>, Error> {
-    if hdr.frame_type != FrameType::KeyFrame || hdr.intra_only {
+    if !header_is_intra_frame(hdr) {
         return Err(Error::Unsupported);
     }
     if hdr.tile_info.tile_cols_log2 != 0 || hdr.tile_info.tile_rows_log2 != 0 {
@@ -386,15 +400,16 @@ pub(crate) fn assemble_keyframe_tree(
 /// tile). `coeffs` supplies, per coded transform block, the quantized
 /// `Tokens` array — only called for non-skip blocks.
 ///
-/// `hdr` must be a key frame (`FrameType::KeyFrame`, `!intra_only`,
-/// `tile_cols_log2 == tile_rows_log2 == 0`); the `header_size_in_bytes`
+/// `hdr` must be an intra frame — a key frame, or a hidden intra-only
+/// frame (see [`header_is_intra_frame`]) — with
+/// `tile_cols_log2 == tile_rows_log2 == 0`; the `header_size_in_bytes`
 /// field is overwritten with the actual compressed-header length.
 pub(crate) fn assemble_keyframe(
     hdr: &Vp9FrameHeader,
     plan: &KeyframePlan,
     coeffs: &mut FrameCoefSource<'_>,
 ) -> Result<Vec<u8>, Error> {
-    if hdr.frame_type != FrameType::KeyFrame || hdr.intra_only {
+    if !header_is_intra_frame(hdr) {
         return Err(Error::Unsupported);
     }
     if hdr.tile_info.tile_cols_log2 != 0 || hdr.tile_info.tile_rows_log2 != 0 {

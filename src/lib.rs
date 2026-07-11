@@ -1103,4 +1103,158 @@ mod encode_roundtrip_tests {
         let path = std::path::Path::new(&dir).join("input.ivf");
         std::fs::write(&path, &ivf).expect("write input.ivf");
     }
+
+    // ----- §6.2 intra-only frames (round 412) -----
+
+    /// The deterministic 64x64 4:2:0 test pattern for the intra-only
+    /// stream (`sel` picks between two distinct patterns).
+    fn intra_only_pattern(sel: u8) -> Vec<u8> {
+        let (w, h, cw, ch) = (64usize, 64usize, 32usize, 32usize);
+        let mut pixels = Vec::with_capacity(w * h + 2 * cw * ch);
+        for y in 0..h {
+            for x in 0..w {
+                pixels.push(match sel {
+                    0 => ((x * 3 + y * 5) ^ (y >> 1)) as u8,
+                    _ => ((x * 7) ^ (y * 2) ^ 0xA5) as u8,
+                });
+            }
+        }
+        for plane in 0..2usize {
+            for y in 0..ch {
+                for x in 0..cw {
+                    pixels.push(match sel {
+                        0 => ((x * 2 + y * 9 + plane * 80) % 253) as u8,
+                        _ => ((x * 11 + y * 4 + plane * 40) % 249) as u8,
+                    });
+                }
+            }
+        }
+        pixels
+    }
+
+    /// Build the round-412 **intra-only** stream (profile 0, 8-bit
+    /// 4:2:0, 64x64):
+    ///
+    /// * F0 — shown lossless keyframe (pattern A), refreshes all slots.
+    /// * F1 — **hidden intra-only frame** (pattern B): `show_frame = 0`,
+    ///   `intra_only = 1`, `reset_frame_context = 3` (§6.2 resets all
+    ///   four §6.1.2 banks to the §10.5 defaults, so the
+    ///   default-probability writers stay bit-aligned with the
+    ///   decoder), `refresh_frame_flags = 0x02` (slot 1 only).
+    /// * F2 — `show_existing_frame` displaying slot 1 (the intra-only
+    ///   reconstruction).
+    /// * F3 — shown all-skip `ZEROMV` P-frame whose `LAST` reference is
+    ///   slot 1: its reconstruction is a verbatim copy of the
+    ///   intra-only frame (§8.5.2 prediction from an
+    ///   intra-only-refreshed §8.10 slot).
+    fn build_intra_only_stream() -> Vec<Vec<u8>> {
+        use crate::frame_writer::{assemble_inter_frame_all_skip_zeromv, inter_pframe_header};
+        use crate::header_writer::write_uncompressed_header;
+        use crate::pixel_encoder::{
+            encode_keyframe_lossless, lossless_keyframe_header, padded_plane_from_bytes,
+        };
+
+        // F0: shown keyframe, pattern A.
+        let kf = encode_vp9(&intra_only_pattern(0), 64, 64).expect("keyframe");
+
+        // F1: hidden intra-only frame, pattern B, lossless, slot 1.
+        let mut hdr1 = lossless_keyframe_header(64, 64);
+        hdr1.frame_type = FrameType::NonKeyFrame;
+        hdr1.intra_only = true;
+        hdr1.show_frame = false;
+        hdr1.reset_frame_context = 3;
+        hdr1.refresh_frame_context = false;
+        hdr1.refresh_frame_flags = 0x02;
+        let pat_b = intra_only_pattern(1);
+        let y = padded_plane_from_bytes(&pat_b[..64 * 64], 64, 64, 64, 64);
+        let u = padded_plane_from_bytes(&pat_b[64 * 64..64 * 64 + 32 * 32], 32, 32, 32, 32);
+        let v = padded_plane_from_bytes(&pat_b[64 * 64 + 32 * 32..], 32, 32, 32, 32);
+        let f1 = encode_keyframe_lossless(&hdr1, &[y, u, v]).expect("intra-only frame");
+
+        // F2: show_existing_frame → slot 1.
+        let mut hdr2 = lossless_keyframe_header(64, 64);
+        hdr2.show_existing_frame = true;
+        hdr2.frame_to_show_map_idx = Some(1);
+        let f2 = write_uncompressed_header(&hdr2).expect("show-existing packet");
+
+        // F3: shown all-skip ZEROMV P-frame over slot 1.
+        let mut hdr3 = inter_pframe_header(64, 64);
+        hdr3.ref_frame_idx = Some([1, 1, 1]);
+        hdr3.refresh_frame_flags = 0x04;
+        let f3 = assemble_inter_frame_all_skip_zeromv(&hdr3).expect("p-frame");
+
+        vec![kf, f1, f2, f3]
+    }
+
+    /// The intra-only stream decodes end-to-end: the hidden intra-only
+    /// frame never appears in the output, the `show_existing_frame`
+    /// packet re-displays its slot, and the P-frame referencing that
+    /// slot reconstructs a verbatim copy — all byte-exact against the
+    /// lossless targets (an independent oracle: the encoder's input
+    /// pattern, not its reconstruction).
+    #[test]
+    fn intra_only_sequence_decodes_byte_exact_against_targets() {
+        let frames = build_intra_only_stream();
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        let out = decode_vp9_sequence(&refs).expect("intra-only sequence");
+        // 4 coded packets, 3 shown frames (F1 is hidden).
+        assert_eq!(out.len(), 3);
+
+        let pat_a = intra_only_pattern(0);
+        let pat_b = intra_only_pattern(1);
+        assert_eq!(out[0].to_planar_bytes(), pat_a, "keyframe != pattern A");
+        assert_eq!(
+            out[1].to_planar_bytes(),
+            pat_b,
+            "show-existing of the intra-only slot != pattern B"
+        );
+        assert_eq!(
+            out[2].to_planar_bytes(),
+            pat_b,
+            "ZEROMV P-frame over the intra-only slot != pattern B"
+        );
+
+        // The F1 header really is a hidden intra-only frame with the
+        // bank-resetting reset_frame_context = 3.
+        let hdr = crate::header::parse_uncompressed_header(&frames[1]).expect("F1 header");
+        assert_eq!(hdr.frame_type, FrameType::NonKeyFrame);
+        assert!(hdr.intra_only && !hdr.show_frame);
+        assert_eq!(hdr.reset_frame_context, 3);
+        assert_eq!(hdr.refresh_frame_flags, 0x02);
+
+        // Byte-determinism (fixture staging relies on it).
+        assert_eq!(frames, build_intra_only_stream());
+    }
+
+    /// Fixture-staging generator (round 412): when `OXIDEAV_VP9_STAGE_DIR`
+    /// is set, writes the intra-only stream as `intra-only/input.ivf`
+    /// under that directory, for staging under
+    /// `docs/video/vp9/fixtures/intra-only/` alongside a black-box
+    /// reference decode (`expected.yuv`). A no-op otherwise.
+    #[test]
+    fn stage_intra_only_fixture_when_requested() {
+        let Some(dir) = std::env::var_os("OXIDEAV_VP9_STAGE_DIR") else {
+            return;
+        };
+        let frames = build_intra_only_stream();
+        let mut ivf = Vec::new();
+        ivf.extend_from_slice(b"DKIF");
+        ivf.extend_from_slice(&0u16.to_le_bytes());
+        ivf.extend_from_slice(&32u16.to_le_bytes());
+        ivf.extend_from_slice(b"VP90");
+        ivf.extend_from_slice(&64u16.to_le_bytes());
+        ivf.extend_from_slice(&64u16.to_le_bytes());
+        ivf.extend_from_slice(&25u32.to_le_bytes());
+        ivf.extend_from_slice(&1u32.to_le_bytes());
+        ivf.extend_from_slice(&(frames.len() as u32).to_le_bytes());
+        ivf.extend_from_slice(&0u32.to_le_bytes());
+        for (i, f) in frames.iter().enumerate() {
+            ivf.extend_from_slice(&(f.len() as u32).to_le_bytes());
+            ivf.extend_from_slice(&(i as u64).to_le_bytes());
+            ivf.extend_from_slice(f);
+        }
+        let subdir = std::path::Path::new(&dir).join("intra-only");
+        std::fs::create_dir_all(&subdir).expect("create stage dir");
+        std::fs::write(subdir.join("input.ivf"), &ivf).expect("write input.ivf");
+    }
 }

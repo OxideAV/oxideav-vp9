@@ -272,7 +272,12 @@ pub(crate) fn encode_keyframe_lossless(
     hdr: &Vp9FrameHeader,
     targets: &[Plane; 3],
 ) -> Result<Vec<u8>, Error> {
-    if hdr.frame_type != FrameType::KeyFrame || !hdr.quantization.lossless {
+    // Key frames and hidden intra-only frames code the identical §6.3 /
+    // §6.4 intra syntax (the assembler validates the header class); both
+    // are accepted here.
+    let intra = hdr.frame_type == FrameType::KeyFrame
+        || (hdr.frame_type == FrameType::NonKeyFrame && hdr.intra_only);
+    if !intra || !hdr.quantization.lossless {
         return Err(Error::Unsupported);
     }
     let mi_cols = (hdr.frame_width + 7) >> 3;

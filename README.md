@@ -32,7 +32,7 @@ motion field, the §6.1.2 / §7.2 `FrameContext[ 4 ]` entropy probability
 banks (`load_probs( )` / `save_probs( )` — **including the full §6.1.2
 `refresh_probs( )` backward adaptation on non-frame-parallel streams**,
 see below), and the §6.4.14 PrevSegmentIds
-map across frames. **All 24 staged corpus fixtures reconstruct fully
+map across frames. **All 35 staged corpus fixtures reconstruct fully
 byte-exact against their `expected.yuv` through `decode_vp9_sequence`**
 (pinned by `full_corpus_sequences_byte_exact`), including the
 profile-1/2/3 P-frames (§8.5.2 motion compensation at 4:4:4 chroma and
@@ -41,7 +41,7 @@ profile-1/2/3 P-frames (§8.5.2 motion compensation at 4:4:4 chroma and
 `profile-1-yuv422-8bit-inter` (4:2:2 chroma inter),
 `intra-blocks-in-inter` (a mid-GOP scene cut coding 62 intra blocks
 inside P-frames), `qcif-inter-gop` (176x144: partial superblocks with
-frame-edge inter leaves) — and the five round-409 extensions:
+frame-edge inter leaves) — the five round-409 extensions:
 `backward-adaptation` (the corpus's first
 `frame_parallel_decoding_mode=0` stream: every frame's entropy decode
 runs on §8.4-adapted probabilities), `scaled-reference` (mid-GOP coded
@@ -49,7 +49,27 @@ size changes 128→64→128→96→64: §8.5.2.3 reference scaling at the 2x
 conformance extreme, a 1/2x upscale, the fractional 4/3 ratio, and a
 scaled `NEWMV`), `lossless-inter` (§8.7.2 WHT on inter residuals),
 `tiles-2col-inter` (two tile columns on P-frames), and
-`hbd-backward-adaptation` (profile-2 10-bit + backward adaptation).
+`hbd-backward-adaptation` (profile-2 10-bit + backward adaptation) —
+and the **eleven round-412 extensions** driving whole-corpus decode
+generality: `profile-1-yuv440-8bit-inter` (**4:4:0** — `ssx=0, ssy=1`,
+the §8.5.2 y-only chroma MV rounding, previously untested),
+`profile-2-yuv420-12bit-inter` + `profile-3-yuv422-12bit-inter`
+(**12-bit inter**, closing the bit-depth × chroma-geometry matrix),
+`cyclic-refresh-aq` (**`segmentation_temporal_update=1`** P-frames —
+the §6.4.12 `seg_id_predicted` branch corpus-validated — plus
+inter-frame `SEG_LVL_ALT_Q`), `tiles-4col-inter` (`tile_cols_log2=2`),
+`color-bt709-full-range` + `rgb-8bit-inter` (color-space / full-range
+signalling incl. `CS_RGB` inter), `partial-mi-58x36-yuv420` /
+`partial-mi-58x36-yuv444` (non-multiple-of-8 luma both axes, odd
+29-wide chroma; the 444 stream is the regression stream for the
+round-412 §8.8.2 fix — the loop filter's step-13 `onScreen` predicate
+extends to the MI grid, not the visible crop, so edges at the visible
+boundary filter with real reconstructed overhang samples),
+`odd-dims-59x37` (truly odd luma, self-encoded — encoder pipelines
+round to even), and `intra-only` (a hidden **intra-only frame** with
+`reset_frame_context=3`, re-displayed via `show_existing_frame` and
+referenced by a P-frame — self-encoded through the round-412 §6.2
+intra-only header-writer branch).
 Highlights: `i-frame-then-p-frame-64x64`
 (keyframe + single-reference LAST P-frame, high-precision MVs,
 8-tap-smooth filter), `frame-parallel-mode` (keyframe + three
@@ -234,10 +254,16 @@ external encoder consulted):
   decoder, with `0xff`-run carry propagation and §9.2.3 superframe-marker
   avoidance;
 * the §6.2 uncompressed-header **writer** (`header_writer`) — the key-frame
-  branch + `show_existing_frame` sentinel across all four profiles, **plus
-  the inter (non-intra-only, shown) branch** (`ref_frame_idx` /
+  branch + `show_existing_frame` sentinel across all four profiles, **the
+  inter branch — shown or hidden** (`ref_frame_idx` /
   `ref_frame_sign_bias` / explicit `frame_size` / `allow_high_precision_mv`
-  / §6.2.7 `interpolation_filter`);
+  / §6.2.7 `interpolation_filter`; a hidden inter frame codes the explicit
+  `intra_only = 0` flag), **and the intra-only branch** (`show_frame == 0`,
+  `intra_only = 1`: `reset_frame_context`, mid-stream `frame_sync_code`,
+  the `Profile > 0` `color_config( )`, `refresh_frame_flags`, explicit
+  sizes — the keyframe assemblers accept intra-only headers since §6.4.5
+  `mode_info( )` and the §9.3.2 probability selection key on
+  `FrameIsIntra`, so both intra classes code the identical body);
 * the §6.3 compressed-header **writer** (`compressed_writer`) — the
   default-probability path (no forward updates) for every `tx_mode`, **both
   the intra prefix and the §6.3.9-§6.3.16 inter tail** (`inter_mode` /
@@ -362,6 +388,17 @@ carries no forward update for it).
   tile-rows stream needs custom encoder tooling — recorded in
   `docs/video/vp9/fixtures/tiles-2col-inter/notes.md`. The decode-side
   tile-row walk itself is exercised by the §6.4 offset unit tests.
+  Similarly fixture-less (further round-412-verified encoder-tooling
+  gaps): non-zero `loop_filter_sharpness` (the wrapper's sharpness knob
+  never reaches the §6.2.8 header field) and
+  `render_and_frame_size_different = 1` (SAR signalling doesn't mint
+  it); both are decode-supported and unit-tested. Per-segment
+  `SEG_LVL_ALT_L` / `SEG_LVL_SKIP` / `SEG_LVL_REF_FRAME` streams are
+  likewise unmintable via the wrapper (only `SEG_LVL_ALT_Q` appears, in
+  the AQ modes) — the decode paths are unit-tested, and the writer
+  *primitives* honour the seg-feature-active no-bits rules, but the
+  inter block-writer driver doesn't wire them yet, so a self-encoded
+  fixture is a later milestone.
 * §9.2.4 multi-coder tile parallelism (tiles decode sequentially).
 * Encoder depth beyond the planner-driven baseline. Keyframes **and
   P-frames** plan partitions `BLOCK_8X8`..`BLOCK_64X64` with
@@ -379,7 +416,7 @@ carries no forward update for it).
 
 ## Testing
 
-The crate carries 995+ lib unit tests plus integration suites in
+The crate carries 1005+ lib unit tests plus integration suites in
 `tests/` (including the keyframe **and inter** encoder writers, each
 round-tripped back through the in-crate decoder; `encode_keyframe`
 exercising the public `encode_vp9` → decode **byte-exact lossless**

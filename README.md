@@ -32,7 +32,7 @@ motion field, the §6.1.2 / §7.2 `FrameContext[ 4 ]` entropy probability
 banks (`load_probs( )` / `save_probs( )` — **including the full §6.1.2
 `refresh_probs( )` backward adaptation on non-frame-parallel streams**,
 see below), and the §6.4.14 PrevSegmentIds
-map across frames. **All 35 staged corpus fixtures reconstruct fully
+map across frames. **All 36 staged corpus fixtures reconstruct fully
 byte-exact against their `expected.yuv` through `decode_vp9_sequence`**
 (pinned by `full_corpus_sequences_byte_exact`), including the
 profile-1/2/3 P-frames (§8.5.2 motion compensation at 4:4:4 chroma and
@@ -50,7 +50,7 @@ conformance extreme, a 1/2x upscale, the fractional 4/3 ratio, and a
 scaled `NEWMV`), `lossless-inter` (§8.7.2 WHT on inter residuals),
 `tiles-2col-inter` (two tile columns on P-frames), and
 `hbd-backward-adaptation` (profile-2 10-bit + backward adaptation) —
-and the **eleven round-412 extensions** driving whole-corpus decode
+and the **twelve round-412 extensions** driving whole-corpus decode
 generality: `profile-1-yuv440-8bit-inter` (**4:4:0** — `ssx=0, ssy=1`,
 the §8.5.2 y-only chroma MV rounding, previously untested),
 `profile-2-yuv420-12bit-inter` + `profile-3-yuv422-12bit-inter`
@@ -66,10 +66,15 @@ round-412 §8.8.2 fix — the loop filter's step-13 `onScreen` predicate
 extends to the MI grid, not the visible crop, so edges at the visible
 boundary filter with real reconstructed overhang samples),
 `odd-dims-59x37` (truly odd luma, self-encoded — encoder pipelines
-round to even), and `intra-only` (a hidden **intra-only frame** with
+round to even), `intra-only` (a hidden **intra-only frame** with
 `reset_frame_context=3`, re-displayed via `show_existing_frame` and
 referenced by a P-frame — self-encoded through the round-412 §6.2
-intra-only header-writer branch).
+intra-only header-writer branch), and `seg-features-skip-ref-altl`
+(**`SEG_LVL_SKIP` + `SEG_LVL_REF_FRAME` + `SEG_LVL_ALT_L`** segments
+with the corpus's first non-zero `loop_filter_sharpness` — self-encoded
+through the round-412 segment-feature-aware inter block writer; its
+level-0 copy frame pins that §8.10 reference stores are post-§8.8
+samples).
 Highlights: `i-frame-then-p-frame-64x64`
 (keyframe + single-reference LAST P-frame, high-precision MVs,
 8-tap-smooth filter), `frame-parallel-mode` (keyframe + three
@@ -388,17 +393,15 @@ carries no forward update for it).
   tile-rows stream needs custom encoder tooling — recorded in
   `docs/video/vp9/fixtures/tiles-2col-inter/notes.md`. The decode-side
   tile-row walk itself is exercised by the §6.4 offset unit tests.
-  Similarly fixture-less (further round-412-verified encoder-tooling
-  gaps): non-zero `loop_filter_sharpness` (the wrapper's sharpness knob
-  never reaches the §6.2.8 header field) and
-  `render_and_frame_size_different = 1` (SAR signalling doesn't mint
-  it); both are decode-supported and unit-tested. Per-segment
-  `SEG_LVL_ALT_L` / `SEG_LVL_SKIP` / `SEG_LVL_REF_FRAME` streams are
-  likewise unmintable via the wrapper (only `SEG_LVL_ALT_Q` appears, in
-  the AQ modes) — the decode paths are unit-tested, and the writer
-  *primitives* honour the seg-feature-active no-bits rules, but the
-  inter block-writer driver doesn't wire them yet, so a self-encoded
-  fixture is a later milestone.
+  Similarly fixture-less: `render_and_frame_size_different = 1` (SAR
+  signalling doesn't mint it; decode-supported and unit-tested). The
+  two other round-412-verified wrapper gaps were closed by
+  self-encoding: non-zero `loop_filter_sharpness` and the per-segment
+  `SEG_LVL_SKIP` / `SEG_LVL_REF_FRAME` / `SEG_LVL_ALT_L` features (the
+  wrapper only ever emits `SEG_LVL_ALT_Q`) are corpus-validated via the
+  `seg-features-skip-ref-altl` fixture, coded by the round-412
+  segment-feature-aware inter block writer and byte-exact against a
+  black-box reference decode.
 * §9.2.4 multi-coder tile parallelism (tiles decode sequentially).
 * Encoder depth beyond the planner-driven baseline. Keyframes **and
   P-frames** plan partitions `BLOCK_8X8`..`BLOCK_64X64` with
@@ -416,7 +419,7 @@ carries no forward update for it).
 
 ## Testing
 
-The crate carries 1005+ lib unit tests plus integration suites in
+The crate carries 1010+ lib unit tests plus integration suites in
 `tests/` (including the keyframe **and inter** encoder writers, each
 round-tripped back through the in-crate decoder; `encode_keyframe`
 exercising the public `encode_vp9` → decode **byte-exact lossless**

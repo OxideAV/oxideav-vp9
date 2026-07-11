@@ -1460,9 +1460,18 @@ fn decode_single_frame(
         lvl_lookup: &lvl_lookup,
     };
 
-    // §8.8 input is CurrFrame at the FrameWidth x FrameHeight extent;
-    // the working planes are MI-aligned, so the filter views carry the
-    // working stride with the §8.10 visible extents.
+    // §8.8 input is CurrFrame at the MI-aligned working extents: the
+    // §8.8.2 step-13 onScreen predicate tests `x >= 8 * MiCols` /
+    // `y >= 8 * MiRows`, NOT the visible FrameWidth / FrameHeight — an
+    // edge between the visible boundary and the MI-grid boundary (a
+    // frame whose width or height is not a multiple of 8) is on-screen
+    // and is filtered, and the §8.8.5.1 stencil reads the *real*
+    // reconstructed samples beyond the visible edge (they exist: §6.4
+    // decodes whole mode-info blocks, overhang included). Passing the
+    // visible extents here would edge-replicate those q-side reads and
+    // drop the writes, desynchronising every visible row the filter
+    // touches from below/right of the frame edge (§8.10 crops after
+    // filtering, so only the visible rows would show it).
     let crop_w = hdr.frame_width as usize;
     let crop_h = hdr.frame_height as usize;
     let uv_crop_w = ((hdr.frame_width + u32::from(ssx)) >> u32::from(ssx)) as usize;
@@ -1479,20 +1488,20 @@ fn decode_single_frame(
                 SuperblockFilterPlane {
                     data: plane_y.samples_mut(),
                     stride: y_w,
-                    width: crop_w,
-                    height: crop_h,
+                    width: y_w,
+                    height: y_h,
                 },
                 SuperblockFilterPlane {
                     data: plane_u.samples_mut(),
                     stride: uv_w,
-                    width: uv_crop_w,
-                    height: uv_crop_h,
+                    width: uv_w,
+                    height: uv_h,
                 },
                 SuperblockFilterPlane {
                     data: plane_v.samples_mut(),
                     stride: uv_w,
-                    width: uv_crop_w,
-                    height: uv_crop_h,
+                    width: uv_w,
+                    height: uv_h,
                 },
             ],
         };

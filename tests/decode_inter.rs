@@ -941,6 +941,20 @@ fn full_corpus_sequences_byte_exact() {
         "lossless-inter",
         "tiles-2col-inter",
         "hbd-backward-adaptation",
+        // Round-412 corpus extensions (black-box generation; notes.md in
+        // each dir). The two partial-MI 58x36 streams are the corpus's
+        // first frames whose luma dimensions are not multiples of 8 on
+        // BOTH axes (MiCols*8 = 64 > 58, MiRows*8 = 40 > 36): §6.4 codes
+        // blocks overhanging the visible frame, the 4:2:0 chroma planes
+        // are odd-width (29), and — critically — the §8.8.2 step-13
+        // onScreen predicate keeps filtering edges *between* the visible
+        // boundary and the MI-grid boundary. The 444 stream is the
+        // regression stream for the round-412 filter-extent fix: its
+        // loop filter fires across the y == FrameHeight edge, reading
+        // real reconstructed overhang samples (visible-extent clamping
+        // diverges on the bottom visible row).
+        "partial-mi-58x36-yuv420",
+        "partial-mi-58x36-yuv444",
     ] {
         let base = root.join(name);
         let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");

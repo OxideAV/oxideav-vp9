@@ -985,6 +985,13 @@ fn full_corpus_sequences_byte_exact() {
         "color-bt709-full-range",
         "rgb-8bit-inter",
         "intra-only",
+        // * seg-features-skip-ref-altl — SEG_LVL_SKIP (forced skip +
+        //   ZEROMV, no bits) + SEG_LVL_REF_FRAME (derived is_inter +
+        //   reference pair, no bits) + SEG_LVL_ALT_L (§8.8.1 per-segment
+        //   filter strength) with the corpus's first non-zero
+        //   loop_filter_sharpness; self-encoded (no black-box encoder
+        //   emits these features).
+        "seg-features-skip-ref-altl",
     ] {
         let base = root.join(name);
         let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");
@@ -1311,6 +1318,45 @@ fn round_412_fixture_flags_pin_their_feature_classes() {
             n_alt_q >= 8,
             "per-segment ALT_Q rewritten on P-frames ({n_alt_q})"
         );
+    }
+
+    // seg-features-skip-ref-altl: the feature frame carries the three
+    // corpus-first segment features and non-zero sharpness.
+    {
+        let ivf =
+            std::fs::read(root.join("seg-features-skip-ref-altl").join("input.ivf")).expect("ivf");
+        let chunks = ivf_chunks(&ivf);
+        assert_eq!(chunks.len(), 4, "4 coded packets");
+        let cc0 = oxideav_vp9::parse_uncompressed_header(&chunks[0])
+            .expect("keyframe")
+            .color_config;
+        let ref_dims = vec![(64u32, 64u32); 8];
+        let h2 = oxideav_vp9::parse_uncompressed_header_with_refs(
+            &chunks[2],
+            Some(oxideav_vp9::RefFrameState {
+                ref_dims: &ref_dims,
+                color_config: cc0,
+            }),
+        )
+        .expect("feature-frame header");
+        assert!(h2.segmentation.enabled && h2.segmentation.update_map);
+        assert!(h2.segmentation.update_data);
+        // §3 feature indices: ALT_Q=0, ALT_L=1, REF_FRAME=2, SKIP=3.
+        assert!(h2.segmentation.feature_enabled[1][3], "seg 1: SEG_LVL_SKIP");
+        assert!(
+            h2.segmentation.feature_enabled[2][2],
+            "seg 2: SEG_LVL_REF_FRAME"
+        );
+        assert_eq!(
+            h2.segmentation.feature_data[2][2], 2,
+            "seg 2 override names GOLDEN"
+        );
+        assert!(
+            h2.segmentation.feature_enabled[3][1],
+            "seg 3: SEG_LVL_ALT_L"
+        );
+        assert!(h2.loop_filter.level > 0, "loop filter live");
+        assert_eq!(h2.loop_filter.sharpness, 3, "non-zero sharpness");
     }
 
     // intra-only: one hidden intra-only frame with reset_frame_context=3

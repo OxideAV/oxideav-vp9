@@ -1339,4 +1339,205 @@ mod encode_roundtrip_tests {
         std::fs::create_dir_all(&subdir).expect("create stage dir");
         std::fs::write(subdir.join("input.ivf"), &ivf).expect("write input.ivf");
     }
+    // ----- per-segment feature streams (round 412) -----
+
+    /// Build the round-412 **segment-features** stream (profile 0, 8-bit
+    /// 4:2:0, 64x64):
+    ///
+    /// * F0 — shown lossless keyframe (pattern A), fills all slots.
+    /// * F1 — hidden intra-only frame (pattern B) → slot 1.
+    /// * F2 — shown all-skip `ZEROMV` P-frame, `LAST` = slot 0 (A) /
+    ///   `GOLDEN` = slot 1 (B), with a live segmentation map (four
+    ///   segments striped by superblock row) carrying the three
+    ///   corpus-untested features: segment 1 = **`SEG_LVL_SKIP`**
+    ///   (§6.4.8 forced skip, §6.4.16 forced ZEROMV — no skip /
+    ///   inter_mode bits), segment 2 = **`SEG_LVL_REF_FRAME` = GOLDEN**
+    ///   (§6.4.13/§6.4.17 derive is_inter + the reference pair — those
+    ///   rows reconstruct from pattern B), segment 3 =
+    ///   **`SEG_LVL_ALT_L` = +32** (§8.8.1 per-segment loop-filter
+    ///   strength). The frame codes `loop_filter_level = 16` with
+    ///   **`loop_filter_sharpness = 3`** (both corpus-firsts for a
+    ///   self-encoded stream), so the §8.8 filter runs over the coded
+    ///   block edges with per-segment strengths. Refreshes slot 2.
+    /// * F3 — shown all-skip `ZEROMV` P-frame over slot 2 with
+    ///   `loop_filter_level = 0` and segmentation disabled: a verbatim
+    ///   copy of F2's (post-filter) reconstruction.
+    fn build_seg_features_stream() -> Vec<Vec<u8>> {
+        use crate::frame_writer::{
+            assemble_inter_frame_all_skip_zeromv, assemble_inter_frame_tree, inter_pframe_header,
+            FrameCoefSource, InterFrameTreePlan, InterTreeLeaf, InterTreePlanner,
+        };
+        use crate::header::SegmentationParams;
+        use crate::mode_info::{
+            GOLDEN_FRAME, LAST_FRAME, NONE_REF_FRAME, SEG_LVL_REF_FRAME, SEG_LVL_SKIP, ZEROMV,
+        };
+        use crate::pixel_encoder::{
+            encode_keyframe_lossless, lossless_keyframe_header, padded_plane_from_bytes,
+        };
+
+        // F0: shown keyframe, pattern A.
+        let kf = encode_vp9(&intra_only_pattern(0), 64, 64).expect("keyframe");
+
+        // F1: hidden intra-only frame, pattern B, lossless, slot 1.
+        let mut hdr1 = lossless_keyframe_header(64, 64);
+        hdr1.frame_type = FrameType::NonKeyFrame;
+        hdr1.intra_only = true;
+        hdr1.show_frame = false;
+        hdr1.reset_frame_context = 3;
+        hdr1.refresh_frame_context = false;
+        hdr1.refresh_frame_flags = 0x02;
+        let pat_b = intra_only_pattern(1);
+        let y = padded_plane_from_bytes(&pat_b[..64 * 64], 64, 64, 64, 64);
+        let u = padded_plane_from_bytes(&pat_b[64 * 64..64 * 64 + 32 * 32], 32, 32, 32, 32);
+        let v = padded_plane_from_bytes(&pat_b[64 * 64 + 32 * 32..], 32, 32, 32, 32);
+        let f1 = encode_keyframe_lossless(&hdr1, &[y, u, v]).expect("intra-only frame");
+
+        // F2: the segment-features frame.
+        let mut hdr2 = inter_pframe_header(64, 64);
+        hdr2.ref_frame_idx = Some([0, 1, 1]);
+        hdr2.refresh_frame_flags = 0x04;
+        hdr2.loop_filter.level = 16;
+        hdr2.loop_filter.sharpness = 3;
+        let mut seg = SegmentationParams::default_disabled();
+        seg.enabled = true;
+        seg.update_map = true;
+        seg.tree_probs = Some([128; 7]);
+        seg.update_data = true;
+        seg.abs_or_delta_update = false;
+        seg.feature_enabled[1][SEG_LVL_SKIP] = true;
+        seg.feature_enabled[2][SEG_LVL_REF_FRAME] = true;
+        seg.feature_data[2][SEG_LVL_REF_FRAME] = GOLDEN_FRAME as i16;
+        seg.feature_enabled[3][crate::loop_filter::SEG_LVL_ALT_L] = true;
+        seg.feature_data[3][crate::loop_filter::SEG_LVL_ALT_L] = 32;
+        hdr2.segmentation = seg;
+
+        let plan = InterFrameTreePlan {
+            tx_mode: crate::compressed::TxMode::Only4x4,
+            reference_mode: crate::compressed::ReferenceMode::SingleReference,
+            partitions: std::collections::HashMap::new(), // all-8x8 leaves
+        };
+        // Segments striped by MI row pairs: rows 0-1 seg 0 (plain skip),
+        // rows 2-3 seg 1 (SKIP-forced), rows 4-5 seg 2 (GOLDEN
+        // override → pattern B), rows 6-7 seg 3 (ALT_L).
+        let mut planner: Box<InterTreePlanner<'_>> =
+            Box::new(|lr: u32, _lc: u32, subsize: u8, _state| {
+                let segment_id = (lr / 2).min(3) as u8;
+                let ref0 = if segment_id == 2 {
+                    GOLDEN_FRAME
+                } else {
+                    LAST_FRAME
+                };
+                InterTreeLeaf {
+                    mi_size: subsize,
+                    tx_size: 0, // inferred under Only4x4
+                    y_mode: ZEROMV,
+                    interp_filter: 0,
+                    ref_frame: [ref0, NONE_REF_FRAME],
+                    mv: [[0, 0], [0, 0]],
+                    skip: true,
+                    segment_id,
+                }
+            });
+        let mut coeffs: Box<FrameCoefSource<'_>> = Box::new(|_r, _c, _p, _x, _y, _b| Vec::new());
+        let f2 = assemble_inter_frame_tree(&hdr2, &plan, &mut planner, &mut coeffs).expect("f2");
+
+        // F3: verbatim copy of F2's post-filter reconstruction.
+        let mut hdr3 = inter_pframe_header(64, 64);
+        hdr3.ref_frame_idx = Some([2, 2, 2]);
+        hdr3.refresh_frame_flags = 0x08;
+        let f3 = assemble_inter_frame_all_skip_zeromv(&hdr3).expect("f3");
+
+        vec![kf, f1, f2, f3]
+    }
+
+    /// The segment-features stream decodes end-to-end with the feature
+    /// semantics observable in the output: the `SEG_LVL_REF_FRAME`
+    /// stripe reconstructs from the GOLDEN (intra-only) pattern while
+    /// the other stripes keep the keyframe pattern (checked on
+    /// filter-untouched interior samples), and the `loop_filter_level=0`
+    /// copy frame equals the (filtered) feature frame byte-for-byte —
+    /// pinning that the §8.10 reference stores are post-§8.8 samples.
+    #[test]
+    fn seg_features_sequence_decodes_with_observable_feature_semantics() {
+        let frames = build_seg_features_stream();
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        let out = decode_vp9_sequence(&refs).expect("seg-features sequence");
+        assert_eq!(out.len(), 3); // F1 is hidden.
+
+        let pat_a = intra_only_pattern(0);
+        let pat_b = intra_only_pattern(1);
+        assert_eq!(out[0].to_planar_bytes(), pat_a, "keyframe != pattern A");
+
+        // Interior luma samples ≥ 3 samples away from every 8-aligned
+        // edge line are untouched by the §8.8 filter (the strongest
+        // filter this stream admits is the 8-tap, modifying p2..q2):
+        // sample (4, 12) sits in the seg-0 stripe (pattern A), (36, 12)
+        // in the SEG_LVL_REF_FRAME stripe (GOLDEN → pattern B),
+        // (52, 12) in the ALT_L stripe (still LAST → pattern A).
+        let f2 = &out[1];
+        assert_eq!(
+            f2.y[4 * 64 + 12],
+            u16::from(pat_a[4 * 64 + 12]),
+            "seg-0 stripe reconstructs from LAST (pattern A)"
+        );
+        assert_eq!(
+            f2.y[36 * 64 + 12],
+            u16::from(pat_b[36 * 64 + 12]),
+            "SEG_LVL_REF_FRAME stripe reconstructs from GOLDEN (pattern B)"
+        );
+        assert_eq!(
+            f2.y[52 * 64 + 12],
+            u16::from(pat_a[52 * 64 + 12]),
+            "ALT_L stripe still reconstructs from LAST (pattern A)"
+        );
+        // The filter did run: the A/B stripe boundary at row 32 must
+        // show filtered samples (the prediction is a hard edge there).
+        let row31: Vec<u16> = (0..64).map(|x| f2.y[31 * 64 + x]).collect();
+        let unfiltered31: Vec<u16> = (0..64).map(|x| u16::from(pat_a[31 * 64 + x])).collect();
+        assert_ne!(
+            row31, unfiltered31,
+            "\u{a7}8.8 filtering visible at the stripe boundary"
+        );
+
+        // F3 (level-0, no residual) is a verbatim copy of F2's stored
+        // (post-filter) reconstruction.
+        assert_eq!(
+            out[2].to_planar_bytes(),
+            out[1].to_planar_bytes(),
+            "copy frame != stored post-filter reconstruction"
+        );
+
+        // Byte-determinism (fixture staging relies on it).
+        assert_eq!(frames, build_seg_features_stream());
+    }
+
+    /// Fixture-staging generator (round 412): stages the segment-features
+    /// stream as `seg-features-skip-ref-altl/input.ivf` under
+    /// `OXIDEAV_VP9_STAGE_DIR`.
+    #[test]
+    fn stage_seg_features_fixture_when_requested() {
+        let Some(dir) = std::env::var_os("OXIDEAV_VP9_STAGE_DIR") else {
+            return;
+        };
+        let frames = build_seg_features_stream();
+        let mut ivf = Vec::new();
+        ivf.extend_from_slice(b"DKIF");
+        ivf.extend_from_slice(&0u16.to_le_bytes());
+        ivf.extend_from_slice(&32u16.to_le_bytes());
+        ivf.extend_from_slice(b"VP90");
+        ivf.extend_from_slice(&64u16.to_le_bytes());
+        ivf.extend_from_slice(&64u16.to_le_bytes());
+        ivf.extend_from_slice(&25u32.to_le_bytes());
+        ivf.extend_from_slice(&1u32.to_le_bytes());
+        ivf.extend_from_slice(&(frames.len() as u32).to_le_bytes());
+        ivf.extend_from_slice(&0u32.to_le_bytes());
+        for (i, f) in frames.iter().enumerate() {
+            ivf.extend_from_slice(&(f.len() as u32).to_le_bytes());
+            ivf.extend_from_slice(&(i as u64).to_le_bytes());
+            ivf.extend_from_slice(f);
+        }
+        let subdir = std::path::Path::new(&dir).join("seg-features-skip-ref-altl");
+        std::fs::create_dir_all(&subdir).expect("create stage dir");
+        std::fs::write(subdir.join("input.ivf"), &ivf).expect("write input.ivf");
+    }
 }

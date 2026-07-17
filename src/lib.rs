@@ -1743,6 +1743,7 @@ mod encode_roundtrip_tests {
             &hdr1,
             &targets,
             &reference,
+            None,
             64,
             64,
             partitions,

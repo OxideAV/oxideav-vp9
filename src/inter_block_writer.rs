@@ -970,6 +970,33 @@ mod tests {
     }
 
     #[test]
+    fn sub8x8_switchable_interp_filter_roundtrips() {
+        let sb = [false; 4];
+        let fc = frame_ctx(
+            &sb,
+            TxMode::Only4x4,
+            ReferenceMode::SingleReference,
+            SWITCHABLE,
+            true,
+        );
+        let ctx = FrameContext::default();
+        // The per-block interp_filter token sits between the (absent)
+        // block-level inter_mode and the sub-8x8 walk, per the §6.4.16
+        // listing order.
+        let mut s = sub_spec(
+            0,
+            0,
+            BLOCK_4X4,
+            [NEWMV; 4],
+            [[16, 8], [-8, 8], [8, -16], [24, 0]],
+        );
+        s.interp_filter = 2; // EIGHTTAP_SHARP
+        let got = roundtrip(&fc, &ctx, &[s]);
+        assert_eq!(got[0].interp_filter, 2);
+        assert_eq!(got[0].block_mvs[0][3], [24, 0]);
+    }
+
+    #[test]
     fn sub8x8_compound_per_cell_mvs_roundtrip() {
         let sb = [false; 4];
         let fc = frame_ctx(

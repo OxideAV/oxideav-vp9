@@ -370,19 +370,19 @@
 //!   `adaptive_filter_strength`, and §8.8.5 sample-filtering
 //!   primitives are deferred.
 //! * Round 244 lifts §8.8.3 `filter_size( )` to a public leaf
-//!   primitive — [`filter_size`] — covering the `baseSize` derivation
+//!   primitive — `filter_size` — covering the `baseSize` derivation
 //!   (`txSz == TX_4X4 && is32Edge == 1 → TX_8X8`; otherwise
 //!   `Min(TX_16X16, txSz)`) plus the vertical chroma-right-edge clip
 //!   (`pass == 0 && sub_x == 1 && baseSize == TX_16X16 && (x >> 3)
 //!   == MiCols - 1 → TX_8X8`) and horizontal chroma-bottom-edge clip
 //!   (`pass == 1 && sub_y == 1 && baseSize == TX_16X16 && (y >> 3)
 //!   == MiRows - 1 → TX_8X8`) per `vp9-spec.txt` §8.8.3 lines
-//!   5587-5625. Public surface: [`filter_size`] + the four §7.4.8
+//!   5587-5625. Public surface: `filter_size` + the four §7.4.8
 //!   transform-size constants [`TX_4X4`], [`TX_8X8`], [`TX_16X16`],
 //!   [`TX_32X32`] (verbatim from §7.4.8 lines 3937-3940) + the two
 //!   pass-direction constants [`PASS_VERTICAL`] and [`PASS_HORIZONTAL`].
 //! * Round 250 lifts §8.8.4 `adaptive_filter_strength( )` to a public
-//!   leaf primitive — [`adaptive_filter_strength`] — covering the
+//!   leaf primitive — `adaptive_filter_strength` — covering the
 //!   four §8.8.4 steps verbatim. Step 1 reads `LvlLookup[ segment ][
 //!   ref ][ modeType ]` from the round-37 §8.8.1
 //!   [`loop_filter_frame_init`] output, deriving `modeType = 1` for
@@ -393,7 +393,7 @@
 //!   loop_filter_sharpness, lvl >> shift )` (sharpness > 0) or
 //!   `Max( 1, lvl >> shift )` (sharpness = 0). Step 4 sets `blimit =
 //!   2 * (lvl + 2) + limit`. Step 5 sets `thresh = lvl >> 4`. Public
-//!   surface: [`adaptive_filter_strength`] + [`FilterStrength`] +
+//!   surface: `adaptive_filter_strength` + [`FilterStrength`] +
 //!   [`mode_to_mode_type`] + the four §7.4.11 inter-mode constants
 //!   [`NEARESTMV`], [`NEARMV`], [`ZEROMV`], [`NEWMV`] (verbatim
 //!   from `vp9-spec.txt` §7.4.11 lines 3957-3961). The §8.8.2
@@ -401,7 +401,7 @@
 //!   `(loopRow, loopCol)` step and the §8.8.5 sample-filter pass
 //!   that consumes its output both remain deferred.
 //! * Round 253 lifts §8.8.5.1 `filter mask process` to a public leaf
-//!   primitive — [`filter_mask`] — covering the four mask outputs
+//!   primitive — `filter_mask` — covering the four mask outputs
 //!   verbatim. The primitive accepts a 16-sample stencil
 //!   [`FilterMaskSamples`] (`p7`..`p0`, `q0`..`q7`) and the §8.8.4
 //!   [`FilterStrength`] tuple, plus `filterSize` and `BitDepth`. It
@@ -419,7 +419,7 @@
 //!   ]` and the §8.8.5.2 / §8.8.5.3 sample-filter primitives that
 //!   read the mask remain deferred.
 //! * Round 255 lifts §8.8.5.2 `narrow filter process` to a public
-//!   leaf primitive — [`narrow_filter`] — covering the per-edge
+//!   leaf primitive — `narrow_filter` — covering the per-edge
 //!   sample mutation `vp9-spec.txt` §8.8.5.2 lines 5795-5853
 //!   verbatim. The primitive accepts a 4-sample stencil
 //!   [`NarrowFilterSamples`] (`p1`, `p0`, `q0`, `q1`), the
@@ -438,7 +438,7 @@
 //!   +/- dx*k ]` and writes the four outputs back and the §8.8.2
 //!   superblock raster walk remain deferred.
 //! * Round 259 lifts §8.8.5.3 `wide filter process` to a public
-//!   leaf primitive — [`wide_filter`] — covering the per-edge
+//!   leaf primitive — `wide_filter` — covering the per-edge
 //!   sample mutation `vp9-spec.txt` §8.8.5.3 lines 5855-5888
 //!   verbatim. The primitive accepts a 16-sample stencil
 //!   [`WideFilterSamples`] (`p7`..`p0`, `q0`..`q7`), a `log2_size`
@@ -550,39 +550,72 @@ mod token_writer;
 mod tokens;
 mod wide_filter;
 
+// Stable entry points: single-frame + multi-frame decode and the
+// decoded-frame type in their visible signatures.
+pub use decode_frame::{decode_intra_frame, decode_vp9_sequence, Vp9DecodedFrame};
+// Stable container utility: the Annex B superframe split that a caller
+// runs before feeding frames to `decode_vp9_sequence`.
+pub use superframe::split_superframe;
+
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use adaptive_filter_strength::{
     adaptive_filter_strength, mode_to_mode_type, FilterStrength, NEARESTMV, NEARMV, NEWMV, ZEROMV,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use coef_probs::CoefProbs;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use compressed::{
     parse_compressed_header, parse_compressed_header_inter, CompoundReferenceConfig, MvProbs,
     RefFrameSignBias, ReferenceMode, TxMode, Vp9CompressedHeader, Vp9CompressedHeaderInter,
     Vp9CompressedHeaderInterInputs,
 };
-pub use decode_frame::{decode_intra_frame, decode_vp9_sequence, Vp9DecodedFrame};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use filter_mask::{filter_mask, FilterMask, FilterMaskSamples};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use filter_size::{
     filter_size, PASS_HORIZONTAL, PASS_VERTICAL, TX_16X16, TX_32X32, TX_4X4, TX_8X8,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use frame_loop_filter::{frame_loop_filter, CurrFrame};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use header::{
     parse_uncompressed_header, parse_uncompressed_header_with_refs, ColorConfig, ColorSpace,
     FrameType, LoopFilterParams, QuantizationParams, RefFrameState, SegmentationParams, TileInfo,
     Vp9FrameHeader, MAX_SEGMENTS, SEGMENTATION_FEATURE_BITS, SEGMENTATION_FEATURE_SIGNED,
     SEG_LVL_MAX,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use loop_filter::{loop_filter_frame_init, LvlLookup, MAX_LOOP_FILTER, MAX_MODE_LF_DELTAS};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use narrow_filter::{narrow_filter, NarrowFilterOutput, NarrowFilterSamples};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use partition::tile_payload_sizes;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use sample_filtering::{sample_filtering, SampleFilterOutput, SampleFilterSamples};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use superblock_filter::{
     superblock_filter_edge, superblock_filter_geometry, SuperblockFilterEdge,
     SuperblockFilterGeometry, SuperblockFilterMi,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use superblock_loop_filter::{
     superblock_loop_filter, SuperblockFilterFrame, SuperblockFilterPlane,
 };
-pub use superframe::split_superframe;
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use wide_filter::{wide_filter, WideFilterOutput, WideFilterSamples};
 
 /// Crate-local error type.

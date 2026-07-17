@@ -227,7 +227,7 @@ impl SampleFilterOutput {
 ///   dy*k ][ x +/- dx*k ]` per §8.8.5.1 lines 5703-5727.
 /// * `limit` / `blimit` / `thresh` — the §8.8.4 [`crate::
 ///   FilterStrength`] tuple, forwarded to the §8.8.5.1 mask step.
-/// * `filter_size` — the §8.8.3 [`crate::filter_size`] output: one of
+/// * `filter_size` — the §8.8.3 `filter_size` output: one of
 ///   `TX_4X4` / `TX_8X8` / `TX_16X16` (the §8.8.3 step caps it below
 ///   `TX_32X32`). Drives both the §8.8.5.1 `flatMask` / `flatMask2`
 ///   gating and the §8.8.5 dispatch table.

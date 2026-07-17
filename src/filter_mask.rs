@@ -172,7 +172,7 @@ fn abs_diff(a: i32, b: i32) -> i32 {
 /// * `limit` / `blimit` / `thresh` — the §8.8.4 [`crate::
 ///   FilterStrength`] tuple this primitive reads. All are `u8` per
 ///   §8.8.4 (lines 5648-5661).
-/// * `filter_size` — the §8.8.3 [`crate::filter_size`] output: one
+/// * `filter_size` — the §8.8.3 `filter_size` output: one
 ///   of `TX_4X4` / `TX_8X8` / `TX_16X16` (the §8.8.3 step caps it
 ///   below `TX_32X32`).
 /// * `bit_depth` — `BitDepth` per §6.2.2 (8, 10, or 12). Drives the

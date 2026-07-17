@@ -269,7 +269,7 @@ fn sample_at(s: &WideFilterSamples, k: i32) -> i32 {
 ///   rejected per §8.8.5.3 lines 5860 / 5864 (the spec only defines
 ///   `log2Size ∈ {3, 4}` at the §8.8.5 invocation site).
 /// * `_bit_depth` — `BitDepth` per §6.2.2 (8, 10, or 12). Carried
-///   for API symmetry with [`crate::narrow_filter`] but not consumed
+///   for API symmetry with `narrow_filter` but not consumed
 ///   by the §8.8.5.3 listing: the wide-filter kernel operates
 ///   directly on unsigned sample values (no `0x80` working-range
 ///   offset, no `filter4_clamp` BitDepth scaling) per

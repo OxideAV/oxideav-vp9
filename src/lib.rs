@@ -1574,4 +1574,281 @@ mod encode_roundtrip_tests {
         std::fs::create_dir_all(&subdir).expect("create stage dir");
         std::fs::write(subdir.join("input.ivf"), &ivf).expect("write input.ivf");
     }
+
+    // ----- sub-8x8 inter blocks (round 415) -----
+
+    /// The `BLOCK_8X8` nodes the round-415 stream splits below 8x8, as
+    /// `(MiRow, MiCol)` pairs (two SPLIT → 4x4, two HORZ → 8x4, two
+    /// VERT → 4x8; see [`build_sub8x8_inter_stream`]).
+    const SUB8X8_NODES: [(u32, u32); 6] = [(0, 0), (0, 7), (2, 6), (3, 3), (5, 5), (7, 0)];
+
+    /// The F1 target of the sub-8x8 stream: pattern A everywhere except
+    /// the six sub-8x8 MI cells, which carry pattern-B content (so their
+    /// §8.7.2 WHT residual is live while every other block is an exact
+    /// ZEROMV copy).
+    fn sub8x8_composite_pattern() -> Vec<u8> {
+        let mut px = intra_only_pattern(0);
+        let pat_b = intra_only_pattern(1);
+        for &(r, c) in SUB8X8_NODES.iter() {
+            let (r, c) = (r as usize, c as usize);
+            for y in r * 8..r * 8 + 8 {
+                for x in c * 8..c * 8 + 8 {
+                    px[y * 64 + x] = pat_b[y * 64 + x];
+                }
+            }
+            for plane in 0..2usize {
+                let off = 64 * 64 + plane * 32 * 32;
+                for y in r * 4..r * 4 + 4 {
+                    for x in c * 4..c * 4 + 4 {
+                        px[off + y * 32 + x] = pat_b[off + y * 32 + x];
+                    }
+                }
+            }
+        }
+        px
+    }
+
+    /// Build the round-415 **sub-8x8 inter** stream (profile 0, 8-bit
+    /// 4:2:0, 64x64):
+    ///
+    /// * F0 — shown lossless keyframe (pattern A), fills all slots.
+    /// * F1 — shown lossless P-frame whose §6.4.3 layout splits six
+    ///   `BLOCK_8X8` nodes below 8x8 — two SPLIT (4x4 leaves), two HORZ
+    ///   (8x4), two VERT (4x8) — carrying per-cell `NEWMV` /
+    ///   `NEARESTMV` / `NEARMV` / `ZEROMV` modes with distinct motion
+    ///   vectors (integer and quarter-pel) through the §6.4.16
+    ///   per-`(idy, idx)` walk and its §6.5.14 `append_sub8x8_mvs( )`
+    ///   predictor rewrites. The sub-8x8 regions reconstruct pattern-B
+    ///   content via live §8.7.2 WHT inter residual at the 8x8 grid;
+    ///   every other 8x8 block is an exact-copy `ZEROMV` skip.
+    ///   Error-resilient (the §7.2.6 `UsePrevFrameMvs == 0` model NEWMV
+    ///   requires), refreshes slot 0.
+    /// * F2 — shown all-skip `ZEROMV` copy frame over slot 0 (pins the
+    ///   §8.10 store of F1's reconstruction).
+    ///
+    /// No black-box encoder wrapper exposes per-sub-block motion
+    /// planning, so this axis is only mintable by the in-crate writers.
+    fn build_sub8x8_inter_stream() -> Vec<Vec<u8>> {
+        use crate::frame_writer::{assemble_inter_frame_all_skip_zeromv, InterTreeLeaf};
+        use crate::inter_block_writer::InterSubBlockSpec;
+        use crate::mode_info::{LAST_FRAME, NEARESTMV, NEARMV, NEWMV, NONE_REF_FRAME, ZEROMV};
+        use crate::partition::{PARTITION_HORZ, PARTITION_SPLIT, PARTITION_VERT};
+        use crate::pixel_encoder::{
+            encode_pframe_lossless_layout, lossless_pframe_header, padded_plane_from_bytes,
+        };
+        use crate::residual::BLOCK_8X8;
+
+        // F0: shown keyframe, pattern A.
+        let pat_a = intra_only_pattern(0);
+        let kf = encode_vp9(&pat_a, 64, 64).expect("keyframe");
+
+        // F1: the sub-8x8 P-frame toward the composite target.
+        let composite = sub8x8_composite_pattern();
+        let targets = [
+            padded_plane_from_bytes(&composite[..64 * 64], 64, 64, 64, 64),
+            padded_plane_from_bytes(&composite[64 * 64..64 * 64 + 32 * 32], 32, 32, 32, 32),
+            padded_plane_from_bytes(&composite[64 * 64 + 32 * 32..], 32, 32, 32, 32),
+        ];
+        let prev: [Vec<i32>; 3] = [
+            pat_a[..64 * 64].iter().map(|&s| i32::from(s)).collect(),
+            pat_a[64 * 64..64 * 64 + 32 * 32]
+                .iter()
+                .map(|&s| i32::from(s))
+                .collect(),
+            pat_a[64 * 64 + 32 * 32..]
+                .iter()
+                .map(|&s| i32::from(s))
+                .collect(),
+        ];
+        let reference: [(&[i32], usize); 3] = [
+            (prev[0].as_slice(), 64),
+            (prev[1].as_slice(), 32),
+            (prev[2].as_slice(), 32),
+        ];
+
+        let hdr1 = lossless_pframe_header(64, 64);
+        let mut partitions = std::collections::HashMap::new();
+        partitions.insert((0u32, 0u32, BLOCK_8X8), PARTITION_SPLIT);
+        partitions.insert((0, 7, BLOCK_8X8), PARTITION_HORZ);
+        partitions.insert((2, 6, BLOCK_8X8), PARTITION_VERT);
+        partitions.insert((3, 3, BLOCK_8X8), PARTITION_VERT);
+        partitions.insert((5, 5, BLOCK_8X8), PARTITION_HORZ);
+        partitions.insert((7, 0, BLOCK_8X8), PARTITION_SPLIT);
+
+        // Every MV component is even, so each difference stays §6.4.20
+        // codeable under either §6.5.13 hp-gate outcome.
+        let zero2 = [[0, 0], [0, 0]];
+        let sv = |mv: [i32; 2]| -> [[i32; 2]; 2] { [mv, [0, 0]] };
+        let sub_for = move |r: u32, c: u32| -> Option<InterSubBlockSpec> {
+            match (r, c) {
+                // 4x4: NEWMV a, NEARESTMV (block 1 seeds BlockMvs[0] =
+                // a), NEWMV b, ZEROMV.
+                (0, 0) => Some(InterSubBlockSpec {
+                    modes: [NEWMV, NEARESTMV, NEWMV, ZEROMV],
+                    mvs: [sv([16, 8]), sv([16, 8]), sv([-16, 24]), zero2],
+                }),
+                // 8x4 (cells {0, 2}): integer + quarter-pel NEWMV.
+                (0, 7) => Some(InterSubBlockSpec {
+                    modes: [NEWMV, ZEROMV, NEWMV, ZEROMV],
+                    mvs: [sv([8, -8]), zero2, sv([4, 6]), zero2],
+                }),
+                // 4x8 (cells {0, 1}): ZEROMV + NEWMV.
+                (2, 6) => Some(InterSubBlockSpec {
+                    modes: [ZEROMV, NEWMV, ZEROMV, ZEROMV],
+                    mvs: [zero2, sv([-8, -16]), zero2, zero2],
+                }),
+                // 4x8: NEWMV + NEARESTMV (block 1 seeds BlockMvs[0]).
+                (3, 3) => Some(InterSubBlockSpec {
+                    modes: [NEWMV, NEARESTMV, ZEROMV, ZEROMV],
+                    mvs: [sv([24, 0]), sv([24, 0]), zero2, zero2],
+                }),
+                // 8x4: NEWMV + NEARESTMV (block 2 seeds BlockMvs[0]).
+                (5, 5) => Some(InterSubBlockSpec {
+                    modes: [NEWMV, ZEROMV, NEARESTMV, ZEROMV],
+                    mvs: [sv([0, 32]), zero2, sv([0, 32]), zero2],
+                }),
+                // 4x4 with a NEARMV cell: block 3 seeds BlockMvs[2] = b2
+                // then walks BlockMvs[1] = a2 (differs) => NearMv = a2.
+                (7, 0) => Some(InterSubBlockSpec {
+                    modes: [NEWMV, NEARESTMV, NEWMV, NEARMV],
+                    mvs: [sv([8, 16]), sv([8, 16]), sv([-8, 8]), sv([8, 16])],
+                }),
+                _ => None,
+            }
+        };
+        let mut leaf_plan = move |r: u32,
+                                  c: u32,
+                                  subsize: u8,
+                                  _s: &crate::decode_block::Vp9FrameState|
+              -> InterTreeLeaf {
+            let sub = if subsize < BLOCK_8X8 {
+                sub_for(r, c)
+            } else {
+                None
+            };
+            let skip = sub.is_none(); // plain 8x8 blocks are exact copies.
+            InterTreeLeaf {
+                mi_size: subsize,
+                tx_size: 0, // inferred under Only4x4
+                y_mode: ZEROMV,
+                interp_filter: 0,
+                ref_frame: [LAST_FRAME, NONE_REF_FRAME],
+                mv: [[0, 0], [0, 0]],
+                skip,
+                segment_id: 0,
+                sub,
+            }
+        };
+        let f1 = encode_pframe_lossless_layout(
+            &hdr1,
+            &targets,
+            &reference,
+            64,
+            64,
+            partitions,
+            &mut leaf_plan,
+        )
+        .expect("sub-8x8 p-frame");
+
+        // F2: verbatim copy of F1's reconstruction (slot 0).
+        let hdr2 = lossless_pframe_header(64, 64);
+        let f2 = assemble_inter_frame_all_skip_zeromv(&hdr2).expect("copy p-frame");
+
+        vec![kf, f1, f2]
+    }
+
+    /// The sub-8x8 stream decodes byte-exact against its lossless
+    /// targets (pattern A, then the composite carrying pattern-B content
+    /// exactly in the six sub-8x8 MI cells, then the copy frame), and is
+    /// byte-deterministic.
+    #[test]
+    fn sub8x8_inter_sequence_decodes_byte_exact() {
+        let frames = build_sub8x8_inter_stream();
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        let out = decode_vp9_sequence(&refs).expect("sub-8x8 sequence");
+        assert_eq!(out.len(), 3);
+
+        let pat_a = intra_only_pattern(0);
+        let composite = sub8x8_composite_pattern();
+        assert_eq!(out[0].to_planar_bytes(), pat_a, "keyframe != pattern A");
+        assert_eq!(
+            out[1].to_planar_bytes(),
+            composite,
+            "sub-8x8 P-frame != composite target"
+        );
+        assert_eq!(
+            out[2].to_planar_bytes(),
+            composite,
+            "copy frame != stored reconstruction"
+        );
+
+        // The composite really differs from pattern A inside every
+        // sub-8x8 cell (the assertion above would otherwise pass with
+        // dead sub-8x8 residual).
+        for &(r, c) in SUB8X8_NODES.iter() {
+            let (r, c) = (r as usize, c as usize);
+            let differs = (0..8).any(|y| {
+                (0..8).any(|x| {
+                    composite[(r * 8 + y) * 64 + c * 8 + x] != pat_a[(r * 8 + y) * 64 + c * 8 + x]
+                })
+            });
+            assert!(differs, "node ({r}, {c}) carries no live content");
+        }
+
+        // Byte-determinism (fixture staging relies on it).
+        assert_eq!(frames, build_sub8x8_inter_stream());
+    }
+
+    /// Fixture-staging generator (round 415): stages the sub-8x8 stream
+    /// as `sub8x8-inter-mvs/input.ivf` under `OXIDEAV_VP9_STAGE_DIR`.
+    #[test]
+    fn stage_sub8x8_fixture_when_requested() {
+        let Some(dir) = std::env::var_os("OXIDEAV_VP9_STAGE_DIR") else {
+            return;
+        };
+        let frames = build_sub8x8_inter_stream();
+        let ivf = ivf_wrap_64x64(&frames);
+        let subdir = std::path::Path::new(&dir).join("sub8x8-inter-mvs");
+        std::fs::create_dir_all(&subdir).expect("create stage dir");
+        std::fs::write(subdir.join("input.ivf"), &ivf).expect("write input.ivf");
+    }
+
+    /// The staged corpus fixture is byte-identical to the builder's
+    /// output — the fixture IS this crate's writer output (docs-gated).
+    #[test]
+    fn staged_sub8x8_fixture_matches_builder() {
+        let path = std::path::Path::new("../../docs/video/vp9/fixtures/sub8x8-inter-mvs/input.ivf");
+        if !path.is_file() {
+            eprintln!("docs corpus not present; docs-gated");
+            return;
+        }
+        let staged = std::fs::read(path).expect("staged input.ivf");
+        assert_eq!(
+            staged,
+            ivf_wrap_64x64(&build_sub8x8_inter_stream()),
+            "staged fixture bytes != builder output"
+        );
+    }
+
+    /// Wrap coded frames in a minimal 64x64 IVF container (the layout
+    /// every 64x64 staging generator in this module emits).
+    fn ivf_wrap_64x64(frames: &[Vec<u8>]) -> Vec<u8> {
+        let mut ivf = Vec::new();
+        ivf.extend_from_slice(b"DKIF");
+        ivf.extend_from_slice(&0u16.to_le_bytes());
+        ivf.extend_from_slice(&32u16.to_le_bytes());
+        ivf.extend_from_slice(b"VP90");
+        ivf.extend_from_slice(&64u16.to_le_bytes());
+        ivf.extend_from_slice(&64u16.to_le_bytes());
+        ivf.extend_from_slice(&25u32.to_le_bytes());
+        ivf.extend_from_slice(&1u32.to_le_bytes());
+        ivf.extend_from_slice(&(frames.len() as u32).to_le_bytes());
+        ivf.extend_from_slice(&0u32.to_le_bytes());
+        for (i, f) in frames.iter().enumerate() {
+            ivf.extend_from_slice(&(f.len() as u32).to_le_bytes());
+            ivf.extend_from_slice(&(i as u64).to_le_bytes());
+            ivf.extend_from_slice(f);
+        }
+        ivf
+    }
 }

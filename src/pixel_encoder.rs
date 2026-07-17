@@ -48,7 +48,9 @@ use crate::inter_mv::{BlockGrid, ScaleGeom};
 use crate::inter_pred::{predict_inter, InterPredArgs, RefPlane, RefPlanes};
 use crate::intra::{predict_intra, Plane, PredMode};
 use crate::reconstruct::reconstruct_block;
-use crate::residual::{get_plane_block_size, BLOCK_8X8, NUM_4X4_BLOCKS_WIDE_LOOKUP};
+use crate::residual::{
+    get_plane_block_size, BLOCK_8X8, NUM_4X4_BLOCKS_HIGH_LOOKUP, NUM_4X4_BLOCKS_WIDE_LOOKUP,
+};
 use crate::Error;
 
 /// Build a padded target [`Plane`] from a row-major 8-bit source
@@ -1426,6 +1428,228 @@ fn predict_inter_leaf2(
         };
         predict_inter(pred_plane, &args, &grid, &geom, &block_mvs, &refs, ssx, ssy);
     }
+}
+
+/// Run the §8.5.2 inter prediction for one **sub-8x8** leaf at `(r, c)`
+/// with the §6.4.16 `BlockMvs[ refList ][ 4 ]` per-cell vectors,
+/// predicting each 4x4 sub-block of every plane exactly as the decoder's
+/// §6.4.21 inter arm does for `MiSize < BLOCK_8X8`: the per-plane grid is
+/// the 8x8 MI cell's (`get_plane_block_size( BLOCK_8X8, plane )`) 4x4
+/// walk, each step a 4x4 `predict_inter` region at `blockIdx = y *
+/// num4x4w + x` — the shared §8.5.2 driver resolves the per-`blockIdx`
+/// luma vector and the §8.5.2.1 averaged chroma vectors internally.
+// Spec-shaped geometry fan-in, matching the style of the §8.5.2 driver.
+#[allow(clippy::too_many_arguments)]
+fn predict_inter_leaf_sub8x8(
+    pred: &mut [Plane; 3],
+    reference: &[(&[i32], usize); 3],
+    vis_w: u32,
+    vis_h: u32,
+    r: u32,
+    c: u32,
+    mi_size: u8,
+    block_mvs: &[[[i32; 2]; 4]; 2],
+    mi_cols: u32,
+    mi_rows: u32,
+    ssx: bool,
+    ssy: bool,
+    bit_depth: u32,
+) {
+    debug_assert!(mi_size < BLOCK_8X8);
+    for (plane, pred_plane) in pred.iter_mut().enumerate() {
+        let sub_x = plane > 0 && ssx;
+        let sub_y = plane > 0 && ssy;
+        // §6.4.21: bsize = Max( MiSize, BLOCK_8X8 ) selects the plane
+        // grid; the sub-8x8 arm predicts per 4x4 step.
+        let plane_sz = get_plane_block_size(BLOCK_8X8, plane, ssx, ssy);
+        let num4x4w = NUM_4X4_BLOCKS_WIDE_LOOKUP[plane_sz as usize];
+        let num4x4h = NUM_4X4_BLOCKS_HIGH_LOOKUP[plane_sz as usize];
+        let base_x = ((c * 8) >> u32::from(sub_x)) as i32;
+        let base_y = ((r * 8) >> u32::from(sub_y)) as i32;
+
+        let (samples, stride) = reference[plane];
+        let refs = RefPlanes {
+            list: [
+                Some(RefPlane {
+                    samples,
+                    stride,
+                    ref_frame_width: vis_w as i32,
+                    ref_frame_height: vis_h as i32,
+                }),
+                None,
+            ],
+        };
+        let grid = BlockGrid {
+            mi_row: r as i32,
+            mi_col: c as i32,
+            mi_rows: mi_rows as i32,
+            mi_cols: mi_cols as i32,
+            mi_size,
+        };
+        let geom = ScaleGeom {
+            ref_frame_width: vis_w as i32,
+            ref_frame_height: vis_h as i32,
+            frame_width: vis_w as i32,
+            frame_height: vis_h as i32,
+            subsampling_x: ssx,
+            subsampling_y: ssy,
+        };
+        for y in 0..num4x4h {
+            for x in 0..num4x4w {
+                let args = InterPredArgs {
+                    plane,
+                    x: base_x + 4 * x as i32,
+                    y: base_y + 4 * y as i32,
+                    w: 4,
+                    h: 4,
+                    block_idx: (y * num4x4w + x) as usize,
+                    interp_filter: 0, // EIGHTTAP.
+                    bit_depth,
+                    is_compound: false,
+                };
+                predict_inter(pred_plane, &args, &grid, &geom, block_mvs, &refs, ssx, ssy);
+            }
+        }
+    }
+}
+
+/// The §6.4.16 `BlockMvs[ refList ][ 4 ]` replication for a sub-8x8
+/// leaf's per-cell plan: each visited `(idy, idx)` cell's vector is
+/// copied across its `(num4x4h × num4x4w)` span, exactly as the decoder's
+/// per-sub-block walk does.
+fn sub8x8_block_mvs(
+    mi_size: u8,
+    sub: &crate::inter_block_writer::InterSubBlockSpec,
+) -> [[[i32; 2]; 4]; 2] {
+    let num4x4w = NUM_4X4_BLOCKS_WIDE_LOOKUP[mi_size as usize] as usize;
+    let num4x4h = NUM_4X4_BLOCKS_HIGH_LOOKUP[mi_size as usize] as usize;
+    let mut block_mvs = [[[0i32; 2]; 4]; 2];
+    let mut idy = 0usize;
+    while idy < 2 {
+        let mut idx = 0usize;
+        while idx < 2 {
+            let cell = idy * 2 + idx;
+            for y2 in 0..num4x4h {
+                for x2 in 0..num4x4w {
+                    let b = (idy + y2) * 2 + idx + x2;
+                    block_mvs[0][b] = sub.mvs[cell][0];
+                    block_mvs[1][b] = sub.mvs[cell][1];
+                }
+            }
+            idx += num4x4w;
+        }
+        idy += num4x4h;
+    }
+    block_mvs
+}
+
+/// Encode one **lossless** P-frame over a caller-chosen §6.4.3 partition
+/// layout — [`encode_pframe_lossless_motion`] generalised past the
+/// all-`BLOCK_8X8` grid: the layout may split `BLOCK_8X8` nodes into the
+/// sub-8x8 shapes (4x4 / 4x8 / 8x4 leaves carrying per-cell inter modes
+/// and motion vectors through
+/// [`crate::frame_writer::InterTreeLeaf::sub`]).
+///
+/// Each non-skip leaf is §8.5.2-predicted with exactly the vectors it
+/// codes (the per-`blockIdx` sub-8x8 walk included), and the §8.7.2 WHT
+/// residual makes `Clip1( prediction + residual ) == target` hold
+/// sample-for-sample, so the frame chain stays bit-exact. Leaves planned
+/// `skip = true` reconstruct from prediction alone — the caller elects
+/// skip only when the prediction is exact (e.g. `ZEROMV` copy blocks).
+///
+/// `leaf_plan` supplies the per-leaf mode info in §6.4.3 decode order
+/// against the shared [`Vp9FrameState`]; any non-`ZEROMV` plan (block
+/// level or sub-8x8 cell) requires an error-resilient header, per
+/// [`crate::frame_writer::assemble_inter_frame_tree`]'s §7.2.6 model.
+// Drives the sub-8x8 corpus-stream builder (`build_sub8x8_inter_stream`)
+// and its round-trip tests; the production sequence encoders adopt
+// sub-8x8 layouts once their partition search elects them.
+#[allow(dead_code)]
+pub(crate) fn encode_pframe_lossless_layout(
+    hdr: &Vp9FrameHeader,
+    targets: &[Plane; 3],
+    reference: &[(&[i32], usize); 3],
+    ref_w: u32,
+    ref_h: u32,
+    partitions: std::collections::HashMap<(u32, u32, u8), u8>,
+    leaf_plan: &mut dyn FnMut(
+        u32,
+        u32,
+        u8,
+        &crate::decode_block::Vp9FrameState,
+    ) -> crate::frame_writer::InterTreeLeaf,
+) -> Result<Vec<u8>, Error> {
+    use crate::frame_writer::{InterFrameTreePlan, InterTreeLeaf, InterTreePlanner};
+    use std::cell::RefCell;
+
+    if hdr.frame_type != FrameType::NonKeyFrame || !hdr.quantization.lossless {
+        return Err(Error::Unsupported);
+    }
+    let mi_cols = (hdr.frame_width + 7) >> 3;
+    let mi_rows = (hdr.frame_height + 7) >> 3;
+    let ssx = hdr.color_config.subsampling_x;
+    let ssy = hdr.color_config.subsampling_y;
+    let bit_depth = u32::from(hdr.color_config.bit_depth);
+
+    let y_w = (mi_cols * 8) as usize;
+    let y_h = (mi_rows * 8) as usize;
+    let uv_w = y_w >> usize::from(ssx);
+    let uv_h = y_h >> usize::from(ssy);
+    let pred = RefCell::new([
+        Plane::new(y_w, y_h),
+        Plane::new(uv_w, uv_h),
+        Plane::new(uv_w, uv_h),
+    ]);
+
+    let mut planner: Box<InterTreePlanner<'_>> =
+        Box::new(|r: u32, c: u32, subsize: u8, state| -> InterTreeLeaf {
+            let leaf = leaf_plan(r, c, subsize, state);
+            // Predict with exactly what will be coded, so the residual
+            // callback below sees the decoder's prediction. Skip leaves
+            // never request coefficients, so their prediction is only
+            // needed when it IS the reconstruction — which the caller
+            // guarantees by planning skip solely for exact-copy blocks;
+            // predicting them anyway keeps the planes decoder-true.
+            let mut pred = pred.borrow_mut();
+            if subsize < BLOCK_8X8 {
+                if let Some(sub) = leaf.sub.as_ref() {
+                    let block_mvs = sub8x8_block_mvs(subsize, sub);
+                    predict_inter_leaf_sub8x8(
+                        &mut pred, reference, ref_w, ref_h, r, c, subsize, &block_mvs, mi_cols,
+                        mi_rows, ssx, ssy, bit_depth,
+                    );
+                }
+            } else {
+                predict_inter_leaf(
+                    &mut pred, reference, ref_w, ref_h, r, c, subsize, leaf.mv[0], mi_cols,
+                    mi_rows, ssx, ssy, bit_depth,
+                );
+            }
+            leaf
+        });
+
+    let mut coeffs: Box<FrameCoefSource<'_>> = Box::new(
+        |_mi_r: u32, _mi_c: u32, plane: usize, sx: u32, sy: u32, _b: usize| -> Vec<i64> {
+            let pred = pred.borrow();
+            let mut block = vec![0i64; 16];
+            for i in 0..4usize {
+                for j in 0..4usize {
+                    let t = targets[plane].get(sx as usize + j, sy as usize + i);
+                    let p = pred[plane].get(sx as usize + j, sy as usize + i);
+                    block[i * 4 + j] = i64::from(t) - i64::from(p);
+                }
+            }
+            forward_wht_2d(&mut block);
+            block
+        },
+    );
+
+    let plan = InterFrameTreePlan {
+        tx_mode: crate::compressed::TxMode::Only4x4,
+        reference_mode: crate::compressed::ReferenceMode::SingleReference,
+        partitions,
+    };
+    crate::frame_writer::assemble_inter_frame_tree(hdr, &plan, &mut *planner, &mut *coeffs)
 }
 
 /// Full-search one 8x8 luma block over integer motion vectors in
@@ -4236,6 +4460,116 @@ mod tests {
             assert_eq!((frame.width, frame.height), (w, h), "frame {i} geometry");
             assert_eq!(&frame.to_planar_bytes(), input, "frame {i} not byte-exact");
         }
+    }
+
+    /// A lossless P-frame over a mixed layout with **sub-8x8 leaves**
+    /// (4x4 / 8x4 / 4x8) carrying distinct per-cell NEWMV / NEARESTMV /
+    /// ZEROMV vectors — noise-content keyframe and target, so every
+    /// sub-block's residual is live — reconstructs **byte-exact**
+    /// through `decode_vp9_sequence` (per-`blockIdx` §8.5.2 prediction,
+    /// averaged chroma vectors, and the §8.7.2 WHT residual included).
+    #[test]
+    fn lossless_layout_sub8x8_leaves_roundtrip_byte_exact() {
+        use crate::decode_frame::decode_vp9_sequence;
+        use crate::frame_writer::InterTreeLeaf;
+        use crate::inter_block_writer::InterSubBlockSpec;
+        use crate::mode_info::{LAST_FRAME, NEARESTMV, NEWMV, NONE_REF_FRAME, ZEROMV};
+        use crate::partition::{PARTITION_HORZ, PARTITION_SPLIT, PARTITION_VERT};
+        use crate::residual::{BLOCK_4X4, BLOCK_4X8, BLOCK_8X4};
+
+        let (w, h) = (64u32, 64u32);
+        let (wu, hu, cw, ch) = (64usize, 64usize, 32usize, 32usize);
+        let f0 = noise_frame(w, h, 0x5EED_0001);
+        let f1 = noise_frame(w, h, 0x5EED_0002);
+
+        let kf = encode_keyframe_lossless_420(&f0, w, h).expect("keyframe");
+
+        let targets = [
+            padded_plane_from_bytes(&f1[..wu * hu], wu, hu, wu, hu),
+            padded_plane_from_bytes(&f1[wu * hu..wu * hu + cw * ch], cw, ch, cw, ch),
+            padded_plane_from_bytes(&f1[wu * hu + cw * ch..], cw, ch, cw, ch),
+        ];
+        let prev: [Vec<i32>; 3] = [
+            f0[..wu * hu].iter().map(|&s| i32::from(s)).collect(),
+            f0[wu * hu..wu * hu + cw * ch]
+                .iter()
+                .map(|&s| i32::from(s))
+                .collect(),
+            f0[wu * hu + cw * ch..]
+                .iter()
+                .map(|&s| i32::from(s))
+                .collect(),
+        ];
+        let reference: [(&[i32], usize); 3] = [
+            (prev[0].as_slice(), wu),
+            (prev[1].as_slice(), cw),
+            (prev[2].as_slice(), cw),
+        ];
+
+        let hdr = lossless_pframe_header(w, h);
+        let mut partitions = std::collections::HashMap::new();
+        partitions.insert((0u32, 0u32, BLOCK_8X8), PARTITION_SPLIT);
+        partitions.insert((3, 4, BLOCK_8X8), PARTITION_HORZ);
+        partitions.insert((6, 2, BLOCK_8X8), PARTITION_VERT);
+
+        // All components even => codeable under either §6.5.13 hp gate.
+        let a = [16, 8];
+        let b = [-16, 24];
+        let mut leaf_plan = |_r: u32,
+                             _c: u32,
+                             subsize: u8,
+                             _s: &crate::decode_block::Vp9FrameState|
+         -> InterTreeLeaf {
+            let sub = match subsize {
+                // 4x4: NEWMV a, NEARESTMV (block 1 seeds BlockMvs[0] =
+                // a), NEWMV b, ZEROMV.
+                BLOCK_4X4 => Some(InterSubBlockSpec {
+                    modes: [NEWMV, NEARESTMV, NEWMV, ZEROMV],
+                    mvs: [[a, [0, 0]], [a, [0, 0]], [b, [0, 0]], [[0, 0], [0, 0]]],
+                }),
+                // 8x4: cells {0, 2} visited.
+                BLOCK_8X4 => Some(InterSubBlockSpec {
+                    modes: [NEWMV, ZEROMV, NEWMV, ZEROMV],
+                    mvs: [
+                        [[8, -8], [0, 0]],
+                        [[0, 0]; 2],
+                        [[4, 6], [0, 0]],
+                        [[0, 0]; 2],
+                    ],
+                }),
+                // 4x8: cells {0, 1} visited.
+                BLOCK_4X8 => Some(InterSubBlockSpec {
+                    modes: [ZEROMV, NEWMV, ZEROMV, ZEROMV],
+                    mvs: [[[0, 0]; 2], [[-8, -16], [0, 0]], [[0, 0]; 2], [[0, 0]; 2]],
+                }),
+                _ => None,
+            };
+            InterTreeLeaf {
+                mi_size: subsize,
+                tx_size: 0,
+                y_mode: ZEROMV,
+                interp_filter: 0,
+                ref_frame: [LAST_FRAME, NONE_REF_FRAME],
+                mv: [[0, 0], [0, 0]],
+                skip: false,
+                segment_id: 0,
+                sub,
+            }
+        };
+        let pf = encode_pframe_lossless_layout(
+            &hdr,
+            &targets,
+            &reference,
+            w,
+            h,
+            partitions,
+            &mut leaf_plan,
+        )
+        .expect("sub-8x8 layout p-frame");
+
+        let decoded = decode_vp9_sequence(&[&kf, &pf]).expect("decode");
+        assert_eq!(decoded[0].to_planar_bytes(), f0, "keyframe");
+        assert_eq!(decoded[1].to_planar_bytes(), f1, "sub-8x8 P-frame");
     }
 
     /// A mostly-static sequence codes its P-frames far smaller than the

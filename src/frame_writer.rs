@@ -792,6 +792,7 @@ pub(crate) fn assemble_inter_frame_planned(
                 mv: [mv, [0, 0]],
                 skip: skip_all || block_skip,
                 segment_id: 0,
+                sub: None,
             }
         });
     let mut src: Box<FrameCoefSource<'_>> =
@@ -837,6 +838,12 @@ pub(crate) struct InterTreeLeaf {
     /// `skip = true` + `ZEROMV`; blocks on a `SEG_LVL_REF_FRAME`
     /// segment must plan the override's single reference.
     pub segment_id: u8,
+    /// The §6.4.16 sub-8x8 per-cell walk spec — required (`Some`) when
+    /// the partition tree produces this leaf at `MiSize < BLOCK_8X8`
+    /// (`y_mode` / `mv` above are then ignored), and ignored otherwise.
+    /// Sub-8x8 leaves always plan `tx_size = 0` (§6.4.10 codes no bits;
+    /// the inferred size is `TX_4X4`).
+    pub sub: Option<crate::inter_block_writer::InterSubBlockSpec>,
 }
 
 /// Per-leaf inter planner for [`assemble_inter_frame_tree`]: called once
@@ -859,7 +866,9 @@ pub(crate) struct InterFrameTreePlan {
 
 /// Assemble a complete VP9 **inter** frame over an **arbitrary §6.4.3
 /// partition tree** — [`assemble_inter_frame_planned`] generalised over
-/// the partition layout, per-block transform sizes (`TxModeSelect`
+/// the partition layout (sub-8x8 leaves included: `BLOCK_4X4` /
+/// `BLOCK_4X8` / `BLOCK_8X4` with per-cell inter modes and MVs through
+/// [`InterTreeLeaf::sub`]), per-block transform sizes (`TxModeSelect`
 /// included), reference selection (any single reference, or compound
 /// when the plan's `reference_mode` + the header's sign biases allow
 /// it), and per-block switchable interpolation filters.
@@ -1027,19 +1036,24 @@ pub(crate) fn assemble_inter_frame_tree(
             };
             let mut leaf =
                 |enc: &mut BoolEncoder, lr: u32, lc: u32, subsize: u8| -> Result<(), Error> {
-                    if subsize < BLOCK_8X8 {
-                        // Sub-8x8 leaves need the per-(idy, idx) MV walk
-                        // the inter block writer defers.
-                        return Err(Error::Unsupported);
-                    }
                     let lp = planner(lr, lc, subsize, &state);
                     if lp.mi_size != subsize {
                         return Err(Error::Unsupported);
                     }
-                    if lp.y_mode != ZEROMV && !hdr.error_resilient_mode {
-                        // §7.2.6: the decoder would run the §6.5 scan with
-                        // UsePrevFrameMvs == 1, which this writer does not
-                        // model — see the function docs.
+                    // §7.2.6: a non-ZEROMV leaf (block-level, or any
+                    // visited sub-8x8 cell) reaches the coded syntax
+                    // through the §6.5 predictors, which this writer only
+                    // models with UsePrevFrameMvs == 0 — see the function
+                    // docs.
+                    let any_non_zeromv = if subsize < BLOCK_8X8 {
+                        match lp.sub {
+                            Some(sub) => sub.modes.iter().any(|&m| m != ZEROMV),
+                            None => return Err(Error::Unsupported),
+                        }
+                    } else {
+                        lp.y_mode != ZEROMV
+                    };
+                    if any_non_zeromv && !hdr.error_resilient_mode {
                         return Err(Error::Unsupported);
                     }
                     if lp.ref_frame[1] > crate::mode_info::INTRA_FRAME
@@ -1070,6 +1084,7 @@ pub(crate) fn assemble_inter_frame_tree(
                         y_mode: lp.y_mode,
                         interp_filter: lp.interp_filter,
                         mv: lp.mv,
+                        sub: lp.sub,
                     };
                     let mut src = |p: usize, tx_sz: u32, sx: u32, sy: u32, b: usize| {
                         let n0 = 1usize << (tx_sz + 2);
@@ -1893,6 +1908,7 @@ mod tests {
             mv: [[0, 0], [0, 0]],
             skip: true,
             segment_id: 0,
+            sub: None,
         }
     }
 
@@ -2007,6 +2023,80 @@ mod tests {
         assert_eq!(frames[1].u, frames[0].u);
     }
 
+    /// Sub-8x8 leaves (4x4 / 8x4 / 4x8 at the three `BLOCK_8X8`
+    /// partition arms) flow through the tree assembler: an all-`ZEROMV`
+    /// per-cell plan reconstructs to a verbatim copy of the reference,
+    /// and a non-skip sub-8x8 leaf codes its §6.4.21 residual at the
+    /// 8x8 grid — end-to-end through `decode_vp9_sequence`.
+    #[test]
+    fn inter_tree_sub8x8_leaves_decode_end_to_end() {
+        use crate::decode_frame::decode_vp9_sequence;
+        use crate::partition::{PARTITION_HORZ, PARTITION_VERT};
+        use crate::residual::{BLOCK_4X4, BLOCK_4X8, BLOCK_8X4};
+
+        let kf_hdr = keyframe_header(64, 64);
+        let plan = KeyframePlan::all_skip(8, 8, 0, 0);
+        let kf = assemble_keyframe(&kf_hdr, &plan, &mut *no_coeffs()).expect("keyframe");
+
+        let p_hdr = inter_header(64, 64);
+        let mut partitions = HashMap::new();
+        // Default fallback splits everything to 8x8; three nodes go
+        // below: SPLIT -> 4x4, HORZ -> 8x4, VERT -> 4x8.
+        partitions.insert((0u32, 0u32, BLOCK_8X8), PARTITION_SPLIT);
+        partitions.insert((0, 1, BLOCK_8X8), PARTITION_HORZ);
+        partitions.insert((1, 0, BLOCK_8X8), PARTITION_VERT);
+        let tree_plan = InterFrameTreePlan {
+            tx_mode: TxMode::Only4x4,
+            reference_mode: ReferenceMode::SingleReference,
+            partitions,
+        };
+        let zero_sub = crate::inter_block_writer::InterSubBlockSpec {
+            modes: [crate::mode_info::ZEROMV; 4],
+            mvs: [[[0, 0]; 2]; 4],
+        };
+        let mut seen: Vec<(u32, u32, u8)> = Vec::new();
+        let mut planner: Box<InterTreePlanner> = Box::new(|r, c, subsize, _s| {
+            seen.push((r, c, subsize));
+            let mut leaf = skip_leaf(subsize, TxMode::Only4x4);
+            if subsize < BLOCK_8X8 {
+                leaf.sub = Some(zero_sub);
+                // The 4x4 leaf codes a real (non-skip) residual: a DC
+                // token per luma 4x4 block of the 8x8 grid.
+                if subsize == BLOCK_4X4 {
+                    leaf.skip = false;
+                }
+            }
+            leaf
+        });
+        let mut coeffs: Box<FrameCoefSource> =
+            Box::new(
+                |_r, _c, p, _sx, _sy, _b| {
+                    if p == 0 {
+                        vec![24i64]
+                    } else {
+                        Vec::new()
+                    }
+                },
+            );
+        let pf = assemble_inter_frame_tree(&p_hdr, &tree_plan, &mut *planner, &mut *coeffs)
+            .expect("sub-8x8 p-frame");
+        drop(planner);
+
+        assert!(seen.contains(&(0, 0, BLOCK_4X4)), "SPLIT 4x4 leaf");
+        assert!(seen.contains(&(0, 1, BLOCK_8X4)), "HORZ 8x4 leaf");
+        assert!(seen.contains(&(1, 0, BLOCK_4X8)), "VERT 4x8 leaf");
+
+        let frames = decode_vp9_sequence(&[&kf, &pf]).expect("decode");
+        // The non-skip 4x4 leaf's luma moved off the flat-128 reference.
+        let touched = (0..8).any(|i| (0..8).any(|j| frames[1].y[i * 64 + j] != 128));
+        assert!(touched, "4x4 leaf residual missing");
+        // Everything outside the top-left 8x8 is a verbatim copy.
+        let copied = (0..64usize)
+            .all(|i| (0..64usize).all(|j| (i < 8 && j < 8) || frames[1].y[i * 64 + j] == 128));
+        assert!(copied, "ZEROMV sub-8x8 / 8x8 leaves must copy");
+        assert_eq!(frames[1].u, frames[0].u, "chroma copies");
+    }
+
     /// The tree assembler validates leaf specs: a leaf `mi_size` that
     /// disagrees with the partition tree, an over-large `tx_size`, a
     /// non-inferred tx on a skip block under `TxModeSelect`, a compound
@@ -2075,6 +2165,43 @@ mod tests {
         assert_eq!(
             assemble_inter_frame_tree(&p_hdr, &plan, &mut *p, &mut *no_coeffs()).unwrap_err(),
             Error::Unsupported
+        );
+
+        // A sub-8x8 leaf without a sub spec, and one with a NEWMV cell
+        // on a non-error-resilient header.
+        let mut sub_partitions = HashMap::new();
+        sub_partitions.insert((0u32, 0u32, BLOCK_8X8), PARTITION_SPLIT);
+        let sub_plan = InterFrameTreePlan {
+            tx_mode: TxMode::Only4x4,
+            reference_mode: ReferenceMode::SingleReference,
+            partitions: sub_partitions,
+        };
+        let mut p: Box<InterTreePlanner> =
+            Box::new(|_r, _c, sz, _s| skip_leaf(sz, TxMode::Only4x4));
+        assert_eq!(
+            assemble_inter_frame_tree(&p_hdr, &sub_plan, &mut *p, &mut *no_coeffs()).unwrap_err(),
+            Error::Unsupported,
+            "sub-8x8 leaf without a sub spec"
+        );
+        let mut p: Box<InterTreePlanner> = Box::new(|_r, _c, sz, _s| {
+            let mut l = skip_leaf(sz, TxMode::Only4x4);
+            if sz < BLOCK_8X8 {
+                l.sub = Some(crate::inter_block_writer::InterSubBlockSpec {
+                    modes: [
+                        crate::mode_info::NEWMV,
+                        crate::mode_info::ZEROMV,
+                        crate::mode_info::ZEROMV,
+                        crate::mode_info::ZEROMV,
+                    ],
+                    mvs: [[[8, 8], [0, 0]], [[0, 0]; 2], [[0, 0]; 2], [[0, 0]; 2]],
+                });
+            }
+            l
+        });
+        assert_eq!(
+            assemble_inter_frame_tree(&p_hdr, &sub_plan, &mut *p, &mut *no_coeffs()).unwrap_err(),
+            Error::Unsupported,
+            "NEWMV sub-8x8 cell without error_resilient_mode"
         );
     }
 

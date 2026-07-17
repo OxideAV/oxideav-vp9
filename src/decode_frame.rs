@@ -2041,11 +2041,14 @@ pub(crate) struct RecoveredInterBlock {
     pub ref_frame: [i32; 2],
     pub interp_filter: u8,
     pub mv: [[i32; 2]; 2],
+    /// The full §6.4.16 `BlockMvs[ refList ][ 4 ]` array — per-cell for a
+    /// sub-8x8 block, replicated for `MiSize >= BLOCK_8X8`.
+    pub block_mvs: [[[i32; 2]; 4]; 2],
 }
 
-/// Decode a fixed list of `MiSize >= BLOCK_8X8` **inter** blocks at the
-/// mode-info + residual-token level (no §8.5.2 motion compensation), for
-/// the `inter_block_writer` round-trip tests.
+/// Decode a fixed list of **inter** blocks (any `MiSize`, sub-8x8
+/// included) at the mode-info + residual-token level (no §8.5.2 motion
+/// compensation), for the `inter_block_writer` round-trip tests.
 ///
 /// Mirrors `decode_block_inter`'s §6.4.11 argument assembly exactly — the
 /// same neighbour bundles, the same `InterFrameModeArgs`, the shared §6.5
@@ -2358,6 +2361,7 @@ pub(crate) fn decode_inter_blocks_for_test(
                 [block_mvs[0][3][0], block_mvs[0][3][1]],
                 [block_mvs[1][3][0], block_mvs[1][3][1]],
             ],
+            block_mvs,
         });
         let _ = is_compound;
     }

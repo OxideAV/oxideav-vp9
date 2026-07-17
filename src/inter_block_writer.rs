@@ -23,16 +23,20 @@
 //! decoder's, and a written block decodes back to the same mode info +
 //! motion vectors + coefficients.
 //!
-//! Scope: `MiSize >= BLOCK_8X8` inter blocks with segmentation either
+//! Scope: inter blocks of **every** `MiSize` — `>= BLOCK_8X8` single-mode
+//! blocks and the `MiSize < BLOCK_8X8` sub-8x8 per-`(idy, idx)` MV walk
+//! (each visited cell writes its own `inter_mode` token and §6.4.18
+//! `assign_mv( )`, with the §6.5.14 `append_sub8x8_mvs( )` predictor
+//! rewrite for `NEARESTMV` / `NEARMV` cells) — with segmentation either
 //! disabled or a non-temporal `update_map` (the per-block `segment_id`
 //! coded by the §6.4.7 tree), including the §6.4.9 segment-feature
 //! no-bits arms — `SEG_LVL_SKIP` (§6.4.8 hardwires `skip = 1`, §6.4.16
-//! forces `y_mode = ZEROMV` with no `inter_mode` token) and
-//! `SEG_LVL_REF_FRAME` (§6.4.13 derives `is_inter` and §6.4.17 derives
-//! the reference pair from `FeatureData`, no bits for either). The
-//! sub-8x8 per-(idy, idx) MV walk (`MiSize < BLOCK_8X8`) and the
-//! §6.4.12 temporal-predicted segment-id branch are later milestones,
-//! mirroring how the keyframe block writer deferred sub-8x8 intra.
+//! forces `y_mode = ZEROMV` with no `inter_mode` token; only modeled for
+//! `MiSize >= BLOCK_8X8`, the single shape a conforming plan pairs it
+//! with) and `SEG_LVL_REF_FRAME` (§6.4.13 derives `is_inter` and §6.4.17
+//! derives the reference pair from `FeatureData`, no bits for either).
+//! The §6.4.12 temporal-predicted segment-id branch remains a later
+//! milestone.
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7
 //! (`docs/video/vp9/vp9-spec.txt`) §6.4.11 / §6.4.13 / §6.4.16 / §6.4.17 /
@@ -59,9 +63,33 @@ use crate::mode_writer::{tx_size_is_coded, write_skip, write_tx_size};
 use crate::mv::MvPredictors;
 use crate::mv_ref::MvRefGeometry;
 use crate::mv_writer::write_assign_mv;
-use crate::residual::{BLOCK_8X8, MAX_TXSIZE_LOOKUP};
+use crate::residual::{
+    BLOCK_8X8, MAX_TXSIZE_LOOKUP, NUM_4X4_BLOCKS_HIGH_LOOKUP, NUM_4X4_BLOCKS_WIDE_LOOKUP,
+};
 use crate::residual_writer::{write_residual_inter, CoefSource, ResidualWriteCtx};
 use crate::Error;
+
+/// Per-sub-block spec for a `MiSize < BLOCK_8X8` inter block — the
+/// §6.4.16 `(idy, idx)` walk's per-cell `inter_mode` and §6.4.18 motion
+/// vectors.
+///
+/// Cells are indexed `idy * 2 + idx` over the 8x8 MI cell's 4x4 quadrant
+/// grid; only the cells the §6.4.16 walk visits are read (all four for
+/// `BLOCK_4X4`, cells `{0, 1}` for `BLOCK_4X8`, cells `{0, 2}` for
+/// `BLOCK_8X4`) — the walk itself replicates each visited cell's vector
+/// across its `(num4x4h × num4x4w)` span exactly as the decoder does.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InterSubBlockSpec {
+    /// Per-cell inter `y_mode` (`NEARESTMV` / `NEARMV` / `ZEROMV` /
+    /// `NEWMV`). For `NEARESTMV` / `NEARMV` cells the corresponding
+    /// `mvs` entry must equal the §6.5.14 `append_sub8x8_mvs( )`
+    /// predictor (the writer verifies it, exactly as [`write_assign_mv`]
+    /// does at the block level).
+    pub modes: [u8; 4],
+    /// Per-cell per-list eighth-pel motion vectors
+    /// `[cell][ref_list][row, col]`.
+    pub mvs: [[[i32; 2]; 2]; 4],
+}
 
 /// Per-block inter spec the caller supplies. The mode-info fields are the
 /// values the decoder will recover; the residual comes through the
@@ -93,8 +121,13 @@ pub(crate) struct InterBlockSpec {
     /// The final per-list motion vectors `[Mv[0], Mv[1]]` (eighth-pel).
     /// For non-`NEWMV` modes these must equal the corresponding predictor
     /// (the writer verifies it); for `NEWMV` the difference onto `BestMv`
-    /// is coded.
+    /// is coded. Ignored for `MiSize < BLOCK_8X8` (the per-cell `sub`
+    /// vectors apply instead).
     pub mv: [[i32; 2]; 2],
+    /// The §6.4.16 sub-8x8 per-cell walk spec — required (`Some`) when
+    /// `mi_size < BLOCK_8X8`, ignored otherwise. `y_mode` and `mv` above
+    /// are not read for sub-8x8 blocks.
+    pub sub: Option<InterSubBlockSpec>,
 }
 
 /// Frame-level parameters the inter block writer threads (the subset of
@@ -144,16 +177,18 @@ pub(crate) struct InterBlockProbs<'a> {
     pub tree_probs: Option<&'a [u8; 7]>,
 }
 
-/// Write one `MiSize >= BLOCK_8X8` inter MI block — the inverse of
+/// Write one inter MI block of any `MiSize` — the inverse of
 /// `decode_block_inter( )`.
 ///
 /// Derives the §9.3.2 neighbour contexts from `state`, writes the §6.4.11
 /// prelude (segment id / skip / is_inter / tx_size), the §6.4.16 inter
-/// mode info (ref frames / inter_mode / interp_filter / MVs), then the
-/// §6.4.21 inter residual via [`write_residual_inter`], and finally fans
-/// the per-MI values into the frame-wide arrays via [`decode_block_apply`]
-/// — exactly as the decoder does — so the next block reads the right
-/// neighbour context.
+/// mode info (ref frames / inter_mode / interp_filter / MVs — the single
+/// block-level pair for `MiSize >= BLOCK_8X8`, or the per-`(idy, idx)`
+/// sub-8x8 walk with its §6.5.14 `append_sub8x8_mvs( )` predictor rewrite
+/// for `MiSize < BLOCK_8X8`), then the §6.4.21 inter residual via
+/// [`write_residual_inter`], and finally fans the per-MI values into the
+/// frame-wide arrays via [`decode_block_apply`] — exactly as the decoder
+/// does — so the next block reads the right neighbour context.
 #[allow(clippy::too_many_arguments)]
 // The `j in 0..2` reference-list loop indexes `spec.ref_frame` / `preds`
 // in lock-step with the §6.4.16 listing, matching the decoder's form.
@@ -168,8 +203,12 @@ pub(crate) fn write_inter_block(
     token_cache: &mut [u8],
     coef_src: &mut CoefSource<'_>,
 ) -> Result<(), Error> {
-    if spec.mi_size < BLOCK_8X8 {
-        // Sub-8x8 per-(idy, idx) MV walk is a later milestone.
+    let is_sub8x8 = spec.mi_size < BLOCK_8X8;
+    // A sub-8x8 block needs the per-cell walk spec, and §6.4.10 never
+    // codes tx_size for it — the inferred size is TX_4X4 unconditionally
+    // (MAX_TXSIZE_LOOKUP[ MiSize ] == TX_4X4), so any other plan value
+    // would silently desync the residual grid.
+    if is_sub8x8 && (spec.sub.is_none() || spec.tx_size != 0) {
         return Err(Error::Unsupported);
     }
     let (r, c) = (spec.r, spec.c);
@@ -270,8 +309,10 @@ pub(crate) fn write_inter_block(
 
     // §6.4.8 read_skip( ): seg_feature_active(SKIP) hardwires skip = 1
     // reading no bits — the spec forces it, so a non-skip plan on a
-    // SKIP segment is uncodeable.
-    if skip_active && !spec.skip {
+    // SKIP segment is uncodeable. A sub-8x8 shape on a SKIP segment is
+    // outside this writer's modeled scope (the §6.4.16 listing would
+    // still run the per-cell walk; no conforming plan pairs them).
+    if skip_active && (!spec.skip || is_sub8x8) {
         return Err(Error::Unsupported);
     }
     let skip_ctx = usize::from(nb_skip.above.unwrap_or(0)) + usize::from(nb_skip.left.unwrap_or(0));
@@ -350,16 +391,20 @@ pub(crate) fn write_inter_block(
     let mode_ctx = usize::from(mode_context);
 
     // §6.4.16: on a SEG_LVL_SKIP segment y_mode = ZEROMV with no
-    // inter_mode token; otherwise the >= BLOCK_8X8 token is coded.
-    if skip_active {
-        if spec.y_mode != crate::mode_info::ZEROMV {
-            return Err(Error::Unsupported);
+    // inter_mode token; otherwise the >= BLOCK_8X8 block-level token is
+    // coded (a sub-8x8 block codes one token per visited cell below).
+    if !is_sub8x8 {
+        if skip_active {
+            if spec.y_mode != crate::mode_info::ZEROMV {
+                return Err(Error::Unsupported);
+            }
+        } else {
+            write_inter_mode(enc, spec.y_mode, mode_ctx, probs.inter_mode_probs)?;
         }
-    } else {
-        write_inter_mode(enc, spec.y_mode, mode_ctx, probs.inter_mode_probs)?;
     }
 
-    // §6.4.16 switchable interp_filter.
+    // §6.4.16 switchable interp_filter (between the block-level
+    // inter_mode and the sub-8x8 walk, matching the listing order).
     write_interp_filter(
         enc,
         spec.interp_filter,
@@ -368,16 +413,87 @@ pub(crate) fn write_inter_block(
         interp_nb,
     )?;
 
-    // §6.4.18 assign_mv( ).
-    write_assign_mv(
-        enc,
-        probs.mv_probs,
-        spec.y_mode,
-        is_compound,
-        &preds,
-        &spec.mv,
-        fctx.allow_high_precision_mv,
-    )?;
+    // §6.4.16 / §6.4.18: the motion-vector syntax, building the decoder's
+    // `BlockMvs[ refList ][ 4 ]` array along the way.
+    let ref_count = 1 + usize::from(is_compound);
+    let mut block_mvs = [[[0i32; 2]; 4]; 2];
+    let mut y_mode_out = spec.y_mode;
+    if is_sub8x8 {
+        let sub = spec.sub.as_ref().ok_or(Error::Unsupported)?;
+        let num4x4w = NUM_4X4_BLOCKS_WIDE_LOOKUP[spec.mi_size as usize] as usize;
+        let num4x4h = NUM_4X4_BLOCKS_HIGH_LOOKUP[spec.mi_size as usize] as usize;
+        let mut idy = 0usize;
+        while idy < 2 {
+            let mut idx = 0usize;
+            while idx < 2 {
+                let block = idy * 2 + idx;
+                let mode = sub.modes[block];
+                // Per-cell inter_mode: the same block-level ModeContext
+                // row selects the probabilities for every cell (§9.3.2:
+                // ctx = ModeContext[ ref_frame[ 0 ] ]).
+                write_inter_mode(enc, mode, mode_ctx, probs.inter_mode_probs)?;
+
+                // §6.5.14 append_sub8x8_mvs( ) rewrites this cell's
+                // NearestMv / NearMv per reference list; BestMv keeps the
+                // block-level §6.5.12 value — mirroring the decoder.
+                let mut sub_preds = preds;
+                if mode == crate::mode_info::NEARESTMV || mode == crate::mode_info::NEARMV {
+                    for (rl, sub_pred) in sub_preds.iter_mut().enumerate().take(ref_count) {
+                        let pair = geom.append_sub8x8_mvs(
+                            &src,
+                            block,
+                            spec.ref_frame[rl],
+                            &block_mvs[rl],
+                            fctx.sign_bias,
+                            fctx.use_prev_frame_mvs,
+                        );
+                        sub_pred.nearest = pair[0];
+                        sub_pred.near = pair[1];
+                    }
+                }
+
+                write_assign_mv(
+                    enc,
+                    probs.mv_probs,
+                    mode,
+                    is_compound,
+                    &sub_preds,
+                    &sub.mvs[block],
+                    fctx.allow_high_precision_mv,
+                )?;
+
+                // §6.4.16: replicate across the (num4x4h × num4x4w) span.
+                for y2 in 0..num4x4h {
+                    for x2 in 0..num4x4w {
+                        let b = (idy + y2) * 2 + idx + x2;
+                        for (rl, slot) in block_mvs.iter_mut().enumerate().take(ref_count) {
+                            slot[b] = sub.mvs[block][rl];
+                        }
+                    }
+                }
+                // §6.4.16: y_mode carries the last-decoded cell's mode.
+                y_mode_out = mode;
+                idx += num4x4w;
+            }
+            idy += num4x4h;
+        }
+    } else {
+        // §6.4.18 assign_mv( ) — the single block-level pair.
+        write_assign_mv(
+            enc,
+            probs.mv_probs,
+            spec.y_mode,
+            is_compound,
+            &preds,
+            &spec.mv,
+            fctx.allow_high_precision_mv,
+        )?;
+        for (rl, slot) in block_mvs.iter_mut().enumerate().take(ref_count) {
+            for cell in slot.iter_mut() {
+                *cell = spec.mv[rl];
+            }
+        }
+    }
 
     // §6.4.21 residual( ) — inter arm.
     let rctx = ResidualWriteCtx {
@@ -408,16 +524,6 @@ pub(crate) fn write_inter_block(
     } else {
         fctx.interpolation_filter
     };
-    let block_mvs = {
-        let mut bm = [[[0i32; 2]; 4]; 2];
-        let ref_count = 1 + usize::from(is_compound);
-        for (rl, slot) in bm.iter_mut().enumerate().take(ref_count) {
-            for cell in slot.iter_mut() {
-                *cell = spec.mv[rl];
-            }
-        }
-        bm
-    };
     let block_mvs_i16: [[(i16, i16); 4]; 2] = {
         let mut out = [[(0i16, 0i16); 4]; 2];
         for (rl, row) in block_mvs.iter().enumerate() {
@@ -430,7 +536,7 @@ pub(crate) fn write_inter_block(
     let result = DecodedBlockResult {
         skip: spec.skip,
         tx_size: spec.tx_size as u8,
-        y_mode: spec.y_mode,
+        y_mode: y_mode_out,
         segment_id: spec.segment_id,
         ref_frame: spec.ref_frame,
         is_inter: true,
@@ -563,6 +669,7 @@ mod tests {
             y_mode: ZEROMV,
             interp_filter: 0,
             mv: [[0, 0], [0, 0]],
+            sub: None,
         }
     }
 
@@ -728,8 +835,233 @@ mod tests {
         assert_eq!(got[0].tx_size, 1);
     }
 
+    // ----- sub-8x8 per-(idy, idx) walk -----
+
+    use crate::mode_info::NEARMV;
+    use crate::residual::{BLOCK_4X4, BLOCK_4X8, BLOCK_8X4};
+
+    /// A sub-8x8 spec with per-cell single-reference modes / MVs.
+    fn sub_spec(r: u32, c: u32, mi_size: u8, modes: [u8; 4], mvs: [[i32; 2]; 4]) -> InterBlockSpec {
+        let mut s = base_spec(r, c, mi_size);
+        s.sub = Some(InterSubBlockSpec {
+            modes,
+            mvs: [
+                [mvs[0], [0, 0]],
+                [mvs[1], [0, 0]],
+                [mvs[2], [0, 0]],
+                [mvs[3], [0, 0]],
+            ],
+        });
+        s
+    }
+
     #[test]
-    fn rejects_sub_8x8() {
+    fn sub8x8_4x4_per_cell_newmv_roundtrips() {
+        let sb = [false; 4];
+        let fc = frame_ctx(
+            &sb,
+            TxMode::Only4x4,
+            ReferenceMode::SingleReference,
+            0,
+            true,
+        );
+        let ctx = FrameContext::default();
+        // Four distinct NEWMV cells (fresh state => BestMv = [0, 0]).
+        let mvs = [[16, 8], [-24, 32], [8, -8], [40, 0]];
+        let s = sub_spec(0, 0, BLOCK_4X4, [NEWMV; 4], mvs);
+        let got = roundtrip(&fc, &ctx, &[s]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].y_mode, NEWMV, "last-decoded cell mode");
+        for (b, mv) in mvs.iter().enumerate() {
+            assert_eq!(got[0].block_mvs[0][b], *mv, "cell {b}");
+        }
+        // Mvs[ ][ ][ refList ] carries BlockMvs[ refList ][ 3 ].
+        assert_eq!(got[0].mv[0], mvs[3]);
+    }
+
+    #[test]
+    fn sub8x8_nearest_and_near_cells_pull_prior_sub_block_mvs() {
+        let sb = [false; 4];
+        let fc = frame_ctx(
+            &sb,
+            TxMode::Only4x4,
+            ReferenceMode::SingleReference,
+            0,
+            true,
+        );
+        let ctx = FrameContext::default();
+        let a = [16, 8];
+        let b = [-24, 32];
+        // §6.5.14: block 1 seeds NearestMv from BlockMvs[ 0 ], block 3
+        // seeds from BlockMvs[ 2 ] with NearMv walked from BlockMvs[ 1 ].
+        let s = sub_spec(
+            0,
+            0,
+            BLOCK_4X4,
+            [NEWMV, NEARESTMV, NEWMV, NEARESTMV],
+            [a, a, b, b],
+        );
+        let got = roundtrip(&fc, &ctx, &[s]);
+        assert_eq!(got[0].block_mvs[0], [a, a, b, b]);
+
+        // NEARMV on block 3: sub8x8Mvs = [ BlockMvs[2] = b, BlockMvs[1]
+        // = a (differs) ] => NearMv = a.
+        let s2 = sub_spec(
+            0,
+            2,
+            BLOCK_4X4,
+            [NEWMV, NEARESTMV, NEWMV, NEARMV],
+            [a, a, b, a],
+        );
+        let got2 = roundtrip(&fc, &ctx, &[s2]);
+        assert_eq!(got2[0].block_mvs[0], [a, a, b, a]);
+    }
+
+    #[test]
+    fn sub8x8_4x8_walk_replicates_column_pairs() {
+        let sb = [false; 4];
+        let fc = frame_ctx(
+            &sb,
+            TxMode::Only4x4,
+            ReferenceMode::SingleReference,
+            0,
+            true,
+        );
+        let ctx = FrameContext::default();
+        let left = [8, -16];
+        // BLOCK_4X8: num4x4w = 1, num4x4h = 2 => cells {0, 1} visited;
+        // cell 0 replicates into {0, 2}, cell 1 into {1, 3}.
+        let s = sub_spec(
+            0,
+            0,
+            BLOCK_4X8,
+            [NEWMV, ZEROMV, ZEROMV, ZEROMV],
+            [left, [0, 0], [0, 0], [0, 0]],
+        );
+        let got = roundtrip(&fc, &ctx, &[s]);
+        assert_eq!(got[0].block_mvs[0], [left, [0, 0], left, [0, 0]]);
+        assert_eq!(got[0].y_mode, ZEROMV, "last visited cell is 1");
+    }
+
+    #[test]
+    fn sub8x8_8x4_walk_replicates_row_pairs() {
+        let sb = [false; 4];
+        let fc = frame_ctx(
+            &sb,
+            TxMode::Only4x4,
+            ReferenceMode::SingleReference,
+            0,
+            true,
+        );
+        let ctx = FrameContext::default();
+        let top = [-8, 8];
+        let bottom = [24, 16];
+        // BLOCK_8X4: num4x4w = 2, num4x4h = 1 => cells {0, 2} visited;
+        // cell 0 replicates into {0, 1}, cell 2 into {2, 3}.
+        let s = sub_spec(
+            0,
+            0,
+            BLOCK_8X4,
+            [NEWMV, ZEROMV, NEWMV, ZEROMV],
+            [top, [0, 0], bottom, [0, 0]],
+        );
+        let got = roundtrip(&fc, &ctx, &[s]);
+        assert_eq!(got[0].block_mvs[0], [top, top, bottom, bottom]);
+    }
+
+    #[test]
+    fn sub8x8_compound_per_cell_mvs_roundtrip() {
+        let sb = [false; 4];
+        let fc = frame_ctx(
+            &sb,
+            TxMode::Only4x4,
+            ReferenceMode::CompoundReference,
+            0,
+            true,
+        );
+        let ctx = FrameContext::default();
+        let mut s = base_spec(0, 0, BLOCK_4X4);
+        s.ref_frame = [ALTREF_FRAME, GOLDEN_FRAME];
+        s.sub = Some(InterSubBlockSpec {
+            modes: [NEWMV, ZEROMV, NEWMV, NEWMV],
+            mvs: [
+                [[16, 8], [-8, 24]],
+                [[0, 0], [0, 0]],
+                [[-16, 0], [8, 8]],
+                [[32, -8], [-24, -16]],
+            ],
+        });
+        let got = roundtrip(&fc, &ctx, &[s]);
+        assert_eq!(got[0].ref_frame, [ALTREF_FRAME, GOLDEN_FRAME]);
+        let sub = s.sub.unwrap();
+        for b in 0..4 {
+            assert_eq!(got[0].block_mvs[0][b], sub.mvs[b][0], "list 0 cell {b}");
+            assert_eq!(got[0].block_mvs[1][b], sub.mvs[b][1], "list 1 cell {b}");
+        }
+    }
+
+    #[test]
+    fn sub8x8_non_skip_codes_residual_at_the_8x8_grid() {
+        let sb = [false; 4];
+        let fc = frame_ctx(
+            &sb,
+            TxMode::Only4x4,
+            ReferenceMode::SingleReference,
+            0,
+            true,
+        );
+        let ctx = FrameContext::default();
+        let mut s = sub_spec(
+            0,
+            0,
+            BLOCK_4X4,
+            [NEWMV; 4],
+            [[8, 8], [16, 0], [0, 16], [-8, -8]],
+        );
+        s.skip = false;
+        let probs = probs_view(&ctx);
+        let mut state = Vp9FrameState::new(fc.mi_rows, fc.mi_cols);
+        let mut nz = fresh_nz();
+        let mut cache = vec![0u8; 4096];
+        let mut enc = BoolEncoder::new();
+        // A DC token on every coded 4x4 block (4 luma + 1 per chroma
+        // plane at 4:2:0 — the §6.4.21 grid runs at max(MiSize, 8x8)).
+        let mut n_coded = 0usize;
+        let mut src: Box<CoefSource> = Box::new(|_p, tx_sz, _x, _y, _b| {
+            n_coded += 1;
+            let n0 = 1usize << (tx_sz + 2);
+            let mut v = vec![0i64; n0 * n0];
+            v[0] = 3;
+            v
+        });
+        write_inter_block(
+            &mut enc, &fc, &s, &probs, &mut state, &mut nz, &mut cache, &mut src,
+        )
+        .unwrap();
+        drop(src);
+        assert_eq!(n_coded, 6, "4 luma + 2 chroma coded 4x4 blocks");
+        let bytes = enc.finish();
+        let got = crate::decode_frame::decode_inter_blocks_for_test(
+            &bytes,
+            fc.mi_rows,
+            fc.mi_cols,
+            &ctx,
+            fc.tx_mode,
+            fc.reference_mode,
+            fc.comp_config,
+            fc.sign_bias,
+            fc.interpolation_filter,
+            fc.allow_high_precision_mv,
+            &fc.seg,
+            vec![(0, 0, BLOCK_4X4)],
+        )
+        .unwrap();
+        assert!(!got[0].skip);
+        assert_eq!(got[0].block_mvs[0][3], [-8, -8]);
+    }
+
+    #[test]
+    fn sub8x8_rejects_missing_sub_spec_and_coded_tx_size() {
         let sb = [false; 4];
         let fc = frame_ctx(
             &sb,
@@ -744,12 +1076,21 @@ mod tests {
         let mut nz = fresh_nz();
         let mut cache = vec![0u8; 4096];
         let mut enc = BoolEncoder::new();
-        let s = base_spec(0, 0, crate::residual::BLOCK_4X4);
+        // No sub spec.
+        let s = base_spec(0, 0, BLOCK_4X4);
         let mut src = no_coeffs();
         let r = write_inter_block(
             &mut enc, &fc, &s, &probs, &mut state, &mut nz, &mut cache, &mut src,
         );
         assert_eq!(r.unwrap_err(), Error::Unsupported);
+        // Non-TX_4X4 tx_size on a sub-8x8 block.
+        let mut s2 = sub_spec(0, 0, BLOCK_4X4, [ZEROMV; 4], [[0, 0]; 4]);
+        s2.tx_size = 1;
+        let mut src2 = no_coeffs();
+        let r2 = write_inter_block(
+            &mut enc, &fc, &s2, &probs, &mut state, &mut nz, &mut cache, &mut src2,
+        );
+        assert_eq!(r2.unwrap_err(), Error::Unsupported);
     }
 
     /// A live segmentation map with feature segments: seg 1 carries

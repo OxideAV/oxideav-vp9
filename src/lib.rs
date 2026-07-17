@@ -1469,6 +1469,7 @@ mod encode_roundtrip_tests {
                     mv: [[0, 0], [0, 0]],
                     skip: true,
                     segment_id,
+                    sub: None,
                 }
             });
         let mut coeffs: Box<FrameCoefSource<'_>> = Box::new(|_r, _c, _p, _x, _y, _b| Vec::new());

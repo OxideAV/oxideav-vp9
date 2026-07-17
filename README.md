@@ -32,7 +32,7 @@ motion field, the §6.1.2 / §7.2 `FrameContext[ 4 ]` entropy probability
 banks (`load_probs( )` / `save_probs( )` — **including the full §6.1.2
 `refresh_probs( )` backward adaptation on non-frame-parallel streams**,
 see below), and the §6.4.14 PrevSegmentIds
-map across frames. **All 36 staged corpus fixtures reconstruct fully
+map across frames. **All 38 staged corpus fixtures reconstruct fully
 byte-exact against their `expected.yuv` through `decode_vp9_sequence`**
 (pinned by `full_corpus_sequences_byte_exact`), including the
 profile-1/2/3 P-frames (§8.5.2 motion compensation at 4:4:4 chroma and
@@ -74,7 +74,14 @@ intra-only header-writer branch), and `seg-features-skip-ref-altl`
 with the corpus's first non-zero `loop_filter_sharpness` — self-encoded
 through the round-412 segment-feature-aware inter block writer; its
 level-0 copy frame pins that §8.10 reference stores are post-§8.8
-samples).
+samples) — and the **two round-415 extensions**: `sub8x8-inter-mvs`
+(the corpus's first *planned* per-sub-block motion — six sub-8x8 nodes
+at 4x4 / 8x4 / 4x8 with NEWMV / NEARESTMV / NEARMV / ZEROMV cells,
+integer + quarter-pel vectors and live sub-8x8 WHT residual,
+self-encoded through the round-415 sub-8x8 inter writer) and
+`render-size-128x72` (`render_and_frame_size_different = 1` on every
+frame across all three §6.2.3 `render_size( )` call sites,
+self-encoded).
 Highlights: `i-frame-then-p-frame-64x64`
 (keyframe + single-reference LAST P-frame, high-precision MVs,
 8-tap-smooth filter), `frame-parallel-mode` (keyframe + three
@@ -393,15 +400,16 @@ carries no forward update for it).
   tile-rows stream needs custom encoder tooling — recorded in
   `docs/video/vp9/fixtures/tiles-2col-inter/notes.md`. The decode-side
   tile-row walk itself is exercised by the §6.4 offset unit tests.
-  Similarly fixture-less: `render_and_frame_size_different = 1` (SAR
-  signalling doesn't mint it; decode-supported and unit-tested). The
-  two other round-412-verified wrapper gaps were closed by
+  The three other round-412-verified wrapper gaps were closed by
   self-encoding: non-zero `loop_filter_sharpness` and the per-segment
   `SEG_LVL_SKIP` / `SEG_LVL_REF_FRAME` / `SEG_LVL_ALT_L` features (the
   wrapper only ever emits `SEG_LVL_ALT_Q`) are corpus-validated via the
-  `seg-features-skip-ref-altl` fixture, coded by the round-412
-  segment-feature-aware inter block writer and byte-exact against a
-  black-box reference decode.
+  `seg-features-skip-ref-altl` fixture (round 412), and
+  `render_and_frame_size_different = 1` (SAR signalling doesn't mint
+  the bitstream field) is corpus-validated via the round-415
+  `render-size-128x72` fixture across all three §6.2.3 `render_size( )`
+  call sites — tile rows are now the ledger's only remaining
+  fixture-less axis (docs ask #270).
 * §9.2.4 multi-coder tile parallelism (tiles decode sequentially).
 * Encoder depth beyond the planner-driven baseline. Keyframes **and
   P-frames** plan partitions `BLOCK_8X8`..`BLOCK_64X64` with
@@ -411,15 +419,17 @@ carries no forward update for it).
   mode-mapping (a searched vector equal to a §6.5 predictor still
   codes `NEWMV`'s costlier syntax), encode-side loop filtering (frames
   are coded with `filter_level == 0`), keyframe skip election, and the
-  sub-8x8 per-(idy, idx) MV walk / §6.4.12 temporal-predicted
-  segment-id branch are later milestones. Lossy encoding is 8-bit
-  4:2:0 (the lossless path covers all four profiles). The inter
-  *writers* already carry compound references and
-  `MiSize >= BLOCK_8X8`; the planner simply does not elect them yet.
+  §6.4.12 temporal-predicted segment-id branch are later milestones.
+  Lossy encoding is 8-bit 4:2:0 (the lossless path covers all four
+  profiles). The inter *writers* now carry compound references and
+  **every** `MiSize` — the round-415 sub-8x8 per-(idy, idx) MV walk
+  included, driven by `encode_pframe_lossless_layout` over arbitrary
+  §6.4.3 layouts; the partition search simply does not *elect*
+  compound or sub-8x8 shapes yet.
 
 ## Testing
 
-The crate carries 1010+ lib unit tests plus integration suites in
+The crate carries 1025+ lib unit tests plus integration suites in
 `tests/` (including the keyframe **and inter** encoder writers, each
 round-tripped back through the in-crate decoder; `encode_keyframe`
 exercising the public `encode_vp9` → decode **byte-exact lossless**

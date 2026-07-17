@@ -992,6 +992,21 @@ fn full_corpus_sequences_byte_exact() {
         //   loop_filter_sharpness; self-encoded (no black-box encoder
         //   emits these features).
         "seg-features-skip-ref-altl",
+        // Round-415 corpus extensions (notes.md in each dir):
+        //
+        // * sub8x8-inter-mvs — self-encoded P-frame whose §6.4.3 layout
+        //   splits six BLOCK_8X8 nodes below 8x8 (4x4 / 8x4 / 4x8) with
+        //   per-cell NEWMV / NEARESTMV / NEARMV / ZEROMV modes, integer
+        //   + quarter-pel vectors, the §6.5.14 append_sub8x8_mvs
+        //   predictor seeds, and live sub-8x8 WHT inter residual — the
+        //   corpus's first *planned* per-sub-block motion (the encoder
+        //   wrappers only emit sub-8x8 when their own search elects it).
+        // * render-size-128x72 — every frame codes the §6.2.3
+        //   render_and_frame_size_different = 1 arm (64x64 coded,
+        //   128x72 render), across the keyframe / intra-only / inter
+        //   render_size() call sites; self-encoded.
+        "sub8x8-inter-mvs",
+        "render-size-128x72",
     ] {
         let base = root.join(name);
         let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");
@@ -1392,6 +1407,87 @@ fn round_412_fixture_flags_pin_their_feature_classes() {
             Some([1, 1, 1]),
             "every reference list draws from the intra-only slot"
         );
+    }
+}
+
+/// Round-415 corpus extensions: assert each new fixture's headers carry
+/// the flags that make it exercise its target feature class, so the
+/// byte-exact sweep can't silently degrade into re-testing an existing
+/// path. (The sub-8x8 partition layout itself is below header level;
+/// the crate's `staged_sub8x8_fixture_matches_builder` unit test pins
+/// the staged bytes as the writer's exact output.)
+#[test]
+fn round_415_fixture_flags_pin_their_feature_classes() {
+    let root = std::path::Path::new("../../docs/video/vp9/fixtures");
+    if !root.is_dir() {
+        eprintln!("docs corpus not present; docs-gated");
+        return;
+    }
+
+    // render-size-128x72: every coded frame codes the §6.2.3
+    // render_and_frame_size_different = 1 arm (64x64 coded, 128x72
+    // render) — keyframe, hidden intra-only, and two inter frames.
+    {
+        let ivf = std::fs::read(root.join("render-size-128x72").join("input.ivf")).expect("ivf");
+        let chunks = ivf_chunks(&ivf);
+        assert_eq!(chunks.len(), 4, "4 coded packets");
+        let cc0 = oxideav_vp9::parse_uncompressed_header(&chunks[0])
+            .expect("keyframe")
+            .color_config;
+        let ref_dims = vec![(64u32, 64u32); 8];
+        for (i, p) in chunks.iter().enumerate() {
+            let hdr = if i < 2 {
+                oxideav_vp9::parse_uncompressed_header(p).expect("intra header")
+            } else {
+                oxideav_vp9::parse_uncompressed_header_with_refs(
+                    p,
+                    Some(oxideav_vp9::RefFrameState {
+                        ref_dims: &ref_dims,
+                        color_config: cc0,
+                    }),
+                )
+                .expect("inter header")
+            };
+            assert_eq!((hdr.frame_width, hdr.frame_height), (64, 64), "frame {i}");
+            assert_eq!(
+                (hdr.render_width, hdr.render_height),
+                (128, 72),
+                "frame {i}: render override"
+            );
+        }
+        let h0 = oxideav_vp9::parse_uncompressed_header(&chunks[0]).expect("F0");
+        assert_eq!(h0.frame_type, oxideav_vp9::FrameType::KeyFrame);
+        let h1 = oxideav_vp9::parse_uncompressed_header(&chunks[1]).expect("F1");
+        assert!(h1.intra_only && !h1.show_frame, "hidden intra-only frame");
+    }
+
+    // sub8x8-inter-mvs: keyframe + the error-resilient lossless sub-8x8
+    // P-frame + the copy frame.
+    {
+        let ivf = std::fs::read(root.join("sub8x8-inter-mvs").join("input.ivf")).expect("ivf");
+        let chunks = ivf_chunks(&ivf);
+        assert_eq!(chunks.len(), 3, "3 coded packets");
+        let h0 = oxideav_vp9::parse_uncompressed_header(&chunks[0]).expect("F0");
+        assert_eq!(h0.frame_type, oxideav_vp9::FrameType::KeyFrame);
+        assert!(h0.quantization.lossless, "lossless keyframe");
+        let cc0 = h0.color_config;
+        let ref_dims = vec![(64u32, 64u32); 8];
+        let h1 = oxideav_vp9::parse_uncompressed_header_with_refs(
+            &chunks[1],
+            Some(oxideav_vp9::RefFrameState {
+                ref_dims: &ref_dims,
+                color_config: cc0,
+            }),
+        )
+        .expect("F1");
+        assert_eq!(h1.frame_type, oxideav_vp9::FrameType::NonKeyFrame);
+        assert!(!h1.intra_only && h1.show_frame);
+        assert!(
+            h1.error_resilient_mode,
+            "NEWMV sub-8x8 cells require the §7.2.6 UsePrevFrameMvs == 0 model"
+        );
+        assert!(h1.quantization.lossless, "lossless P-frame (WHT residual)");
+        assert_eq!(h1.refresh_frame_flags, 0x01, "refreshes slot 0");
     }
 }
 

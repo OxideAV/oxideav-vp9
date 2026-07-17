@@ -1830,6 +1830,166 @@ mod encode_roundtrip_tests {
         );
     }
 
+    // ----- render_and_frame_size_different (round 415) -----
+
+    /// Build the round-415 **render-size** stream (profile 0, 8-bit
+    /// 4:2:0, coded 64x64, render 128x72): every coded frame writes the
+    /// §6.2.3 `render_and_frame_size_different = 1` arm — explicit
+    /// `render_width_minus_1` / `render_height_minus_1` — across all
+    /// three `render_size( )` call sites:
+    ///
+    /// * F0 — shown lossless keyframe (pattern A; the §6.2 key-frame
+    ///   arm), fills all slots.
+    /// * F1 — hidden lossless intra-only frame (pattern B; the §6.2
+    ///   intra-only arm) → slot 1.
+    /// * F2 — shown all-skip `ZEROMV` P-frame over slot 1 (the §6.2.5
+    ///   `frame_size_with_refs( )` explicit-size arm) → slot 2.
+    /// * F3 — shown all-skip `ZEROMV` copy P-frame over slot 2.
+    ///
+    /// The black-box encoder wrappers only signal display geometry
+    /// through container-level aspect metadata (the bitstream field
+    /// stays 0), so this header axis is only mintable by the in-crate
+    /// writers.
+    fn build_render_size_stream() -> Vec<Vec<u8>> {
+        use crate::frame_writer::{assemble_inter_frame_all_skip_zeromv, inter_pframe_header};
+        use crate::pixel_encoder::{
+            encode_keyframe_lossless, lossless_keyframe_header, padded_plane_from_bytes,
+        };
+
+        const RENDER: (u32, u32) = (128, 72);
+
+        // F0: shown keyframe, pattern A, render override.
+        let mut hdr0 = lossless_keyframe_header(64, 64);
+        hdr0.render_width = RENDER.0;
+        hdr0.render_height = RENDER.1;
+        let pat_a = intra_only_pattern(0);
+        let planes_a = [
+            padded_plane_from_bytes(&pat_a[..64 * 64], 64, 64, 64, 64),
+            padded_plane_from_bytes(&pat_a[64 * 64..64 * 64 + 32 * 32], 32, 32, 32, 32),
+            padded_plane_from_bytes(&pat_a[64 * 64 + 32 * 32..], 32, 32, 32, 32),
+        ];
+        let f0 = encode_keyframe_lossless(&hdr0, &planes_a).expect("keyframe");
+
+        // F1: hidden intra-only frame, pattern B, slot 1, render override.
+        let mut hdr1 = lossless_keyframe_header(64, 64);
+        hdr1.frame_type = FrameType::NonKeyFrame;
+        hdr1.intra_only = true;
+        hdr1.show_frame = false;
+        hdr1.reset_frame_context = 3;
+        hdr1.refresh_frame_context = false;
+        hdr1.refresh_frame_flags = 0x02;
+        hdr1.render_width = RENDER.0;
+        hdr1.render_height = RENDER.1;
+        let pat_b = intra_only_pattern(1);
+        let planes_b = [
+            padded_plane_from_bytes(&pat_b[..64 * 64], 64, 64, 64, 64),
+            padded_plane_from_bytes(&pat_b[64 * 64..64 * 64 + 32 * 32], 32, 32, 32, 32),
+            padded_plane_from_bytes(&pat_b[64 * 64 + 32 * 32..], 32, 32, 32, 32),
+        ];
+        let f1 = encode_keyframe_lossless(&hdr1, &planes_b).expect("intra-only frame");
+
+        // F2: shown all-skip ZEROMV P-frame over slot 1, render override.
+        let mut hdr2 = inter_pframe_header(64, 64);
+        hdr2.ref_frame_idx = Some([1, 1, 1]);
+        hdr2.refresh_frame_flags = 0x04;
+        hdr2.render_width = RENDER.0;
+        hdr2.render_height = RENDER.1;
+        let f2 = assemble_inter_frame_all_skip_zeromv(&hdr2).expect("p-frame");
+
+        // F3: copy P-frame over slot 2, render override.
+        let mut hdr3 = inter_pframe_header(64, 64);
+        hdr3.ref_frame_idx = Some([2, 2, 2]);
+        hdr3.refresh_frame_flags = 0x08;
+        hdr3.render_width = RENDER.0;
+        hdr3.render_height = RENDER.1;
+        let f3 = assemble_inter_frame_all_skip_zeromv(&hdr3).expect("copy p-frame");
+
+        vec![f0, f1, f2, f3]
+    }
+
+    /// The render-size stream decodes byte-exact against its lossless
+    /// targets, every coded frame's parsed header carries the 128x72
+    /// render override (the §6.2.3 different-size arm across the
+    /// key-frame / intra-only / inter call sites), and the stream is
+    /// byte-deterministic.
+    #[test]
+    fn render_size_sequence_decodes_byte_exact_with_render_override() {
+        let frames = build_render_size_stream();
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        let out = decode_vp9_sequence(&refs).expect("render-size sequence");
+        assert_eq!(out.len(), 3); // F1 is hidden.
+
+        let pat_a = intra_only_pattern(0);
+        let pat_b = intra_only_pattern(1);
+        assert_eq!(out[0].to_planar_bytes(), pat_a, "keyframe != pattern A");
+        assert_eq!(out[1].to_planar_bytes(), pat_b, "P over intra-only slot");
+        assert_eq!(out[2].to_planar_bytes(), pat_b, "copy frame");
+
+        // Every coded frame parses back with the render override; the
+        // inter headers need reference-size state for the §6.2.5
+        // frame_size_with_refs( ) arm.
+        let ref_dims = vec![(64u32, 64u32); 8];
+        let cc0 = crate::header::parse_uncompressed_header(&frames[0])
+            .expect("F0")
+            .color_config;
+        for (i, f) in frames.iter().enumerate() {
+            let hdr = if i < 2 {
+                crate::header::parse_uncompressed_header(f).expect("intra header")
+            } else {
+                crate::header::parse_uncompressed_header_with_refs(
+                    f,
+                    Some(crate::header::RefFrameState {
+                        ref_dims: &ref_dims,
+                        color_config: cc0,
+                    }),
+                )
+                .expect("inter header")
+            };
+            assert_eq!((hdr.frame_width, hdr.frame_height), (64, 64), "frame {i}");
+            assert_eq!(
+                (hdr.render_width, hdr.render_height),
+                (128, 72),
+                "frame {i}: render_and_frame_size_different arm"
+            );
+        }
+
+        // Byte-determinism (fixture staging relies on it).
+        assert_eq!(frames, build_render_size_stream());
+    }
+
+    /// Fixture-staging generator (round 415): stages the render-size
+    /// stream as `render-size-128x72/input.ivf` under
+    /// `OXIDEAV_VP9_STAGE_DIR`.
+    #[test]
+    fn stage_render_size_fixture_when_requested() {
+        let Some(dir) = std::env::var_os("OXIDEAV_VP9_STAGE_DIR") else {
+            return;
+        };
+        let frames = build_render_size_stream();
+        let ivf = ivf_wrap_64x64(&frames);
+        let subdir = std::path::Path::new(&dir).join("render-size-128x72");
+        std::fs::create_dir_all(&subdir).expect("create stage dir");
+        std::fs::write(subdir.join("input.ivf"), &ivf).expect("write input.ivf");
+    }
+
+    /// The staged corpus fixture is byte-identical to the builder's
+    /// output — the fixture IS this crate's writer output (docs-gated).
+    #[test]
+    fn staged_render_size_fixture_matches_builder() {
+        let path =
+            std::path::Path::new("../../docs/video/vp9/fixtures/render-size-128x72/input.ivf");
+        if !path.is_file() {
+            eprintln!("docs corpus not present; docs-gated");
+            return;
+        }
+        let staged = std::fs::read(path).expect("staged input.ivf");
+        assert_eq!(
+            staged,
+            ivf_wrap_64x64(&build_render_size_stream()),
+            "staged fixture bytes != builder output"
+        );
+    }
+
     /// Wrap coded frames in a minimal 64x64 IVF container (the layout
     /// every 64x64 staging generator in this module emits).
     fn ivf_wrap_64x64(frames: &[Vec<u8>]) -> Vec<u8> {

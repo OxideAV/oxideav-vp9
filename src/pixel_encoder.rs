@@ -4894,6 +4894,238 @@ mod tests {
         assert_eq!(decoded[1].to_planar_bytes(), f1, "444 sub-8x8 P-frame");
     }
 
+    /// **4:2:2 and 4:4:0 sub-8x8** end-to-end: half-resolution chroma
+    /// on one axis makes the §8.5.2 sub-8x8 chroma prediction average
+    /// exactly *two* luma cell vectors per chroma 4x4 (the third
+    /// averaging arm, between 4:2:0's four-cell average and 4:4:4's
+    /// none). Byte-exact through `decode_vp9_sequence` for both
+    /// orientations.
+    #[test]
+    fn lossless_layout_sub8x8_yuv422_and_yuv440_roundtrip_byte_exact() {
+        use crate::decode_frame::decode_vp9_sequence;
+        use crate::frame_writer::InterTreeLeaf;
+        use crate::inter_block_writer::InterSubBlockSpec;
+        use crate::mode_info::{LAST_FRAME, NEWMV, NONE_REF_FRAME, ZEROMV};
+        use crate::partition::{PARTITION_HORZ, PARTITION_SPLIT};
+        use crate::residual::{BLOCK_4X4, BLOCK_8X4};
+
+        for (ssx, ssy) in [(true, false), (false, true)] {
+            let (w, h) = (64u32, 64u32);
+            let n = (w * h) as usize;
+            let cw = 64usize >> usize::from(ssx);
+            let ch = 64usize >> usize::from(ssy);
+            let cn = cw * ch;
+            let mk = |seed: u64| -> Vec<u8> {
+                let mut state = seed;
+                let mut next = move || {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (state >> 33) as u8
+                };
+                (0..n + 2 * cn).map(|_| next()).collect()
+            };
+            let f0 = mk(0x2242 + u64::from(ssx));
+            let f1 = mk(0x2243 + u64::from(ssy));
+
+            let planes_of = |px: &[u8]| -> [Plane; 3] {
+                [
+                    padded_plane_from_bytes(&px[..n], 64, 64, 64, 64),
+                    padded_plane_from_bytes(&px[n..n + cn], cw, ch, cw, ch),
+                    padded_plane_from_bytes(&px[n + cn..], cw, ch, cw, ch),
+                ]
+            };
+            let hdr_kf = lossless_keyframe_header_ex(w, h, 1, 8, ssx, ssy);
+            let kf = encode_keyframe_lossless(&hdr_kf, &planes_of(&f0)).expect("keyframe");
+
+            let mut hdr = lossless_pframe_header(w, h);
+            hdr.profile = 1;
+            hdr.color_config.subsampling_x = ssx;
+            hdr.color_config.subsampling_y = ssy;
+
+            let targets = planes_of(&f1);
+            let prev: [Vec<i32>; 3] = [
+                f0[..n].iter().map(|&s| i32::from(s)).collect(),
+                f0[n..n + cn].iter().map(|&s| i32::from(s)).collect(),
+                f0[n + cn..].iter().map(|&s| i32::from(s)).collect(),
+            ];
+            let reference: [(&[i32], usize); 3] = [
+                (prev[0].as_slice(), 64),
+                (prev[1].as_slice(), cw),
+                (prev[2].as_slice(), cw),
+            ];
+
+            let mut partitions = std::collections::HashMap::new();
+            partitions.insert((2u32, 5u32, BLOCK_8X8), PARTITION_SPLIT);
+            partitions.insert((5, 1, BLOCK_8X8), PARTITION_HORZ);
+
+            let mut leaf_plan = |_r: u32,
+                                 _c: u32,
+                                 subsize: u8,
+                                 _s: &crate::decode_block::Vp9FrameState|
+             -> InterTreeLeaf {
+                let sub = match subsize {
+                    // Four distinct vectors => the chroma pair averages
+                    // differ per cell on both axes.
+                    BLOCK_4X4 => Some(InterSubBlockSpec {
+                        modes: [NEWMV; 4],
+                        mvs: [
+                            [[16, 8], [0, 0]],
+                            [[-8, 16], [0, 0]],
+                            [[8, -16], [0, 0]],
+                            [[24, 0], [0, 0]],
+                        ],
+                    }),
+                    BLOCK_8X4 => Some(InterSubBlockSpec {
+                        modes: [NEWMV, ZEROMV, NEWMV, ZEROMV],
+                        mvs: [
+                            [[8, -8], [0, 0]],
+                            [[0, 0]; 2],
+                            [[-16, 8], [0, 0]],
+                            [[0, 0]; 2],
+                        ],
+                    }),
+                    _ => None,
+                };
+                InterTreeLeaf {
+                    mi_size: subsize,
+                    tx_size: 0,
+                    y_mode: ZEROMV,
+                    interp_filter: 0,
+                    ref_frame: [LAST_FRAME, NONE_REF_FRAME],
+                    mv: [[0, 0], [0, 0]],
+                    skip: false,
+                    segment_id: 0,
+                    sub,
+                }
+            };
+            let pf = encode_pframe_lossless_layout(
+                &hdr,
+                &targets,
+                &reference,
+                None,
+                w,
+                h,
+                partitions,
+                &mut leaf_plan,
+            )
+            .expect("chroma-geometry sub-8x8 p-frame");
+
+            let decoded = decode_vp9_sequence(&[&kf, &pf]).expect("decode");
+            assert_eq!(decoded[0].to_planar_bytes(), f0, "keyframe (ssx={ssx})");
+            assert_eq!(
+                decoded[1].to_planar_bytes(),
+                f1,
+                "sub-8x8 P-frame (ssx={ssx}, ssy={ssy})"
+            );
+        }
+    }
+
+    /// **10-bit sub-8x8** end-to-end (profile 2, 4:2:0): the sub-8x8
+    /// per-`blockIdx` §8.5.2 prediction runs the bit-depth-scaled
+    /// convolution clamps and the §8.7.2 WHT carries HBD-range
+    /// residual. Byte-exact through `decode_vp9_sequence`.
+    #[test]
+    fn lossless_layout_sub8x8_10bit_roundtrips_byte_exact() {
+        use crate::decode_frame::decode_vp9_sequence;
+        use crate::frame_writer::InterTreeLeaf;
+        use crate::inter_block_writer::InterSubBlockSpec;
+        use crate::mode_info::{LAST_FRAME, NEWMV, NONE_REF_FRAME, ZEROMV};
+        use crate::partition::PARTITION_SPLIT;
+        use crate::residual::BLOCK_4X4;
+
+        let (w, h) = (64u32, 64u32);
+        let (n, cn) = (64usize * 64, 32usize * 32);
+        let mk = |seed: u64| -> Vec<u16> {
+            let mut state = seed;
+            let mut next = move || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) & 0x3FF) as u16
+            };
+            (0..n + 2 * cn).map(|_| next()).collect()
+        };
+        let f0 = mk(0x10B1);
+        let f1 = mk(0x10B2);
+
+        let kf = encode_keyframe_lossless_hbd(&f0, w, h, 10, true).expect("10-bit keyframe");
+
+        let mut hdr = lossless_pframe_header(w, h);
+        hdr.profile = 2;
+        hdr.color_config.bit_depth = 10;
+
+        let targets = [
+            padded_plane_from_u16(&f1[..n], 64, 64, 64, 64),
+            padded_plane_from_u16(&f1[n..n + cn], 32, 32, 32, 32),
+            padded_plane_from_u16(&f1[n + cn..], 32, 32, 32, 32),
+        ];
+        let prev: [Vec<i32>; 3] = [
+            f0[..n].iter().map(|&s| i32::from(s)).collect(),
+            f0[n..n + cn].iter().map(|&s| i32::from(s)).collect(),
+            f0[n + cn..].iter().map(|&s| i32::from(s)).collect(),
+        ];
+        let reference: [(&[i32], usize); 3] = [
+            (prev[0].as_slice(), 64),
+            (prev[1].as_slice(), 32),
+            (prev[2].as_slice(), 32),
+        ];
+
+        let mut partitions = std::collections::HashMap::new();
+        partitions.insert((4u32, 4u32, BLOCK_8X8), PARTITION_SPLIT);
+
+        let mut leaf_plan = |_r: u32,
+                             _c: u32,
+                             subsize: u8,
+                             _s: &crate::decode_block::Vp9FrameState|
+         -> InterTreeLeaf {
+            let sub = if subsize == BLOCK_4X4 {
+                Some(InterSubBlockSpec {
+                    modes: [NEWMV; 4],
+                    mvs: [
+                        [[16, 8], [0, 0]],
+                        [[-8, 16], [0, 0]],
+                        [[8, -16], [0, 0]],
+                        [[24, 0], [0, 0]],
+                    ],
+                })
+            } else {
+                None
+            };
+            InterTreeLeaf {
+                mi_size: subsize,
+                tx_size: 0,
+                y_mode: ZEROMV,
+                interp_filter: 0,
+                ref_frame: [LAST_FRAME, NONE_REF_FRAME],
+                mv: [[0, 0], [0, 0]],
+                skip: false,
+                segment_id: 0,
+                sub,
+            }
+        };
+        let pf = encode_pframe_lossless_layout(
+            &hdr,
+            &targets,
+            &reference,
+            None,
+            w,
+            h,
+            partitions,
+            &mut leaf_plan,
+        )
+        .expect("10-bit sub-8x8 p-frame");
+
+        let decoded = decode_vp9_sequence(&[&kf, &pf]).expect("decode");
+        let planar = |px: &[u16]| -> Vec<u8> { px.iter().flat_map(|&s| s.to_le_bytes()).collect() };
+        assert_eq!(decoded[0].to_planar_bytes(), planar(&f0), "10-bit keyframe");
+        assert_eq!(
+            decoded[1].to_planar_bytes(),
+            planar(&f1),
+            "10-bit sub-8x8 P-frame"
+        );
+    }
+
     /// A mostly-static sequence codes its P-frames far smaller than the
     /// keyframe: unchanged blocks carry all-zero residual syntax.
     #[test]

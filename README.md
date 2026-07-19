@@ -32,7 +32,7 @@ motion field, the §6.1.2 / §7.2 `FrameContext[ 4 ]` entropy probability
 banks (`load_probs( )` / `save_probs( )` — **including the full §6.1.2
 `refresh_probs( )` backward adaptation on non-frame-parallel streams**,
 see below), and the §6.4.14 PrevSegmentIds
-map across frames. **All 38 staged corpus fixtures reconstruct fully
+map across frames. **All 41 staged corpus fixtures reconstruct fully
 byte-exact against their `expected.yuv` through `decode_vp9_sequence`**
 (pinned by `full_corpus_sequences_byte_exact`), including the
 profile-1/2/3 P-frames (§8.5.2 motion compensation at 4:4:4 chroma and
@@ -81,7 +81,20 @@ integer + quarter-pel vectors and live sub-8x8 WHT residual,
 self-encoded through the round-415 sub-8x8 inter writer) and
 `render-size-128x72` (`render_and_frame_size_different = 1` on every
 frame across all three §6.2.3 `render_size( )` call sites,
-self-encoded).
+self-encoded) — and the **three round-418 extensions**:
+`temporal-seg-predicted` (the corpus's first *writer-side* §6.4.12
+temporal seg-map stream — hand-planned `seg_id_predicted` / tree-escape
+placement over a visible `SEG_LVL_REF_FRAME = GOLDEN` band shifting
+across two `segmentation_temporal_update = 1` P-frames),
+`lossy-sub8x8-elected` (the encoder's own lossy partition search
+electing 4x8 / 8x4 / 4x4 leaves with per-cell `NEWMV` — search-elected,
+where `sub8x8-inter-mvs` is hand-planned), and `lossy-compound-elected`
+(the encoder's reference election choosing `[ LAST, ALTREF ]`
+§8.5.2 compound averages on a cross-fade at a 26x rate win — on a
+**non-error-resilient** frame with a hidden predecessor, per the
+round-418 §7.2 `setup_past_independence` finding: error-resilient
+frames zero their effective `ref_frame_sign_bias`, so compound is
+uncodeable there).
 Highlights: `i-frame-then-p-frame-64x64`
 (keyframe + single-reference LAST P-frame, high-precision MVs,
 8-tap-smooth filter), `frame-parallel-mode` (keyframe + three
@@ -412,14 +425,18 @@ carries no forward update for it).
   fixture-less axis (docs ask #270).
 * §9.2.4 multi-coder tile parallelism (tiles decode sequentially).
 * Encoder depth beyond the planner-driven baseline. Keyframes **and
-  P-frames** plan partitions `BLOCK_8X8`..`BLOCK_64X64` with
+  P-frames** plan partitions `BLOCK_4X4`..`BLOCK_64X64` with
   transforms `TX_4X4`..`TX_32X32` (P-frames select per-block inter tx
-  sizes, search motion to quarter/eighth-pel, and elect
-  LAST/GOLDEN/compound references). `NEARESTMV` / `NEARMV`
-  mode-mapping (a searched vector equal to a §6.5 predictor still
-  codes `NEWMV`'s costlier syntax), encode-side loop filtering (frames
-  are coded with `filter_level == 0`), keyframe skip election, and the
-  §6.4.12 temporal-predicted segment-id branch are later milestones.
+  sizes, search motion to quarter/eighth-pel, elect LAST/GOLDEN and —
+  on non-error-resilient frames — `[ LAST, ALTREF ]` compound
+  references, and probe each 8x8 cell's 4x4 quadrants to elect
+  below-8x8 leaves where divergent motion wins — round 418). The
+  §6.4.12 temporal-predicted segment-id **writer** branch landed in
+  round 418, closing the last §6.4.11 writer arm. Encode-side loop
+  filtering (frames are coded with `filter_level == 0`), keyframe skip
+  election, and previous-frame-MV modeling in the writer (which would
+  let non-error-resilient P-frame *chains* — and therefore compound —
+  run without a hidden/intra predecessor) are later milestones.
   Lossy encoding is 8-bit 4:2:0 (the lossless path covers all four
   profiles). The inter *writers* now carry compound references and
   **every** `MiSize` — the round-415 sub-8x8 per-(idy, idx) MV walk

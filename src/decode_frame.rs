@@ -1662,6 +1662,18 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
             persist_abs_or_delta = false;
             persist_ref_deltas = DEFAULT_LOOP_FILTER_REF_DELTAS;
             persist_mode_deltas = DEFAULT_LOOP_FILTER_MODE_DELTAS;
+            // §7.2: `ref_frame_sign_bias[ i ] = 0 for i = 0..3`. The
+            // §6.2 ref-frames loop consumes the sign-bias *bits* before
+            // setup_past_independence( ) runs (the reset sits after the
+            // ref-frames section in the §6.2 listing), so on an
+            // error-resilient inter frame the coded values are dead and
+            // the effective biases are all zero — which in turn makes
+            // §6.3.12 `compoundReferenceAllowed` 0: an error-resilient
+            // frame can never code compound prediction, and the §6.5
+            // scan never sign-flips candidates. (Found by black-box
+            // reference-decoder divergence on a self-encoded
+            // error-resilient compound stream, round 418.)
+            hdr.ref_frame_sign_bias = [false; 3];
         }
 
         // §7.2.8: a `loop_filter_delta_update == 1` frame folds the
@@ -1716,14 +1728,25 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
         // §6.4.14 PrevSegmentIds: the last map-bearing frame's
         // `SegmentIds`, if it matches the current dimensions. A run of
         // `update_map == 0` frames keeps predicting from this same map.
-        let prev_seg_slice: Option<&[u8]> =
+        // §7.2 setup_past_independence( ) on an error-resilient frame
+        // clears `PrevSegmentIds[ ][ ]` to zero — model that with an
+        // explicit zero map (falling through to the previous frame's
+        // ids would resurrect the cleared state).
+        let er_zero_seg_map: Vec<u8>;
+        let prev_seg_slice: Option<&[u8]> = if hdr.error_resilient_mode {
+            let mi_cols = ((hdr.frame_width + 7) >> 3) as usize;
+            let mi_rows = ((hdr.frame_height + 7) >> 3) as usize;
+            er_zero_seg_map = vec![0u8; mi_cols * mi_rows];
+            Some(er_zero_seg_map.as_slice())
+        } else {
             prev_segment_ids_map.as_ref().and_then(|(map, mw, mh)| {
                 if *mw == hdr.frame_width && *mh == hdr.frame_height {
                     Some(map.as_slice())
                 } else {
                     None
                 }
-            });
+            })
+        };
 
         // §6.5 / §6.4.14 previous-frame snapshot (same-dimension only).
         // §6.5 MV/ref prediction reads the immediately-preceding decoded

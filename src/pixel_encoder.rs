@@ -1705,11 +1705,15 @@ pub(crate) fn encode_pframe_lossless_layout(
     } else {
         crate::compressed::ReferenceMode::SingleReference
     };
+    // A non-error-resilient header is this encoder's assertion that the
+    // §7.2.6 UsePrevFrameMvs derivation yields 0 for the frame (hidden
+    // / intra / differently-sized predecessor) — see the function docs.
     let plan = InterFrameTreePlan {
         tx_mode: crate::compressed::TxMode::Only4x4,
         reference_mode,
         partitions,
         prev_segment_ids: None,
+        prev_frame_mvs_absent: !hdr.error_resilient_mode,
     };
     crate::frame_writer::assemble_inter_frame_tree(hdr, &plan, &mut *planner, &mut *coeffs)
 }
@@ -1974,12 +1978,18 @@ pub(crate) fn encode_pframe_lossless_motion(
     let ssx = hdr.color_config.subsampling_x;
     let ssy = hdr.color_config.subsampling_y;
     let bit_depth = u32::from(hdr.color_config.bit_depth);
-    let sign_bias = [
-        false,
-        hdr.ref_frame_sign_bias[0],
-        hdr.ref_frame_sign_bias[1],
-        hdr.ref_frame_sign_bias[2],
-    ];
+    // §7.2 setup_past_independence( ): error-resilient frames have
+    // all-zero *effective* sign biases (see assemble_inter_frame_tree).
+    let sign_bias = if hdr.error_resilient_mode {
+        [false; 4]
+    } else {
+        [
+            false,
+            hdr.ref_frame_sign_bias[0],
+            hdr.ref_frame_sign_bias[1],
+            hdr.ref_frame_sign_bias[2],
+        ]
+    };
 
     let y_w = (mi_cols * 8) as usize;
     let y_h = (mi_rows * 8) as usize;
@@ -2186,12 +2196,18 @@ pub(crate) fn encode_pframe_lossy_motion(
     let ssx = hdr.color_config.subsampling_x;
     let ssy = hdr.color_config.subsampling_y;
     let bit_depth = u32::from(hdr.color_config.bit_depth);
-    let sign_bias = [
-        false,
-        hdr.ref_frame_sign_bias[0],
-        hdr.ref_frame_sign_bias[1],
-        hdr.ref_frame_sign_bias[2],
-    ];
+    // §7.2 setup_past_independence( ): error-resilient frames have
+    // all-zero *effective* sign biases (see assemble_inter_frame_tree).
+    let sign_bias = if hdr.error_resilient_mode {
+        [false; 4]
+    } else {
+        [
+            false,
+            hdr.ref_frame_sign_bias[0],
+            hdr.ref_frame_sign_bias[1],
+            hdr.ref_frame_sign_bias[2],
+        ]
+    };
     let seg = hdr.segmentation;
     let quant = hdr.quantization;
     let bd8 = hdr.color_config.bit_depth;
@@ -2530,7 +2546,16 @@ fn plan_inter_partitions(
                     (PARTITION_SPLIT, 4u64)
                 };
                 let sub_sad: u64 = qsad.iter().sum();
-                if sub_sad + SUB8X8_SPLIT_MARGIN_PER_MV * n_mvs < cell_sad[cell] {
+                // Election needs BOTH the absolute per-coded-vector
+                // margin and a large (>= 2x) relative improvement: on
+                // noise-like content the minimum-of-search quadrant
+                // SADs sit only slightly below the single-vector SAD
+                // (a statistical artefact, not motion), and a split
+                // elected there would also forgo the >= 8x8 leaf's
+                // compound / multi-reference candidates.
+                if sub_sad + SUB8X8_SPLIT_MARGIN_PER_MV * n_mvs < cell_sad[cell]
+                    && 2 * sub_sad < cell_sad[cell]
+                {
                     sub_hints.insert(
                         (r, c),
                         Sub8x8Hint {
@@ -3110,12 +3135,18 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
     let ssx = hdr.color_config.subsampling_x;
     let ssy = hdr.color_config.subsampling_y;
     let bit_depth = u32::from(hdr.color_config.bit_depth);
-    let sign_bias = [
-        false,
-        hdr.ref_frame_sign_bias[0],
-        hdr.ref_frame_sign_bias[1],
-        hdr.ref_frame_sign_bias[2],
-    ];
+    // §7.2 setup_past_independence( ): error-resilient frames have
+    // all-zero *effective* sign biases (see assemble_inter_frame_tree).
+    let sign_bias = if hdr.error_resilient_mode {
+        [false; 4]
+    } else {
+        [
+            false,
+            hdr.ref_frame_sign_bias[0],
+            hdr.ref_frame_sign_bias[1],
+            hdr.ref_frame_sign_bias[2],
+        ]
+    };
     let seg = hdr.segmentation;
     let quant = hdr.quantization;
 
@@ -3563,11 +3594,15 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
         },
     );
 
+    // A non-error-resilient header is this encoder's assertion that the
+    // §7.2.6 UsePrevFrameMvs derivation yields 0 for the frame (hidden
+    // / intra / differently-sized predecessor) — see the function docs.
     let plan = InterFrameTreePlan {
         tx_mode,
         reference_mode,
         partitions,
         prev_segment_ids: None,
+        prev_frame_mvs_absent: !hdr.error_resilient_mode,
     };
     let bytes =
         crate::frame_writer::assemble_inter_frame_tree(hdr, &plan, &mut *planner, &mut *coeffs)?;
@@ -5069,8 +5104,15 @@ mod tests {
             (alt_i[2].as_slice(), cw),
         ];
 
-        // Compound needs the §6.3.12 asymmetric sign bias (ALTREF only).
+        // Compound needs the §6.3.12 asymmetric sign bias (ALTREF only)
+        // — and per §7.2 setup_past_independence the frame must NOT be
+        // error-resilient (error-resilient frames zero the effective
+        // sign biases, making compound uncodeable). The §7.2.6
+        // UsePrevFrameMvs derivation still yields 0 because the
+        // previously-decoded frame (the intra-only ALTREF carrier) is
+        // hidden.
         let mut hdr2 = lossless_pframe_header(w, h);
+        hdr2.error_resilient_mode = false;
         hdr2.ref_frame_idx = Some([0, 0, 1]);
         hdr2.ref_frame_sign_bias = [false, false, true];
         hdr2.refresh_frame_flags = 0x04;
@@ -6196,11 +6238,15 @@ mod tests {
         let (kf, kf_recon) = encode_keyframe_lossy_420_with_recon(&fa, w, h, q).expect("kf");
         let gold = crop3(&kf_recon);
 
-        // Compound-capable header: sign-bias asymmetry on ALTREF.
-        let mut hdr = lossless_pframe_header(w, h);
-        hdr.ref_frame_idx = Some([0, 1, 1]);
-        hdr.ref_frame_sign_bias = [false, false, true];
-        hdr.quantization = QuantizationParams {
+        // P1 codes the second noise pattern — HIDDEN, so the compound
+        // frame's §7.2.6 UsePrevFrameMvs derivation yields 0 (a
+        // non-error-resilient frame is required for compound: per §7.2
+        // setup_past_independence, error-resilient frames zero the
+        // effective sign biases and compoundReferenceAllowed with them).
+        let mut hdr1 = lossless_pframe_header(w, h);
+        hdr1.show_frame = false;
+        hdr1.ref_frame_idx = Some([0, 1, 1]);
+        hdr1.quantization = QuantizationParams {
             base_q_idx: q,
             delta_q_y_dc: 0,
             delta_q_uv_dc: 0,
@@ -6208,7 +6254,7 @@ mod tests {
             lossless: false,
         };
         let (p1, p1_recon) = encode_pframe_lossy_tree_motion(
-            &hdr,
+            &hdr1,
             &padded_targets_420(&fb, w, h),
             &as_ref_planes(&gold),
             None,
@@ -6221,6 +6267,12 @@ mod tests {
         .expect("p1");
         let prev = crop3(&p1_recon);
 
+        // Compound-capable header: sign-bias asymmetry on ALTREF +
+        // error_resilient_mode == 0 (hidden predecessor ⇒ no prev MVs).
+        let mut hdr = hdr1;
+        hdr.show_frame = true;
+        hdr.error_resilient_mode = false;
+        hdr.ref_frame_sign_bias = [false, false, true];
         let targets2 = padded_targets_420(&fmid, w, h);
         let (p2_comp, p2_recon) = encode_pframe_lossy_tree_motion(
             &hdr,
@@ -6257,9 +6309,9 @@ mod tests {
             p2_single.len()
         );
 
-        // Decoder mirror for the compound frame.
+        // Decoder mirror for the compound frame (P1 is hidden).
         let decoded = decode_vp9_sequence(&[&kf, &p1, &p2_comp]).expect("decode");
-        let d = &decoded[2];
+        let d = &decoded[1];
         for y in 0..64usize {
             for x in 0..64usize {
                 assert_eq!(

@@ -1449,6 +1449,7 @@ mod encode_roundtrip_tests {
             reference_mode: crate::compressed::ReferenceMode::SingleReference,
             partitions: std::collections::HashMap::new(), // all-8x8 leaves
             prev_segment_ids: None,
+            prev_frame_mvs_absent: false,
         };
         // Segments striped by MI row pairs: rows 0-1 seg 0 (plain skip),
         // rows 2-3 seg 1 (SKIP-forced), rows 4-5 seg 2 (GOLDEN
@@ -2072,6 +2073,7 @@ mod encode_roundtrip_tests {
             reference_mode: crate::compressed::ReferenceMode::SingleReference,
             partitions: std::collections::HashMap::new(), // all-8x8 leaves
             prev_segment_ids: prev,
+            prev_frame_mvs_absent: false,
         };
         let mut planner: Box<InterTreePlanner<'_>> =
             Box::new(|lr: u32, lc: u32, subsize: u8, _state| {
@@ -2468,6 +2470,208 @@ mod encode_roundtrip_tests {
         assert_eq!(
             staged,
             ivf_wrap_64x64(&build_lossy_sub8x8_stream()),
+            "staged fixture bytes != builder output"
+        );
+    }
+
+    // ----- lossy compound election on a cross-fade (round 418) -----
+
+    /// Deterministic iid-noise planar frame (luma noise, flat chroma)
+    /// for the compound-election stream.
+    fn compound_noise_frame(seed: u64) -> Vec<u8> {
+        let n = 64 * 64 + 2 * 32 * 32;
+        let mut v = Vec::with_capacity(n);
+        let mut s = seed;
+        for i in 0..n {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            v.push(if i < 64 * 64 { (s >> 33) as u8 } else { 128 });
+        }
+        v
+    }
+
+    /// Build the round-418 **lossy compound-elected** stream (profile
+    /// 0, 8-bit 4:2:0, 64x64) — the encoder's own reference election
+    /// choosing the §8.5.2 `Round2( p0 + p1, 1 )` compound average on a
+    /// cross-fade:
+    ///
+    /// * F0 — shown lossy keyframe (noise pattern A), fills all slots.
+    /// * F1 — **hidden** lossy P-frame of noise pattern B over `LAST` =
+    ///   A (single-reference, error-resilient) → slot 0. Hidden so the
+    ///   compound frame's §7.2.6 `UsePrevFrameMvs` derivation yields 0.
+    /// * F2 — `show_existing_frame` displaying slot 0 (pattern B).
+    /// * F3 — shown **non-error-resilient** lossy P-frame of the A/B
+    ///   cross-fade midpoint with `LAST` = F1's reconstruction and
+    ///   `GOLDEN`/`ALTREF` = the keyframe (slot 1) under ALTREF
+    ///   sign-bias asymmetry (`compoundReferenceAllowed`): the search
+    ///   elects `[ LAST, ALTREF ]` compound leaves (`reference_mode =
+    ///   SELECT`) because the two-reference average predicts the
+    ///   midpoint — the frame codes a fraction of F1's bytes. Per §7.2
+    ///   `setup_past_independence( )` an error-resilient frame zeroes
+    ///   its effective sign biases, so compound REQUIRES the
+    ///   non-error-resilient header (the round-418 spec fix).
+    ///
+    /// The corpus's existing compound streams are black-box encodes;
+    /// this one pins the in-crate **election** path end-to-end.
+    fn build_lossy_compound_stream() -> Vec<Vec<u8>> {
+        use crate::header::QuantizationParams;
+        use crate::header_writer::write_uncompressed_header;
+        use crate::intra::Plane;
+        use crate::pixel_encoder::{
+            encode_keyframe_lossy_420_with_recon, encode_pframe_lossy_tree_motion,
+            lossless_pframe_header, padded_plane_from_bytes, ReconState, PFRAME_SEARCH_RANGE,
+        };
+
+        let fa = compound_noise_frame(0x1111_2222_3333_4444);
+        let fb = compound_noise_frame(0x9999_8888_7777_6666);
+        let fmid: Vec<u8> = fa
+            .iter()
+            .zip(&fb)
+            .map(|(&a, &b)| (u16::from(a) + u16::from(b)).div_ceil(2) as u8)
+            .collect();
+        let q = 60u8;
+
+        let targets = |px: &[u8]| -> [Plane; 3] {
+            [
+                padded_plane_from_bytes(&px[..64 * 64], 64, 64, 64, 64),
+                padded_plane_from_bytes(&px[64 * 64..64 * 64 + 32 * 32], 32, 32, 32, 32),
+                padded_plane_from_bytes(&px[64 * 64 + 32 * 32..], 32, 32, 32, 32),
+            ]
+        };
+        let crop3 = |r: &ReconState| -> [Vec<i32>; 3] {
+            let crop = |p: &Plane, vw: usize, vh: usize| -> Vec<i32> {
+                let mut out = Vec::with_capacity(vw * vh);
+                for y in 0..vh {
+                    for x in 0..vw {
+                        out.push(p.get(x, y));
+                    }
+                }
+                out
+            };
+            [
+                crop(&r.planes[0], 64, 64),
+                crop(&r.planes[1], 32, 32),
+                crop(&r.planes[2], 32, 32),
+            ]
+        };
+        fn as_ref_planes(v: &[Vec<i32>; 3]) -> [(&[i32], usize); 3] {
+            [
+                (v[0].as_slice(), 64),
+                (v[1].as_slice(), 32),
+                (v[2].as_slice(), 32),
+            ]
+        }
+
+        let (kf, kf_recon) = encode_keyframe_lossy_420_with_recon(&fa, 64, 64, q).expect("kf");
+        let gold = crop3(&kf_recon);
+
+        // F1: hidden single-reference P of pattern B (error-resilient).
+        let mut hdr1 = lossless_pframe_header(64, 64);
+        hdr1.show_frame = false;
+        hdr1.ref_frame_idx = Some([0, 1, 1]);
+        hdr1.quantization = QuantizationParams {
+            base_q_idx: q,
+            delta_q_y_dc: 0,
+            delta_q_uv_dc: 0,
+            delta_q_uv_ac: 0,
+            lossless: false,
+        };
+        let (f1, p1_recon) = encode_pframe_lossy_tree_motion(
+            &hdr1,
+            &targets(&fb),
+            &as_ref_planes(&gold),
+            None,
+            64,
+            64,
+            PFRAME_SEARCH_RANGE,
+            true,
+            true,
+        )
+        .expect("p1");
+        let prev = crop3(&p1_recon);
+
+        // F2: show_existing_frame → slot 0 (displays pattern B).
+        let mut hdr_show = lossless_pframe_header(64, 64);
+        hdr_show.show_existing_frame = true;
+        hdr_show.frame_to_show_map_idx = Some(0);
+        let f2 = write_uncompressed_header(&hdr_show).expect("show-existing packet");
+
+        // F3: the non-error-resilient compound cross-fade frame.
+        let mut hdr3 = hdr1;
+        hdr3.show_frame = true;
+        hdr3.error_resilient_mode = false;
+        hdr3.ref_frame_sign_bias = [false, false, true];
+        hdr3.refresh_frame_flags = 0;
+        let gold_refs = as_ref_planes(&gold);
+        let (f3, _p3_recon) = encode_pframe_lossy_tree_motion(
+            &hdr3,
+            &targets(&fmid),
+            &as_ref_planes(&prev),
+            Some(&gold_refs),
+            64,
+            64,
+            PFRAME_SEARCH_RANGE,
+            true,
+            true,
+        )
+        .expect("p3 compound");
+
+        vec![kf, f1, f2, f3]
+    }
+
+    /// The compound-elected stream decodes end-to-end with the election
+    /// visible in the rate: the cross-fade frame (whose content is the
+    /// average of its two references — exactly what the elected §8.5.2
+    /// compound average predicts) codes less than a third of the
+    /// single-reference noise frame's bytes. Byte-deterministic.
+    #[test]
+    fn lossy_compound_sequence_decodes_with_compound_rate_win() {
+        let frames = build_lossy_compound_stream();
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        let out = decode_vp9_sequence(&refs).expect("compound sequence");
+        assert_eq!(out.len(), 3); // F1 is hidden; F2 re-displays it.
+
+        assert!(
+            frames[3].len() * 3 < frames[1].len(),
+            "compound cross-fade frame ({} B) should be far below the single-ref noise frame ({} B)",
+            frames[3].len(),
+            frames[1].len()
+        );
+
+        // Byte-determinism (fixture staging relies on it).
+        assert_eq!(frames, build_lossy_compound_stream());
+    }
+
+    /// Fixture-staging generator (round 418): stages the compound
+    /// stream as `lossy-compound-elected/input.ivf` under
+    /// `OXIDEAV_VP9_STAGE_DIR`.
+    #[test]
+    fn stage_lossy_compound_fixture_when_requested() {
+        let Some(dir) = std::env::var_os("OXIDEAV_VP9_STAGE_DIR") else {
+            return;
+        };
+        let frames = build_lossy_compound_stream();
+        let ivf = ivf_wrap_64x64(&frames);
+        let subdir = std::path::Path::new(&dir).join("lossy-compound-elected");
+        std::fs::create_dir_all(&subdir).expect("create stage dir");
+        std::fs::write(subdir.join("input.ivf"), &ivf).expect("write input.ivf");
+    }
+
+    /// The staged corpus fixture is byte-identical to the builder's
+    /// output — the fixture IS this crate's writer output (docs-gated).
+    #[test]
+    fn staged_lossy_compound_fixture_matches_builder() {
+        let path =
+            std::path::Path::new("../../docs/video/vp9/fixtures/lossy-compound-elected/input.ivf");
+        if !path.is_file() {
+            eprintln!("docs corpus not present; docs-gated");
+            return;
+        }
+        let staged = std::fs::read(path).expect("staged input.ivf");
+        assert_eq!(
+            staged,
+            ivf_wrap_64x64(&build_lossy_compound_stream()),
             "staged fixture bytes != builder output"
         );
     }

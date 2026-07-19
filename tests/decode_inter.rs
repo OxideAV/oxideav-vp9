@@ -1022,8 +1022,14 @@ fn full_corpus_sequences_byte_exact() {
         //   VERT / HORZ / SPLIT below-8x8 leaves with per-cell NEWMV);
         //   the hand-planned sub8x8-inter-mvs fixture covers the
         //   writer branches, this one covers the election path.
+        // * lossy-compound-elected — the corpus's first *encoder-elected*
+        //   compound stream (the black-box compound fixtures place
+        //   compound blocks by their own heuristics): a cross-fade
+        //   frame whose search elects [LAST, ALTREF] Round2-average
+        //   leaves (reference_mode=SELECT) at a 26x rate win.
         "temporal-seg-predicted",
         "lossy-sub8x8-elected",
+        "lossy-compound-elected",
     ] {
         let base = root.join(name);
         let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");
@@ -1601,6 +1607,55 @@ fn round_418_fixture_flags_pin_their_feature_classes() {
         assert!(!h1.quantization.lossless, "lossy P-frame");
         assert_eq!(h1.quantization.base_q_idx, 80);
         assert_eq!(h1.refresh_frame_flags, 0x01, "refreshes slot 0");
+    }
+
+    // lossy-compound-elected: the cross-fade frame carries the ALTREF
+    // sign-bias asymmetry that admits compound prediction — on a
+    // NON-error-resilient header (§7.2 setup_past_independence zeroes
+    // the effective sign biases of error-resilient frames, so compound
+    // is uncodeable there) after a HIDDEN predecessor (keeping §7.2.6
+    // UsePrevFrameMvs at 0) — and its coded size shows the elected
+    // [LAST, ALTREF] average (a small fraction of the single-reference
+    // noise frame before it).
+    {
+        let ivf =
+            std::fs::read(root.join("lossy-compound-elected").join("input.ivf")).expect("ivf");
+        let chunks = ivf_chunks(&ivf);
+        assert_eq!(chunks.len(), 4, "4 coded packets");
+        let h0 = oxideav_vp9::parse_uncompressed_header(&chunks[0]).expect("F0");
+        assert_eq!(h0.frame_type, oxideav_vp9::FrameType::KeyFrame);
+        let parse_inter2 = |p: &[u8]| {
+            oxideav_vp9::parse_uncompressed_header_with_refs(
+                p,
+                Some(oxideav_vp9::RefFrameState {
+                    ref_dims: &ref_dims,
+                    color_config: h0.color_config,
+                }),
+            )
+            .expect("inter header")
+        };
+        // F1: hidden error-resilient single-reference predecessor.
+        let h1 = parse_inter2(&chunks[1]);
+        assert!(!h1.show_frame, "F1 is hidden");
+        assert!(h1.error_resilient_mode);
+        // F2: show_existing_frame displaying F1's slot.
+        let h2 = parse_inter2(&chunks[2]);
+        assert!(h2.show_existing_frame, "F2 is a show-existing packet");
+        // F3: the non-error-resilient compound frame.
+        let h3 = parse_inter2(&chunks[3]);
+        assert!(h3.show_frame && !h3.error_resilient_mode);
+        assert_eq!(
+            h3.ref_frame_sign_bias,
+            [false, false, true],
+            "ALTREF sign-bias asymmetry (compoundReferenceAllowed)"
+        );
+        assert_eq!(h3.ref_frame_idx, Some([0, 1, 1]));
+        assert!(
+            chunks[3].len() * 3 < chunks[1].len(),
+            "compound cross-fade frame ({} B) far below the single-ref noise frame ({} B)",
+            chunks[3].len(),
+            chunks[1].len()
+        );
     }
 }
 

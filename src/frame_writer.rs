@@ -776,6 +776,7 @@ pub(crate) fn assemble_inter_frame_planned(
         reference_mode: ReferenceMode::SingleReference,
         partitions: HashMap::new(), // default fallback = all-8x8 layout.
         prev_segment_ids: None,
+        prev_frame_mvs_absent: false,
     };
     let mut tree_planner: Box<InterTreePlanner<'_>> =
         Box::new(|lr: u32, lc: u32, subsize: u8, state: &Vp9FrameState| {
@@ -869,6 +870,13 @@ pub(crate) struct InterFrameTreePlan {
     /// `seg_id_predicted` branch predicts against it); ignored — and
     /// normally `None` — otherwise.
     pub prev_segment_ids: Option<Vec<u8>>,
+    /// Caller's assertion that the §7.2.6 `UsePrevFrameMvs` derivation
+    /// yields 0 for this frame *without* `error_resilient_mode` — true
+    /// when the previously-decoded frame is hidden (`show_frame == 0`),
+    /// intra, or differently sized. Non-`ZEROMV` leaves on a
+    /// non-error-resilient header are accepted only under this flag
+    /// (the writer models no previous-frame motion field).
+    pub prev_frame_mvs_absent: bool,
 }
 
 /// Assemble a complete VP9 **inter** frame over an **arbitrary §6.4.3
@@ -920,7 +928,11 @@ pub(crate) fn assemble_inter_frame_tree(
     let tx_mode = plan.tx_mode;
     let reference_mode = plan.reference_mode;
 
-    if hdr.frame_type != FrameType::NonKeyFrame || hdr.intra_only || !hdr.show_frame {
+    // Hidden (`show_frame == 0`) inter frames are accepted — the §6.2
+    // writer codes the explicit `intra_only = 0` flag for them — and
+    // serve as reference-building frames (e.g. the predecessor of a
+    // compound frame, keeping §7.2.6 UsePrevFrameMvs at 0).
+    if hdr.frame_type != FrameType::NonKeyFrame || hdr.intra_only {
         return Err(Error::Unsupported);
     }
     if hdr.tile_info.tile_cols_log2 != 0 || hdr.tile_info.tile_rows_log2 != 0 {
@@ -937,12 +949,25 @@ pub(crate) fn assemble_inter_frame_tree(
     let mi_rows = (hdr.frame_height + 7) >> 3;
     let switchable = hdr.interpolation_filter == 4;
     // sign_bias indexed by §3 ref value: [INTRA, LAST, GOLDEN, ALTREF].
-    let sign_bias = [
-        false,
-        hdr.ref_frame_sign_bias[0],
-        hdr.ref_frame_sign_bias[1],
-        hdr.ref_frame_sign_bias[2],
-    ];
+    // §7.2 setup_past_independence( ): an error-resilient frame's
+    // *effective* sign biases are all zero — the §6.2 bits are consumed
+    // before the reset runs, so the coded values are dead. Everything
+    // the writer derives from the biases (compoundReferenceAllowed,
+    // the §6.3.18 compound layout, §6.5 candidate sign flips) must use
+    // the effective values, exactly as the decoder does; in particular
+    // a non-single `reference_mode` is uncodeable on an
+    // error-resilient header (write_compressed_header_inter rejects it
+    // through the §6.3.12 compoundReferenceAllowed derivation).
+    let sign_bias = if hdr.error_resilient_mode {
+        [false; 4]
+    } else {
+        [
+            false,
+            hdr.ref_frame_sign_bias[0],
+            hdr.ref_frame_sign_bias[1],
+            hdr.ref_frame_sign_bias[2],
+        ]
+    };
 
     // §6.3 compressed header (default-probability path). The write
     // validates `reference_mode` against the sign-bias-derived
@@ -999,6 +1024,13 @@ pub(crate) fn assemble_inter_frame_tree(
     // PrevSegmentIds plane from the plan.
     let temporal_seg =
         hdr.segmentation.enabled && hdr.segmentation.update_map && hdr.segmentation.temporal_update;
+    // §7.2 setup_past_independence( ) clears PrevSegmentIds on an
+    // error-resilient frame — the §6.4.14 predictor would be the
+    // all-zero map, so a temporal update there is pointless and the
+    // writer's caller-supplied map could silently disagree with it.
+    if temporal_seg && hdr.error_resilient_mode {
+        return Err(Error::Unsupported);
+    }
     if temporal_seg
         && plan
             .prev_segment_ids
@@ -1081,7 +1113,7 @@ pub(crate) fn assemble_inter_frame_tree(
                     } else {
                         lp.y_mode != ZEROMV
                     };
-                    if any_non_zeromv && !hdr.error_resilient_mode {
+                    if any_non_zeromv && !hdr.error_resilient_mode && !plan.prev_frame_mvs_absent {
                         return Err(Error::Unsupported);
                     }
                     if lp.ref_frame[1] > crate::mode_info::INTRA_FRAME
@@ -1967,6 +1999,7 @@ mod tests {
             reference_mode: ReferenceMode::SingleReference,
             partitions,
             prev_segment_ids: None,
+            prev_frame_mvs_absent: false,
         };
         let mut seen: Vec<(u32, u32, u8)> = Vec::new();
         let mut planner: Box<InterTreePlanner> = Box::new(|r, c, subsize, _s| {
@@ -2014,6 +2047,7 @@ mod tests {
             reference_mode: ReferenceMode::SingleReference,
             partitions,
             prev_segment_ids: None,
+            prev_frame_mvs_absent: false,
         };
         // Quadrant -> tx size: TL 32x32, TR 16x16, BL 8x8, BR 4x4.
         let mut planner: Box<InterTreePlanner> = Box::new(|r, c, subsize, _s| {
@@ -2081,6 +2115,7 @@ mod tests {
             reference_mode: ReferenceMode::SingleReference,
             partitions,
             prev_segment_ids: None,
+            prev_frame_mvs_absent: false,
         };
         let zero_sub = crate::inter_block_writer::InterSubBlockSpec {
             modes: [crate::mode_info::ZEROMV; 4],
@@ -2142,6 +2177,7 @@ mod tests {
             reference_mode: ReferenceMode::SingleReference,
             partitions: HashMap::new(),
             prev_segment_ids: None,
+            prev_frame_mvs_absent: false,
         };
 
         // Leaf size disagreeing with the tree's subsize.
@@ -2209,6 +2245,7 @@ mod tests {
             reference_mode: ReferenceMode::SingleReference,
             partitions: sub_partitions,
             prev_segment_ids: None,
+            prev_frame_mvs_absent: false,
         };
         let mut p: Box<InterTreePlanner> =
             Box::new(|_r, _c, sz, _s| skip_leaf(sz, TxMode::Only4x4));
@@ -2256,6 +2293,7 @@ mod tests {
             reference_mode: ReferenceMode::SingleReference,
             partitions: HashMap::new(),
             prev_segment_ids: None,
+            prev_frame_mvs_absent: false,
         };
         // Variant A: every 8x8 leaf codes NEWMV [8, 8] (the first leaf
         // establishes the predictor; the rest re-code a zero diff).
@@ -2290,6 +2328,80 @@ mod tests {
     /// The tree assembler is byte-deterministic and byte-identical to the
     /// legacy all-8x8 assembler when given the fallback (empty) partition
     /// map — the delegation path is a strict generalisation.
+    /// §7.2 setup_past_independence( ): an error-resilient frame's
+    /// effective sign biases are zero, so `compoundReferenceAllowed` is
+    /// 0 and a non-single `reference_mode` is uncodeable — the
+    /// assembler must reject it even when the header carries asymmetric
+    /// *coded* biases. Likewise a temporal seg-map update is rejected
+    /// (PrevSegmentIds is cleared on error-resilient frames).
+    #[test]
+    fn error_resilient_rejects_compound_and_temporal_seg() {
+        use crate::mode_info::{LAST_FRAME, NONE_REF_FRAME, ZEROMV};
+
+        let mut hdr = inter_header(64, 64);
+        hdr.error_resilient_mode = true;
+        hdr.ref_frame_sign_bias = [false, false, true]; // dead bits under ER
+        let plan = InterFrameTreePlan {
+            tx_mode: TxMode::Only4x4,
+            reference_mode: ReferenceMode::ReferenceModeSelect,
+            partitions: HashMap::new(),
+            prev_segment_ids: None,
+            prev_frame_mvs_absent: false,
+        };
+        let mut p: Box<InterTreePlanner> = Box::new(|_r, _c, subsize, _s| InterTreeLeaf {
+            mi_size: subsize,
+            tx_size: 0,
+            y_mode: ZEROMV,
+            interp_filter: 0,
+            ref_frame: [LAST_FRAME, NONE_REF_FRAME],
+            mv: [[0, 0], [0, 0]],
+            skip: true,
+            segment_id: 0,
+            sub: None,
+        });
+        let mut c = no_coeffs();
+        assert_eq!(
+            assemble_inter_frame_tree(&hdr, &plan, &mut *p, &mut *c).unwrap_err(),
+            Error::Unsupported,
+            "ER + REFERENCE_MODE_SELECT must be uncodeable"
+        );
+
+        // Temporal seg-map on an error-resilient frame.
+        let mut hdr2 = inter_header(64, 64);
+        hdr2.error_resilient_mode = true;
+        let mut seg = crate::header::SegmentationParams::default_disabled();
+        seg.enabled = true;
+        seg.update_map = true;
+        seg.temporal_update = true;
+        seg.tree_probs = Some([128; 7]);
+        seg.pred_prob = Some([128; 3]);
+        hdr2.segmentation = seg;
+        let plan2 = InterFrameTreePlan {
+            tx_mode: TxMode::Only4x4,
+            reference_mode: ReferenceMode::SingleReference,
+            partitions: HashMap::new(),
+            prev_segment_ids: Some(vec![0u8; 64]),
+            prev_frame_mvs_absent: false,
+        };
+        let mut p2: Box<InterTreePlanner> = Box::new(|_r, _c, subsize, _s| InterTreeLeaf {
+            mi_size: subsize,
+            tx_size: 0,
+            y_mode: ZEROMV,
+            interp_filter: 0,
+            ref_frame: [LAST_FRAME, NONE_REF_FRAME],
+            mv: [[0, 0], [0, 0]],
+            skip: true,
+            segment_id: 0,
+            sub: None,
+        });
+        let mut c2 = no_coeffs();
+        assert_eq!(
+            assemble_inter_frame_tree(&hdr2, &plan2, &mut *p2, &mut *c2).unwrap_err(),
+            Error::Unsupported,
+            "ER + temporal seg-map must be uncodeable"
+        );
+    }
+
     #[test]
     fn inter_tree_assembly_matches_all_8x8_and_is_deterministic() {
         let h = inter_header(40, 24);
@@ -2299,6 +2411,7 @@ mod tests {
             reference_mode: ReferenceMode::SingleReference,
             partitions: HashMap::new(),
             prev_segment_ids: None,
+            prev_frame_mvs_absent: false,
         };
         let mut p: Box<InterTreePlanner> =
             Box::new(|_r, _c, sz, _s| skip_leaf(sz, TxMode::Only4x4));

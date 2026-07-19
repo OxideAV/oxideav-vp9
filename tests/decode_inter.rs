@@ -1007,6 +1007,16 @@ fn full_corpus_sequences_byte_exact() {
         //   render_size() call sites; self-encoded.
         "sub8x8-inter-mvs",
         "render-size-128x72",
+        // Round-418 corpus extension (notes.md in the dir):
+        //
+        // * temporal-seg-predicted — the corpus's first *writer-side*
+        //   §6.4.12 temporal seg-map stream: a non-temporal P-frame
+        //   establishes a visible SEG_LVL_REF_FRAME=GOLDEN band, then
+        //   two segmentation_temporal_update=1 P-frames shift the band
+        //   with hand-planned seg_id_predicted=1 rows and §6.4.7 tree
+        //   escapes (the AQ heuristics of black-box encoders place
+        //   temporal updates uncontrollably); self-encoded.
+        "temporal-seg-predicted",
     ] {
         let base = root.join(name);
         let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");
@@ -1489,6 +1499,72 @@ fn round_415_fixture_flags_pin_their_feature_classes() {
         assert!(h1.quantization.lossless, "lossless P-frame (WHT residual)");
         assert_eq!(h1.refresh_frame_flags, 0x01, "refreshes slot 0");
     }
+}
+
+/// Round-418 corpus extension: the `temporal-seg-predicted` fixture's
+/// headers carry the flags that make it exercise the §6.4.12 temporal
+/// seg-map writer class — one non-temporal map-establishing P-frame,
+/// then two `segmentation_temporal_update = 1` P-frames with a coded
+/// `segmentation_pred_prob`. (The predicted/escape block placement is
+/// below header level; the crate's
+/// `staged_temporal_segmap_fixture_matches_builder` unit test pins the
+/// staged bytes as the writer's exact output.)
+#[test]
+fn round_418_fixture_flags_pin_their_feature_classes() {
+    let root = std::path::Path::new("../../docs/video/vp9/fixtures");
+    if !root.is_dir() {
+        eprintln!("docs corpus not present; docs-gated");
+        return;
+    }
+
+    let ivf = std::fs::read(root.join("temporal-seg-predicted").join("input.ivf")).expect("ivf");
+    let chunks = ivf_chunks(&ivf);
+    assert_eq!(chunks.len(), 6, "6 coded packets");
+    let h0 = oxideav_vp9::parse_uncompressed_header(&chunks[0]).expect("F0");
+    assert_eq!(h0.frame_type, oxideav_vp9::FrameType::KeyFrame);
+    let cc0 = h0.color_config;
+    let h1 = oxideav_vp9::parse_uncompressed_header(&chunks[1]).expect("F1");
+    assert!(h1.intra_only && !h1.show_frame, "hidden intra-only frame");
+
+    let ref_dims = vec![(64u32, 64u32); 8];
+    let parse_inter = |p: &[u8]| {
+        oxideav_vp9::parse_uncompressed_header_with_refs(
+            p,
+            Some(oxideav_vp9::RefFrameState {
+                ref_dims: &ref_dims,
+                color_config: cc0,
+            }),
+        )
+        .expect("inter header")
+    };
+
+    // F2: non-temporal map establishment.
+    let h2 = parse_inter(&chunks[2]);
+    assert!(h2.segmentation.enabled && h2.segmentation.update_map);
+    assert!(
+        !h2.segmentation.temporal_update,
+        "F2 codes the map via the tree"
+    );
+
+    // F3 / F4: temporal updates with a coded pred_prob.
+    for (i, p) in [&chunks[3], &chunks[4]].into_iter().enumerate() {
+        let h = parse_inter(p);
+        assert!(h.segmentation.enabled && h.segmentation.update_map);
+        assert!(
+            h.segmentation.temporal_update,
+            "frame {}: segmentation_temporal_update",
+            i + 3
+        );
+        assert!(
+            h.segmentation.pred_prob.is_some(),
+            "frame {}: segmentation_pred_prob present",
+            i + 3
+        );
+    }
+
+    // F5: the copy frame runs with segmentation off.
+    let h5 = parse_inter(&chunks[5]);
+    assert!(!h5.segmentation.enabled, "copy frame: segmentation off");
 }
 
 /// §6.4.14 / §8.1 segment-map threading + §7.2.10 segmentation feature

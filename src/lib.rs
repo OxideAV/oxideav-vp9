@@ -1992,6 +1992,288 @@ mod encode_roundtrip_tests {
         );
     }
 
+    // ----- §6.4.12 temporal-predicted segment ids (round 418) -----
+
+    /// The round-418 temporal-seg-map segmentation parameters: a live
+    /// two-segment map whose segment 1 carries `SEG_LVL_REF_FRAME =
+    /// GOLDEN` (so the map is *visible* — segment-1 blocks reconstruct
+    /// from the GOLDEN slot's pattern-B content), coded either
+    /// non-temporally (the §6.4.7 tree) or temporally (the §6.4.12
+    /// `seg_id_predicted` branch under `segmentation_pred_prob`).
+    fn temporal_seg_params(temporal: bool) -> crate::header::SegmentationParams {
+        use crate::mode_info::SEG_LVL_REF_FRAME;
+        let mut seg = crate::header::SegmentationParams::default_disabled();
+        seg.enabled = true;
+        seg.update_map = true;
+        seg.temporal_update = temporal;
+        seg.tree_probs = Some([128; 7]);
+        if temporal {
+            seg.pred_prob = Some([180, 128, 220]);
+        }
+        seg.update_data = true;
+        seg.abs_or_delta_update = false;
+        seg.feature_enabled[1][SEG_LVL_REF_FRAME] = true;
+        seg.feature_data[1][SEG_LVL_REF_FRAME] = crate::mode_info::GOLDEN_FRAME as i16;
+        seg
+    }
+
+    /// The round-418 segment map: MI rows `t..t+3` are segment 1 (the
+    /// GOLDEN-override band), everything else segment 0 (64x64 → an
+    /// 8x8 MI grid).
+    fn band_map(t: u32) -> Vec<u8> {
+        let mut map = vec![0u8; 64];
+        for r in t..(t + 3).min(8) {
+            for c in 0..8u32 {
+                map[(r * 8 + c) as usize] = 1;
+            }
+        }
+        map
+    }
+
+    /// The visible reconstruction the band map produces: pattern-B
+    /// content on the band's rows (luma rows `8t..8(t+3)`, chroma rows
+    /// `4t..4(t+3)`), pattern A elsewhere.
+    fn band_composite(t: usize) -> Vec<u8> {
+        let mut px = intra_only_pattern(0);
+        let pat_b = intra_only_pattern(1);
+        for y in 8 * t..8 * (t + 3) {
+            for x in 0..64usize {
+                px[y * 64 + x] = pat_b[y * 64 + x];
+            }
+        }
+        for plane in 0..2usize {
+            let off = 64 * 64 + plane * 32 * 32;
+            for y in 4 * t..4 * (t + 3) {
+                for x in 0..32usize {
+                    px[off + y * 32 + x] = pat_b[off + y * 32 + x];
+                }
+            }
+        }
+        px
+    }
+
+    /// Assemble one all-skip `ZEROMV` P-frame carrying the band map
+    /// (per-MI-row segment ids from `map`; segment-1 blocks take the
+    /// §6.4.13/§6.4.17 GOLDEN override, segment-0 blocks LAST), with
+    /// the map coded temporally against `prev` when supplied.
+    fn temporal_segmap_pframe(
+        hdr: &crate::header::Vp9FrameHeader,
+        map: &[u8],
+        prev: Option<Vec<u8>>,
+    ) -> Vec<u8> {
+        use crate::frame_writer::{
+            assemble_inter_frame_tree, FrameCoefSource, InterFrameTreePlan, InterTreeLeaf,
+            InterTreePlanner,
+        };
+        use crate::mode_info::{GOLDEN_FRAME, LAST_FRAME, NONE_REF_FRAME, ZEROMV};
+
+        let plan = InterFrameTreePlan {
+            tx_mode: crate::compressed::TxMode::Only4x4,
+            reference_mode: crate::compressed::ReferenceMode::SingleReference,
+            partitions: std::collections::HashMap::new(), // all-8x8 leaves
+            prev_segment_ids: prev,
+        };
+        let mut planner: Box<InterTreePlanner<'_>> =
+            Box::new(|lr: u32, lc: u32, subsize: u8, _state| {
+                let segment_id = map[(lr * 8 + lc) as usize];
+                let ref0 = if segment_id == 1 {
+                    GOLDEN_FRAME
+                } else {
+                    LAST_FRAME
+                };
+                InterTreeLeaf {
+                    mi_size: subsize,
+                    tx_size: 0, // inferred under Only4x4
+                    y_mode: ZEROMV,
+                    interp_filter: 0,
+                    ref_frame: [ref0, NONE_REF_FRAME],
+                    mv: [[0, 0], [0, 0]],
+                    skip: true,
+                    segment_id,
+                    sub: None,
+                }
+            });
+        let mut coeffs: Box<FrameCoefSource<'_>> = Box::new(|_r, _c, _p, _x, _y, _b| Vec::new());
+        assemble_inter_frame_tree(hdr, &plan, &mut planner, &mut coeffs).expect("segmap p-frame")
+    }
+
+    /// Build the round-418 **temporal-predicted segment-map** stream
+    /// (profile 0, 8-bit 4:2:0, 64x64):
+    ///
+    /// * F0 — shown lossless keyframe (pattern A), fills all slots.
+    /// * F1 — hidden lossless intra-only frame (pattern B) → slot 1.
+    /// * F2 — shown all-skip P-frame establishing the map
+    ///   **non-temporally** (§6.4.7 tree): segment-1 band on MI rows
+    ///   0..3 with `SEG_LVL_REF_FRAME = GOLDEN` (those rows reconstruct
+    ///   pattern B), refreshes nothing — its coded `SegmentIds` become
+    ///   the §6.4.14 `PrevSegmentIds`.
+    /// * F3 — shown all-skip P-frame, **`segmentation_temporal_update =
+    ///   1`**: the band shifts to rows 1..4, so the §6.4.12 walk codes
+    ///   `seg_id_predicted = 1` on the unchanged rows and the §6.4.7
+    ///   tree escape on rows 0 and 3, threading the ctx strips across
+    ///   the frame.
+    /// * F4 — shown all-skip P-frame, temporal again over F3's map:
+    ///   band rows 2..5 (escapes on rows 1 and 4) → slot 2.
+    /// * F5 — shown all-skip `ZEROMV` copy frame over slot 2 with
+    ///   segmentation disabled: a verbatim copy of F4's reconstruction.
+    ///
+    /// The black-box encoder wrappers only emit temporal seg-map
+    /// updates through their AQ heuristics (uncontrollable placement);
+    /// the *writer-side* §6.4.12 branch with hand-planned predicted /
+    /// escape blocks is only mintable by the in-crate writers.
+    fn build_temporal_segmap_stream() -> Vec<Vec<u8>> {
+        use crate::frame_writer::{assemble_inter_frame_all_skip_zeromv, inter_pframe_header};
+        use crate::pixel_encoder::{
+            encode_keyframe_lossless, lossless_keyframe_header, padded_plane_from_bytes,
+        };
+
+        // F0: shown keyframe, pattern A.
+        let kf = encode_vp9(&intra_only_pattern(0), 64, 64).expect("keyframe");
+
+        // F1: hidden intra-only frame, pattern B, lossless, slot 1.
+        let mut hdr1 = lossless_keyframe_header(64, 64);
+        hdr1.frame_type = FrameType::NonKeyFrame;
+        hdr1.intra_only = true;
+        hdr1.show_frame = false;
+        hdr1.reset_frame_context = 3;
+        hdr1.refresh_frame_context = false;
+        hdr1.refresh_frame_flags = 0x02;
+        let pat_b = intra_only_pattern(1);
+        let y = padded_plane_from_bytes(&pat_b[..64 * 64], 64, 64, 64, 64);
+        let u = padded_plane_from_bytes(&pat_b[64 * 64..64 * 64 + 32 * 32], 32, 32, 32, 32);
+        let v = padded_plane_from_bytes(&pat_b[64 * 64 + 32 * 32..], 32, 32, 32, 32);
+        let f1 = encode_keyframe_lossless(&hdr1, &[y, u, v]).expect("intra-only frame");
+
+        // F2: non-temporal map establishment (band rows 0..3).
+        let mut hdr2 = inter_pframe_header(64, 64);
+        hdr2.ref_frame_idx = Some([0, 1, 1]);
+        hdr2.refresh_frame_flags = 0;
+        hdr2.segmentation = temporal_seg_params(false);
+        let f2 = temporal_segmap_pframe(&hdr2, &band_map(0), None);
+
+        // F3: temporal update, band rows 1..4, predicted vs F2's map.
+        let mut hdr3 = inter_pframe_header(64, 64);
+        hdr3.ref_frame_idx = Some([0, 1, 1]);
+        hdr3.refresh_frame_flags = 0;
+        hdr3.segmentation = temporal_seg_params(true);
+        let f3 = temporal_segmap_pframe(&hdr3, &band_map(1), Some(band_map(0)));
+
+        // F4: temporal update, band rows 2..5, predicted vs F3's map.
+        let mut hdr4 = inter_pframe_header(64, 64);
+        hdr4.ref_frame_idx = Some([0, 1, 1]);
+        hdr4.refresh_frame_flags = 0x04;
+        hdr4.segmentation = temporal_seg_params(true);
+        let f4 = temporal_segmap_pframe(&hdr4, &band_map(2), Some(band_map(1)));
+
+        // F5: verbatim copy of F4's reconstruction (slot 2), seg off.
+        let mut hdr5 = inter_pframe_header(64, 64);
+        hdr5.ref_frame_idx = Some([2, 2, 2]);
+        hdr5.refresh_frame_flags = 0x08;
+        let f5 = assemble_inter_frame_all_skip_zeromv(&hdr5).expect("copy p-frame");
+
+        vec![kf, f1, f2, f3, f4, f5]
+    }
+
+    /// The temporal-seg-map stream decodes end-to-end with the map
+    /// semantics observable in the output: the GOLDEN-override band
+    /// (pattern B) sits at rows 0..3 / 1..4 / 2..5 across the three
+    /// map-bearing frames — the two temporal frames recover their maps
+    /// through the §6.4.12 `seg_id_predicted` walk over §6.4.14
+    /// `PrevSegmentIds` — and the copy frame equals the second temporal
+    /// frame byte-for-byte. Headers pin the feature class, and the
+    /// stream is byte-deterministic.
+    #[test]
+    fn temporal_segmap_sequence_decodes_with_observable_map_semantics() {
+        let frames = build_temporal_segmap_stream();
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        let out = decode_vp9_sequence(&refs).expect("temporal-segmap sequence");
+        assert_eq!(out.len(), 5); // F1 is hidden.
+
+        assert_eq!(
+            out[0].to_planar_bytes(),
+            intra_only_pattern(0),
+            "keyframe != pattern A"
+        );
+        assert_eq!(out[1].to_planar_bytes(), band_composite(0), "F2 band 0..3");
+        assert_eq!(
+            out[2].to_planar_bytes(),
+            band_composite(1),
+            "F3 (temporal) band 1..4"
+        );
+        assert_eq!(
+            out[3].to_planar_bytes(),
+            band_composite(2),
+            "F4 (temporal) band 2..5"
+        );
+        assert_eq!(
+            out[4].to_planar_bytes(),
+            out[3].to_planar_bytes(),
+            "copy frame != stored reconstruction"
+        );
+
+        // Header pins: F3/F4 code segmentation_temporal_update = 1 with
+        // the chosen pred_prob; F2 codes the non-temporal map.
+        let ref_dims = vec![(64u32, 64u32); 8];
+        let cc0 = crate::header::parse_uncompressed_header(&frames[0])
+            .expect("F0")
+            .color_config;
+        let parse_inter = |f: &[u8]| {
+            crate::header::parse_uncompressed_header_with_refs(
+                f,
+                Some(crate::header::RefFrameState {
+                    ref_dims: &ref_dims,
+                    color_config: cc0,
+                }),
+            )
+            .expect("inter header")
+        };
+        let h2 = parse_inter(&frames[2]);
+        assert!(h2.segmentation.enabled && h2.segmentation.update_map);
+        assert!(!h2.segmentation.temporal_update);
+        for f in [&frames[3], &frames[4]] {
+            let h = parse_inter(f);
+            assert!(h.segmentation.enabled && h.segmentation.update_map);
+            assert!(h.segmentation.temporal_update, "temporal seg-map frame");
+            assert_eq!(h.segmentation.pred_prob, Some([180, 128, 220]));
+        }
+
+        // Byte-determinism (fixture staging relies on it).
+        assert_eq!(frames, build_temporal_segmap_stream());
+    }
+
+    /// Fixture-staging generator (round 418): stages the temporal
+    /// seg-map stream as `temporal-seg-predicted/input.ivf` under
+    /// `OXIDEAV_VP9_STAGE_DIR`.
+    #[test]
+    fn stage_temporal_segmap_fixture_when_requested() {
+        let Some(dir) = std::env::var_os("OXIDEAV_VP9_STAGE_DIR") else {
+            return;
+        };
+        let frames = build_temporal_segmap_stream();
+        let ivf = ivf_wrap_64x64(&frames);
+        let subdir = std::path::Path::new(&dir).join("temporal-seg-predicted");
+        std::fs::create_dir_all(&subdir).expect("create stage dir");
+        std::fs::write(subdir.join("input.ivf"), &ivf).expect("write input.ivf");
+    }
+
+    /// The staged corpus fixture is byte-identical to the builder's
+    /// output — the fixture IS this crate's writer output (docs-gated).
+    #[test]
+    fn staged_temporal_segmap_fixture_matches_builder() {
+        let path =
+            std::path::Path::new("../../docs/video/vp9/fixtures/temporal-seg-predicted/input.ivf");
+        if !path.is_file() {
+            eprintln!("docs corpus not present; docs-gated");
+            return;
+        }
+        let staged = std::fs::read(path).expect("staged input.ivf");
+        assert_eq!(
+            staged,
+            ivf_wrap_64x64(&build_temporal_segmap_stream()),
+            "staged fixture bytes != builder output"
+        );
+    }
+
     /// Wrap coded frames in a minimal 64x64 IVF container (the layout
     /// every 64x64 staging generator in this module emits).
     fn ivf_wrap_64x64(frames: &[Vec<u8>]) -> Vec<u8> {

@@ -1016,7 +1016,14 @@ fn full_corpus_sequences_byte_exact() {
         //   with hand-planned seg_id_predicted=1 rows and §6.4.7 tree
         //   escapes (the AQ heuristics of black-box encoders place
         //   temporal updates uncontrollably); self-encoded.
+        // * lossy-sub8x8-elected — the corpus's first stream whose
+        //   sub-8x8 inter blocks are elected by the encoder's own
+        //   lossy partition search (per-quadrant probes electing
+        //   VERT / HORZ / SPLIT below-8x8 leaves with per-cell NEWMV);
+        //   the hand-planned sub8x8-inter-mvs fixture covers the
+        //   writer branches, this one covers the election path.
         "temporal-seg-predicted",
+        "lossy-sub8x8-elected",
     ] {
         let base = root.join(name);
         let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");
@@ -1565,6 +1572,36 @@ fn round_418_fixture_flags_pin_their_feature_classes() {
     // F5: the copy frame runs with segmentation off.
     let h5 = parse_inter(&chunks[5]);
     assert!(!h5.segmentation.enabled, "copy frame: segmentation off");
+
+    // lossy-sub8x8-elected: lossless keyframe + the error-resilient
+    // lossy P-frame the partition search planned (the sub-8x8 layout
+    // itself is below header level; the crate's
+    // `staged_lossy_sub8x8_fixture_matches_builder` unit test pins the
+    // staged bytes as the writer's exact output).
+    {
+        let ivf = std::fs::read(root.join("lossy-sub8x8-elected").join("input.ivf")).expect("ivf");
+        let chunks = ivf_chunks(&ivf);
+        assert_eq!(chunks.len(), 3, "3 coded packets");
+        let h0 = oxideav_vp9::parse_uncompressed_header(&chunks[0]).expect("F0");
+        assert_eq!(h0.frame_type, oxideav_vp9::FrameType::KeyFrame);
+        assert!(h0.quantization.lossless, "lossless keyframe");
+        let h1 = oxideav_vp9::parse_uncompressed_header_with_refs(
+            &chunks[1],
+            Some(oxideav_vp9::RefFrameState {
+                ref_dims: &ref_dims,
+                color_config: h0.color_config,
+            }),
+        )
+        .expect("F1");
+        assert_eq!(h1.frame_type, oxideav_vp9::FrameType::NonKeyFrame);
+        assert!(
+            h1.error_resilient_mode,
+            "NEWMV leaves require the §7.2.6 UsePrevFrameMvs == 0 model"
+        );
+        assert!(!h1.quantization.lossless, "lossy P-frame");
+        assert_eq!(h1.quantization.base_q_idx, 80);
+        assert_eq!(h1.refresh_frame_flags, 0x01, "refreshes slot 0");
+    }
 }
 
 /// §6.4.14 / §8.1 segment-map threading + §7.2.10 segmentation feature

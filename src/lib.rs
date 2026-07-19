@@ -2274,6 +2274,204 @@ mod encode_roundtrip_tests {
         );
     }
 
+    // ----- lossy sub-8x8 election (round 418) -----
+
+    /// Alias-free texture for the sub-8x8-election stream: a spatial
+    /// hash, so no two distinct small shifts of the plane agree on any
+    /// 4x4 block (the search must have a unique zero-SAD winner).
+    fn lossy_sub8x8_texture(x: i64, y: i64) -> i32 {
+        let v = (x as u64)
+            .wrapping_add((y as u64).wrapping_mul(131))
+            .wrapping_add(7);
+        let h = v
+            .wrapping_mul(v)
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add(v.wrapping_mul(97));
+        ((h >> 24) & 0xff) as i32
+    }
+
+    /// The luma displacement field of the sub-8x8-election stream:
+    /// three 8x8 cells whose 4x4 quadrants move divergently — MI (2,2)
+    /// left/right halves at `(0, ±4)` (VERT), MI (3,6) top/bottom
+    /// halves at `(±4, 0)` (HORZ), MI (5,5) all four quadrants distinct
+    /// (SPLIT) — everything else static.
+    fn lossy_sub8x8_disp(x: i64, y: i64) -> (i64, i64) {
+        let (cr, cc) = (y / 8, x / 8);
+        let (qr, qc) = ((y % 8) / 4, (x % 8) / 4);
+        match (cr, cc) {
+            (2, 2) => (0, if qc == 0 { 4 } else { -4 }),
+            (3, 6) => (if qr == 0 { 4 } else { -4 }, 0),
+            (5, 5) => (if qr == 0 { 4 } else { -4 }, if qc == 0 { 4 } else { -4 }),
+            _ => (0, 0),
+        }
+    }
+
+    /// Build the round-418 **lossy sub-8x8-elected** stream (profile 0,
+    /// 8-bit 4:2:0, 64x64):
+    ///
+    /// * F0 — shown **lossless** keyframe of the hash texture (the
+    ///   decoder's reference IS the texture), fills all slots.
+    /// * F1 — shown **lossy** P-frame (`base_q_idx = 80`) whose §6.4.3
+    ///   layout is elected by the content-adaptive partition search:
+    ///   three 8x8 cells carry opposing 4x4-quadrant motion, so the
+    ///   sub-8x8 probe elects one `PARTITION_VERT` (4x8), one
+    ///   `PARTITION_HORZ` (8x4) and one `PARTITION_SPLIT` (4x4) leaf
+    ///   with per-cell `NEWMV` vectors — exact predictions, so the
+    ///   leaves skip — while the static remainder merges upward into
+    ///   large `ZEROMV` leaves. Error-resilient, refreshes slot 0.
+    /// * F2 — shown all-skip `ZEROMV` copy frame over slot 0 (pins the
+    ///   §8.10 store of F1's reconstruction).
+    ///
+    /// Unlike `sub8x8-inter-mvs` (hand-planned layout), this stream's
+    /// sub-8x8 leaves are **search-elected** — the encoder's own RD
+    /// probe places them.
+    fn build_lossy_sub8x8_stream() -> Vec<Vec<u8>> {
+        use crate::frame_writer::assemble_inter_frame_all_skip_zeromv;
+        use crate::header::QuantizationParams;
+        use crate::intra::Plane;
+        use crate::pixel_encoder::{
+            encode_pframe_lossy_tree_motion, lossless_pframe_header, PFRAME_SEARCH_RANGE,
+        };
+
+        // F0: lossless keyframe of the texture.
+        let mut kf_px = vec![0u8; 64 * 64 + 2 * 32 * 32];
+        for y in 0..64i64 {
+            for x in 0..64i64 {
+                kf_px[(y * 64 + x) as usize] = lossy_sub8x8_texture(x, y) as u8;
+            }
+        }
+        for px in kf_px.iter_mut().skip(64 * 64) {
+            *px = 128;
+        }
+        let kf = encode_vp9(&kf_px, 64, 64).expect("lossless keyframe");
+
+        // F1: the search-elected sub-8x8 lossy P-frame.
+        let mut targets = [Plane::new(64, 64), Plane::new(32, 32), Plane::new(32, 32)];
+        for y in 0..64i64 {
+            for x in 0..64i64 {
+                let (dy, dx) = lossy_sub8x8_disp(x, y);
+                targets[0].set(x as usize, y as usize, lossy_sub8x8_texture(x + dx, y + dy));
+            }
+        }
+        for y in 0..32 {
+            for x in 0..32 {
+                targets[1].set(x, y, 128);
+                targets[2].set(x, y, 128);
+            }
+        }
+        let ref_y: Vec<i32> = (0..64i64)
+            .flat_map(|y| (0..64i64).map(move |x| lossy_sub8x8_texture(x, y)))
+            .collect();
+        let flat_uv: Vec<i32> = vec![128; 32 * 32];
+        let reference: [(&[i32], usize); 3] = [
+            (ref_y.as_slice(), 64),
+            (flat_uv.as_slice(), 32),
+            (flat_uv.as_slice(), 32),
+        ];
+        let mut hdr = lossless_pframe_header(64, 64);
+        hdr.quantization = QuantizationParams {
+            base_q_idx: 80,
+            delta_q_y_dc: 0,
+            delta_q_uv_dc: 0,
+            delta_q_uv_ac: 0,
+            lossless: false,
+        };
+        let (f1, _recon) = encode_pframe_lossy_tree_motion(
+            &hdr,
+            &targets,
+            &reference,
+            None,
+            64,
+            64,
+            PFRAME_SEARCH_RANGE,
+            false,
+            true,
+        )
+        .expect("sub-8x8-elected p-frame");
+
+        // F2: verbatim copy of F1's reconstruction (slot 0).
+        let mut hdr2 = lossless_pframe_header(64, 64);
+        hdr2.refresh_frame_flags = 0x02;
+        let f2 = assemble_inter_frame_all_skip_zeromv(&hdr2).expect("copy p-frame");
+
+        vec![kf, f1, f2]
+    }
+
+    /// The lossy sub-8x8-elected stream decodes byte-exact against the
+    /// encoder's reconstruction chain: the keyframe recovers the exact
+    /// texture (lossless), the search-elected sub-8x8 P-frame recovers
+    /// the displaced target **exactly** (the elected per-cell vectors
+    /// predict perfectly, so every sub-8x8 leaf skips), and the copy
+    /// frame equals it. Byte-deterministic.
+    #[test]
+    fn lossy_sub8x8_sequence_decodes_byte_exact() {
+        let frames = build_lossy_sub8x8_stream();
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        let out = decode_vp9_sequence(&refs).expect("lossy sub-8x8 sequence");
+        assert_eq!(out.len(), 3);
+
+        // F0: the exact texture.
+        for y in 0..64i64 {
+            for x in 0..64i64 {
+                assert_eq!(
+                    i64::from(out[0].y[(y * 64 + x) as usize]),
+                    i64::from(lossy_sub8x8_texture(x, y) as u8),
+                    "keyframe texture ({x},{y})"
+                );
+            }
+        }
+        // F1: the displaced target, exactly (all elected leaves predict
+        // perfectly and skip; the static remainder is a ZEROMV copy).
+        for y in 0..64i64 {
+            for x in 0..64i64 {
+                let (dy, dx) = lossy_sub8x8_disp(x, y);
+                assert_eq!(
+                    i64::from(out[1].y[(y * 64 + x) as usize]),
+                    i64::from(lossy_sub8x8_texture(x + dx, y + dy) as u8),
+                    "sub-8x8 frame ({x},{y})"
+                );
+            }
+        }
+        // F2: verbatim copy.
+        assert_eq!(out[2].to_planar_bytes(), out[1].to_planar_bytes());
+
+        // Byte-determinism (fixture staging relies on it).
+        assert_eq!(frames, build_lossy_sub8x8_stream());
+    }
+
+    /// Fixture-staging generator (round 418): stages the lossy
+    /// sub-8x8-elected stream as `lossy-sub8x8-elected/input.ivf` under
+    /// `OXIDEAV_VP9_STAGE_DIR`.
+    #[test]
+    fn stage_lossy_sub8x8_fixture_when_requested() {
+        let Some(dir) = std::env::var_os("OXIDEAV_VP9_STAGE_DIR") else {
+            return;
+        };
+        let frames = build_lossy_sub8x8_stream();
+        let ivf = ivf_wrap_64x64(&frames);
+        let subdir = std::path::Path::new(&dir).join("lossy-sub8x8-elected");
+        std::fs::create_dir_all(&subdir).expect("create stage dir");
+        std::fs::write(subdir.join("input.ivf"), &ivf).expect("write input.ivf");
+    }
+
+    /// The staged corpus fixture is byte-identical to the builder's
+    /// output — the fixture IS this crate's writer output (docs-gated).
+    #[test]
+    fn staged_lossy_sub8x8_fixture_matches_builder() {
+        let path =
+            std::path::Path::new("../../docs/video/vp9/fixtures/lossy-sub8x8-elected/input.ivf");
+        if !path.is_file() {
+            eprintln!("docs corpus not present; docs-gated");
+            return;
+        }
+        let staged = std::fs::read(path).expect("staged input.ivf");
+        assert_eq!(
+            staged,
+            ivf_wrap_64x64(&build_lossy_sub8x8_stream()),
+            "staged fixture bytes != builder output"
+        );
+    }
+
     /// Wrap coded frames in a minimal 64x64 IVF container (the layout
     /// every 64x64 staging generator in this module emits).
     fn ivf_wrap_64x64(frames: &[Vec<u8>]) -> Vec<u8> {

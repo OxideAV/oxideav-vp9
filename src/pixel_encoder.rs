@@ -2388,21 +2388,56 @@ type InterPartitionMap = std::collections::HashMap<(u32, u32, u8), u8>;
 /// Per-leaf integer motion-vector hints keyed by the leaf's top-left MI.
 type InterMvHints = std::collections::HashMap<(u32, u32), (i32, i32)>;
 
+/// A below-8x8 split the planner elected for one 8x8 MI cell: the
+/// §6.4.3 partition value at the `BLOCK_8X8` node (`PARTITION_HORZ` /
+/// `PARTITION_VERT` / `PARTITION_SPLIT`) plus the per-cell integer
+/// motion vectors in §6.4.16 `idy * 2 + idx` layout (only the cells the
+/// sub-8x8 walk visits are read).
+#[derive(Debug, Clone, Copy)]
+struct Sub8x8Hint {
+    partition: u8,
+    cell_mvs: [(i32, i32); 4],
+}
+
+/// Elected sub-8x8 splits keyed by the 8x8 cell's `(MiRow, MiCol)`.
+type InterSub8x8Hints = std::collections::HashMap<(u32, u32), Sub8x8Hint>;
+
+/// Margin a 4x4 quadrant's searched vector must beat its `ZEROMV` SAD
+/// by before the sub-8x8 probe adopts it (the quadrant-level analogue
+/// of [`NEWMV_SAD_MARGIN_PER_MI`], scaled to a quarter of the area).
+const SUB8X8_QUAD_MARGIN: u64 = 24;
+
+/// Per-coded-vector syntax margin a below-8x8 decomposition must beat
+/// the cell's best single-vector SAD by before it is elected: each
+/// visited cell codes its own `inter_mode` token and (for `NEWMV`)
+/// §6.4.20 mv-diff bits, so a split must pay for that rate in
+/// prediction error.
+const SUB8X8_SPLIT_MARGIN_PER_MV: u64 = 48;
+
 /// Plan the §6.4.3 partition tree of a lossy P-frame from its integer
 /// motion field — the inter counterpart of [`plan_keyframe_tree`].
 ///
 /// First every 8x8 MI cell full-searches an integer motion vector
 /// against the reference (electing `(0, 0)` unless the winner beats
-/// `ZEROMV` by [`NEWMV_SAD_MARGIN_PER_MI`]); then the superblock tree
-/// merges bottom-up: a node becomes one leaf when it is fully contained
-/// in the frame's MI extents **and** every 8x8 cell under it elected the
-/// same vector (uniform motion — one coded MV serves the whole leaf,
-/// and a larger transform can span the coherent residual). Anything
-/// else splits toward `BLOCK_8X8`.
+/// `ZEROMV` by [`NEWMV_SAD_MARGIN_PER_MI`]); then, with `sub8x8`
+/// enabled, each cell probes its four 4x4 quadrants independently — a
+/// cell whose quadrants elect **divergent** vectors that beat the best
+/// single-vector SAD by [`SUB8X8_SPLIT_MARGIN_PER_MV`] per coded vector
+/// becomes a below-8x8 leaf (`PARTITION_HORZ` → 8x4 when only the top /
+/// bottom halves differ, `PARTITION_VERT` → 4x8 when only the left /
+/// right halves differ, `PARTITION_SPLIT` → 4x4 otherwise) with
+/// per-cell MV hints; then the superblock tree merges bottom-up: a node
+/// becomes one leaf when it is fully contained in the frame's MI
+/// extents **and** every 8x8 cell under it elected the same vector with
+/// no sub-8x8 split (uniform motion — one coded MV serves the whole
+/// leaf, and a larger transform can span the coherent residual).
+/// Anything else splits toward `BLOCK_8X8`.
 ///
 /// Returns the partition map (feeding
-/// [`crate::frame_writer::InterFrameTreePlan`]) and the per-leaf
-/// integer-MV hints keyed by the leaf's top-left MI.
+/// [`crate::frame_writer::InterFrameTreePlan`]), the per-leaf
+/// integer-MV hints keyed by the leaf's top-left MI, and the elected
+/// sub-8x8 splits.
+#[allow(clippy::too_many_arguments)]
 fn plan_inter_partitions(
     targets: &[Plane; 3],
     reference: &[(&[i32], usize); 3],
@@ -2411,14 +2446,18 @@ fn plan_inter_partitions(
     mi_cols: u32,
     mi_rows: u32,
     search_range: i32,
-) -> (InterPartitionMap, InterMvHints) {
+    sub8x8: bool,
+) -> (InterPartitionMap, InterMvHints, InterSub8x8Hints) {
     use crate::partition::{
-        NUM_8X8_BLOCKS_WIDE_LOOKUP, PARTITION_NONE, PARTITION_SPLIT, SUBSIZE_LOOKUP,
+        NUM_8X8_BLOCKS_WIDE_LOOKUP, PARTITION_HORZ, PARTITION_NONE, PARTITION_SPLIT,
+        PARTITION_VERT, SUBSIZE_LOOKUP,
     };
     use crate::residual::BLOCK_64X64;
 
-    // The per-8x8-cell integer motion field.
+    // The per-8x8-cell integer motion field + each cell's effective
+    // (margin-adjusted) single-vector SAD.
     let mut field = vec![(0i32, 0i32); (mi_rows * mi_cols) as usize];
+    let mut cell_sad = vec![0u64; (mi_rows * mi_cols) as usize];
     if search_range > 0 {
         for r in 0..mi_rows {
             for c in 0..mi_cols {
@@ -2432,8 +2471,73 @@ fn plan_inter_partitions(
                     (r * 8) as i32,
                     search_range,
                 );
+                let cell = (r * mi_cols + c) as usize;
                 if (dy, dx) != (0, 0) && best_sad + NEWMV_SAD_MARGIN_PER_MI < zero_sad {
-                    field[(r * mi_cols + c) as usize] = (dy, dx);
+                    field[cell] = (dy, dx);
+                    cell_sad[cell] = best_sad + NEWMV_SAD_MARGIN_PER_MI;
+                } else {
+                    cell_sad[cell] = zero_sad;
+                }
+            }
+        }
+    }
+
+    // Sub-8x8 probe: per-quadrant 4x4 searches, shape selection from
+    // which quadrant pairs agree, and the per-coded-vector election
+    // margin against the cell's best single-vector SAD.
+    let mut sub_hints: InterSub8x8Hints = std::collections::HashMap::new();
+    if sub8x8 && search_range > 0 {
+        for r in 0..mi_rows {
+            for c in 0..mi_cols {
+                let cell = (r * mi_cols + c) as usize;
+                // Quadrants in §6.4.16 idy * 2 + idx layout.
+                let mut qmv = [(0i32, 0i32); 4];
+                let mut qsad = [0u64; 4];
+                for (q, (dy2, dx2)) in [(0i32, 0i32), (0, 1), (1, 0), (1, 1)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let ((dy, dx), best_sad, zero_sad) = search_block_mv_wh(
+                        &targets[0],
+                        reference[0].0,
+                        reference[0].1,
+                        ref_w as i32,
+                        ref_h as i32,
+                        (c * 8) as i32 + 4 * dx2,
+                        (r * 8) as i32 + 4 * dy2,
+                        4,
+                        4,
+                        search_range,
+                    );
+                    if (dy, dx) != (0, 0) && best_sad + SUB8X8_QUAD_MARGIN < zero_sad {
+                        qmv[q] = (dy, dx);
+                        qsad[q] = best_sad;
+                    } else {
+                        qsad[q] = zero_sad;
+                    }
+                }
+                if qmv.iter().all(|&m| m == qmv[0]) {
+                    continue; // uniform quadrant motion — no split.
+                }
+                // Shape: HORZ when rows agree, VERT when columns agree,
+                // SPLIT otherwise; coded-vector count per §6.4.16 (the
+                // visited cells).
+                let (partition, n_mvs) = if qmv[0] == qmv[1] && qmv[2] == qmv[3] {
+                    (PARTITION_HORZ, 2u64)
+                } else if qmv[0] == qmv[2] && qmv[1] == qmv[3] {
+                    (PARTITION_VERT, 2u64)
+                } else {
+                    (PARTITION_SPLIT, 4u64)
+                };
+                let sub_sad: u64 = qsad.iter().sum();
+                if sub_sad + SUB8X8_SPLIT_MARGIN_PER_MV * n_mvs < cell_sad[cell] {
+                    sub_hints.insert(
+                        (r, c),
+                        Sub8x8Hint {
+                            partition,
+                            cell_mvs: qmv,
+                        },
+                    );
                 }
             }
         }
@@ -2442,12 +2546,14 @@ fn plan_inter_partitions(
     let mut partitions = std::collections::HashMap::new();
     let mut hints = std::collections::HashMap::new();
 
-    // Recursive merge: leaf on contained + uniform motion.
+    // Recursive merge: leaf on contained + uniform motion (a cell with
+    // an elected sub-8x8 split never merges upward).
     // Spec-shaped geometry fan-in, matching the §6.4.3 recursion style.
     #[allow(clippy::too_many_arguments)]
     fn walk(
         partitions: &mut InterPartitionMap,
         hints: &mut InterMvHints,
+        sub_hints: &InterSub8x8Hints,
         field: &[(i32, i32)],
         mi_rows: u32,
         mi_cols: u32,
@@ -2463,12 +2569,14 @@ fn plan_inter_partitions(
         let half = num8x8 >> 1;
         let contained = (r + num8x8) <= mi_rows && (c + num8x8) <= mi_cols;
 
-        let mut merge = contained;
-        if contained {
+        let mut merge = contained && bsize != B8;
+        if merge {
             let mv0 = field[(r * mi_cols + c) as usize];
             'scan: for i in 0..num8x8 {
                 for j in 0..num8x8 {
-                    if field[((r + i) * mi_cols + (c + j)) as usize] != mv0 {
+                    if field[((r + i) * mi_cols + (c + j)) as usize] != mv0
+                        || sub_hints.contains_key(&(r + i, c + j))
+                    {
                         merge = false;
                         break 'scan;
                     }
@@ -2476,7 +2584,16 @@ fn plan_inter_partitions(
             }
         }
 
-        if merge || bsize == B8 {
+        if bsize == B8 {
+            if let Some(hint) = sub_hints.get(&(r, c)) {
+                partitions.insert((r, c, bsize), hint.partition);
+            } else {
+                partitions.insert((r, c, bsize), PARTITION_NONE);
+                hints.insert((r, c), field[(r * mi_cols + c) as usize]);
+            }
+            return;
+        }
+        if merge {
             partitions.insert((r, c, bsize), PARTITION_NONE);
             hints.insert((r, c), field[(r * mi_cols + c) as usize]);
             return;
@@ -2487,6 +2604,7 @@ fn plan_inter_partitions(
             walk(
                 partitions,
                 hints,
+                sub_hints,
                 field,
                 mi_rows,
                 mi_cols,
@@ -2502,6 +2620,7 @@ fn plan_inter_partitions(
             walk(
                 &mut partitions,
                 &mut hints,
+                &sub_hints,
                 &field,
                 mi_rows,
                 mi_cols,
@@ -2511,7 +2630,7 @@ fn plan_inter_partitions(
             );
         }
     }
-    (partitions, hints)
+    (partitions, hints, sub_hints)
 }
 
 /// One quantized transform block of an inter leaf: `(plane, start_x,
@@ -2716,6 +2835,203 @@ fn leaf_contains(
     sx >= base_x && sx < base_x + region_w && sy >= base_y && sy < base_y + region_h
 }
 
+/// Plan + reconstruct one **elected sub-8x8 leaf** of the lossy tree
+/// encoder: build the §6.4.16 per-cell spec from the planner's
+/// [`Sub8x8Hint`] (per-cell `NEWMV` for searched vectors — snapped
+/// §6.4.20-codeable against the leaf's §6.5.12 `BestMv` under the
+/// §6.5.13 `use_mv_hp` gate, exactly as the writer will verify —
+/// `ZEROMV` otherwise), predict via the decoder-mirror per-`blockIdx`
+/// §8.5.2 walk, elect skip at the forced `TX_4X4` (§6.4.10 codes no tx
+/// bits below 8x8), replay the §8.6.2 reconstruction for coded blocks,
+/// and apply the same strict-SSE-improvement skip guard as `>= 8x8`
+/// leaves. Single-reference `LAST` (the planner's motion field).
+#[allow(clippy::too_many_arguments)]
+fn plan_sub8x8_leaf(
+    hint: &Sub8x8Hint,
+    allow_high_precision_mv: bool,
+    targets: &[Plane; 3],
+    reference: &[(&[i32], usize); 3],
+    ref_w: u32,
+    ref_h: u32,
+    r: u32,
+    c: u32,
+    subsize: u8,
+    mi_cols: u32,
+    mi_rows: u32,
+    ssx: bool,
+    ssy: bool,
+    bit_depth: u32,
+    seg: &SegmentationParams,
+    quant: &QuantizationParams,
+    sign_bias: &[bool; 4],
+    state: &crate::decode_block::Vp9FrameState,
+    work: &mut ReconState,
+    token_cache: &mut std::collections::HashMap<(usize, u32, u32), Vec<i64>>,
+) -> crate::frame_writer::InterTreeLeaf {
+    use crate::frame_writer::InterTreeLeaf;
+    use crate::inter_block_writer::InterSubBlockSpec;
+    use crate::inter_decode::FrameStateMvSource;
+    use crate::mode_info::{LAST_FRAME, NEWMV, NONE_REF_FRAME, ZEROMV};
+    use crate::mv::use_mv_hp;
+    use crate::mv_ref::MvRefGeometry;
+    use crate::residual::{BLOCK_4X4, BLOCK_4X8, BLOCK_8X4};
+
+    // The §6.4.16 walk's visited cells for this shape.
+    let cells: &[usize] = match subsize {
+        BLOCK_4X4 => &[0, 1, 2, 3],
+        BLOCK_4X8 => &[0, 1],
+        BLOCK_8X4 => &[0, 2],
+        _ => unreachable!("sub-8x8 leaf with MiSize >= BLOCK_8X8"),
+    };
+
+    // §6.5.12 BestMv at the leaf's own geometry (the writer derives the
+    // identical value from the shared state).
+    let geom = MvRefGeometry {
+        mi_row: r as i32,
+        mi_col: c as i32,
+        mi_rows: mi_rows as i32,
+        mi_cols: mi_cols as i32,
+        mi_size: subsize as usize,
+        mi_col_start: 0,
+        mi_col_end: mi_cols as i32,
+    };
+    let src = FrameStateMvSource::new(state, None);
+    let mv_refs = geom.find_mv_refs(&src, LAST_FRAME, -1, sign_bias, false);
+    let best = geom.find_best_ref_mvs(mv_refs.ref_list_mv, allow_high_precision_mv)[0];
+    let use_hp = allow_high_precision_mv && use_mv_hp(best);
+
+    let mut modes = [ZEROMV; 4];
+    let mut mvs = [[[0i32; 2]; 2]; 4];
+    for &cell in cells {
+        let (dy, dx) = hint.cell_mvs[cell];
+        if (dy, dx) != (0, 0) {
+            let mut m = [8 * dy, 8 * dx];
+            for (comp, mm) in m.iter_mut().enumerate() {
+                let d = *mm - best[comp];
+                if d != 0 && !use_hp && (d & 1) != 0 {
+                    // Only even-magnitude differences are codeable
+                    // without the hp bit; nudge by one eighth-pel.
+                    *mm -= 1;
+                }
+            }
+            modes[cell] = NEWMV;
+            mvs[cell][0] = m;
+        }
+    }
+    let sub = InterSubBlockSpec { modes, mvs };
+
+    // Decoder-mirror per-blockIdx §8.5.2 prediction.
+    let block_mvs = sub8x8_block_mvs(subsize, &sub);
+    predict_inter_leaf_sub8x8(
+        &mut work.planes,
+        reference,
+        None,
+        ref_w,
+        ref_h,
+        r,
+        c,
+        subsize,
+        &block_mvs,
+        mi_cols,
+        mi_rows,
+        ssx,
+        ssy,
+        bit_depth,
+    );
+
+    // Trial quantization at the forced TX_4X4 (the only §6.4.10
+    // candidate below 8x8), then the skip / strict-SSE-guard election.
+    let (tx, blocks, all_zero) = select_inter_leaf_tx(
+        targets,
+        &work.planes,
+        r,
+        c,
+        subsize,
+        mi_cols,
+        mi_rows,
+        ssx,
+        ssy,
+        bit_depth,
+        seg,
+        quant,
+    );
+    debug_assert_eq!(tx, 0, "sub-8x8 leaves are TX_4X4 only");
+    let mut skip = all_zero;
+    if !skip {
+        let sse_skip = leaf_sse(
+            targets,
+            &work.planes,
+            r,
+            c,
+            subsize,
+            mi_cols,
+            mi_rows,
+            ssx,
+            ssy,
+        );
+        for (plane, sx, sy, tx_sz, block) in blocks {
+            let dc_q = get_dc_quant(plane, seg, quant, 0, bit_depth as u8);
+            let ac_q = get_ac_quant(plane, seg, quant, 0, bit_depth as u8);
+            reconstruct_block(
+                &mut work.planes[plane],
+                sx as usize,
+                sy as usize,
+                tx_sz,
+                &block,
+                dc_q,
+                ac_q,
+                DCT_DCT,
+                false,
+                bit_depth,
+            );
+            token_cache.insert((plane, sx, sy), block);
+        }
+        let sse_coded = leaf_sse(
+            targets,
+            &work.planes,
+            r,
+            c,
+            subsize,
+            mi_cols,
+            mi_rows,
+            ssx,
+            ssy,
+        );
+        if sse_coded >= sse_skip {
+            token_cache
+                .retain(|&(p, sx, sy), _| !leaf_contains(r, c, subsize, ssx, ssy, p, sx, sy));
+            predict_inter_leaf_sub8x8(
+                &mut work.planes,
+                reference,
+                None,
+                ref_w,
+                ref_h,
+                r,
+                c,
+                subsize,
+                &block_mvs,
+                mi_cols,
+                mi_rows,
+                ssx,
+                ssy,
+                bit_depth,
+            );
+            skip = true;
+        }
+    }
+    InterTreeLeaf {
+        mi_size: subsize,
+        tx_size: 0,
+        y_mode: ZEROMV, // ignored for sub-8x8 (per-cell modes apply)
+        interp_filter: 0,
+        ref_frame: [LAST_FRAME, NONE_REF_FRAME],
+        mv: [[0, 0], [0, 0]],
+        skip,
+        segment_id: 0,
+        sub: Some(sub),
+    }
+}
+
 /// Encode one **lossy** P-frame over a content-adaptive §6.4.3 partition
 /// tree — [`encode_pframe_lossy_motion`] generalised past the fixed
 /// all-`BLOCK_8X8` / inferred-`TX_8X8` layout:
@@ -2751,6 +3067,17 @@ fn leaf_contains(
 /// `golden` planes (the sequence encoders park the keyframe there as a
 /// long-term reference).
 ///
+/// With `sub8x8 == true` the planner additionally probes each 8x8
+/// cell's four 4x4 quadrants and elects a below-8x8 leaf (4x4 / 4x8 /
+/// 8x4 per the agreeing quadrant pairs) where divergent per-quadrant
+/// motion beats the best single vector by the per-coded-vector margin
+/// ([`plan_inter_partitions`]); elected leaves code the §6.4.16
+/// per-`(idy, idx)` walk (per-cell `NEWMV` / `ZEROMV` over `LAST`,
+/// snapped §6.4.20-codeable against the leaf's §6.5.12 `BestMv`),
+/// predict via the decoder-mirror per-`blockIdx` §8.5.2 walk, and run
+/// the same skip / SSE-guard election as `>= 8x8` leaves at the forced
+/// `TX_4X4`.
+///
 /// Requires an error-resilient non-key lossy header (see
 /// [`crate::frame_writer::assemble_inter_frame_tree`]).
 // Spec-shaped fan-in (header + targets + per-reference planes + search
@@ -2765,6 +3092,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
     ref_h: u32,
     search_range: i32,
     subpel: bool,
+    sub8x8: bool,
 ) -> Result<(Vec<u8>, ReconState), Error> {
     use crate::frame_writer::{InterFrameTreePlan, InterTreeLeaf, InterTreePlanner};
     use crate::inter_decode::FrameStateMvSource;
@@ -2791,7 +3119,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
     let seg = hdr.segmentation;
     let quant = hdr.quantization;
 
-    let (partitions, _hints) = plan_inter_partitions(
+    let (partitions, _hints, sub_hints) = plan_inter_partitions(
         targets,
         reference,
         ref_w,
@@ -2799,6 +3127,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
         mi_cols,
         mi_rows,
         search_range,
+        sub8x8,
     );
 
     let work = RefCell::new(ReconState::new(mi_cols, mi_rows, ssx, ssy, bit_depth));
@@ -2825,6 +3154,35 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
 
     let mut planner: Box<InterTreePlanner<'_>> =
         Box::new(|r: u32, c: u32, subsize: u8, state| -> InterTreeLeaf {
+            // Elected sub-8x8 leaves: the §6.4.16 per-cell walk over the
+            // planner's quadrant hints (single-reference LAST).
+            if subsize < crate::residual::BLOCK_8X8 {
+                let hint = *sub_hints
+                    .get(&(r, c))
+                    .expect("sub-8x8 leaf without an elected hint");
+                return plan_sub8x8_leaf(
+                    &hint,
+                    hdr.allow_high_precision_mv,
+                    targets,
+                    reference,
+                    ref_w,
+                    ref_h,
+                    r,
+                    c,
+                    subsize,
+                    mi_cols,
+                    mi_rows,
+                    ssx,
+                    ssy,
+                    bit_depth,
+                    &seg,
+                    &quant,
+                    &sign_bias,
+                    state,
+                    &mut work.borrow_mut(),
+                    &mut token_cache.borrow_mut(),
+                );
+            }
             let max_tx = MAX_TXSIZE_LOOKUP[subsize as usize];
             let num8x8 = u32::from(crate::partition::NUM_8X8_BLOCKS_WIDE_LOOKUP[subsize as usize]);
 
@@ -3325,6 +3683,7 @@ pub(crate) fn encode_sequence_lossy_420(
             height,
             PFRAME_SEARCH_RANGE,
             true,
+            true,
         )?;
         out.push(bytes);
         prev_recon = recon;
@@ -3472,6 +3831,7 @@ pub(crate) fn encode_sequence_lossy_rc_420(
                     width,
                     height,
                     PFRAME_SEARCH_RANGE,
+                    true,
                     true,
                 )
             },
@@ -5334,6 +5694,7 @@ mod tests {
             h,
             PFRAME_SEARCH_RANGE,
             true,
+            true, // the sequence encoder runs with sub-8x8 election on
         )
         .expect("re-encode last hop");
         assert_eq!(bytes, coded[3], "re-encoded last frame must be identical");
@@ -5593,11 +5954,12 @@ mod tests {
         };
 
         let (subpel, subpel_recon) =
-            encode_pframe_lossy_tree_motion(&hdr, &targets, &reference, None, w, h, 8, true)
+            encode_pframe_lossy_tree_motion(&hdr, &targets, &reference, None, w, h, 8, true, false)
                 .expect("subpel");
-        let (fullpel, _) =
-            encode_pframe_lossy_tree_motion(&hdr, &targets, &reference, None, w, h, 8, false)
-                .expect("fullpel");
+        let (fullpel, _) = encode_pframe_lossy_tree_motion(
+            &hdr, &targets, &reference, None, w, h, 8, false, false,
+        )
+        .expect("fullpel");
         assert!(
             subpel.len() < fullpel.len(),
             "sub-pel tree ({} B) should beat full-pel tree ({} B) on half-pel motion",
@@ -5706,6 +6068,7 @@ mod tests {
             h,
             PFRAME_SEARCH_RANGE,
             true,
+            false,
         )
         .expect("p1");
         let prev = [
@@ -5725,6 +6088,7 @@ mod tests {
             h,
             PFRAME_SEARCH_RANGE,
             true,
+            false,
         )
         .expect("p2 multi");
         let (p2_single, _) = encode_pframe_lossy_tree_motion(
@@ -5736,6 +6100,7 @@ mod tests {
             h,
             PFRAME_SEARCH_RANGE,
             true,
+            false,
         )
         .expect("p2 single");
         assert!(
@@ -5851,6 +6216,7 @@ mod tests {
             h,
             PFRAME_SEARCH_RANGE,
             true,
+            false,
         )
         .expect("p1");
         let prev = crop3(&p1_recon);
@@ -5865,6 +6231,7 @@ mod tests {
             h,
             PFRAME_SEARCH_RANGE,
             true,
+            false,
         )
         .expect("p2 compound");
         // Baseline: same references, but symmetric sign biases forbid
@@ -5880,6 +6247,7 @@ mod tests {
             h,
             PFRAME_SEARCH_RANGE,
             true,
+            false,
         )
         .expect("p2 single");
         assert!(
@@ -5958,8 +6326,8 @@ mod tests {
         // frame exactly like the §8.5.2.4 edge-clamped reference read —
         // so the vector is a perfect match on edge cells too.
         let uniform = mk_targets(&|x, y| tree_pattern((x + 3).min(63), (y + 2).min(63)));
-        let (parts, hints) =
-            plan_inter_partitions(&uniform, &reference, 64, 64, mi_cols, mi_rows, 8);
+        let (parts, hints, _sub) =
+            plan_inter_partitions(&uniform, &reference, 64, 64, mi_cols, mi_rows, 8, false);
         assert_eq!(
             parts.get(&(0, 0, BLOCK_64X64)),
             Some(&PARTITION_NONE),
@@ -5981,7 +6349,8 @@ mod tests {
                 tree_pattern(x, y)
             }
         });
-        let (parts, hints) = plan_inter_partitions(&mixed, &reference, 64, 64, mi_cols, mi_rows, 8);
+        let (parts, hints, _sub) =
+            plan_inter_partitions(&mixed, &reference, 64, 64, mi_cols, mi_rows, 8, false);
         assert_eq!(
             parts.get(&(0, 0, BLOCK_64X64)),
             Some(&PARTITION_SPLIT),
@@ -5991,6 +6360,230 @@ mod tests {
         assert_eq!(parts.get(&(0, 4, BLOCK_32X32)), Some(&PARTITION_NONE));
         assert_eq!(hints.get(&(0, 0)), Some(&(2, 3)), "moving quadrant MV");
         assert_eq!(hints.get(&(0, 4)), Some(&(0, 0)), "static quadrant MV");
+    }
+
+    /// Alias-free texture for the sub-8x8 election tests: a spatial
+    /// hash, so no two distinct small shifts of the plane agree on any
+    /// 4x4 block (the structured `tree_pattern` aliases at 4x4 scale).
+    fn sub8x8_texture(x: i64, y: i64) -> i32 {
+        let v = (x as u64)
+            .wrapping_add((y as u64).wrapping_mul(131))
+            .wrapping_add(7);
+        let h = v
+            .wrapping_mul(v)
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add(v.wrapping_mul(97));
+        ((h >> 24) & 0xff) as i32
+    }
+
+    /// The luma displacement field of the sub-8x8 election tests: three
+    /// 8x8 cells whose 4x4 quadrants move divergently — MI (2,2) left /
+    /// right halves at `(0, ±4)` (VERT), MI (3,6) top / bottom halves
+    /// at `(±4, 0)` (HORZ), MI (5,5) all four quadrants distinct
+    /// (SPLIT) — everything else static.
+    fn sub8x8_disp(x: i64, y: i64) -> (i64, i64) {
+        let (cr, cc) = (y / 8, x / 8); // MI cell
+        let (qr, qc) = ((y % 8) / 4, (x % 8) / 4); // quadrant within it
+        match (cr, cc) {
+            (2, 2) => (0, if qc == 0 { 4 } else { -4 }),
+            (3, 6) => (if qr == 0 { 4 } else { -4 }, 0),
+            (5, 5) => (if qr == 0 { 4 } else { -4 }, if qc == 0 { 4 } else { -4 }),
+            _ => (0, 0),
+        }
+    }
+
+    /// With `sub8x8` enabled the planner elects below-8x8 leaves on
+    /// cells whose quadrants move divergently — the shape follows which
+    /// quadrant pairs agree (VERT / HORZ / SPLIT) and the hints carry
+    /// the per-cell vectors — while static cells and the surrounding
+    /// tree are untouched; with the probe disabled the same content
+    /// plans no sub-8x8 nodes.
+    #[test]
+    fn planner_elects_sub8x8_on_divergent_quadrant_motion() {
+        use crate::partition::{PARTITION_HORZ, PARTITION_SPLIT, PARTITION_VERT};
+        use crate::residual::BLOCK_8X8;
+
+        let (mi_cols, mi_rows) = (8u32, 8u32);
+        let (w, h) = (64usize, 64usize);
+        let ref_y: Vec<i32> = (0..h as i64)
+            .flat_map(|y| (0..w as i64).map(move |x| sub8x8_texture(x, y)))
+            .collect();
+        let flat_uv: Vec<i32> = vec![128; (w / 2) * (h / 2)];
+        let reference: [(&[i32], usize); 3] = [
+            (ref_y.as_slice(), w),
+            (flat_uv.as_slice(), w / 2),
+            (flat_uv.as_slice(), w / 2),
+        ];
+        let mut targets = [
+            Plane::new(w, h),
+            Plane::new(w / 2, h / 2),
+            Plane::new(w / 2, h / 2),
+        ];
+        for y in 0..h as i64 {
+            for x in 0..w as i64 {
+                let (dy, dx) = sub8x8_disp(x, y);
+                targets[0].set(x as usize, y as usize, sub8x8_texture(x + dx, y + dy));
+            }
+        }
+        for y in 0..h / 2 {
+            for x in 0..w / 2 {
+                targets[1].set(x, y, 128);
+                targets[2].set(x, y, 128);
+            }
+        }
+
+        let (parts, _hints, sub) =
+            plan_inter_partitions(&targets, &reference, 64, 64, mi_cols, mi_rows, 8, true);
+        assert_eq!(sub.len(), 3, "exactly the three divergent cells split");
+
+        let v = sub.get(&(2, 2)).expect("VERT cell");
+        assert_eq!(v.partition, PARTITION_VERT);
+        assert_eq!(v.cell_mvs[0], (0, 4));
+        assert_eq!(v.cell_mvs[1], (0, -4));
+        assert_eq!(parts.get(&(2, 2, BLOCK_8X8)), Some(&PARTITION_VERT));
+
+        let hz = sub.get(&(3, 6)).expect("HORZ cell");
+        assert_eq!(hz.partition, PARTITION_HORZ);
+        assert_eq!(hz.cell_mvs[0], (4, 0));
+        assert_eq!(hz.cell_mvs[2], (-4, 0));
+        assert_eq!(parts.get(&(3, 6, BLOCK_8X8)), Some(&PARTITION_HORZ));
+
+        let sp = sub.get(&(5, 5)).expect("SPLIT cell");
+        assert_eq!(sp.partition, PARTITION_SPLIT);
+        assert_eq!(
+            sp.cell_mvs,
+            [(4, 4), (4, -4), (-4, 4), (-4, -4)],
+            "per-quadrant vectors in §6.4.16 cell layout"
+        );
+        assert_eq!(parts.get(&(5, 5, BLOCK_8X8)), Some(&PARTITION_SPLIT));
+
+        // Disabled probe: no sub-8x8 nodes on the same content.
+        let (_p2, _h2, sub_off) =
+            plan_inter_partitions(&targets, &reference, 64, 64, mi_cols, mi_rows, 8, false);
+        assert!(sub_off.is_empty(), "probe off ⇒ no sub-8x8 election");
+    }
+
+    /// Sub-8x8 election pays on divergent sub-block motion — **rate and
+    /// quality together**: against the same lossless keyframe reference,
+    /// the sub-8x8-enabled encode of a frame whose 8x8 cells contain
+    /// opposing quadrant motion is strictly smaller *and* strictly
+    /// closer to the target than the 8x8-limited encode (the elected
+    /// leaves predict exactly and skip; the 8x8 encoder must code a
+    /// large mismatch residual). The coded stream decodes byte-exact
+    /// against the encoder's reconstruction (decoder mirror).
+    #[test]
+    fn sub8x8_election_beats_8x8_on_rate_and_quality() {
+        let (w, h) = (64u32, 64u32);
+        // Keyframe content: the tree_pattern texture (lossless keyframe
+        // ⇒ the decoder's reference IS this pattern).
+        let mut kf_px = vec![0u8; (64 * 64 + 2 * 32 * 32) as usize];
+        for y in 0..64i64 {
+            for x in 0..64i64 {
+                kf_px[(y * 64 + x) as usize] = sub8x8_texture(x, y) as u8;
+            }
+        }
+        for px in kf_px.iter_mut().skip(64 * 64) {
+            *px = 128;
+        }
+        let kf = crate::encode_vp9(&kf_px, w, h).expect("lossless keyframe");
+
+        // P-frame target: the displacement field of the planner test.
+        let mut targets = [Plane::new(64, 64), Plane::new(32, 32), Plane::new(32, 32)];
+        for y in 0..64i64 {
+            for x in 0..64i64 {
+                let (dy, dx) = sub8x8_disp(x, y);
+                targets[0].set(x as usize, y as usize, sub8x8_texture(x + dx, y + dy));
+            }
+        }
+        for y in 0..32 {
+            for x in 0..32 {
+                targets[1].set(x, y, 128);
+                targets[2].set(x, y, 128);
+            }
+        }
+        let ref_y: Vec<i32> = (0..64i64)
+            .flat_map(|y| (0..64i64).map(move |x| sub8x8_texture(x, y)))
+            .collect();
+        let flat_uv: Vec<i32> = vec![128; 32 * 32];
+        let reference: [(&[i32], usize); 3] = [
+            (ref_y.as_slice(), 64),
+            (flat_uv.as_slice(), 32),
+            (flat_uv.as_slice(), 32),
+        ];
+
+        let mut hdr = lossless_pframe_header(w, h);
+        hdr.quantization = QuantizationParams {
+            base_q_idx: 80,
+            delta_q_y_dc: 0,
+            delta_q_uv_dc: 0,
+            delta_q_uv_ac: 0,
+            lossless: false,
+        };
+        let encode = |sub8x8: bool| {
+            encode_pframe_lossy_tree_motion(
+                &hdr,
+                &targets,
+                &reference,
+                None,
+                w,
+                h,
+                PFRAME_SEARCH_RANGE,
+                false,
+                sub8x8,
+            )
+            .expect("lossy tree p-frame")
+        };
+        let (bytes_on, recon_on) = encode(true);
+        let (bytes_off, recon_off) = encode(false);
+
+        let sse = |recon: &ReconState| -> u64 {
+            leaf_sse(
+                &targets,
+                &recon.planes,
+                0,
+                0,
+                crate::residual::BLOCK_64X64,
+                8,
+                8,
+                true,
+                true,
+            )
+        };
+        let (sse_on, sse_off) = (sse(&recon_on), sse(&recon_off));
+        eprintln!(
+            "sub-8x8 A/B: on = {} B / SSE {sse_on}, off = {} B / SSE {sse_off}",
+            bytes_on.len(),
+            bytes_off.len()
+        );
+        assert!(
+            bytes_on.len() < bytes_off.len(),
+            "sub-8x8 rate: {} B (on) vs {} B (off)",
+            bytes_on.len(),
+            bytes_off.len()
+        );
+        assert!(
+            sse_on < sse_off,
+            "sub-8x8 quality: SSE {sse_on} (on) vs {sse_off} (off)"
+        );
+
+        // Decoder mirror for the sub-8x8-elected frame.
+        let decoded = crate::decode_vp9_sequence(&[&kf, &bytes_on]).expect("decode");
+        let d = &decoded[1];
+        for y in 0..64usize {
+            for x in 0..64usize {
+                assert_eq!(
+                    i32::from(d.y[y * 64 + x]),
+                    recon_on.planes[0].get(x, y),
+                    "luma mirror ({x},{y})"
+                );
+            }
+        }
+        for y in 0..32usize {
+            for x in 0..32usize {
+                assert_eq!(i32::from(d.u[y * 32 + x]), recon_on.planes[1].get(x, y));
+                assert_eq!(i32::from(d.v[y * 32 + x]), recon_on.planes[2].get(x, y));
+            }
+        }
     }
 
     /// The per-leaf inter transform-size election adapts to the residual:
@@ -6154,6 +6747,7 @@ mod tests {
             h,
             PFRAME_SEARCH_RANGE,
             true,
+            false,
         )
         .expect("tree p-frame");
         let (fixed, _) =

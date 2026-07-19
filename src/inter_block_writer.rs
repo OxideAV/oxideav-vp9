@@ -27,16 +27,18 @@
 //! blocks and the `MiSize < BLOCK_8X8` sub-8x8 per-`(idy, idx)` MV walk
 //! (each visited cell writes its own `inter_mode` token and §6.4.18
 //! `assign_mv( )`, with the §6.5.14 `append_sub8x8_mvs( )` predictor
-//! rewrite for `NEARESTMV` / `NEARMV` cells) — with segmentation either
-//! disabled or a non-temporal `update_map` (the per-block `segment_id`
-//! coded by the §6.4.7 tree), including the §6.4.9 segment-feature
-//! no-bits arms — `SEG_LVL_SKIP` (§6.4.8 hardwires `skip = 1`, §6.4.16
-//! forces `y_mode = ZEROMV` with no `inter_mode` token; only modeled for
-//! `MiSize >= BLOCK_8X8`, the single shape a conforming plan pairs it
-//! with) and `SEG_LVL_REF_FRAME` (§6.4.13 derives `is_inter` and §6.4.17
-//! derives the reference pair from `FeatureData`, no bits for either).
-//! The §6.4.12 temporal-predicted segment-id branch remains a later
-//! milestone.
+//! rewrite for `NEARESTMV` / `NEARMV` cells) — with segmentation
+//! disabled, a non-temporal `update_map` (the per-block `segment_id`
+//! coded by the §6.4.7 tree), or a **temporal** `update_map` (the
+//! §6.4.12 `seg_id_predicted` bit against the §6.4.14 spatial-min
+//! predictor over `PrevSegmentIds[ ][ ]`, with the tree-coded escape
+//! when the planned id differs and the trailing §6.4.12 ctx-strip
+//! write-back), including the §6.4.9 segment-feature no-bits arms —
+//! `SEG_LVL_SKIP` (§6.4.8 hardwires `skip = 1`, §6.4.16 forces `y_mode
+//! = ZEROMV` with no `inter_mode` token; only modeled for `MiSize >=
+//! BLOCK_8X8`, the single shape a conforming plan pairs it with) and
+//! `SEG_LVL_REF_FRAME` (§6.4.13 derives `is_inter` and §6.4.17 derives
+//! the reference pair from `FeatureData`, no bits for either).
 //!
 //! Provenance: VP9 Bitstream & Decoding Process Specification v0.7
 //! (`docs/video/vp9/vp9-spec.txt`) §6.4.11 / §6.4.13 / §6.4.16 / §6.4.17 /
@@ -158,6 +160,12 @@ pub(crate) struct InterBlockFrameCtx<'a> {
     pub allow_high_precision_mv: bool,
     /// §6.5 `UsePrevFrameMvs` (false ⇒ no previous-frame motion field).
     pub use_prev_frame_mvs: bool,
+    /// §6.4.14 `PrevSegmentIds[ ][ ]` — the last map-bearing frame's
+    /// segment-id plane (row-major `MiRows × MiCols`). Required (`Some`)
+    /// when the frame codes the §6.4.12 temporal-update branch
+    /// (`seg.enabled && update_map && temporal_update`); ignored
+    /// otherwise.
+    pub prev_segment_ids: Option<&'a [u8]>,
 }
 
 /// The §6.3 probability banks the inter block writer codes against.
@@ -175,6 +183,9 @@ pub(crate) struct InterBlockProbs<'a> {
     pub coef_probs: &'a crate::coef_probs::CoefProbs,
     /// `segmentation_tree_probs` (only consulted when seg + update_map).
     pub tree_probs: Option<&'a [u8; 7]>,
+    /// `segmentation_pred_prob[ 3 ]` (only consulted on the §6.4.12
+    /// temporal-update branch).
+    pub pred_prob: Option<&'a [u8; 3]>,
 }
 
 /// Write one inter MI block of any `MiSize` — the inverse of
@@ -199,6 +210,7 @@ pub(crate) fn write_inter_block(
     spec: &InterBlockSpec,
     probs: &InterBlockProbs<'_>,
     state: &mut Vp9FrameState,
+    seg_pred_ctx: Option<&mut crate::mode_info::SegPredContextState>,
     nz: &mut [crate::tokens::NonzeroContext; 3],
     token_cache: &mut [u8],
     coef_src: &mut CoefSource<'_>,
@@ -286,15 +298,39 @@ pub(crate) fn write_inter_block(
         left: left_pair,
     };
 
-    // §6.4.12 inter_segment_id( ): the non-temporal path. Coded by the
-    // §6.4.7 tree only when seg enabled + update_map; otherwise no bits.
+    // §6.4.12 inter_segment_id( ). Coded only when seg enabled +
+    // update_map; the temporal-update arm codes `seg_id_predicted`
+    // against the §6.4.14 spatial-min predictor over PrevSegmentIds
+    // (flag = 1 ⇔ the planned id equals the predictor — the shortest
+    // encoding; only a non-predicted id costs the §6.4.7 tree walk),
+    // then performs the §6.4.12 trailing ctx-strip write-back exactly
+    // as the decoder does. The non-temporal arm is the plain §6.4.7
+    // tree; otherwise no bits.
     if fctx.seg.enabled && fctx.seg.update_map {
         if fctx.seg.temporal_update {
-            // The §6.4.12 seg_id_predicted branch is a later milestone.
-            return Err(Error::Unsupported);
+            let pp = probs.pred_prob.ok_or(Error::InvalidBitstream)?;
+            let prev_data = fctx.prev_segment_ids.ok_or(Error::Unsupported)?;
+            if prev_data.len() != (fctx.mi_rows as usize) * (fctx.mi_cols as usize) {
+                return Err(Error::Unsupported);
+            }
+            let spc = seg_pred_ctx.ok_or(Error::Unsupported)?;
+            let prev = crate::mode_info::PrevSegmentIds {
+                mi_rows: fctx.mi_rows,
+                mi_cols: fctx.mi_cols,
+                data: prev_data,
+            };
+            let predicted = crate::mode_info::get_segment_id(&prev, r, c, spec.mi_size);
+            let flag = spec.segment_id == predicted;
+            crate::mode_writer::write_seg_id_predicted(enc, flag, pp, spc, r, c)?;
+            if !flag {
+                let tp = probs.tree_probs.ok_or(Error::InvalidBitstream)?;
+                crate::mode_writer::write_segment_id(enc, spec.segment_id, tp)?;
+            }
+            spc.write_back(r, c, spec.mi_size, flag);
+        } else {
+            let tp = probs.tree_probs.ok_or(Error::InvalidBitstream)?;
+            crate::mode_writer::write_segment_id(enc, spec.segment_id, tp)?;
         }
-        let tp = probs.tree_probs.ok_or(Error::InvalidBitstream)?;
-        crate::mode_writer::write_segment_id(enc, spec.segment_id, tp)?;
     } else if spec.segment_id != 0 {
         // A reused / disabled map can only carry segment 0 from the writer.
         return Err(Error::Unsupported);
@@ -554,7 +590,7 @@ mod tests {
     use super::*;
     use crate::compressed::FrameContext;
     use crate::mode_info::{ALTREF_FRAME, GOLDEN_FRAME, LAST_FRAME, NEARESTMV, NEWMV, ZEROMV};
-    use crate::residual::{BLOCK_16X16, BLOCK_64X64};
+    use crate::residual::{BLOCK_16X16, BLOCK_32X32, BLOCK_64X64};
     use crate::tokens::NonzeroContext;
 
     fn fresh_nz() -> [NonzeroContext; 3] {
@@ -591,6 +627,7 @@ mod tests {
             interpolation_filter,
             allow_high_precision_mv: allow_hp,
             use_prev_frame_mvs: false,
+            prev_segment_ids: None,
         }
     }
 
@@ -607,6 +644,7 @@ mod tests {
             mv_probs: &fc.mv_probs,
             coef_probs: &fc.coef_probs,
             tree_probs: None,
+            pred_prob: None,
         }
     }
 
@@ -627,14 +665,24 @@ mod tests {
     ) -> Vec<crate::decode_frame::RecoveredInterBlock> {
         let mut probs = probs_view(ctx);
         probs.tree_probs = fc.seg.tree_probs.as_ref();
+        probs.pred_prob = fc.seg.pred_prob.as_ref();
         let mut state = Vp9FrameState::new(fc.mi_rows, fc.mi_cols);
+        let mut seg_pred_ctx = crate::mode_info::SegPredContextState::new(fc.mi_cols, fc.mi_rows);
         let mut nz = fresh_nz();
         let mut cache = vec![0u8; 4096];
         let mut enc = BoolEncoder::new();
         for spec in specs {
             let mut src = no_coeffs();
             write_inter_block(
-                &mut enc, fc, spec, &probs, &mut state, &mut nz, &mut cache, &mut src,
+                &mut enc,
+                fc,
+                spec,
+                &probs,
+                &mut state,
+                Some(&mut seg_pred_ctx),
+                &mut nz,
+                &mut cache,
+                &mut src,
             )
             .unwrap();
         }
@@ -651,6 +699,7 @@ mod tests {
             fc.interpolation_filter,
             fc.allow_high_precision_mv,
             &fc.seg,
+            fc.prev_segment_ids,
             specs.iter().map(|s| (s.r, s.c, s.mi_size)).collect(),
         )
         .unwrap()
@@ -795,7 +844,7 @@ mod tests {
             v
         });
         write_inter_block(
-            &mut enc, &fc, &s, &probs, &mut state, &mut nz, &mut cache, &mut src,
+            &mut enc, &fc, &s, &probs, &mut state, None, &mut nz, &mut cache, &mut src,
         )
         .unwrap();
         let bytes = enc.finish();
@@ -811,6 +860,7 @@ mod tests {
             fc.interpolation_filter,
             fc.allow_high_precision_mv,
             &fc.seg,
+            None,
             vec![(0, 0, BLOCK_8X8)],
         )
         .unwrap();
@@ -1062,7 +1112,7 @@ mod tests {
             v
         });
         write_inter_block(
-            &mut enc, &fc, &s, &probs, &mut state, &mut nz, &mut cache, &mut src,
+            &mut enc, &fc, &s, &probs, &mut state, None, &mut nz, &mut cache, &mut src,
         )
         .unwrap();
         drop(src);
@@ -1080,6 +1130,7 @@ mod tests {
             fc.interpolation_filter,
             fc.allow_high_precision_mv,
             &fc.seg,
+            None,
             vec![(0, 0, BLOCK_4X4)],
         )
         .unwrap();
@@ -1107,7 +1158,7 @@ mod tests {
         let s = base_spec(0, 0, BLOCK_4X4);
         let mut src = no_coeffs();
         let r = write_inter_block(
-            &mut enc, &fc, &s, &probs, &mut state, &mut nz, &mut cache, &mut src,
+            &mut enc, &fc, &s, &probs, &mut state, None, &mut nz, &mut cache, &mut src,
         );
         assert_eq!(r.unwrap_err(), Error::Unsupported);
         // Non-TX_4X4 tx_size on a sub-8x8 block.
@@ -1115,7 +1166,7 @@ mod tests {
         s2.tx_size = 1;
         let mut src2 = no_coeffs();
         let r2 = write_inter_block(
-            &mut enc, &fc, &s2, &probs, &mut state, &mut nz, &mut cache, &mut src2,
+            &mut enc, &fc, &s2, &probs, &mut state, None, &mut nz, &mut cache, &mut src2,
         );
         assert_eq!(r2.unwrap_err(), Error::Unsupported);
     }
@@ -1197,7 +1248,7 @@ mod tests {
         s.skip = false;
         let mut src = no_coeffs();
         let r = write_inter_block(
-            &mut enc, &fc, &s, &probs, &mut state, &mut nz, &mut cache, &mut src,
+            &mut enc, &fc, &s, &probs, &mut state, None, &mut nz, &mut cache, &mut src,
         );
         assert_eq!(r.unwrap_err(), Error::Unsupported);
     }
@@ -1218,8 +1269,165 @@ mod tests {
         s.ref_frame = [LAST_FRAME, NONE_REF_FRAME]; // override says GOLDEN
         let mut src = no_coeffs();
         let r = write_inter_block(
-            &mut enc, &fc, &s, &probs, &mut state, &mut nz, &mut cache, &mut src,
+            &mut enc, &fc, &s, &probs, &mut state, None, &mut nz, &mut cache, &mut src,
         );
         assert_eq!(r.unwrap_err(), Error::Unsupported);
+    }
+
+    // ----- §6.4.12 temporal-predicted segment ids -----
+
+    /// A temporal-update segmentation frame ctx over an 8x8-MI grid
+    /// whose §6.4.14 `PrevSegmentIds` plane is striped by column:
+    /// cols 0..4 segment 1, cols 4..8 segment 2.
+    fn temporal_seg_ctx<'a>(
+        sign_bias: &'a [bool; 4],
+        prev_map: &'a [u8],
+    ) -> InterBlockFrameCtx<'a> {
+        let mut fc = frame_ctx(
+            sign_bias,
+            TxMode::Only4x4,
+            ReferenceMode::SingleReference,
+            0,
+            false,
+        );
+        let mut seg = crate::header::SegmentationParams::default_disabled();
+        seg.enabled = true;
+        seg.update_map = true;
+        seg.temporal_update = true;
+        seg.tree_probs = Some([128; 7]);
+        seg.pred_prob = Some([170, 128, 200]);
+        fc.seg = seg;
+        fc.prev_segment_ids = Some(prev_map);
+        fc
+    }
+
+    fn column_striped_prev_map() -> Vec<u8> {
+        let mut map = vec![0u8; 64];
+        for r in 0..8usize {
+            for c in 0..8usize {
+                map[r * 8 + c] = if c < 4 { 1 } else { 2 };
+            }
+        }
+        map
+    }
+
+    /// Temporal-update blocks round-trip through the real §6.4.12 path-4
+    /// decode: predicted ids (seg_id_predicted = 1, no tree bits),
+    /// non-predicted ids (flag = 0 + the §6.4.7 tree escape), and a
+    /// 32x32 block whose §6.4.14 predictor is the min over its covered
+    /// region — with the ctx strips carrying between blocks on both
+    /// sides.
+    #[test]
+    fn temporal_seg_predicted_roundtrips() {
+        let sb = [false; 4];
+        let prev = column_striped_prev_map();
+        let fc = temporal_seg_ctx(&sb, &prev);
+        let ctx = FrameContext::default();
+
+        // (0,0) 8x8: prev = 1, plan 1 → flag = 1 (predicted).
+        let mut s0 = base_spec(0, 0, BLOCK_8X8);
+        s0.segment_id = 1;
+        // (0,1) 8x8: prev = 1, plan 5 → flag = 0 + tree escape. Reads
+        // ctx = Left[0] + Above[1] = 1 + 0 (left neighbour wrote 1).
+        let mut s1 = base_spec(0, 1, BLOCK_8X8);
+        s1.segment_id = 5;
+        // (0,4) 8x8: prev = 2, plan 2 → flag = 1.
+        let mut s2 = base_spec(0, 4, BLOCK_8X8);
+        s2.segment_id = 2;
+        // (2,0) 32x32 spans cols 0..4 → §6.4.14 min = 1; plan 1 → flag=1.
+        let mut s3 = base_spec(2, 0, BLOCK_32X32);
+        s3.segment_id = 1;
+        // (2,4) 32x32 spans cols 4..8 → min = 2; plan 0 → flag = 0.
+        let mut s4 = base_spec(2, 4, BLOCK_32X32);
+        s4.segment_id = 0;
+        // (6,0) 8x8 under s3's strip: Above[0] = 1 → ctx includes the
+        // 32x32 write-back; prev = 1, plan 1 → flag = 1.
+        let mut s5 = base_spec(6, 0, BLOCK_8X8);
+        s5.segment_id = 1;
+
+        let got = roundtrip(&fc, &ctx, &[s0, s1, s2, s3, s4, s5]);
+        let want = [1u8, 5, 2, 1, 0, 1];
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(g.segment_id, *w, "block {i} segment_id");
+        }
+    }
+
+    /// The temporal branch needs `pred_prob`, the prev-frame map, and
+    /// the ctx strips; each missing input is rejected up front (the
+    /// bits would otherwise silently desync the §9.2 coder).
+    #[test]
+    fn temporal_seg_missing_inputs_rejected() {
+        let sb = [false; 4];
+        let prev = column_striped_prev_map();
+        let ctx = FrameContext::default();
+        let mut s = base_spec(0, 0, BLOCK_8X8);
+        s.segment_id = 1;
+        let mut src = no_coeffs();
+
+        // Missing seg_pred_ctx.
+        let fc = temporal_seg_ctx(&sb, &prev);
+        let mut probs = probs_view(&ctx);
+        probs.tree_probs = fc.seg.tree_probs.as_ref();
+        probs.pred_prob = fc.seg.pred_prob.as_ref();
+        let mut state = Vp9FrameState::new(fc.mi_rows, fc.mi_cols);
+        let mut nz = fresh_nz();
+        let mut cache = vec![0u8; 4096];
+        let mut enc = BoolEncoder::new();
+        let r = write_inter_block(
+            &mut enc, &fc, &s, &probs, &mut state, None, &mut nz, &mut cache, &mut src,
+        );
+        assert_eq!(r.unwrap_err(), Error::Unsupported);
+
+        // Missing prev map.
+        let mut fc2 = temporal_seg_ctx(&sb, &prev);
+        fc2.prev_segment_ids = None;
+        let mut spc = crate::mode_info::SegPredContextState::new(fc2.mi_cols, fc2.mi_rows);
+        let r2 = write_inter_block(
+            &mut enc,
+            &fc2,
+            &s,
+            &probs,
+            &mut state,
+            Some(&mut spc),
+            &mut nz,
+            &mut cache,
+            &mut src,
+        );
+        assert_eq!(r2.unwrap_err(), Error::Unsupported);
+
+        // Missing pred_prob.
+        let fc3 = temporal_seg_ctx(&sb, &prev);
+        let mut probs3 = probs_view(&ctx);
+        probs3.tree_probs = fc3.seg.tree_probs.as_ref();
+        probs3.pred_prob = None;
+        let r3 = write_inter_block(
+            &mut enc,
+            &fc3,
+            &s,
+            &probs3,
+            &mut state,
+            Some(&mut spc),
+            &mut nz,
+            &mut cache,
+            &mut src,
+        );
+        assert_eq!(r3.unwrap_err(), Error::InvalidBitstream);
+
+        // Wrong-sized prev map.
+        let short_map = vec![0u8; 63];
+        let mut fc4 = temporal_seg_ctx(&sb, &prev);
+        fc4.prev_segment_ids = Some(&short_map);
+        let r4 = write_inter_block(
+            &mut enc,
+            &fc4,
+            &s,
+            &probs,
+            &mut state,
+            Some(&mut spc),
+            &mut nz,
+            &mut cache,
+            &mut src,
+        );
+        assert_eq!(r4.unwrap_err(), Error::Unsupported);
     }
 }

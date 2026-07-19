@@ -1448,6 +1448,7 @@ mod encode_roundtrip_tests {
             tx_mode: crate::compressed::TxMode::Only4x4,
             reference_mode: crate::compressed::ReferenceMode::SingleReference,
             partitions: std::collections::HashMap::new(), // all-8x8 leaves
+            prev_segment_ids: None,
         };
         // Segments striped by MI row pairs: rows 0-1 seg 0 (plain skip),
         // rows 2-3 seg 1 (SKIP-forced), rows 4-5 seg 2 (GOLDEN

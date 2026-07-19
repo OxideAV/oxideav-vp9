@@ -1709,6 +1709,7 @@ pub(crate) fn encode_pframe_lossless_layout(
         tx_mode: crate::compressed::TxMode::Only4x4,
         reference_mode,
         partitions,
+        prev_segment_ids: None,
     };
     crate::frame_writer::assemble_inter_frame_tree(hdr, &plan, &mut *planner, &mut *coeffs)
 }
@@ -3208,6 +3209,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
         tx_mode,
         reference_mode,
         partitions,
+        prev_segment_ids: None,
     };
     let bytes =
         crate::frame_writer::assemble_inter_frame_tree(hdr, &plan, &mut *planner, &mut *coeffs)?;

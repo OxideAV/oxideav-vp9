@@ -2075,6 +2075,7 @@ pub(crate) fn decode_inter_blocks_for_test(
     interpolation_filter: u8,
     allow_high_precision_mv: bool,
     seg: &SegmentationParams,
+    prev_segment_ids: Option<&[u8]>,
     blocks: Vec<(u32, u32, u8)>,
 ) -> Result<Vec<RecoveredInterBlock>, Error> {
     use crate::residual::{
@@ -2091,7 +2092,13 @@ pub(crate) fn decode_inter_blocks_for_test(
         NonzeroContext::new((2 * mi_cols) as usize, (2 * mi_rows) as usize),
     ];
     let mut seg_pred_ctx = SegPredContextState::new(mi_cols, mi_rows);
-    let prev_seg_ids = vec![0u8; (mi_rows * mi_cols) as usize];
+    let prev_seg_ids = match prev_segment_ids {
+        Some(map) => {
+            assert_eq!(map.len(), (mi_rows * mi_cols) as usize);
+            map.to_vec()
+        }
+        None => vec![0u8; (mi_rows * mi_cols) as usize],
+    };
 
     let mut coder = BoolCoder::init_bool(data, data.len())?;
     let mut counts = crate::prob_adapt::FrameCounts::new_boxed();

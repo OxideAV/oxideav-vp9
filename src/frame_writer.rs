@@ -775,6 +775,7 @@ pub(crate) fn assemble_inter_frame_planned(
         tx_mode,
         reference_mode: ReferenceMode::SingleReference,
         partitions: HashMap::new(), // default fallback = all-8x8 layout.
+        prev_segment_ids: None,
     };
     let mut tree_planner: Box<InterTreePlanner<'_>> =
         Box::new(|lr: u32, lc: u32, subsize: u8, state: &Vp9FrameState| {
@@ -862,6 +863,12 @@ pub(crate) struct InterFrameTreePlan {
     pub tx_mode: TxMode,
     pub reference_mode: crate::compressed::ReferenceMode,
     pub partitions: HashMap<(u32, u32, u8), u8>,
+    /// §6.4.14 `PrevSegmentIds[ ][ ]` — the last map-bearing frame's
+    /// segment-id plane (row-major `MiRows × MiCols`). Required when the
+    /// header codes `segmentation_temporal_update = 1` (the §6.4.12
+    /// `seg_id_predicted` branch predicts against it); ignored — and
+    /// normally `None` — otherwise.
+    pub prev_segment_ids: Option<Vec<u8>>,
 }
 
 /// Assemble a complete VP9 **inter** frame over an **arbitrary §6.4.3
@@ -986,6 +993,23 @@ pub(crate) fn assemble_inter_frame_tree(
     let mut pctx = PartitionContextState::new(sb64_cols as usize, sb64_rows as usize);
     let mut token_cache = vec![0u8; 1024];
 
+    // §6.4.12 temporal-update state: the §7.4 seg-pred context strips
+    // (per-tile above reset here; per-superblock-row left reset below,
+    // mirroring the decoder's decode_tile) and the §6.4.14
+    // PrevSegmentIds plane from the plan.
+    let temporal_seg =
+        hdr.segmentation.enabled && hdr.segmentation.update_map && hdr.segmentation.temporal_update;
+    if temporal_seg
+        && plan
+            .prev_segment_ids
+            .as_ref()
+            .map(|m| m.len() != (mi_rows as usize) * (mi_cols as usize))
+            .unwrap_or(true)
+    {
+        return Err(Error::Unsupported);
+    }
+    let mut seg_pred_ctx = crate::mode_info::SegPredContextState::new(mi_cols, mi_rows);
+
     let fctx = InterBlockFrameCtx {
         mi_cols,
         mi_rows,
@@ -1002,6 +1026,7 @@ pub(crate) fn assemble_inter_frame_tree(
         interpolation_filter: hdr.interpolation_filter,
         allow_high_precision_mv: hdr.allow_high_precision_mv,
         use_prev_frame_mvs: false,
+        prev_segment_ids: plan.prev_segment_ids.as_deref(),
     };
     let probs = InterBlockProbs {
         skip_prob: &ctx.skip_prob,
@@ -1015,6 +1040,7 @@ pub(crate) fn assemble_inter_frame_tree(
         mv_probs: &ctx.mv_probs,
         coef_probs: &ctx.coef_probs,
         tree_probs: hdr.segmentation.tree_probs.as_ref(),
+        pred_prob: hdr.segmentation.pred_prob.as_ref(),
     };
 
     pctx.clear_above();
@@ -1022,6 +1048,8 @@ pub(crate) fn assemble_inter_frame_tree(
     let mut r = 0u32;
     while r < mi_rows {
         pctx.clear_left();
+        // §7.4.2: LeftSegPredContext resets per superblock row.
+        seg_pred_ctx.clear_left();
         let mut c = 0u32;
         while c < mi_cols {
             let mut layout = |lr: u32, lc: u32, bsize: u8| -> u8 {
@@ -1102,6 +1130,7 @@ pub(crate) fn assemble_inter_frame_tree(
                         &spec,
                         &probs,
                         &mut state,
+                        Some(&mut seg_pred_ctx),
                         &mut nz,
                         &mut token_cache,
                         &mut src,
@@ -1937,6 +1966,7 @@ mod tests {
             tx_mode: TxMode::Only4x4,
             reference_mode: ReferenceMode::SingleReference,
             partitions,
+            prev_segment_ids: None,
         };
         let mut seen: Vec<(u32, u32, u8)> = Vec::new();
         let mut planner: Box<InterTreePlanner> = Box::new(|r, c, subsize, _s| {
@@ -1983,6 +2013,7 @@ mod tests {
             tx_mode: TxMode::TxModeSelect,
             reference_mode: ReferenceMode::SingleReference,
             partitions,
+            prev_segment_ids: None,
         };
         // Quadrant -> tx size: TL 32x32, TR 16x16, BL 8x8, BR 4x4.
         let mut planner: Box<InterTreePlanner> = Box::new(|r, c, subsize, _s| {
@@ -2049,6 +2080,7 @@ mod tests {
             tx_mode: TxMode::Only4x4,
             reference_mode: ReferenceMode::SingleReference,
             partitions,
+            prev_segment_ids: None,
         };
         let zero_sub = crate::inter_block_writer::InterSubBlockSpec {
             modes: [crate::mode_info::ZEROMV; 4],
@@ -2109,6 +2141,7 @@ mod tests {
             tx_mode,
             reference_mode: ReferenceMode::SingleReference,
             partitions: HashMap::new(),
+            prev_segment_ids: None,
         };
 
         // Leaf size disagreeing with the tree's subsize.
@@ -2175,6 +2208,7 @@ mod tests {
             tx_mode: TxMode::Only4x4,
             reference_mode: ReferenceMode::SingleReference,
             partitions: sub_partitions,
+            prev_segment_ids: None,
         };
         let mut p: Box<InterTreePlanner> =
             Box::new(|_r, _c, sz, _s| skip_leaf(sz, TxMode::Only4x4));
@@ -2221,6 +2255,7 @@ mod tests {
             tx_mode: TxMode::Only4x4,
             reference_mode: ReferenceMode::SingleReference,
             partitions: HashMap::new(),
+            prev_segment_ids: None,
         };
         // Variant A: every 8x8 leaf codes NEWMV [8, 8] (the first leaf
         // establishes the predictor; the rest re-code a zero diff).
@@ -2263,6 +2298,7 @@ mod tests {
             tx_mode: TxMode::Only4x4,
             reference_mode: ReferenceMode::SingleReference,
             partitions: HashMap::new(),
+            prev_segment_ids: None,
         };
         let mut p: Box<InterTreePlanner> =
             Box::new(|_r, _c, sz, _s| skip_leaf(sz, TxMode::Only4x4));

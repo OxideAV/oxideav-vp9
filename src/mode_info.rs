@@ -1524,6 +1524,37 @@ impl SegPredContextState {
     pub(crate) fn left(&self, mi_row: u32) -> u8 {
         self.left[mi_row as usize]
     }
+
+    /// The §6.4.12 trailing write-back of the `seg_id_predicted` flag:
+    ///
+    /// ```text
+    /// for ( i = 0; i < num_8x8_blocks_wide_lookup[ MiSize ]; i++ )
+    ///     AboveSegPredContext[ MiCol + i ] = seg_id_predicted
+    /// for ( i = 0; i < num_8x8_blocks_high_lookup[ MiSize ]; i++ )
+    ///     LeftSegPredContext[ MiRow + i ] = seg_id_predicted
+    /// ```
+    ///
+    /// Shared by the §6.4.12 decoder driver and the inter block writer
+    /// (which mirrors the decode-side ctx state exactly). The strip
+    /// writes are clamped to the allocated `MiCols` / `MiRows` extents —
+    /// a partial-edge block's `bw` / `bh` may overhang the frame.
+    pub(crate) fn write_back(&mut self, mi_row: u32, mi_col: u32, mi_size: u8, flag: bool) {
+        let flag_u8 = u8::from(flag);
+        let bw = NUM_8X8_BLOCKS_WIDE_LOOKUP[mi_size as usize] as u32;
+        let bh = NUM_8X8_BLOCKS_HIGH_LOOKUP[mi_size as usize] as u32;
+        for i in 0..bw {
+            let c = (mi_col + i) as usize;
+            if c < self.above.len() {
+                self.above[c] = flag_u8;
+            }
+        }
+        for i in 0..bh {
+            let r = (mi_row + i) as usize;
+            if r < self.left.len() {
+                self.left[r] = flag_u8;
+            }
+        }
+    }
 }
 
 /// `seg_id_predicted` per §9.3.2.
@@ -1653,21 +1684,7 @@ pub(crate) fn inter_segment_id(
         read_segment_id(coder, probs)?
     };
     // §6.4.12 trailing write-back of the seg_id_predicted flag.
-    let flag_u8 = u8::from(predicted_flag);
-    let bw = NUM_8X8_BLOCKS_WIDE_LOOKUP[mi_size as usize] as u32;
-    let bh = NUM_8X8_BLOCKS_HIGH_LOOKUP[mi_size as usize] as u32;
-    for i in 0..bw {
-        let c = (mi_col + i) as usize;
-        if c < seg_pred_ctx.above.len() {
-            seg_pred_ctx.above[c] = flag_u8;
-        }
-    }
-    for i in 0..bh {
-        let r = (mi_row + i) as usize;
-        if r < seg_pred_ctx.left.len() {
-            seg_pred_ctx.left[r] = flag_u8;
-        }
-    }
+    seg_pred_ctx.write_back(mi_row, mi_col, mi_size, predicted_flag);
     Ok(segment_id)
 }
 

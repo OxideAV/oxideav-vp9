@@ -114,6 +114,26 @@ pub(crate) fn write_segment_id(
     })
 }
 
+/// §6.4.12 `seg_id_predicted` inverse — the single §9.3.1 [`BINARY_TREE`]
+/// bit under `segmentation_pred_prob[ ctx ]`, where the §9.3.2 ctx is
+/// `LeftSegPredContext[ MiRow ] + AboveSegPredContext[ MiCol ]` — the
+/// exact mirror of `mode_info::read_seg_id_predicted`. The §6.4.12
+/// trailing strip write-back is the caller's step
+/// ([`crate::mode_info::SegPredContextState::write_back`]), since it
+/// spans the block's `bw` / `bh`, not just this bit.
+pub(crate) fn write_seg_id_predicted(
+    enc: &mut BoolEncoder,
+    flag: bool,
+    pred_prob: &[u8; 3],
+    seg_pred_ctx: &crate::mode_info::SegPredContextState,
+    mi_row: u32,
+    mi_col: u32,
+) -> Result<(), Error> {
+    let ctx = (seg_pred_ctx.left(mi_row) + seg_pred_ctx.above(mi_col)) as usize;
+    debug_assert!(ctx <= 2, "seg_id_predicted ctx must be in 0..=2");
+    tree_encode(enc, &BINARY_TREE, i32::from(flag), |_| pred_prob[ctx])
+}
+
 /// §6.4.6 `default_intra_mode` inverse — the §9.3.1 `INTRA_MODE_TREE`
 /// under `kf_y_mode_probs[ abovemode ][ leftmode ]`.
 pub(crate) fn write_default_intra_mode(

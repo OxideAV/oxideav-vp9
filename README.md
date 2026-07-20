@@ -17,8 +17,12 @@ sub-pel search), and `encode_vp9_lossy` / `encode_vp9_lossy_sequence`
 provide quantized encoding over content-adaptive partition/transform
 trees on **both keyframes and P-frames** (`BLOCK_8X8`..`BLOCK_64X64`,
 `TX_4X4`..`TX_32X32`, per-block inter transform-size selection,
-quarter/eighth-pel motion search, multi-reference LAST/GOLDEN election
-and `[ LAST, ALTREF ]` compound prediction) whose output equals the
+quarter/eighth-pel motion search, multi-reference LAST/GOLDEN election,
+`[ LAST, ALTREF ]` compound prediction, and — round 420 — the
+**encode-side §8.8 loop filter** with per-frame elected
+`loop_filter_level` / `loop_filter_sharpness`, the reference chain
+threading the *filtered* reconstructions per the §8.10 post-filter
+store) whose output equals the
 encoder's in-loop reconstruction bit-for-bit, and
 `encode_vp9_lossy_sequence_rc` adds per-frame byte-budget rate control
 (see the "Encoder" section). [`decode_vp9`]
@@ -95,6 +99,13 @@ where `sub8x8-inter-mvs` is hand-planned), and `lossy-compound-elected`
 round-418 §7.2 `setup_past_independence` finding: error-resilient
 frames zero their effective `ref_frame_sign_bias`, so compound is
 uncodeable there).
+A **round-420 extension is built and awaiting docs staging**:
+`lossy-filtered-gop` — the corpus's first stream whose non-zero
+`loop_filter_level`s are *elected by this crate's own encoder*
+(per-frame levels 19/27/19/24 through the public lossy sequence API;
+the staged package is verified byte-exact through a black-box
+reference decode against the crate's own output; presence-gated
+sweep/flags/identity tests pick it up the moment it lands).
 Highlights: `i-frame-then-p-frame-64x64`
 (keyframe + single-reference LAST P-frame, high-precision MVs,
 8-tap-smooth filter), `frame-parallel-mode` (keyframe + three
@@ -248,11 +259,24 @@ prediction sees the decoder's exact state. Public entry points:
   codes the better of `LAST` / `GOLDEN`), **compound prediction**
   (the `[ LAST, ALTREF ]` §8.5.2 `Round2( p0 + p1, 1 )` average,
   admitted through the §6.3.12 sign-bias asymmetry and coded under
-  `ReferenceModeSelect` — the cross-fade predictor), and **per-leaf
+  `ReferenceModeSelect` — the cross-fade predictor), **per-leaf
   skip election with a skip-if-no-gain guard** (a leaf codes its
   residual only when that strictly reduces its SSE, so static content
   converges to all-skip instead of re-coding quantization noise every
-  frame).
+  frame), and the **encode-side §8.8 loop filter with per-frame
+  parameter election** (round 420): every frame — keyframe and
+  standalone `encode_vp9_lossy` keyframes included — closes out
+  through the identical §8.8 chain the decoder runs (the §8.8.1 init
+  over the §7.2-resolved deltas, then the superblock raster, keyed by
+  the writer's own §6.4.4 per-MI arrays), with `loop_filter_level`
+  elected by a full 0..=63 SSE-vs-source sweep and
+  `loop_filter_sharpness` by a second-stage 0..=7 sweep at the winning
+  level — both §6.2.8 fields are fixed-width, so the election is
+  rate-free — and each P-frame references the previous frame's
+  *filtered* reconstruction, mirroring the §8.10 post-filter
+  `FrameStore[ ]`. A/B pin: keyframe elects level 49 on graded
+  content at `q = 140` and the decoded GOP's SSE drops 7.6% at an
+  identical 443-byte total rate vs filtering forced off.
   The decoder's output equals the encoder's reconstruction
   bit-for-bit at every partition / transform size (pinned
   sample-for-sample on all three planes across `TX_8X8` / `TX_16X16` /
@@ -432,8 +456,10 @@ carries no forward update for it).
   references, and probe each 8x8 cell's 4x4 quadrants to elect
   below-8x8 leaves where divergent motion wins — round 418). The
   §6.4.12 temporal-predicted segment-id **writer** branch landed in
-  round 418, closing the last §6.4.11 writer arm. Encode-side loop
-  filtering (frames are coded with `filter_level == 0`), keyframe skip
+  round 418, closing the last §6.4.11 writer arm; **encode-side §8.8
+  loop filtering with per-frame `level` / `sharpness` election landed
+  in round 420** (the sequence encoders' reference chains thread
+  filtered reconstructions). Keyframe skip
   election, and previous-frame-MV modeling in the writer (which would
   let non-error-resilient P-frame *chains* — and therefore compound —
   run without a hidden/intra predecessor) are later milestones.
@@ -446,7 +472,7 @@ carries no forward update for it).
 
 ## Testing
 
-The crate carries 1025+ lib unit tests plus integration suites in
+The crate carries 1055+ lib unit tests plus integration suites in
 `tests/` (including the keyframe **and inter** encoder writers, each
 round-tripped back through the in-crate decoder; `encode_keyframe`
 exercising the public `encode_vp9` → decode **byte-exact lossless**
@@ -465,7 +491,9 @@ every §8.5.1 intra mode against flat-preservation + `Clip1`-bound
 properties. A `cargo-fuzz` harness lives in `fuzz/` with panic-surface
 targets over the header parsers, the Boolean-decoder walkers, the whole
 `decode_frame` pipeline (single-frame, Annex B split, and the multi-frame
-sequence driver), and the `encode_keyframe` encode → decode round-trip;
+sequence driver), the `encode_keyframe` encode → decode round-trip, and
+the `encode_lossy_keyframe` **oracle-carrying** round-trip (a stream the
+lossy encoder emitted — elected §8.8 filter included — MUST decode);
 the `decode_robustness` integration suite pins the same
 garbage-in-no-panic contract in standard CI, including a fuzz-found
 OOM regression (headers claiming huge frame geometries are rejected

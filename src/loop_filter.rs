@@ -143,6 +143,49 @@ impl LvlLookup {
     }
 }
 
+/// §7.2 `setup_past_independence( )` default `loop_filter_ref_deltas`
+/// (`vp9-spec.txt` lines 3494-3497), indexed by §3 `INTRA_FRAME` /
+/// `LAST_FRAME` / `GOLDEN_FRAME` / `ALTREF_FRAME`: `[1, 0, -1, -1]`.
+///
+/// These are the values in force whenever no frame since the last §7.2
+/// reset carried a `loop_filter_delta_update` — both the decoder's §7.2.8
+/// persistence fold and the encoder's §8.8 reconstruction mirror start
+/// from them.
+pub const DEFAULT_LOOP_FILTER_REF_DELTAS: [i8; MAX_REF_FRAMES_USIZE] = [1, 0, -1, -1];
+
+/// §7.2 `setup_past_independence( )` default `loop_filter_mode_deltas`
+/// (`vp9-spec.txt` lines 3498-3499): `[0, 0]`.
+pub const DEFAULT_LOOP_FILTER_MODE_DELTAS: [i8; MAX_MODE_LF_DELTAS] = [0, 0];
+
+/// Resolve a frame header's §6.2.8 `Option<i8>` loop-filter delta slots
+/// against the §7.2 `setup_past_independence( )` defaults — the §7.2.8
+/// "use prior value" rule for the case where the prior values ARE the
+/// defaults (a key / intra-only / error-resilient frame, or any stream
+/// in which no frame since the last reset updated a delta).
+///
+/// Callers tracking persistent deltas across a sequence fold each
+/// frame's `Some` slots into their own running values instead; this
+/// helper serves the single-frame decode path and the encoder's §8.8
+/// reconstruction mirror (this crate's writers never code delta
+/// updates, so the defaults are the persistent values on both sides).
+pub fn resolve_lf_deltas(
+    lf: &LoopFilterParams,
+) -> ([i8; MAX_REF_FRAMES_USIZE], [i8; MAX_MODE_LF_DELTAS]) {
+    let mut ref_deltas = DEFAULT_LOOP_FILTER_REF_DELTAS;
+    for (slot, delta) in ref_deltas.iter_mut().zip(lf.ref_deltas) {
+        if let Some(d) = delta {
+            *slot = d;
+        }
+    }
+    let mut mode_deltas = DEFAULT_LOOP_FILTER_MODE_DELTAS;
+    for (slot, delta) in mode_deltas.iter_mut().zip(lf.mode_deltas) {
+        if let Some(d) = delta {
+            *slot = d;
+        }
+    }
+    (ref_deltas, mode_deltas)
+}
+
 /// `Clip3( x, y, z )` from §5.1 — clamp `z` into `[x, y]`. The §8.8.1
 /// listing applies it twice (line 5476 on `lvlSeg`, and lines 5481 /
 /// 5486 on the per-(ref, mode) computed level).

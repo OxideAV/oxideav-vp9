@@ -240,11 +240,29 @@ fn header_is_intra_frame(hdr: &Vp9FrameHeader) -> bool {
     }
 }
 
+// Bytes-only convenience over the `_with_state` assembler; the
+// non-test encoders all thread the state, so only tests call this.
+#[allow(dead_code)]
 pub(crate) fn assemble_keyframe_tree(
     hdr: &Vp9FrameHeader,
     plan: &KeyframeTreePlan,
     coeffs: &mut FrameCoefSource<'_>,
 ) -> Result<Vec<u8>, Error> {
+    assemble_keyframe_tree_with_state(hdr, plan, coeffs).map(|(bytes, _)| bytes)
+}
+
+/// [`assemble_keyframe_tree`] also returning the writer's final §6.4.4
+/// [`Vp9FrameState`] write-back arrays — the identical per-MI state the
+/// decoder holds after its own §6.4 walk of these bytes (`MiSizes` /
+/// `TxSizes` / `Skips` / `YModes` / `SegmentIds` / `RefFrames`), which
+/// is exactly the per-MI input the §8.8 loop-filter processes consume
+/// (§8.8.2 steps 4-12, §8.8.4 step 1). The encoder's reconstruction
+/// path threads it into the encode-side §8.8 filter mirror.
+pub(crate) fn assemble_keyframe_tree_with_state(
+    hdr: &Vp9FrameHeader,
+    plan: &KeyframeTreePlan,
+    coeffs: &mut FrameCoefSource<'_>,
+) -> Result<(Vec<u8>, Vp9FrameState), Error> {
     if !header_is_intra_frame(hdr) {
         return Err(Error::Unsupported);
     }
@@ -392,7 +410,7 @@ pub(crate) fn assemble_keyframe_tree(
     out.extend_from_slice(&uhdr_bytes);
     out.extend_from_slice(&chdr_bytes);
     out.extend_from_slice(&tile_bytes);
-    Ok(out)
+    Ok((out, state))
 }
 
 /// Assemble a complete VP9 keyframe from `hdr` + `plan`, returning the
@@ -918,6 +936,23 @@ pub(crate) fn assemble_inter_frame_tree(
     planner: &mut InterTreePlanner<'_>,
     coeffs: &mut FrameCoefSource<'_>,
 ) -> Result<Vec<u8>, Error> {
+    assemble_inter_frame_tree_with_state(hdr, plan, planner, coeffs).map(|(bytes, _)| bytes)
+}
+
+/// [`assemble_inter_frame_tree`] also returning the writer's final
+/// §6.4.4 [`Vp9FrameState`] write-back arrays — the identical per-MI
+/// state the decoder holds after its own §6.4 walk of these bytes
+/// (`MiSizes` / `TxSizes` / `Skips` / `YModes` / `SegmentIds` /
+/// `RefFrames`), which is exactly the per-MI input the §8.8 loop-filter
+/// processes consume (§8.8.2 steps 4-12, §8.8.4 step 1). The encoder's
+/// reconstruction path threads it into the encode-side §8.8 filter
+/// mirror.
+pub(crate) fn assemble_inter_frame_tree_with_state(
+    hdr: &Vp9FrameHeader,
+    plan: &InterFrameTreePlan,
+    planner: &mut InterTreePlanner<'_>,
+    coeffs: &mut FrameCoefSource<'_>,
+) -> Result<(Vec<u8>, Vp9FrameState), Error> {
     use crate::compressed::{setup_compound_reference_mode, RefFrameSignBias, ReferenceMode};
     use crate::compressed_writer::write_compressed_header_inter;
     use crate::inter_block_writer::{
@@ -1191,7 +1226,7 @@ pub(crate) fn assemble_inter_frame_tree(
     out.extend_from_slice(&uhdr_bytes);
     out.extend_from_slice(&chdr_bytes);
     out.extend_from_slice(&tile_bytes);
-    Ok(out)
+    Ok((out, state))
 }
 
 #[cfg(test)]

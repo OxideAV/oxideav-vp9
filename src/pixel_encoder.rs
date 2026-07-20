@@ -753,6 +753,22 @@ pub(crate) fn encode_keyframe_lossy_420(
     encode_keyframe_lossy_420_with_recon(pixels, width, height, base_q_idx).map(|(bytes, _)| bytes)
 }
 
+/// The §6.2 header for a **lossy** 8-bit 4:2:0 keyframe at `base_q_idx`
+/// — [`lossless_keyframe_header`] with the quantizer swapped in
+/// (`loop_filter.level` stays 0; the sequence encoders overwrite it
+/// with the elected level before assembly).
+pub(crate) fn lossy_keyframe_header_420(width: u32, height: u32, base_q_idx: u8) -> Vp9FrameHeader {
+    let mut hdr = lossless_keyframe_header(width, height);
+    hdr.quantization = QuantizationParams {
+        base_q_idx,
+        delta_q_y_dc: 0,
+        delta_q_uv_dc: 0,
+        delta_q_uv_ac: 0,
+        lossless: false,
+    };
+    hdr
+}
+
 /// [`encode_keyframe_lossy_420`] also returning the encoder's in-loop
 /// reconstruction (== the decoder's exact output) for reference
 /// threading by the sequence encoder.
@@ -762,6 +778,19 @@ pub(crate) fn encode_keyframe_lossy_420_with_recon(
     height: u32,
     base_q_idx: u8,
 ) -> Result<(Vec<u8>, ReconState), Error> {
+    encode_keyframe_lossy_420_with_recon_state(pixels, width, height, base_q_idx)
+        .map(|(b, r, _)| (b, r))
+}
+
+/// [`encode_keyframe_lossy_420_with_recon`] also returning the writer's
+/// final §6.4.4 [`crate::decode_block::Vp9FrameState`] per-MI arrays —
+/// the input the encode-side §8.8 loop-filter mirror consumes.
+pub(crate) fn encode_keyframe_lossy_420_with_recon_state(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+) -> Result<(Vec<u8>, ReconState, crate::decode_block::Vp9FrameState), Error> {
     if width == 0 || height == 0 || width > (1 << 16) || height > (1 << 16) {
         return Err(Error::Unsupported);
     }
@@ -776,14 +805,7 @@ pub(crate) fn encode_keyframe_lossy_420_with_recon(
         return Err(Error::Unsupported);
     }
 
-    let mut hdr = lossless_keyframe_header(width, height);
-    hdr.quantization = QuantizationParams {
-        base_q_idx,
-        delta_q_y_dc: 0,
-        delta_q_uv_dc: 0,
-        delta_q_uv_ac: 0,
-        lossless: false,
-    };
+    let hdr = lossy_keyframe_header_420(width, height, base_q_idx);
 
     let mi_cols = ((width + 7) >> 3) as usize;
     let mi_rows = ((height + 7) >> 3) as usize;
@@ -806,7 +828,7 @@ pub(crate) fn encode_keyframe_lossy_420_with_recon(
         8,
         base_q_idx,
     );
-    encode_keyframe_lossy_tree(&hdr, &targets, &plan)
+    encode_keyframe_lossy_tree_with_state(&hdr, &targets, &plan)
 }
 
 /// Plan a content-adaptive partition + transform-size tree for a lossy
@@ -1152,11 +1174,25 @@ fn select_leaf_modes(
 /// Plan leaves must be non-skip (a skip leaf reconstructs from
 /// prediction the mirror never replays; the planner codes all-zero
 /// blocks instead, which cost only the per-block `more_coefs` bits).
+// Bytes+recon convenience over the `_with_state` encoder; the non-test
+// encoders all thread the state, so only tests call this.
+#[allow(dead_code)]
 pub(crate) fn encode_keyframe_lossy_tree(
     hdr: &Vp9FrameHeader,
     targets: &[Plane; 3],
     plan: &crate::frame_writer::KeyframeTreePlan,
 ) -> Result<(Vec<u8>, ReconState), Error> {
+    encode_keyframe_lossy_tree_with_state(hdr, targets, plan).map(|(b, r, _)| (b, r))
+}
+
+/// [`encode_keyframe_lossy_tree`] also returning the writer's final
+/// §6.4.4 [`crate::decode_block::Vp9FrameState`] per-MI arrays — the
+/// input the encode-side §8.8 loop-filter mirror consumes.
+pub(crate) fn encode_keyframe_lossy_tree_with_state(
+    hdr: &Vp9FrameHeader,
+    targets: &[Plane; 3],
+    plan: &crate::frame_writer::KeyframeTreePlan,
+) -> Result<(Vec<u8>, ReconState, crate::decode_block::Vp9FrameState), Error> {
     if hdr.frame_type != FrameType::KeyFrame || hdr.quantization.lossless {
         return Err(Error::Unsupported);
     }
@@ -1174,7 +1210,7 @@ pub(crate) fn encode_keyframe_lossy_tree(
     let quant = hdr.quantization;
     let bd8 = hdr.color_config.bit_depth;
 
-    let bytes = {
+    let (bytes, state) = {
         let recon_ref = &mut recon;
         let mut coeffs: Box<FrameCoefSource<'_>> = Box::new(
             move |mi_r: u32, mi_c: u32, plane: usize, sx: u32, sy: u32, _b: usize| -> Vec<i64> {
@@ -1233,10 +1269,10 @@ pub(crate) fn encode_keyframe_lossy_tree(
                 block
             },
         );
-        crate::frame_writer::assemble_keyframe_tree(hdr, plan, &mut *coeffs)?
+        crate::frame_writer::assemble_keyframe_tree_with_state(hdr, plan, &mut *coeffs)?
     };
 
-    Ok((bytes, recon))
+    Ok((bytes, recon, state))
 }
 
 // ----- Lossless inter (P-frame) encoding -----
@@ -3106,8 +3142,11 @@ fn plan_sub8x8_leaf(
 /// Requires an error-resilient non-key lossy header (see
 /// [`crate::frame_writer::assemble_inter_frame_tree`]).
 // Spec-shaped fan-in (header + targets + per-reference planes + search
-// options), matching the crate's encoder-driver style.
-#[allow(clippy::too_many_arguments)]
+// options), matching the crate's encoder-driver style. Bytes+recon
+// convenience over the `_with_state` encoder; the non-test encoders
+// all thread the state, so only tests (and the fixture builders in
+// them) call this.
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn encode_pframe_lossy_tree_motion(
     hdr: &Vp9FrameHeader,
     targets: &[Plane; 3],
@@ -3119,6 +3158,35 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
     subpel: bool,
     sub8x8: bool,
 ) -> Result<(Vec<u8>, ReconState), Error> {
+    encode_pframe_lossy_tree_motion_with_state(
+        hdr,
+        targets,
+        reference,
+        golden,
+        ref_w,
+        ref_h,
+        search_range,
+        subpel,
+        sub8x8,
+    )
+    .map(|(b, r, _)| (b, r))
+}
+
+/// [`encode_pframe_lossy_tree_motion`] also returning the writer's final
+/// §6.4.4 [`crate::decode_block::Vp9FrameState`] per-MI arrays — the
+/// input the encode-side §8.8 loop-filter mirror consumes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_pframe_lossy_tree_motion_with_state(
+    hdr: &Vp9FrameHeader,
+    targets: &[Plane; 3],
+    reference: &[(&[i32], usize); 3],
+    golden: Option<&[(&[i32], usize); 3]>,
+    ref_w: u32,
+    ref_h: u32,
+    search_range: i32,
+    subpel: bool,
+    sub8x8: bool,
+) -> Result<(Vec<u8>, ReconState, crate::decode_block::Vp9FrameState), Error> {
     use crate::frame_writer::{InterFrameTreePlan, InterTreeLeaf, InterTreePlanner};
     use crate::inter_decode::FrameStateMvSource;
     use crate::mode_info::{LAST_FRAME, NEARESTMV, NEARMV, NEWMV, NONE_REF_FRAME, ZEROMV};
@@ -3604,11 +3672,66 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
         prev_segment_ids: None,
         prev_frame_mvs_absent: !hdr.error_resilient_mode,
     };
-    let bytes =
-        crate::frame_writer::assemble_inter_frame_tree(hdr, &plan, &mut *planner, &mut *coeffs)?;
+    let (bytes, state) = crate::frame_writer::assemble_inter_frame_tree_with_state(
+        hdr,
+        &plan,
+        &mut *planner,
+        &mut *coeffs,
+    )?;
     drop(planner);
     drop(coeffs);
-    Ok((bytes, work.into_inner()))
+    Ok((bytes, work.into_inner(), state))
+}
+
+/// Close out one lossy frame with the §8.8 encode-side loop filter:
+/// elect the frame `loop_filter_level` from the level-0 encode products
+/// ([`crate::recon_filter::elect_filter_level`] — the level never
+/// changes the reconstruction, only the header field and the §8.8
+/// post-pass), re-assemble the frame with the elected level when it is
+/// non-zero (byte-deterministic: only the §6.2.8 fixed-width level
+/// field changes, so the stream length is invariant), and apply the
+/// §8.8 chain to the reconstruction exactly as every conforming
+/// decoder will before §8.10 stores it — the filtered planes are what
+/// the next frame must reference.
+///
+/// `hdr` is the level-0 header the `bytes0` encode used; `re_encode`
+/// re-runs the identical (deterministic) assembly under the substituted
+/// header.
+// Spec-shaped fan-in (header + the three level-0 encode products +
+// source/extent scoring inputs), matching the crate's encoder-driver
+// style.
+#[allow(clippy::too_many_arguments)]
+fn finish_frame_with_filter(
+    hdr: &Vp9FrameHeader,
+    bytes0: Vec<u8>,
+    recon0: ReconState,
+    state0: crate::decode_block::Vp9FrameState,
+    targets: &[Plane; 3],
+    vis_w: usize,
+    vis_h: usize,
+    re_encode: impl FnOnce(
+        &Vp9FrameHeader,
+    )
+        -> Result<(Vec<u8>, ReconState, crate::decode_block::Vp9FrameState), Error>,
+) -> Result<(Vec<u8>, ReconState), Error> {
+    use crate::recon_filter::{elect_filter_level, filter_reconstruction};
+
+    let level = elect_filter_level(&recon0, &state0, hdr, targets, vis_w, vis_h);
+    if level == 0 {
+        // §8.1 step 2: level 0 codes no filtering — the level-0 encode
+        // is already final and the reconstruction stays raw.
+        return Ok((bytes0, recon0));
+    }
+    let mut hdr2 = *hdr;
+    hdr2.loop_filter.level = level;
+    let (bytes, mut recon, state) = re_encode(&hdr2)?;
+    debug_assert_eq!(
+        bytes.len(),
+        bytes0.len(),
+        "§6.2.8 filter_level is fixed-width; re-assembly must not change the stream length"
+    );
+    filter_reconstruction(&mut recon, &state, &hdr2);
+    Ok((bytes, recon))
 }
 
 /// Encode a sequence of 8-bit 4:2:0 planar frames into a **lossy** VP9
@@ -3616,6 +3739,12 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
 /// followed by lossy P-frames with per-block `ZEROMV` / `NEWMV` motion,
 /// each referencing the previous frame's in-loop **reconstruction** (the
 /// decoder's exact output), so encoder and decoder never drift.
+///
+/// Every frame runs the encode-side §8.8 loop filter with a per-frame
+/// **elected** `loop_filter_level` (see [`finish_frame_with_filter`]):
+/// the reference chain threads the *filtered* reconstructions, exactly
+/// mirroring the §8.10 post-filter frame store every conforming decoder
+/// keeps.
 pub(crate) fn encode_sequence_lossy_420(
     frames: &[&[u8]],
     width: u32,
@@ -3669,9 +3798,31 @@ pub(crate) fn encode_sequence_lossy_420(
         ]
     };
 
-    // Lossy keyframe over the content-adaptive partition/tx tree.
-    let (kf_bytes, kf_recon) =
-        encode_keyframe_lossy_420_with_recon(frames[0], width, height, base_q_idx)?;
+    // Lossy keyframe over the content-adaptive partition/tx tree, with
+    // the elected §8.8 filter level and the filtered reconstruction.
+    let kf_targets = padded_targets(frames[0]);
+    let kf_hdr = lossy_keyframe_header_420(width, height, base_q_idx);
+    let kf_plan = plan_keyframe_tree(
+        &kf_targets,
+        mi_rows as u32,
+        mi_cols as u32,
+        true,
+        true,
+        8,
+        base_q_idx,
+    );
+    let (kf0, kf_recon0, kf_state0) =
+        encode_keyframe_lossy_tree_with_state(&kf_hdr, &kf_targets, &kf_plan)?;
+    let (kf_bytes, kf_recon) = finish_frame_with_filter(
+        &kf_hdr,
+        kf0,
+        kf_recon0,
+        kf_state0,
+        &kf_targets,
+        w,
+        h,
+        |hdr2| encode_keyframe_lossy_tree_with_state(hdr2, &kf_targets, &kf_plan),
+    )?;
 
     let mut out = Vec::with_capacity(frames.len());
     out.push(kf_bytes);
@@ -3680,6 +3831,7 @@ pub(crate) fn encode_sequence_lossy_420(
     // parked in §8.10 slot 1 (the keyframe refreshes every slot; the
     // P-frames refresh only slot 0), so `ref_frame_idx = [0, 1, 1]`
     // resolves LAST to the previous frame and GOLDEN to the keyframe.
+    // Post-filter, per §8.10: the store happens after §8.1 step 2.
     let golden = visible_crop(&kf_recon);
     let golden_ref: [(&[i32], usize); 3] = [
         (golden[0].as_slice(), w),
@@ -3709,7 +3861,7 @@ pub(crate) fn encode_sequence_lossy_420(
             delta_q_uv_ac: 0,
             lossless: false,
         };
-        let (bytes, recon) = encode_pframe_lossy_tree_motion(
+        let (p0, recon0, state0) = encode_pframe_lossy_tree_motion_with_state(
             &hdr,
             &targets,
             &reference,
@@ -3720,6 +3872,20 @@ pub(crate) fn encode_sequence_lossy_420(
             true,
             true,
         )?;
+        let (bytes, recon) =
+            finish_frame_with_filter(&hdr, p0, recon0, state0, &targets, w, h, |hdr2| {
+                encode_pframe_lossy_tree_motion_with_state(
+                    hdr2,
+                    &targets,
+                    &reference,
+                    Some(&golden_ref),
+                    width,
+                    height,
+                    PFRAME_SEARCH_RANGE,
+                    true,
+                    true,
+                )
+            })?;
         out.push(bytes);
         prev_recon = recon;
     }
@@ -3820,16 +3986,40 @@ pub(crate) fn encode_sequence_lossy_rc_420(
         ]
     };
 
-    // Keyframe: bisect q over the planner-driven encoder.
-    let (kf_bytes, kf_recon, _kf_q) = bisect_q(
-        |q| encode_keyframe_lossy_420_with_recon(frames[0], width, height, q),
+    // Keyframe: bisect q over the planner-driven encoder, then elect
+    // the §8.8 filter level at the chosen q (the level is a fixed-width
+    // §6.2.8 field, so the election never disturbs the fitted size).
+    let (kf0, (kf_recon0, kf_state0, kf_q), _) = bisect_q(
+        |q| {
+            encode_keyframe_lossy_420_with_recon_state(frames[0], width, height, q)
+                .map(|(b, r, s)| (b, (r, s, q)))
+        },
         target_bytes_per_frame,
+    )?;
+    let kf_targets = padded_targets(frames[0]);
+    let kf_hdr = lossy_keyframe_header_420(width, height, kf_q);
+    let (kf_bytes, kf_recon) = finish_frame_with_filter(
+        &kf_hdr,
+        kf0,
+        kf_recon0,
+        kf_state0,
+        &kf_targets,
+        w,
+        h,
+        |hdr2| {
+            let mi_cols = (width + 7) >> 3;
+            let mi_rows = (height + 7) >> 3;
+            let plan = plan_keyframe_tree(&kf_targets, mi_rows, mi_cols, true, true, 8, kf_q);
+            encode_keyframe_lossy_tree_with_state(hdr2, &kf_targets, &plan)
+        },
     )?;
 
     let mut out = Vec::with_capacity(frames.len());
     out.push(kf_bytes);
 
-    // Long-term GOLDEN reference (see `encode_sequence_lossy_420`).
+    // Long-term GOLDEN reference (see `encode_sequence_lossy_420`) —
+    // the keyframe's *filtered* reconstruction, per the §8.10
+    // post-filter store.
     let golden = visible_crop(&kf_recon);
     let golden_ref: [(&[i32], usize); 3] = [
         (golden[0].as_slice(), w),
@@ -3846,31 +4036,45 @@ pub(crate) fn encode_sequence_lossy_rc_420(
             (prev[1].as_slice(), cw),
             (prev[2].as_slice(), cw),
         ];
-        let (bytes, recon, _q) = bisect_q(
-            |q| {
-                let mut hdr = lossless_pframe_header(width, height);
-                hdr.ref_frame_idx = Some([0, 1, 1]);
-                hdr.ref_frame_sign_bias = [false, false, true];
-                hdr.quantization = QuantizationParams {
-                    base_q_idx: q,
-                    delta_q_y_dc: 0,
-                    delta_q_uv_dc: 0,
-                    delta_q_uv_ac: 0,
-                    lossless: false,
-                };
-                encode_pframe_lossy_tree_motion(
-                    &hdr,
-                    &targets,
-                    &reference,
-                    Some(&golden_ref),
-                    width,
-                    height,
-                    PFRAME_SEARCH_RANGE,
-                    true,
-                    true,
-                )
-            },
+        let pframe_hdr = |q: u8| -> Vp9FrameHeader {
+            let mut hdr = lossless_pframe_header(width, height);
+            hdr.ref_frame_idx = Some([0, 1, 1]);
+            hdr.ref_frame_sign_bias = [false, false, true];
+            hdr.quantization = QuantizationParams {
+                base_q_idx: q,
+                delta_q_y_dc: 0,
+                delta_q_uv_dc: 0,
+                delta_q_uv_ac: 0,
+                lossless: false,
+            };
+            hdr
+        };
+        let encode_at = |hdr: &Vp9FrameHeader| {
+            encode_pframe_lossy_tree_motion_with_state(
+                hdr,
+                &targets,
+                &reference,
+                Some(&golden_ref),
+                width,
+                height,
+                PFRAME_SEARCH_RANGE,
+                true,
+                true,
+            )
+        };
+        let (p0, (recon0, state0, p_q), _) = bisect_q(
+            |q| encode_at(&pframe_hdr(q)).map(|(b, r, s)| (b, (r, s, q))),
             target_bytes_per_frame,
+        )?;
+        let (bytes, recon) = finish_frame_with_filter(
+            &pframe_hdr(p_q),
+            p0,
+            recon0,
+            state0,
+            &targets,
+            w,
+            h,
+            |hdr2| encode_at(hdr2),
         )?;
         out.push(bytes);
         prev_recon = recon;
@@ -5727,19 +5931,36 @@ mod tests {
             delta_q_uv_ac: 0,
             lossless: false,
         };
-        let (bytes, recon) = encode_pframe_lossy_tree_motion(
+        let encode_at = |hdr: &Vp9FrameHeader| {
+            encode_pframe_lossy_tree_motion_with_state(
+                hdr,
+                &targets,
+                &reference,
+                Some(&golden_ref),
+                w,
+                h,
+                PFRAME_SEARCH_RANGE,
+                true,
+                true, // the sequence encoder runs with sub-8x8 election on
+            )
+        };
+        let (p0, recon0, state0) = encode_at(&hdr).expect("re-encode last hop");
+        // Replay the sequence encoder's per-frame filter-level election
+        // + §8.8 recon filtering — the last hop's exact close-out.
+        let (bytes, recon) = finish_frame_with_filter(
             &hdr,
+            p0,
+            recon0,
+            state0,
             &targets,
-            &reference,
-            Some(&golden_ref),
-            w,
-            h,
-            PFRAME_SEARCH_RANGE,
-            true,
-            true, // the sequence encoder runs with sub-8x8 election on
+            w_us,
+            h as usize,
+            |hdr2| encode_at(hdr2),
         )
-        .expect("re-encode last hop");
+        .expect("elect + filter last hop");
         assert_eq!(bytes, coded[3], "re-encoded last frame must be identical");
+        // The decoder's output IS the filtered reconstruction — the
+        // §8.8 encode-side mirror holds sample-exactly.
         let last_decoded = &decoded[3];
         for row in 0..h as usize {
             for col in 0..w as usize {

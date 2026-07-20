@@ -109,14 +109,7 @@ pub struct Vp9DecodedFrame {
     pub v: Vec<u16>,
 }
 
-/// §7.2 `setup_past_independence( )` default `loop_filter_ref_deltas`
-/// (`vp9-spec.txt` §7.2: 1 for INTRA_FRAME, 0 for LAST_FRAME, -1 for
-/// GOLDEN_FRAME and ALTREF_FRAME).
-const DEFAULT_LOOP_FILTER_REF_DELTAS: [i8; 4] = [1, 0, -1, -1];
-
-/// §7.2 `setup_past_independence( )` default `loop_filter_mode_deltas`
-/// (both zero).
-const DEFAULT_LOOP_FILTER_MODE_DELTAS: [i8; 2] = [0, 0];
+use crate::loop_filter::{DEFAULT_LOOP_FILTER_MODE_DELTAS, DEFAULT_LOOP_FILTER_REF_DELTAS};
 
 /// Per-frame state threaded through the §6.4.4 `decode_block( )` call
 /// sites by the §6.4.3 partition walk.
@@ -1427,18 +1420,7 @@ fn decode_single_frame(
     // §8.8 loop filter over the reconstructed frame. The §8.8.1 init
     // consumes the §6.2.8 deltas resolved against the §7.2
     // setup_past_independence defaults (intra frames reset them).
-    let mut ref_deltas = DEFAULT_LOOP_FILTER_REF_DELTAS;
-    for (slot, delta) in ref_deltas.iter_mut().zip(hdr.loop_filter.ref_deltas) {
-        if let Some(d) = delta {
-            *slot = d;
-        }
-    }
-    let mut mode_deltas = DEFAULT_LOOP_FILTER_MODE_DELTAS;
-    for (slot, delta) in mode_deltas.iter_mut().zip(hdr.loop_filter.mode_deltas) {
-        if let Some(d) = delta {
-            *slot = d;
-        }
-    }
+    let (ref_deltas, mode_deltas) = crate::loop_filter::resolve_lf_deltas(&hdr.loop_filter);
     let lvl_lookup =
         loop_filter_frame_init(&hdr.loop_filter, &hdr.segmentation, ref_deltas, mode_deltas);
 

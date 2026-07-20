@@ -534,6 +534,7 @@ mod partition;
 mod partition_writer;
 mod pixel_encoder;
 mod prob_adapt;
+mod recon_filter;
 mod reconstruct;
 mod ref_buffer;
 mod residual;

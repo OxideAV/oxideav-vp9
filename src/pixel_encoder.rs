@@ -750,7 +750,40 @@ pub(crate) fn encode_keyframe_lossy_420(
     height: u32,
     base_q_idx: u8,
 ) -> Result<Vec<u8>, Error> {
-    encode_keyframe_lossy_420_with_recon(pixels, width, height, base_q_idx).map(|(bytes, _)| bytes)
+    // Level-0 encode, then the §8.8 filter-params election (round
+    // 420): a standalone keyframe's decoded output is its filtered
+    // reconstruction, so the election lifts display quality at zero
+    // rate cost exactly as in the sequence encoders. (The `_with_recon`
+    // variants stay level-0: they are the sequence/fixture primitives
+    // whose callers run their own election.)
+    let (bytes0, recon0, state0) =
+        encode_keyframe_lossy_420_with_recon_state(pixels, width, height, base_q_idx)?;
+    let w = width as usize;
+    let h = height as usize;
+    let cw = width.div_ceil(2) as usize;
+    let ch = height.div_ceil(2) as usize;
+    let y_w = w.div_ceil(8) * 8;
+    let y_h = h.div_ceil(8) * 8;
+    let targets = [
+        padded_plane_from_bytes(&pixels[..w * h], w, h, y_w, y_h),
+        padded_plane_from_bytes(&pixels[w * h..w * h + cw * ch], cw, ch, y_w >> 1, y_h >> 1),
+        padded_plane_from_bytes(&pixels[w * h + cw * ch..], cw, ch, y_w >> 1, y_h >> 1),
+    ];
+    let hdr = lossy_keyframe_header_420(width, height, base_q_idx);
+    let (bytes, _recon) =
+        finish_frame_with_filter(&hdr, bytes0, recon0, state0, &targets, w, h, |hdr2| {
+            let plan = plan_keyframe_tree(
+                &targets,
+                (height + 7) >> 3,
+                (width + 7) >> 3,
+                true,
+                true,
+                8,
+                base_q_idx,
+            );
+            encode_keyframe_lossy_tree_with_state(hdr2, &targets, &plan)
+        })?;
+    Ok(bytes)
 }
 
 /// The §6.2 header for a **lossy** 8-bit 4:2:0 keyframe at `base_q_idx`
@@ -769,9 +802,12 @@ pub(crate) fn lossy_keyframe_header_420(width: u32, height: u32, base_q_idx: u8)
     hdr
 }
 
-/// [`encode_keyframe_lossy_420`] also returning the encoder's in-loop
-/// reconstruction (== the decoder's exact output) for reference
-/// threading by the sequence encoder.
+/// [`encode_keyframe_lossy_420`] at level 0, also returning the
+/// encoder's in-loop reconstruction (== the decoder's exact output)
+/// for reference threading.
+// Bytes+recon convenience over the `_state` variant; the non-test
+// encoders all thread the state, so only tests call this.
+#[allow(dead_code)]
 pub(crate) fn encode_keyframe_lossy_420_with_recon(
     pixels: &[u8],
     width: u32,
@@ -3714,9 +3750,9 @@ fn finish_frame_with_filter(
     )
         -> Result<(Vec<u8>, ReconState, crate::decode_block::Vp9FrameState), Error>,
 ) -> Result<(Vec<u8>, ReconState), Error> {
-    use crate::recon_filter::{elect_filter_level, filter_reconstruction};
+    use crate::recon_filter::{elect_filter_params, filter_reconstruction};
 
-    let level = elect_filter_level(&recon0, &state0, hdr, targets, vis_w, vis_h);
+    let (level, sharpness) = elect_filter_params(&recon0, &state0, hdr, targets, vis_w, vis_h);
     if level == 0 {
         // §8.1 step 2: level 0 codes no filtering — the level-0 encode
         // is already final and the reconstruction stays raw.
@@ -3724,11 +3760,12 @@ fn finish_frame_with_filter(
     }
     let mut hdr2 = *hdr;
     hdr2.loop_filter.level = level;
+    hdr2.loop_filter.sharpness = sharpness;
     let (bytes, mut recon, state) = re_encode(&hdr2)?;
     debug_assert_eq!(
         bytes.len(),
         bytes0.len(),
-        "§6.2.8 filter_level is fixed-width; re-assembly must not change the stream length"
+        "§6.2.8 filter_level / sharpness are fixed-width; re-assembly must not change the length"
     );
     filter_reconstruction(&mut recon, &state, &hdr2);
     Ok((bytes, recon))

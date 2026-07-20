@@ -211,6 +211,9 @@ fn visible_sse(
 /// * `targets` — the MI-padded source planes the encoder quantized.
 /// * `vis_w` / `vis_h` — visible luma extents (`FrameWidth` /
 ///   `FrameHeight`).
+// Level-only convenience over [`elect_filter_params`]; the non-test
+// encoders elect the full pair, so only tests call this.
+#[allow(dead_code)]
 pub(crate) fn elect_filter_level(
     recon: &ReconState,
     state: &Vp9FrameState,
@@ -219,17 +222,37 @@ pub(crate) fn elect_filter_level(
     vis_w: usize,
     vis_h: usize,
 ) -> u8 {
+    elect_filter_params(recon, state, hdr, targets, vis_w, vis_h).0
+}
+
+/// [`elect_filter_level`] extended over the second free §6.2.8 axis:
+/// elect the `(loop_filter_level, loop_filter_sharpness)` pair (both
+/// fixed-width fields — the whole election is rate-free).
+///
+/// Two-stage search keeping the probe count bounded at 64 + 7 full
+/// §8.8 replays: sweep every level `0..=63` at the header's own
+/// sharpness first (ties toward the smaller level, so unimprovable
+/// content elects `(0, hdr.sharpness)` and stays untouched), then —
+/// when a non-zero level won — sweep the remaining sharpness values
+/// `0..=7` at that level (ties toward the header's own sharpness). The
+/// §8.8.4 sharpness derivation only tightens the per-edge `limit`
+/// (`limit = Clip3( 1, 9 - sharpness, lvl >> shift )` instead of
+/// `Max( 1, lvl )`), so it trades smoothing strength for detail
+/// retention along strong edges; the stage-2 sweep picks whichever
+/// trade lands closer to the source.
+pub(crate) fn elect_filter_params(
+    recon: &ReconState,
+    state: &Vp9FrameState,
+    hdr: &Vp9FrameHeader,
+    targets: &[Plane; 3],
+    vis_w: usize,
+    vis_h: usize,
+) -> (u8, u8) {
     let ssx = hdr.color_config.subsampling_x;
     let ssy = hdr.color_config.subsampling_y;
     let arrays = FilterMiArrays::from_state(state);
 
-    // Level 0: §8.1 step 2 skips the filter — the unfiltered baseline.
-    let mut best_level = 0u8;
-    let mut best_sse = visible_sse(&recon.planes, targets, vis_w, vis_h, ssx, ssy);
-
-    let mut cand_hdr = *hdr;
-    for level in 1..=MAX_LOOP_FILTER as u8 {
-        cand_hdr.loop_filter.level = level;
+    let probe_sse = |cand_hdr: &Vp9FrameHeader| -> u64 {
         let (ref_deltas, mode_deltas) = resolve_lf_deltas(&cand_hdr.loop_filter);
         let lvl_lookup = loop_filter_frame_init(
             &cand_hdr.loop_filter,
@@ -238,14 +261,45 @@ pub(crate) fn elect_filter_level(
             mode_deltas,
         );
         let mut probe = recon.planes.clone();
-        run_filter(&mut probe, &arrays, state, &cand_hdr, &lvl_lookup);
-        let sse = visible_sse(&probe, targets, vis_w, vis_h, ssx, ssy);
+        run_filter(&mut probe, &arrays, state, cand_hdr, &lvl_lookup);
+        visible_sse(&probe, targets, vis_w, vis_h, ssx, ssy)
+    };
+
+    // Stage 1 — level sweep at the header's sharpness. Level 0: §8.1
+    // step 2 skips the filter — the unfiltered baseline.
+    let mut best_level = 0u8;
+    let mut best_sse = visible_sse(&recon.planes, targets, vis_w, vis_h, ssx, ssy);
+    let mut cand_hdr = *hdr;
+    for level in 1..=MAX_LOOP_FILTER as u8 {
+        cand_hdr.loop_filter.level = level;
+        let sse = probe_sse(&cand_hdr);
         if sse < best_sse {
             best_sse = sse;
             best_level = level;
         }
     }
-    best_level
+    if best_level == 0 {
+        // No level improves at any strength-limit trade the header's
+        // sharpness allows; keep the header's own sharpness (the field
+        // is coded either way).
+        return (0, hdr.loop_filter.sharpness);
+    }
+
+    // Stage 2 — sharpness sweep at the winning level.
+    let mut best_sharpness = hdr.loop_filter.sharpness;
+    cand_hdr.loop_filter.level = best_level;
+    for sharpness in 0..=7u8 {
+        if sharpness == hdr.loop_filter.sharpness {
+            continue;
+        }
+        cand_hdr.loop_filter.sharpness = sharpness;
+        let sse = probe_sse(&cand_hdr);
+        if sse < best_sse {
+            best_sse = sse;
+            best_sharpness = sharpness;
+        }
+    }
+    (best_level, best_sharpness)
 }
 
 #[cfg(test)]
@@ -300,7 +354,24 @@ mod tests {
     }
 
     /// Encode a lossy keyframe at `q` with the given coded filter
-    /// `level`, returning (bytes, recon, state).
+    /// `level` / `sharpness`, returning (bytes, recon, state).
+    fn encode_kf_sharp(
+        px: &[u8],
+        w: u32,
+        h: u32,
+        q: u8,
+        level: u8,
+        sharpness: u8,
+    ) -> (Vec<u8>, ReconState, Vp9FrameState) {
+        let targets = padded_targets(px, w as usize, h as usize);
+        let mut hdr = lossy_keyframe_header_420(w, h, q);
+        hdr.loop_filter.level = level;
+        hdr.loop_filter.sharpness = sharpness;
+        let plan = plan_keyframe_tree(&targets, (h + 7) >> 3, (w + 7) >> 3, true, true, 8, q);
+        encode_keyframe_lossy_tree_with_state(&hdr, &targets, &plan).expect("kf encode")
+    }
+
+    /// [`encode_kf_sharp`] at sharpness 0.
     fn encode_kf(
         px: &[u8],
         w: u32,
@@ -308,11 +379,7 @@ mod tests {
         q: u8,
         level: u8,
     ) -> (Vec<u8>, ReconState, Vp9FrameState) {
-        let targets = padded_targets(px, w as usize, h as usize);
-        let mut hdr = lossy_keyframe_header_420(w, h, q);
-        hdr.loop_filter.level = level;
-        let plan = plan_keyframe_tree(&targets, (h + 7) >> 3, (w + 7) >> 3, true, true, 8, q);
-        encode_keyframe_lossy_tree_with_state(&hdr, &targets, &plan).expect("kf encode")
+        encode_kf_sharp(px, w, h, q, level, 0)
     }
 
     /// §8.1 step 2: a zero coded level skips the whole §8.8 process —
@@ -551,8 +618,83 @@ mod tests {
         let (_, recon, state) = encode_kf(&px, w, h, 120, 0);
         let hdr = lossy_keyframe_header_420(w, h, 120);
         let targets = padded_targets(&px, w as usize, h as usize);
-        let a = elect_filter_level(&recon, &state, &hdr, &targets, w as usize, h as usize);
-        let b = elect_filter_level(&recon, &state, &hdr, &targets, w as usize, h as usize);
+        let a = elect_filter_params(&recon, &state, &hdr, &targets, w as usize, h as usize);
+        let b = elect_filter_params(&recon, &state, &hdr, &targets, w as usize, h as usize);
         assert_eq!(a, b);
+    }
+
+    /// Keyframe mirror at non-zero `loop_filter_sharpness`: the §8.8.4
+    /// `shift` / `Clip3( 1, 9 - sharpness, … )` limit derivation runs
+    /// through the encode-side chain exactly as through the decoder —
+    /// and a sharpness change demonstrably alters the filtered output
+    /// (the mirror is not vacuous in the sharpness axis).
+    #[test]
+    fn keyframe_filtered_recon_mirrors_decoder_at_nonzero_sharpness() {
+        let (w, h) = (48u32, 40u32);
+        let px = gentle_planar(w as usize, h as usize);
+        let mut outputs: Vec<Vec<i32>> = Vec::new();
+        for sharpness in [0u8, 3, 7] {
+            let (bytes, mut recon, state) = encode_kf_sharp(&px, w, h, 140, 32, sharpness);
+            let mut hdr = lossy_keyframe_header_420(w, h, 140);
+            hdr.loop_filter.level = 32;
+            hdr.loop_filter.sharpness = sharpness;
+            filter_reconstruction(&mut recon, &state, &hdr);
+
+            let decoded = crate::decode_intra_frame(&bytes).expect("decode");
+            let (vis_w, vis_h) = (w as usize, h as usize);
+            for row in 0..vis_h {
+                for col in 0..vis_w {
+                    assert_eq!(
+                        i32::from(decoded.y[row * vis_w + col]),
+                        recon.planes[0].get(col, row),
+                        "sharpness {sharpness}: luma mirror ({col},{row})"
+                    );
+                }
+            }
+            outputs.push(recon.planes[0].samples().to_vec());
+        }
+        assert_ne!(
+            outputs[0], outputs[2],
+            "sharpness 0 vs 7 must alter the filtered plane on this content"
+        );
+    }
+
+    /// The two-stage `(level, sharpness)` election never lands worse
+    /// than the level-only election at the header's sharpness — stage
+    /// 2 only moves on a strict SSE win.
+    #[test]
+    fn sharpness_election_never_regresses_the_level_election() {
+        let (w, h) = (64u32, 48u32);
+        let px = textured_planar(w as usize, h as usize, 11);
+        let q = 160u8;
+        let (_, recon, state) = encode_kf(&px, w, h, q, 0);
+        let hdr = lossy_keyframe_header_420(w, h, q);
+        let targets = padded_targets(&px, w as usize, h as usize);
+        let (level, sharpness) =
+            elect_filter_params(&recon, &state, &hdr, &targets, w as usize, h as usize);
+        assert!(
+            level > 0,
+            "coarse-q textured content should elect filtering"
+        );
+
+        let sse_at = |lv: u8, sh: u8| -> u64 {
+            let mut hdr2 = hdr;
+            hdr2.loop_filter.level = lv;
+            hdr2.loop_filter.sharpness = sh;
+            let mut probe = ReconState {
+                planes: recon.planes.clone(),
+                mi_cols: recon.mi_cols,
+                mi_rows: recon.mi_rows,
+                subsampling_x: recon.subsampling_x,
+                subsampling_y: recon.subsampling_y,
+                bit_depth: recon.bit_depth,
+            };
+            filter_reconstruction(&mut probe, &state, &hdr2);
+            visible_sse(&probe.planes, &targets, w as usize, h as usize, true, true)
+        };
+        assert!(
+            sse_at(level, sharpness) <= sse_at(level, hdr.loop_filter.sharpness),
+            "stage-2 sharpness must not regress the stage-1 winner"
+        );
     }
 }

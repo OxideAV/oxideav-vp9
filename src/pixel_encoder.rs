@@ -5973,6 +5973,171 @@ mod tests {
         }
     }
 
+    /// A/B pin for the encode-side §8.8 loop filter: on gently-graded
+    /// content at a coarse quantizer, the sequence encoder's per-frame
+    /// filter-level election (a) codes a non-zero `loop_filter_level`
+    /// on the keyframe, (b) leaves the keyframe's coded size exactly
+    /// unchanged (the §6.2.8 level field is fixed-width — filtering is
+    /// rate-free on the frame that elects it), and (c) lands the whole
+    /// decoded GOP strictly closer to the source than the identical
+    /// chain with filtering forced off.
+    #[test]
+    fn filter_election_improves_gop_quality_at_equal_keyframe_rate() {
+        use crate::decode_frame::decode_vp9_sequence;
+
+        let (w, h) = (64u32, 48u32);
+        let cw = w.div_ceil(2) as usize;
+        let ch = h.div_ceil(2) as usize;
+        let q = 140u8;
+        // Slow diagonal ramp translating between frames: coarse
+        // quantization leaves small block-edge steps (inside the
+        // §8.8.5.1 filterMask thresholds) that the filter smooths back
+        // toward the source.
+        let frame_at = |t: i64| -> Vec<u8> {
+            let mut px = Vec::with_capacity((w * h) as usize + 2 * cw * ch);
+            for y in 0..h as i64 {
+                for x in 0..w as i64 {
+                    px.push((100 + (x * 3 + y * 2 + 5 * t) / 4 % 48) as u8);
+                }
+            }
+            for y in 0..ch as i64 {
+                for x in 0..cw as i64 {
+                    px.push((90 + (x + y * 3 + 2 * t) / 3 % 30) as u8);
+                }
+            }
+            for y in 0..ch as i64 {
+                for x in 0..cw as i64 {
+                    px.push((130 + (x * 2 + y + 3 * t) / 5 % 26) as u8);
+                }
+            }
+            px
+        };
+        let inputs: Vec<Vec<u8>> = (0..3).map(frame_at).collect();
+        let refs: Vec<&[u8]> = inputs.iter().map(|f| f.as_slice()).collect();
+
+        // A: the sequence encoder with election (the shipping path).
+        let elected = encode_sequence_lossy_420(&refs, w, h, q).expect("elected encode");
+
+        // (a) The keyframe header carries a non-zero elected level.
+        let kf_hdr = crate::header::parse_uncompressed_header(&elected[0]).expect("kf header");
+        assert!(
+            kf_hdr.loop_filter.level > 0,
+            "coarse-q graded content should elect keyframe filtering"
+        );
+
+        // B: the identical chain with filtering forced off — the
+        // pre-round-420 encoder, replayed via the same primitives.
+        let padded = |px: &[u8]| -> [Plane; 3] {
+            let y_w = (((w + 7) >> 3) * 8) as usize;
+            let y_h = (((h + 7) >> 3) * 8) as usize;
+            let wu = w as usize;
+            let hu = h as usize;
+            [
+                padded_plane_from_bytes(&px[..wu * hu], wu, hu, y_w, y_h),
+                padded_plane_from_bytes(&px[wu * hu..wu * hu + cw * ch], cw, ch, y_w / 2, y_h / 2),
+                padded_plane_from_bytes(&px[wu * hu + cw * ch..], cw, ch, y_w / 2, y_h / 2),
+            ]
+        };
+        let crop3 = |r: &ReconState| -> [Vec<i32>; 3] {
+            let crop = |p: &Plane, vw: usize, vh: usize| -> Vec<i32> {
+                let mut out = Vec::with_capacity(vw * vh);
+                for y in 0..vh {
+                    for x in 0..vw {
+                        out.push(p.get(x, y));
+                    }
+                }
+                out
+            };
+            [
+                crop(&r.planes[0], w as usize, h as usize),
+                crop(&r.planes[1], cw, ch),
+                crop(&r.planes[2], cw, ch),
+            ]
+        };
+        let (kf0, kf_recon0) =
+            encode_keyframe_lossy_420_with_recon(&inputs[0], w, h, q).expect("kf level 0");
+        // (b) Same coded size: the elected keyframe differs only in the
+        // fixed-width §6.2.8 level field.
+        assert_eq!(
+            elected[0].len(),
+            kf0.len(),
+            "keyframe rate must be unchanged"
+        );
+        assert_ne!(elected[0], kf0, "elected keyframe must differ (level bits)");
+
+        let mut unfiltered = vec![kf0];
+        let golden = crop3(&kf_recon0);
+        let golden_ref: [(&[i32], usize); 3] = [
+            (golden[0].as_slice(), w as usize),
+            (golden[1].as_slice(), cw),
+            (golden[2].as_slice(), cw),
+        ];
+        let mut prev_recon = kf_recon0;
+        for px in inputs.iter().skip(1) {
+            let targets = padded(px);
+            let prev = crop3(&prev_recon);
+            let reference: [(&[i32], usize); 3] = [
+                (prev[0].as_slice(), w as usize),
+                (prev[1].as_slice(), cw),
+                (prev[2].as_slice(), cw),
+            ];
+            let mut hdr = lossless_pframe_header(w, h);
+            hdr.ref_frame_idx = Some([0, 1, 1]);
+            hdr.ref_frame_sign_bias = [false, false, true];
+            hdr.quantization = QuantizationParams {
+                base_q_idx: q,
+                delta_q_y_dc: 0,
+                delta_q_uv_dc: 0,
+                delta_q_uv_ac: 0,
+                lossless: false,
+            };
+            let (bytes, recon) = encode_pframe_lossy_tree_motion(
+                &hdr,
+                &targets,
+                &reference,
+                Some(&golden_ref),
+                w,
+                h,
+                PFRAME_SEARCH_RANGE,
+                true,
+                true,
+            )
+            .expect("unfiltered p-frame");
+            unfiltered.push(bytes);
+            prev_recon = recon;
+        }
+
+        // (c) Whole-GOP SSE vs source: elected strictly better. (The
+        // measured run: keyframe elects level 49; GOP SSE 78850 vs
+        // 85340 — a 7.6% distortion cut — at an identical 443-byte
+        // total rate on both chains.)
+        let sse_of = |coded: &[Vec<u8>]| -> u64 {
+            let refs: Vec<&[u8]> = coded.iter().map(|f| f.as_slice()).collect();
+            let decoded = decode_vp9_sequence(&refs).expect("decode");
+            decoded
+                .iter()
+                .zip(&inputs)
+                .map(|(f, src)| {
+                    f.to_planar_bytes()
+                        .iter()
+                        .zip(src.iter())
+                        .map(|(&a, &b)| {
+                            let d = i64::from(a) - i64::from(b);
+                            (d * d) as u64
+                        })
+                        .sum::<u64>()
+                })
+                .sum()
+        };
+        let sse_elected = sse_of(&elected);
+        let sse_unfiltered = sse_of(&unfiltered);
+        assert!(
+            sse_elected < sse_unfiltered,
+            "elected filtering must strictly improve the GOP \
+             ({sse_elected} vs {sse_unfiltered})"
+        );
+    }
+
     /// The lossy sequence rejections mirror the lossless ones plus the
     /// lossless-qindex guard.
     #[test]

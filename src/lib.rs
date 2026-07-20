@@ -2677,6 +2677,137 @@ mod encode_roundtrip_tests {
         );
     }
 
+    // ----- lossy filtered GOP: encode-side §8.8 election (round 420) -----
+
+    /// Source frame `t` of the filtered-GOP stream: slow diagonal ramps
+    /// translating over time (luma period ~64px, low-amplitude chroma).
+    /// Coarse quantization leaves small block-edge steps — inside the
+    /// §8.8.5.1 filterMask thresholds — so the per-frame filter-level
+    /// election picks non-zero levels throughout.
+    fn filtered_gop_frame(t: i64) -> Vec<u8> {
+        let (w, h, c) = (64i64, 64i64, 32i64);
+        let mut px = Vec::with_capacity((w * h + 2 * c * c) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                px.push((100 + (x * 3 + y * 2 + 5 * t) / 4 % 48) as u8);
+            }
+        }
+        for y in 0..c {
+            for x in 0..c {
+                px.push((90 + (x + y * 3 + 2 * t) / 3 % 30) as u8);
+            }
+        }
+        for y in 0..c {
+            for x in 0..c {
+                px.push((130 + (x * 2 + y + 3 * t) / 5 % 26) as u8);
+            }
+        }
+        px
+    }
+
+    /// Build the round-420 **lossy filtered GOP** stream (profile 0,
+    /// 8-bit 4:2:0, 64x64, `base_q_idx = 140`) through the public
+    /// [`encode_vp9_lossy_sequence`] API: a lossy keyframe + three lossy
+    /// P-frames over gently-graded translating content, every frame
+    /// closing out through the encode-side §8.8 loop-filter chain with
+    /// a per-frame **elected** non-zero `loop_filter_level` — the
+    /// reference chain threads the *filtered* reconstructions (the
+    /// §8.10 post-filter store every conforming decoder keeps).
+    ///
+    /// The corpus's existing non-zero-filter-level streams are
+    /// black-box encodes; this is the first stream whose filter levels
+    /// are elected (and whose reference frames are filtered) by this
+    /// crate's own encoder.
+    fn build_lossy_filtered_gop_stream() -> Vec<Vec<u8>> {
+        let inputs: Vec<Vec<u8>> = (0..4).map(filtered_gop_frame).collect();
+        let refs: Vec<&[u8]> = inputs.iter().map(|f| f.as_slice()).collect();
+        encode_vp9_lossy_sequence(&refs, 64, 64, 140).expect("filtered GOP encode")
+    }
+
+    /// The filtered GOP decodes end-to-end with every header carrying a
+    /// non-zero elected `loop_filter_level`, distortion bounded by the
+    /// quantizer regime, and byte-determinism (fixture staging relies
+    /// on it).
+    #[test]
+    fn lossy_filtered_gop_decodes_with_nonzero_elected_levels() {
+        let frames = build_lossy_filtered_gop_stream();
+        assert_eq!(frames.len(), 4);
+
+        // Every frame's §6.2.8 header codes an elected non-zero level.
+        let kf_hdr = crate::header::parse_uncompressed_header(&frames[0]).expect("kf header");
+        assert!(kf_hdr.loop_filter.level > 0, "keyframe level");
+        let ref_dims = vec![(64u32, 64u32); 8];
+        for (i, f) in frames.iter().enumerate().skip(1) {
+            let hdr = crate::header::parse_uncompressed_header_with_refs(
+                f,
+                Some(crate::header::RefFrameState {
+                    ref_dims: &ref_dims,
+                    color_config: kf_hdr.color_config,
+                }),
+            )
+            .expect("p header");
+            assert!(hdr.loop_filter.level > 0, "frame {i} level");
+        }
+
+        // Decoded output stays in the q=140 distortion regime against
+        // the source (no drift across the filtered reference chain).
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        let decoded = decode_vp9_sequence(&refs).expect("decode");
+        assert_eq!(decoded.len(), 4);
+        for (i, (frame, src)) in decoded
+            .iter()
+            .zip((0..4).map(filtered_gop_frame))
+            .enumerate()
+        {
+            let out = frame.to_planar_bytes();
+            let mse: f64 = out
+                .iter()
+                .zip(&src)
+                .map(|(&a, &b)| {
+                    let d = f64::from(a) - f64::from(b);
+                    d * d
+                })
+                .sum::<f64>()
+                / out.len() as f64;
+            assert!(mse < 400.0, "frame {i}: MSE {mse} out of the q=140 regime");
+        }
+
+        // Byte-determinism.
+        assert_eq!(frames, build_lossy_filtered_gop_stream());
+    }
+
+    /// Fixture-staging generator (round 420): stages the filtered GOP
+    /// as `lossy-filtered-gop/input.ivf` under `OXIDEAV_VP9_STAGE_DIR`.
+    #[test]
+    fn stage_lossy_filtered_gop_fixture_when_requested() {
+        let Some(dir) = std::env::var_os("OXIDEAV_VP9_STAGE_DIR") else {
+            return;
+        };
+        let frames = build_lossy_filtered_gop_stream();
+        let ivf = ivf_wrap_64x64(&frames);
+        let subdir = std::path::Path::new(&dir).join("lossy-filtered-gop");
+        std::fs::create_dir_all(&subdir).expect("create stage dir");
+        std::fs::write(subdir.join("input.ivf"), &ivf).expect("write input.ivf");
+    }
+
+    /// The staged corpus fixture is byte-identical to the builder's
+    /// output — the fixture IS this crate's writer output (docs-gated).
+    #[test]
+    fn staged_lossy_filtered_gop_fixture_matches_builder() {
+        let path =
+            std::path::Path::new("../../docs/video/vp9/fixtures/lossy-filtered-gop/input.ivf");
+        if !path.is_file() {
+            eprintln!("docs corpus not present; docs-gated");
+            return;
+        }
+        let staged = std::fs::read(path).expect("staged input.ivf");
+        assert_eq!(
+            staged,
+            ivf_wrap_64x64(&build_lossy_filtered_gop_stream()),
+            "staged fixture bytes != builder output"
+        );
+    }
+
     /// Wrap coded frames in a minimal 64x64 IVF container (the layout
     /// every 64x64 staging generator in this module emits).
     fn ivf_wrap_64x64(frames: &[Vec<u8>]) -> Vec<u8> {

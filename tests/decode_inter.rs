@@ -1031,32 +1031,56 @@ fn full_corpus_sequences_byte_exact() {
         "lossy-sub8x8-elected",
         "lossy-compound-elected",
     ] {
-        let base = root.join(name);
-        let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");
-        let expected = std::fs::read(base.join("expected.yuv")).expect("expected.yuv");
-
-        let mut sub: Vec<Vec<u8>> = Vec::new();
-        for p in &ivf_chunks(&ivf) {
-            for f in split_superframe(p) {
-                sub.push(f.to_vec());
-            }
-        }
-        let refs: Vec<&[u8]> = sub.iter().map(|p| p.as_slice()).collect();
-        let frames =
-            decode_vp9_sequence(&refs).unwrap_or_else(|e| panic!("{name}: decode error {e:?}"));
-
-        let mut got = Vec::new();
-        for f in &frames {
-            got.extend(f.to_planar_bytes());
-        }
-        assert_eq!(got.len(), expected.len(), "{name}: planar length");
-        let diffs = got
-            .iter()
-            .zip(expected.iter())
-            .filter(|(a, b)| a != b)
-            .count();
-        assert_eq!(diffs, 0, "{name}: {diffs} differing bytes vs expected.yuv");
+        check_fixture_byte_exact(root, name);
     }
+
+    // Round-420 corpus extension (self-encoded; presence-gated until
+    // the staged bytes land in docs — the builder + docs-gated
+    // identity test live in the crate already):
+    //
+    // * lossy-filtered-gop — the corpus's first stream whose non-zero
+    //   `loop_filter_level`s are ELECTED by this crate's own encoder
+    //   (per-frame §8.8 SSE-vs-source sweep) with the encode-side
+    //   §8.8 chain filtering the reference reconstructions (the
+    //   existing non-zero-level streams are black-box encodes).
+    for name in ["lossy-filtered-gop"] {
+        if !root.join(name).is_dir() {
+            eprintln!("{name}: not yet staged; docs-gated");
+            continue;
+        }
+        check_fixture_byte_exact(root, name);
+    }
+}
+
+/// One `full_corpus_sequences_byte_exact` step: IVF demux → superframe
+/// split → sequence decode → planar packing, byte-exact vs the staged
+/// `expected.yuv`.
+fn check_fixture_byte_exact(root: &std::path::Path, name: &str) {
+    let base = root.join(name);
+    let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");
+    let expected = std::fs::read(base.join("expected.yuv")).expect("expected.yuv");
+
+    let mut sub: Vec<Vec<u8>> = Vec::new();
+    for p in &ivf_chunks(&ivf) {
+        for f in split_superframe(p) {
+            sub.push(f.to_vec());
+        }
+    }
+    let refs: Vec<&[u8]> = sub.iter().map(|p| p.as_slice()).collect();
+    let frames =
+        decode_vp9_sequence(&refs).unwrap_or_else(|e| panic!("{name}: decode error {e:?}"));
+
+    let mut got = Vec::new();
+    for f in &frames {
+        got.extend(f.to_planar_bytes());
+    }
+    assert_eq!(got.len(), expected.len(), "{name}: planar length");
+    let diffs = got
+        .iter()
+        .zip(expected.iter())
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(diffs, 0, "{name}: {diffs} differing bytes vs expected.yuv");
 }
 
 /// §6.1.2 refresh_probs( ) backward adaptation, corpus-pinned: the
@@ -1656,6 +1680,48 @@ fn round_418_fixture_flags_pin_their_feature_classes() {
             chunks[3].len(),
             chunks[1].len()
         );
+    }
+}
+
+/// Round-420 corpus extension: the `lossy-filtered-gop` fixture's
+/// headers carry the flags that make it exercise the encode-side §8.8
+/// class — every frame of the GOP (keyframe + 3 lossy P-frames) codes a
+/// non-zero **elected** `loop_filter_level`, so the whole-corpus
+/// byte-exact sweep proves the encoder's filtered reference chain
+/// against the reference decoder's §8.10 post-filter store. (The level
+/// election itself is below header level; the crate's
+/// `staged_lossy_filtered_gop_fixture_matches_builder` unit test pins
+/// the staged bytes as the encoder's exact output.) Presence-gated
+/// until the staged bytes land in docs.
+#[test]
+fn round_420_filtered_gop_fixture_flags_pin_elected_levels() {
+    let base = std::path::Path::new("../../docs/video/vp9/fixtures/lossy-filtered-gop");
+    if !base.is_dir() {
+        eprintln!("lossy-filtered-gop not yet staged; docs-gated");
+        return;
+    }
+    let ivf = std::fs::read(base.join("input.ivf")).expect("ivf");
+    let chunks = ivf_chunks(&ivf);
+    assert_eq!(chunks.len(), 4, "4 coded packets");
+    let h0 = oxideav_vp9::parse_uncompressed_header(&chunks[0]).expect("F0");
+    assert_eq!(h0.frame_type, oxideav_vp9::FrameType::KeyFrame);
+    assert!(!h0.quantization.lossless, "lossy keyframe");
+    assert_eq!(h0.quantization.base_q_idx, 140);
+    assert!(h0.loop_filter.level > 0, "keyframe: elected non-zero level");
+    let ref_dims = vec![(64u32, 64u32); 8];
+    for (i, p) in chunks.iter().enumerate().skip(1) {
+        let h = oxideav_vp9::parse_uncompressed_header_with_refs(
+            p,
+            Some(oxideav_vp9::RefFrameState {
+                ref_dims: &ref_dims,
+                color_config: h0.color_config,
+            }),
+        )
+        .expect("inter header");
+        assert_eq!(h.frame_type, oxideav_vp9::FrameType::NonKeyFrame);
+        assert!(!h.quantization.lossless, "frame {i}: lossy");
+        assert!(h.loop_filter.level > 0, "frame {i}: elected non-zero level");
+        assert_eq!(h.refresh_frame_flags, 0x01, "frame {i}: refreshes slot 0");
     }
 }
 

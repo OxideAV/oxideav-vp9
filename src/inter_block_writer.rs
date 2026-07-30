@@ -160,6 +160,13 @@ pub(crate) struct InterBlockFrameCtx<'a> {
     pub allow_high_precision_mv: bool,
     /// §6.5 `UsePrevFrameMvs` (false ⇒ no previous-frame motion field).
     pub use_prev_frame_mvs: bool,
+    /// §6.5.10 previous-frame motion field (`PrevRefFrames` / `PrevMvs`)
+    /// the candidate scan reads when `use_prev_frame_mvs` is set — the
+    /// previous decoded frame's §6.4.4 `RefFrames` / `Mvs` write-back
+    /// arrays, exactly what the decoder snapshots between frames.
+    /// Required (`Some`) iff `use_prev_frame_mvs` (a flag/field mismatch
+    /// would silently desync the §6.5 predictors and is rejected).
+    pub prev_frame_mvs: Option<crate::inter_decode::PrevFrameMvs<'a>>,
     /// §6.4.14 `PrevSegmentIds[ ][ ]` — the last map-bearing frame's
     /// segment-id plane (row-major `MiRows × MiCols`). Required (`Some`)
     /// when the frame codes the §6.4.12 temporal-update branch
@@ -221,6 +228,12 @@ pub(crate) fn write_inter_block(
     // (MAX_TXSIZE_LOOKUP[ MiSize ] == TX_4X4), so any other plan value
     // would silently desync the residual grid.
     if is_sub8x8 && (spec.sub.is_none() || spec.tx_size != 0) {
+        return Err(Error::Unsupported);
+    }
+    // §6.5.10: the UsePrevFrameMvs flag and the prev motion field must
+    // agree — scanning a missing field (or ignoring a supplied one)
+    // desyncs the §6.5 candidate list against the decoder.
+    if fctx.use_prev_frame_mvs != fctx.prev_frame_mvs.is_some() {
         return Err(Error::Unsupported);
     }
     let (r, c) = (spec.r, spec.c);
@@ -401,7 +414,7 @@ pub(crate) fn write_inter_block(
         mi_col_start: spec.mi_col_start as i32,
         mi_col_end: fctx.mi_col_end as i32,
     };
-    let src = FrameStateMvSource::new(state, None);
+    let src = FrameStateMvSource::new(state, fctx.prev_frame_mvs);
     let mut preds = [MvPredictors::default(); 2];
     let mut mode_context = 0u8;
     for j in 0..2 {
@@ -627,6 +640,7 @@ mod tests {
             interpolation_filter,
             allow_high_precision_mv: allow_hp,
             use_prev_frame_mvs: false,
+            prev_frame_mvs: None,
             prev_segment_ids: None,
         }
     }

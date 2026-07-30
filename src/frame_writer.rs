@@ -848,6 +848,7 @@ pub(crate) fn assemble_inter_frame_planned(
         partitions: HashMap::new(), // default fallback = all-8x8 layout.
         prev_segment_ids: None,
         prev_frame_mvs_absent: false,
+        prev_frame_mvs: None,
     };
     let mut tree_planner: Box<InterTreePlanner<'_>> =
         Box::new(|lr: u32, lc: u32, subsize: u8, state: &Vp9FrameState| {
@@ -945,9 +946,39 @@ pub(crate) struct InterFrameTreePlan {
     /// yields 0 for this frame *without* `error_resilient_mode` — true
     /// when the previously-decoded frame is hidden (`show_frame == 0`),
     /// intra, or differently sized. Non-`ZEROMV` leaves on a
-    /// non-error-resilient header are accepted only under this flag
-    /// (the writer models no previous-frame motion field).
+    /// non-error-resilient header are accepted under this flag or when
+    /// [`Self::prev_frame_mvs`] models the field instead.
     pub prev_frame_mvs_absent: bool,
+    /// §6.5.10 previous-frame motion field — the previous decoded
+    /// frame's §6.4.4 `RefFrames` / `Mvs` write-back arrays (both
+    /// row-major `MiRows × MiCols × 2`, exactly the
+    /// [`Vp9FrameState::ref_frames`] / [`Vp9FrameState::mvs`] layout the
+    /// `_with_state` assemblers return). Supplying it models the §7.2.6
+    /// `UsePrevFrameMvs == 1` decode: the caller asserts the
+    /// previously-decoded frame is SHOWN, same-sized, and this header is
+    /// not error-resilient — the shape on which the decoder scans the
+    /// prev field — and the writer feeds it to the §6.5.10 candidate
+    /// scan through the same shared
+    /// [`crate::inter_decode::FrameStateMvSource`] the decoder uses, so
+    /// the `NearestMv` / `NearMv` / `BestMv` predictors are
+    /// bit-identical. This is what lets non-error-resilient P-frame
+    /// *chains* (shown predecessor — and therefore compound prediction
+    /// without a hidden/intra predecessor) carry non-`ZEROMV` blocks.
+    /// Mutually exclusive with `prev_frame_mvs_absent` and with an
+    /// error-resilient header (both mean `UsePrevFrameMvs == 0`).
+    pub prev_frame_mvs: Option<PrevMotionField>,
+}
+
+/// The previous decoded frame's motion field for
+/// [`InterFrameTreePlan::prev_frame_mvs`]: the §6.4.4 `RefFrames` /
+/// `Mvs` arrays snapshotted after that frame's walk (`[(row * MiCols +
+/// col) * 2 + refList]` layout on both).
+#[derive(Clone, Debug)]
+pub(crate) struct PrevMotionField {
+    /// `PrevRefFrames[ row ][ col ][ list ]`.
+    pub ref_frames: Vec<i32>,
+    /// `PrevMvs[ row ][ col ][ list ]`.
+    pub mvs: Vec<(i16, i16)>,
 }
 
 /// Assemble a complete VP9 **inter** frame over an **arbitrary §6.4.3
@@ -969,13 +1000,18 @@ pub(crate) struct InterFrameTreePlan {
 /// the left strips resetting per tile row, and the §6.5 candidate scans
 /// clamped to each tile's `MiColStart` / `MiColEnd` window.
 ///
-/// The writer models §6.5 `UsePrevFrameMvs == 0` (it holds no
-/// previous-frame motion field), which matches the decoder's §7.2.6
-/// derivation only when `error_resilient_mode == 1` — so any plan that
-/// returns a non-`ZEROMV` block (where the §6.5 candidate scan reaches
-/// the coded syntax through the MV predictors) requires an
-/// error-resilient header, and a non-`ZEROMV` leaf on a
-/// non-error-resilient header is rejected.
+/// The writer models the §7.2.6 `UsePrevFrameMvs` derivation both ways:
+/// with [`InterFrameTreePlan::prev_frame_mvs`] supplied it scans the
+/// previous frame's motion field exactly as the decoder does
+/// (`UsePrevFrameMvs == 1` — shown same-sized predecessor on a
+/// non-error-resilient header), and without it it models
+/// `UsePrevFrameMvs == 0`, which matches the decoder only on an
+/// error-resilient header or under the caller's
+/// `prev_frame_mvs_absent` assertion (hidden / intra / resized
+/// predecessor) — so a plan that returns a non-`ZEROMV` block (where
+/// the §6.5 candidate scan reaches the coded syntax through the MV
+/// predictors) on a non-error-resilient header without either is
+/// rejected.
 ///
 /// Per-leaf `tx_size` is coded through the §6.4.10 tree when
 /// `read_tx_size( allowSelect = !skip )` codes it (`TxModeSelect`,
@@ -1131,6 +1167,22 @@ pub(crate) fn assemble_inter_frame_tree_with_state(
     }
     let mut seg_pred_ctx = crate::mode_info::SegPredContextState::new(mi_cols, mi_rows);
 
+    // §7.2.6 UsePrevFrameMvs writer model: a supplied prev motion field
+    // asserts the derivation yields 1 — which requires a
+    // non-error-resilient header (§7.2.6) and contradicts the
+    // prev-field-absent assertion — and must span the frame's MI grid
+    // (the §6.5.10 scan indexes it at every block position).
+    let use_prev_frame_mvs = plan.prev_frame_mvs.is_some();
+    if let Some(pmf) = plan.prev_frame_mvs.as_ref() {
+        if hdr.error_resilient_mode || plan.prev_frame_mvs_absent {
+            return Err(Error::Unsupported);
+        }
+        let n = (mi_rows as usize) * (mi_cols as usize) * 2;
+        if pmf.ref_frames.len() != n || pmf.mvs.len() != n {
+            return Err(Error::Unsupported);
+        }
+    }
+
     let probs = InterBlockProbs {
         skip_prob: &ctx.skip_prob,
         tx_probs: &ctx.tx_probs,
@@ -1183,7 +1235,13 @@ pub(crate) fn assemble_inter_frame_tree_with_state(
                 sign_bias: &sign_bias,
                 interpolation_filter: hdr.interpolation_filter,
                 allow_high_precision_mv: hdr.allow_high_precision_mv,
-                use_prev_frame_mvs: false,
+                use_prev_frame_mvs,
+                prev_frame_mvs: plan.prev_frame_mvs.as_ref().map(|p| {
+                    crate::inter_decode::PrevFrameMvs {
+                        prev_ref_frames: &p.ref_frames,
+                        prev_mvs: &p.mvs,
+                    }
+                }),
                 prev_segment_ids: plan.prev_segment_ids.as_deref(),
             };
 
@@ -1222,9 +1280,12 @@ pub(crate) fn assemble_inter_frame_tree_with_state(
                         }
                         // §7.2.6: a non-ZEROMV leaf (block-level, or any
                         // visited sub-8x8 cell) reaches the coded syntax
-                        // through the §6.5 predictors, which this writer only
-                        // models with UsePrevFrameMvs == 0 — see the function
-                        // docs.
+                        // through the §6.5 predictors, so the writer's
+                        // UsePrevFrameMvs model must match the decoder's
+                        // derivation: an error-resilient header, the
+                        // caller-asserted absent prev field, or the
+                        // caller-supplied prev motion field — see the
+                        // function docs.
                         let any_non_zeromv = if subsize < BLOCK_8X8 {
                             match lp.sub {
                                 Some(sub) => sub.modes.iter().any(|&m| m != ZEROMV),
@@ -1236,6 +1297,7 @@ pub(crate) fn assemble_inter_frame_tree_with_state(
                         if any_non_zeromv
                             && !hdr.error_resilient_mode
                             && !plan.prev_frame_mvs_absent
+                            && !use_prev_frame_mvs
                         {
                             return Err(Error::Unsupported);
                         }
@@ -2122,6 +2184,7 @@ mod tests {
             partitions,
             prev_segment_ids: None,
             prev_frame_mvs_absent: false,
+            prev_frame_mvs: None,
         };
         let mut seen: Vec<(u32, u32, u8)> = Vec::new();
         let mut planner: Box<InterTreePlanner> = Box::new(|r, c, subsize, _s| {
@@ -2170,6 +2233,7 @@ mod tests {
             partitions,
             prev_segment_ids: None,
             prev_frame_mvs_absent: false,
+            prev_frame_mvs: None,
         };
         // Quadrant -> tx size: TL 32x32, TR 16x16, BL 8x8, BR 4x4.
         let mut planner: Box<InterTreePlanner> = Box::new(|r, c, subsize, _s| {
@@ -2238,6 +2302,7 @@ mod tests {
             partitions,
             prev_segment_ids: None,
             prev_frame_mvs_absent: false,
+            prev_frame_mvs: None,
         };
         let zero_sub = crate::inter_block_writer::InterSubBlockSpec {
             modes: [crate::mode_info::ZEROMV; 4],
@@ -2300,6 +2365,7 @@ mod tests {
             partitions: HashMap::new(),
             prev_segment_ids: None,
             prev_frame_mvs_absent: false,
+            prev_frame_mvs: None,
         };
 
         // Leaf size disagreeing with the tree's subsize.
@@ -2368,6 +2434,7 @@ mod tests {
             partitions: sub_partitions,
             prev_segment_ids: None,
             prev_frame_mvs_absent: false,
+            prev_frame_mvs: None,
         };
         let mut p: Box<InterTreePlanner> =
             Box::new(|_r, _c, sz, _s| skip_leaf(sz, TxMode::Only4x4));
@@ -2416,6 +2483,7 @@ mod tests {
             partitions: HashMap::new(),
             prev_segment_ids: None,
             prev_frame_mvs_absent: false,
+            prev_frame_mvs: None,
         };
         // Variant A: every 8x8 leaf codes NEWMV [8, 8] (the first leaf
         // establishes the predictor; the rest re-code a zero diff).
@@ -2469,6 +2537,7 @@ mod tests {
             partitions: HashMap::new(),
             prev_segment_ids: None,
             prev_frame_mvs_absent: false,
+            prev_frame_mvs: None,
         };
         let mut p: Box<InterTreePlanner> = Box::new(|_r, _c, subsize, _s| InterTreeLeaf {
             mi_size: subsize,
@@ -2504,6 +2573,7 @@ mod tests {
             partitions: HashMap::new(),
             prev_segment_ids: Some(vec![0u8; 64]),
             prev_frame_mvs_absent: false,
+            prev_frame_mvs: None,
         };
         let mut p2: Box<InterTreePlanner> = Box::new(|_r, _c, subsize, _s| InterTreeLeaf {
             mi_size: subsize,
@@ -2534,6 +2604,7 @@ mod tests {
             partitions: HashMap::new(),
             prev_segment_ids: None,
             prev_frame_mvs_absent: false,
+            prev_frame_mvs: None,
         };
         let mut p: Box<InterTreePlanner> =
             Box::new(|_r, _c, sz, _s| skip_leaf(sz, TxMode::Only4x4));
@@ -2737,6 +2808,7 @@ mod tests {
             partitions: HashMap::new(),
             prev_segment_ids: None,
             prev_frame_mvs_absent: false,
+            prev_frame_mvs: None,
         };
 
         let (pf_single, st_single) = assemble_inter_frame_tree_with_state(
@@ -2776,5 +2848,340 @@ mod tests {
         );
         assert_eq!(f_tiled[1].u, f_single[1].u);
         assert_eq!(f_tiled[1].v, f_single[1].v);
+    }
+
+    /// §7.2.6 `UsePrevFrameMvs == 1` writer model, end-to-end: a
+    /// non-error-resilient SHOWN P-frame chain (keyframe → P1 → P2, no
+    /// hidden/intra predecessor) codes real motion by supplying each
+    /// frame's plan with the previous frame's §6.4.4 motion field. Three
+    /// pins:
+    ///
+    /// 1. P2 codes `NEARMV` with a vector whose ONLY §6.5.10 source is
+    ///    the previous-frame pass — every spatial neighbour is `ZEROMV`,
+    ///    so `NearMv` equals the prev-frame candidate exactly when the
+    ///    writer scans the supplied field.
+    /// 2. The same `NEARMV` plan WITHOUT the prev field is uncodeable
+    ///    (`Error::Unsupported` from the mv-equals-predictor check) —
+    ///    the differential proof that the field genuinely feeds the
+    ///    predictors rather than being carried inertly.
+    /// 3. The chain's decoded output is sample-identical to an
+    ///    error-resilient twin coding the identical final vectors as
+    ///    `NEWMV` (`UsePrevFrameMvs == 0` on both sides): the §8
+    ///    reconstruction depends only on the final vectors, while the
+    ///    entropy paths differ completely — and the prev chain decodes
+    ///    through the decoder's REAL §7.2.6 derivation (shown
+    ///    same-sized predecessor, non-ER header ⇒ it scans the prev
+    ///    field), so any writer/decoder prev-model mismatch desyncs.
+    #[test]
+    fn inter_tree_prev_frame_mvs_chain_matches_er_twin() {
+        use crate::decode_frame::decode_vp9_sequence;
+        use crate::mode_info::{NEARMV, NEWMV, ZEROMV};
+
+        let (w, h) = (64u32, 64u32);
+        // Non-flat keyframe: per-16x16 varying DC so displaced content
+        // is visibly different.
+        let mut kf_plan = KeyframeTreePlan::uniform(8, 8, BLOCK_16X16, 1);
+        for leaf in kf_plan.leaves.values_mut() {
+            leaf.skip = false;
+        }
+        let mut kf_coeffs: Box<FrameCoefSource> = Box::new(|r, c, p, _sx, _sy, _b| {
+            if p == 0 {
+                vec![((r * 5 + c * 3) % 9) as i64 + 1]
+            } else {
+                Vec::new()
+            }
+        });
+        let kf_hdr = keyframe_header(w, h);
+        let (kf, kf_state) =
+            assemble_keyframe_tree_with_state(&kf_hdr, &kf_plan, &mut *kf_coeffs).expect("kf");
+
+        let snapshot = |st: &Vp9FrameState| PrevMotionField {
+            ref_frames: st.ref_frames.clone(),
+            mvs: st.mvs.clone(),
+        };
+
+        // 8 px down, 8 px left: crosses the 16x16 content bands.
+        let mv = [[64, -64], [0, 0]];
+        let mk_planner = move |target_mode: u8| -> Box<InterTreePlanner<'static>> {
+            Box::new(move |r, c, subsize, _s| {
+                let mut leaf = skip_leaf(subsize, TxMode::Only4x4);
+                if (r, c) == (4, 4) {
+                    leaf.y_mode = target_mode;
+                    leaf.mv = mv;
+                } else {
+                    leaf.y_mode = ZEROMV;
+                }
+                leaf
+            })
+        };
+        let mk_plan = |prev: Option<PrevMotionField>| InterFrameTreePlan {
+            tx_mode: TxMode::Only4x4,
+            reference_mode: ReferenceMode::SingleReference,
+            partitions: HashMap::new(),
+            prev_segment_ids: None,
+            prev_frame_mvs_absent: false,
+            prev_frame_mvs: prev,
+        };
+
+        let mut p_hdr = inter_header(w, h);
+        p_hdr.refresh_frame_flags = 0x01;
+        p_hdr.ref_frame_idx = Some([0, 0, 0]);
+        assert!(!p_hdr.error_resilient_mode);
+
+        // P1: NEWMV over the keyframe. The decoder derives
+        // UsePrevFrameMvs = 1 here too (the keyframe is shown and
+        // same-sized), so the writer must model the scan over the
+        // keyframe's state — an all-INTRA field with no matching
+        // candidates, but scanned on both sides.
+        let plan1 = mk_plan(Some(snapshot(&kf_state)));
+        let (p1, p1_state) = assemble_inter_frame_tree_with_state(
+            &p_hdr,
+            &plan1,
+            &mut *mk_planner(NEWMV),
+            &mut *no_coeffs(),
+        )
+        .expect("P1");
+
+        // P2: NEARMV — the (64,-64) candidate only exists through the
+        // prev-frame pass over P1's motion field.
+        let plan2 = mk_plan(Some(snapshot(&p1_state)));
+        let p2 =
+            assemble_inter_frame_tree(&p_hdr, &plan2, &mut *mk_planner(NEARMV), &mut *no_coeffs())
+                .expect("P2 NEARMV via prev-frame candidate");
+
+        // Differential pin: without the prev field the NEARMV predictor
+        // is ZeroMv, so the identical plan is rejected.
+        let mut plan2_no_prev = mk_plan(None);
+        plan2_no_prev.prev_frame_mvs_absent = true;
+        assert_eq!(
+            assemble_inter_frame_tree(
+                &p_hdr,
+                &plan2_no_prev,
+                &mut *mk_planner(NEARMV),
+                &mut *no_coeffs(),
+            )
+            .unwrap_err(),
+            Error::Unsupported,
+            "the NEARMV vector must be reachable ONLY through the prev field"
+        );
+
+        // The error-resilient twin: identical final vectors as NEWMV.
+        let mut er_hdr = p_hdr;
+        er_hdr.error_resilient_mode = true;
+        let er_plan = mk_plan(None);
+        let p1_er = assemble_inter_frame_tree(
+            &er_hdr,
+            &er_plan,
+            &mut *mk_planner(NEWMV),
+            &mut *no_coeffs(),
+        )
+        .expect("P1 er");
+        let p2_er = assemble_inter_frame_tree(
+            &er_hdr,
+            &er_plan,
+            &mut *mk_planner(NEWMV),
+            &mut *no_coeffs(),
+        )
+        .expect("P2 er");
+
+        let fa = decode_vp9_sequence(&[&kf, &p1, &p2]).expect("decode prev-mv chain");
+        let fb = decode_vp9_sequence(&[&kf, &p1_er, &p2_er]).expect("decode er twin");
+        assert_ne!(fa[1].y, fa[0].y, "P1 motion must be visible");
+        for i in 1..3 {
+            assert_eq!(fa[i].y, fb[i].y, "frame {i}: luma differs vs er twin");
+            assert_eq!(fa[i].u, fb[i].u, "frame {i}: U differs vs er twin");
+            assert_eq!(fa[i].v, fb[i].v, "frame {i}: V differs vs er twin");
+        }
+        // And the streams themselves differ (different entropy paths).
+        assert_ne!(p2, p2_er, "prev-modeled stream must differ from the twin");
+    }
+
+    /// The prev-motion-field plan is validated up front: supplying it on
+    /// an error-resilient header (§7.2.6 derives 0 there), together with
+    /// the `prev_frame_mvs_absent` assertion (a contradiction), or with
+    /// arrays that don't span the MI grid, are all rejected.
+    #[test]
+    fn inter_tree_prev_frame_mvs_rejections() {
+        let (w, h) = (64u32, 64u32);
+        let mk_plan = |prev: Option<PrevMotionField>| InterFrameTreePlan {
+            tx_mode: TxMode::Only4x4,
+            reference_mode: ReferenceMode::SingleReference,
+            partitions: HashMap::new(),
+            prev_segment_ids: None,
+            prev_frame_mvs_absent: false,
+            prev_frame_mvs: prev,
+        };
+        let n = 8usize * 8 * 2;
+        let good = PrevMotionField {
+            ref_frames: vec![crate::mode_info::LAST_FRAME; n],
+            mvs: vec![(0, 0); n],
+        };
+        let mut p: Box<InterTreePlanner> =
+            Box::new(|_r, _c, sz, _s| skip_leaf(sz, TxMode::Only4x4));
+
+        // Error-resilient header + prev field.
+        let mut er_hdr = inter_header(w, h);
+        er_hdr.error_resilient_mode = true;
+        assert_eq!(
+            assemble_inter_frame_tree(
+                &er_hdr,
+                &mk_plan(Some(good.clone())),
+                &mut *p,
+                &mut *no_coeffs()
+            )
+            .unwrap_err(),
+            Error::Unsupported,
+            "ER header derives UsePrevFrameMvs = 0"
+        );
+
+        // Contradiction: absent assertion + supplied field.
+        let hdr = inter_header(w, h);
+        let mut plan = mk_plan(Some(good.clone()));
+        plan.prev_frame_mvs_absent = true;
+        assert_eq!(
+            assemble_inter_frame_tree(&hdr, &plan, &mut *p, &mut *no_coeffs()).unwrap_err(),
+            Error::Unsupported,
+            "absent + supplied is a contradiction"
+        );
+
+        // Short arrays.
+        let bad = PrevMotionField {
+            ref_frames: vec![crate::mode_info::LAST_FRAME; n - 2],
+            mvs: vec![(0, 0); n],
+        };
+        assert_eq!(
+            assemble_inter_frame_tree(&hdr, &mk_plan(Some(bad)), &mut *p, &mut *no_coeffs())
+                .unwrap_err(),
+            Error::Unsupported,
+            "prev arrays must span the MI grid"
+        );
+    }
+
+    /// Compound prediction on a SHOWN non-error-resilient chain — the
+    /// header shape that was uncodeable before the prev-motion-field
+    /// model (compound needs non-ER sign biases, and a non-ER frame
+    /// after a shown same-sized predecessor decodes with
+    /// `UsePrevFrameMvs == 1`): keyframe (parked in slot 1 as ALTREF) →
+    /// shown P1 (slot 0) → P2 coding `[ LAST, ALTREF ]` compound
+    /// `ZEROMV` skip everywhere plus one compound `NEWMV` block, with
+    /// P1's motion field supplied as the prev model. Every `ZEROMV`
+    /// compound sample must equal the §8.5.2
+    /// `Round2( LAST + ALTREF, 1 )` average of the two decoded
+    /// references — computed independently from the decoded frames.
+    #[test]
+    fn inter_tree_compound_on_shown_chain_via_prev_mvs() {
+        use crate::decode_frame::decode_vp9_sequence;
+        use crate::mode_info::{ALTREF_FRAME, LAST_FRAME, NEWMV, ZEROMV};
+
+        let (w, h) = (64u32, 64u32);
+        let mut kf_plan = KeyframeTreePlan::uniform(8, 8, BLOCK_16X16, 1);
+        for leaf in kf_plan.leaves.values_mut() {
+            leaf.skip = false;
+        }
+        let mut kf_coeffs: Box<FrameCoefSource> = Box::new(|r, c, p, _sx, _sy, _b| {
+            if p == 0 {
+                vec![((r * 3 + c * 7) % 8) as i64 + 1]
+            } else {
+                Vec::new()
+            }
+        });
+        let kf_hdr = keyframe_header(w, h);
+        let (kf, kf_state) =
+            assemble_keyframe_tree_with_state(&kf_hdr, &kf_plan, &mut *kf_coeffs).expect("kf");
+
+        let snapshot = |st: &Vp9FrameState| PrevMotionField {
+            ref_frames: st.ref_frames.clone(),
+            mvs: st.mvs.clone(),
+        };
+
+        // P1: shown, non-ER, refreshes slot 0 only (slot 1 keeps the
+        // keyframe), real motion everywhere below MI row 4.
+        let mut p1_hdr = inter_header(w, h);
+        p1_hdr.refresh_frame_flags = 0x01;
+        p1_hdr.ref_frame_idx = Some([0, 0, 0]);
+        let plan1 = InterFrameTreePlan {
+            tx_mode: TxMode::Only4x4,
+            reference_mode: ReferenceMode::SingleReference,
+            partitions: HashMap::new(),
+            prev_segment_ids: None,
+            prev_frame_mvs_absent: false,
+            prev_frame_mvs: Some(snapshot(&kf_state)),
+        };
+        let mut planner1: Box<InterTreePlanner> = Box::new(|r, _c, sz, _s| {
+            let mut leaf = skip_leaf(sz, TxMode::Only4x4);
+            if r >= 4 {
+                leaf.y_mode = NEWMV;
+                leaf.mv = [[-32, 32], [0, 0]];
+            } else {
+                leaf.y_mode = ZEROMV;
+            }
+            leaf
+        });
+        let (p1, p1_state) = assemble_inter_frame_tree_with_state(
+            &p1_hdr,
+            &plan1,
+            &mut *planner1,
+            &mut *no_coeffs(),
+        )
+        .expect("P1");
+
+        // P2: LAST = slot 0 (P1), ALTREF = slot 1 (keyframe), asymmetric
+        // sign bias (compoundReferenceAllowed), non-ER, shown — prev
+        // model = P1's motion field.
+        let mut p2_hdr = inter_header(w, h);
+        p2_hdr.refresh_frame_flags = 0x04;
+        p2_hdr.ref_frame_idx = Some([0, 1, 1]);
+        p2_hdr.ref_frame_sign_bias = [false, false, true];
+        let plan2 = InterFrameTreePlan {
+            tx_mode: TxMode::Only4x4,
+            reference_mode: ReferenceMode::CompoundReference,
+            partitions: HashMap::new(),
+            prev_segment_ids: None,
+            prev_frame_mvs_absent: false,
+            prev_frame_mvs: Some(snapshot(&p1_state)),
+        };
+        let mut planner2: Box<InterTreePlanner> = Box::new(|r, c, sz, _s| {
+            let mut leaf = skip_leaf(sz, TxMode::Only4x4);
+            leaf.ref_frame = [LAST_FRAME, ALTREF_FRAME];
+            if (r, c) == (4, 4) {
+                leaf.y_mode = NEWMV;
+                leaf.mv = [[16, 8], [16, 8]];
+            } else {
+                leaf.y_mode = ZEROMV;
+            }
+            leaf
+        });
+        let p2 = assemble_inter_frame_tree(&p2_hdr, &plan2, &mut *planner2, &mut *no_coeffs())
+            .expect("P2 compound on a shown chain");
+
+        let frames = decode_vp9_sequence(&[&kf, &p1, &p2]).expect("decode");
+        assert_eq!(frames.len(), 3);
+        let (f0, f1, f2) = (&frames[0], &frames[1], &frames[2]);
+        assert_ne!(f1.y, f0.y, "P1 motion must be visible");
+
+        // Outside the NEWMV block (luma px 32..40 x 32..40), every
+        // sample is the compound ZEROMV average of the two references.
+        let avg = |a: u16, b: u16| -> u16 { (a + b + 1) >> 1 };
+        for row in 0..64usize {
+            for col in 0..64usize {
+                if (32..40).contains(&row) && (32..40).contains(&col) {
+                    continue;
+                }
+                let want = avg(f1.y[row * 64 + col], f0.y[row * 64 + col]);
+                assert_eq!(
+                    f2.y[row * 64 + col],
+                    want,
+                    "luma ({row},{col}) != Round2(LAST + ALTREF, 1)"
+                );
+            }
+        }
+        for i in 0..f2.u.len() {
+            let (urow, ucol) = (i / 32, i % 32);
+            if (16..20).contains(&urow) && (16..20).contains(&ucol) {
+                continue;
+            }
+            assert_eq!(f2.u[i], avg(f1.u[i], f0.u[i]), "U ({urow},{ucol})");
+            assert_eq!(f2.v[i], avg(f1.v[i], f0.v[i]), "V ({urow},{ucol})");
+        }
     }
 }

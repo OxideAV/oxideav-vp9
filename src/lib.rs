@@ -1451,6 +1451,7 @@ mod encode_roundtrip_tests {
             partitions: std::collections::HashMap::new(), // all-8x8 leaves
             prev_segment_ids: None,
             prev_frame_mvs_absent: false,
+            prev_frame_mvs: None,
         };
         // Segments striped by MI row pairs: rows 0-1 seg 0 (plain skip),
         // rows 2-3 seg 1 (SKIP-forced), rows 4-5 seg 2 (GOLDEN
@@ -2075,6 +2076,7 @@ mod encode_roundtrip_tests {
             partitions: std::collections::HashMap::new(), // all-8x8 leaves
             prev_segment_ids: prev,
             prev_frame_mvs_absent: false,
+            prev_frame_mvs: None,
         };
         let mut planner: Box<InterTreePlanner<'_>> =
             Box::new(|lr: u32, lc: u32, subsize: u8, _state| {

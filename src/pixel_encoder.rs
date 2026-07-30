@@ -1786,6 +1786,7 @@ pub(crate) fn encode_pframe_lossless_layout(
         partitions,
         prev_segment_ids: None,
         prev_frame_mvs_absent: !hdr.error_resilient_mode,
+        prev_frame_mvs: None,
     };
     crate::frame_writer::assemble_inter_frame_tree(hdr, &plan, &mut *planner, &mut *coeffs)
 }
@@ -3707,6 +3708,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion_with_state(
         partitions,
         prev_segment_ids: None,
         prev_frame_mvs_absent: !hdr.error_resilient_mode,
+        prev_frame_mvs: None,
     };
     let (bytes, state) = crate::frame_writer::assemble_inter_frame_tree_with_state(
         hdr,

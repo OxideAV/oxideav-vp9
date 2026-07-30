@@ -479,10 +479,17 @@ carries no forward update for it).
   round 418, closing the last §6.4.11 writer arm; **encode-side §8.8
   loop filtering with per-frame `level` / `sharpness` election landed
   in round 420** (the sequence encoders' reference chains thread
-  filtered reconstructions). Keyframe skip
-  election, and previous-frame-MV modeling in the writer (which would
-  let non-error-resilient P-frame *chains* — and therefore compound —
-  run without a hidden/intra predecessor) are later milestones.
+  filtered reconstructions); **previous-frame-MV modeling in the
+  writer landed in round 434** — `InterFrameTreePlan::prev_frame_mvs`
+  supplies the previous frame's §6.4.4 motion field and the writer
+  scans it through the decoder's own shared §6.5.10 path, so
+  non-error-resilient SHOWN P-frame chains (and therefore compound
+  without a hidden/intra predecessor) are codeable, pinned by a
+  NEARMV-only-reachable-through-the-prev-field differential, an
+  error-resilient-twin sample-identity, and a compound-average check
+  on a shown chain. Keyframe skip election, and migrating the lossy
+  *sequence* encoders' search off error-resilient framing onto the
+  prev-MV model, are later milestones.
   Lossy encoding is 8-bit 4:2:0 (the lossless path covers all four
   profiles). The inter *writers* now carry compound references and
   **every** `MiSize` — the round-415 sub-8x8 per-(idy, idx) MV walk

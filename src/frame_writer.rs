@@ -835,6 +835,24 @@ pub(crate) fn assemble_inter_frame_planned(
     planner: &mut InterBlockPlanner<'_>,
     coeffs: &mut FrameCoefSource<'_>,
 ) -> Result<Vec<u8>, Error> {
+    assemble_inter_frame_planned_with_state(hdr, tx_mode, skip_all, None, planner, coeffs)
+        .map(|(bytes, _)| bytes)
+}
+
+/// [`assemble_inter_frame_planned`] with the §7.2.6 prev-motion-field
+/// model and the §6.4.4 write-back state returned — the chained
+/// sequence encoders thread each frame's returned state into the next
+/// frame's `prev_frame_mvs` (see [`InterFrameTreePlan::prev_frame_mvs`]
+/// for the model's contract). `prev_frame_mvs = None` is byte-identical
+/// to [`assemble_inter_frame_planned`].
+pub(crate) fn assemble_inter_frame_planned_with_state(
+    hdr: &Vp9FrameHeader,
+    tx_mode: TxMode,
+    skip_all: bool,
+    prev_frame_mvs: Option<PrevMotionField>,
+    planner: &mut InterBlockPlanner<'_>,
+    coeffs: &mut FrameCoefSource<'_>,
+) -> Result<(Vec<u8>, Vp9FrameState), Error> {
     use crate::compressed::ReferenceMode;
     use crate::mode_info::{LAST_FRAME, NONE_REF_FRAME};
 
@@ -848,7 +866,7 @@ pub(crate) fn assemble_inter_frame_planned(
         partitions: HashMap::new(), // default fallback = all-8x8 layout.
         prev_segment_ids: None,
         prev_frame_mvs_absent: false,
-        prev_frame_mvs: None,
+        prev_frame_mvs,
     };
     let mut tree_planner: Box<InterTreePlanner<'_>> =
         Box::new(|lr: u32, lc: u32, subsize: u8, state: &Vp9FrameState| {
@@ -877,7 +895,7 @@ pub(crate) fn assemble_inter_frame_planned(
                 coeffs(lr, lc, p, sx, sy, b)
             }
         });
-    assemble_inter_frame_tree(hdr, &plan, &mut *tree_planner, &mut *src)
+    assemble_inter_frame_tree_with_state(hdr, &plan, &mut *tree_planner, &mut *src)
 }
 
 /// Per-leaf inter mode-info an [`InterTreePlanner`] elects: the §6.4.11 /
@@ -979,6 +997,38 @@ pub(crate) struct PrevMotionField {
     pub ref_frames: Vec<i32>,
     /// `PrevMvs[ row ][ col ][ list ]`.
     pub mvs: Vec<(i16, i16)>,
+}
+
+impl PrevMotionField {
+    /// Snapshot a frame's §6.4.4 write-back arrays as the next frame's
+    /// prev motion field.
+    pub fn from_state(state: &Vp9FrameState) -> Self {
+        Self {
+            ref_frames: state.ref_frames.clone(),
+            mvs: state.mvs.clone(),
+        }
+    }
+
+    /// The motion field after an all-intra frame (a keyframe): every MI
+    /// cell holds `ref_frame = [ INTRA_FRAME, NONE ]` with zero vectors
+    /// (§6.4.4 — the intra arm writes the reference pair and leaves
+    /// `Mvs` at the zero initialisation). No §6.5.10 prev candidate can
+    /// match against it (both passes require a `> INTRA_FRAME`
+    /// reference), but the decoder still *scans* it when §7.2.6 derives
+    /// `UsePrevFrameMvs = 1` over a shown keyframe predecessor, so the
+    /// writer must model the same field.
+    pub fn after_intra_frame(mi_rows: u32, mi_cols: u32) -> Self {
+        let n = (mi_rows as usize) * (mi_cols as usize);
+        let mut ref_frames = Vec::with_capacity(n * 2);
+        for _ in 0..n {
+            ref_frames.push(crate::mode_info::INTRA_FRAME);
+            ref_frames.push(crate::mode_info::NONE_REF_FRAME);
+        }
+        Self {
+            ref_frames,
+            mvs: vec![(0, 0); n * 2],
+        }
+    }
 }
 
 /// Assemble a complete VP9 **inter** frame over an **arbitrary §6.4.3
@@ -2848,6 +2898,34 @@ mod tests {
         );
         assert_eq!(f_tiled[1].u, f_single[1].u);
         assert_eq!(f_tiled[1].v, f_single[1].v);
+    }
+
+    /// [`PrevMotionField::after_intra_frame`] equals the actual §6.4.4
+    /// write-back state a keyframe leaves (`ref_frame = [ INTRA, NONE ]`
+    /// with zero vectors on every MI cell) — pinned against the keyframe
+    /// assembler's own returned state so the chained sequence encoders'
+    /// first P-frame models the identical prev field the decoder scans.
+    #[test]
+    fn prev_motion_field_after_intra_matches_keyframe_state() {
+        let hdr = keyframe_header(64, 64);
+        let mut plan = KeyframeTreePlan::uniform(8, 8, BLOCK_16X16, 1);
+        for leaf in plan.leaves.values_mut() {
+            leaf.skip = false;
+        }
+        let mut coeffs: Box<FrameCoefSource> = Box::new(
+            |_r, _c, p, _sx, _sy, _b| {
+                if p == 0 {
+                    vec![3]
+                } else {
+                    Vec::new()
+                }
+            },
+        );
+        let (_bytes, st) =
+            assemble_keyframe_tree_with_state(&hdr, &plan, &mut *coeffs).expect("kf");
+        let f = PrevMotionField::after_intra_frame(8, 8);
+        assert_eq!(f.ref_frames, st.ref_frames, "reference pairs");
+        assert_eq!(f.mvs, st.mvs, "vectors");
     }
 
     /// §7.2.6 `UsePrevFrameMvs == 1` writer model, end-to-end: a

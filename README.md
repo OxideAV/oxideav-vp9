@@ -238,6 +238,14 @@ prediction sees the decoder's exact state. Public entry points:
   codes less than half the forced-`ZEROMV` bytes. P-frames use
   error-resilient framing so the §7.2.6 `UsePrevFrameMvs == 0`
   derivation is pinned identically on both sides.
+  [`encode_vp9_lossless_sequence_chained`] (round 434) carries the
+  same byte-exact guarantee on **non-error-resilient chain framing**:
+  every P-frame is shown, the decoder's §7.2.6 derivation is 1, and
+  the encoder threads each frame's §6.4.4 motion field into the next
+  frame's §6.5.10 candidate scan — temporally persistent motion that
+  the spatial neighbours mispredict codes `NEARESTMV` / `NEARMV`
+  instead of `NEWMV`, a strict deterministic rate win pinned on a
+  banded-motion probe.
 * [`encode_vp9_lossy`] / [`encode_vp9_lossy_sequence`] — **lossy**
   encoding at a caller-chosen `base_q_idx` (1..=255) with a
   **content-adaptive partition + transform-size planner**

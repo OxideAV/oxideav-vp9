@@ -2027,7 +2027,8 @@ fn refine_leaf_mv_subpel(
 ///
 /// `search_range > 0` requires an error-resilient header (the §7.2.6
 /// `UsePrevFrameMvs == 0` model — see
-/// [`crate::frame_writer::assemble_inter_frame_planned`]).
+/// [`crate::frame_writer::assemble_inter_frame_planned`]) — or the
+/// chained variant below, which models `UsePrevFrameMvs == 1` instead.
 pub(crate) fn encode_pframe_lossless_motion(
     hdr: &Vp9FrameHeader,
     targets: &[Plane; 3],
@@ -2037,7 +2038,43 @@ pub(crate) fn encode_pframe_lossless_motion(
     search_range: i32,
     subpel: bool,
 ) -> Result<Vec<u8>, Error> {
-    use crate::inter_decode::FrameStateMvSource;
+    encode_pframe_lossless_motion_prev(
+        hdr,
+        targets,
+        reference,
+        ref_w,
+        ref_h,
+        search_range,
+        subpel,
+        None,
+    )
+    .map(|(bytes, _)| bytes)
+}
+
+/// [`encode_pframe_lossless_motion`] with the §7.2.6 prev-motion-field
+/// model: `prev` (the previous frame's §6.4.4 motion field) is fed to
+/// BOTH the planner's §6.5 predictor derivation and the block writer's
+/// scan, so a non-error-resilient SHOWN chain codes `NEWMV` /
+/// `NEARESTMV` / `NEARMV` with predictors bit-identical to the
+/// decoder's `UsePrevFrameMvs == 1` derivation — and a vector the
+/// previous frame already coded at the same position maps to
+/// `NEARESTMV` / `NEARMV` (no §6.4.20 mv-diff bits) through the prev
+/// candidate. Returns the frame's write-back state for the next
+/// frame's `prev`. `prev = None` on an error-resilient header is the
+/// classic model, byte-identical to
+/// [`encode_pframe_lossless_motion`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_pframe_lossless_motion_prev(
+    hdr: &Vp9FrameHeader,
+    targets: &[Plane; 3],
+    reference: &[(&[i32], usize); 3],
+    ref_w: u32,
+    ref_h: u32,
+    search_range: i32,
+    subpel: bool,
+    prev: Option<&crate::frame_writer::PrevMotionField>,
+) -> Result<(Vec<u8>, crate::decode_block::Vp9FrameState), Error> {
+    use crate::inter_decode::{FrameStateMvSource, PrevFrameMvs};
     use crate::mode_info::{LAST_FRAME, NEARESTMV, NEARMV, NEWMV, ZEROMV};
     use crate::mv::use_mv_hp;
     use crate::mv_ref::MvRefGeometry;
@@ -2109,8 +2146,15 @@ pub(crate) fn encode_pframe_lossless_motion(
                         mi_col_start: 0,
                         mi_col_end: mi_cols as i32,
                     };
-                    let src = FrameStateMvSource::new(state, None);
-                    let mv_refs = geom.find_mv_refs(&src, LAST_FRAME, -1, &sign_bias, false);
+                    let src = FrameStateMvSource::new(
+                        state,
+                        prev.map(|p| PrevFrameMvs {
+                            prev_ref_frames: &p.ref_frames,
+                            prev_mvs: &p.mvs,
+                        }),
+                    );
+                    let mv_refs =
+                        geom.find_mv_refs(&src, LAST_FRAME, -1, &sign_bias, prev.is_some());
                     let preds =
                         geom.find_best_ref_mvs(mv_refs.ref_list_mv, hdr.allow_high_precision_mv);
                     let best = preds[0];
@@ -2215,10 +2259,11 @@ pub(crate) fn encode_pframe_lossless_motion(
         },
     );
 
-    crate::frame_writer::assemble_inter_frame_planned(
+    crate::frame_writer::assemble_inter_frame_planned_with_state(
         hdr,
         crate::compressed::TxMode::Only4x4,
         false,
+        prev.cloned(),
         &mut *planner,
         &mut *coeffs,
     )
@@ -4205,6 +4250,102 @@ pub(crate) fn encode_sequence_lossless_420(
     Ok(out)
 }
 
+/// [`encode_sequence_lossless_420`] on **non-error-resilient** framing
+/// with the §7.2.6 `UsePrevFrameMvs == 1` chain model: every P-frame is
+/// shown and non-error-resilient, so the decoder scans the previous
+/// frame's motion field — and the encoder supplies each frame's plan
+/// with exactly that field (the keyframe's all-intra field first, then
+/// each P-frame's §6.4.4 write-back), so the §6.5 predictors are
+/// bit-identical on both sides. A vector the previous frame already
+/// coded at the same position reaches the §6.5.10 prev candidate list
+/// and maps to `NEARESTMV` / `NEARMV` (no §6.4.20 mv-diff bits), so
+/// motion that persists across frames — where spatial neighbours
+/// predict it wrongly — codes fewer bytes than the error-resilient
+/// chain (rate A/B pinned by test).
+pub(crate) fn encode_sequence_lossless_chained_420(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+) -> Result<Vec<Vec<u8>>, Error> {
+    use crate::frame_writer::PrevMotionField;
+
+    if frames.is_empty() {
+        return Err(Error::Unsupported);
+    }
+    if width == 0 || height == 0 || width > (1 << 16) || height > (1 << 16) {
+        return Err(Error::Unsupported);
+    }
+    let w = width as usize;
+    let h = height as usize;
+    let cw = width.div_ceil(2) as usize;
+    let ch = height.div_ceil(2) as usize;
+    let need = w * h + 2 * cw * ch;
+    if frames.iter().any(|f| f.len() < need) {
+        return Err(Error::Unsupported);
+    }
+
+    let mi_cols = ((width + 7) >> 3) as usize;
+    let mi_rows = ((height + 7) >> 3) as usize;
+    let y_w = mi_cols * 8;
+    let y_h = mi_rows * 8;
+    let uv_w = y_w >> 1;
+    let uv_h = y_h >> 1;
+
+    let padded_targets = |pixels: &[u8]| -> [Plane; 3] {
+        [
+            padded_plane_from_bytes(&pixels[..w * h], w, h, y_w, y_h),
+            padded_plane_from_bytes(&pixels[w * h..w * h + cw * ch], cw, ch, uv_w, uv_h),
+            padded_plane_from_bytes(&pixels[w * h + cw * ch..], cw, ch, uv_w, uv_h),
+        ]
+    };
+    let visible_ref = |pixels: &[u8]| -> [Vec<i32>; 3] {
+        [
+            pixels[..w * h].iter().map(|&s| i32::from(s)).collect(),
+            pixels[w * h..w * h + cw * ch]
+                .iter()
+                .map(|&s| i32::from(s))
+                .collect(),
+            pixels[w * h + cw * ch..w * h + 2 * cw * ch]
+                .iter()
+                .map(|&s| i32::from(s))
+                .collect(),
+        ]
+    };
+
+    let mut out = Vec::with_capacity(frames.len());
+    out.push(encode_keyframe_lossless_420(frames[0], width, height)?);
+
+    // The keyframe leaves an all-intra §6.4.4 motion field.
+    let mut prev_field = PrevMotionField::after_intra_frame(mi_rows as u32, mi_cols as u32);
+
+    for i in 1..frames.len() {
+        let targets = padded_targets(frames[i]);
+        let prev = visible_ref(frames[i - 1]);
+        let reference: [(&[i32], usize); 3] = [
+            (prev[0].as_slice(), w),
+            (prev[1].as_slice(), cw),
+            (prev[2].as_slice(), cw),
+        ];
+        // Shown, non-error-resilient: §7.2.6 derives UsePrevFrameMvs = 1
+        // on the decode side for every P-frame of this chain.
+        let mut hdr = lossless_pframe_header(width, height);
+        hdr.error_resilient_mode = false;
+        let (bytes, state) = encode_pframe_lossless_motion_prev(
+            &hdr,
+            &targets,
+            &reference,
+            width,
+            height,
+            PFRAME_SEARCH_RANGE,
+            true,
+            Some(&prev_field),
+        )?;
+        out.push(bytes);
+        prev_field = PrevMotionField::from_state(&state);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4872,6 +5013,112 @@ mod tests {
         assert!(
             fine <= coarse,
             "MSE at 8000 B ({fine}) worse than at 600 B ({coarse})"
+        );
+    }
+
+    /// Deterministic banded-motion content: each 8-px luma band
+    /// translates rigidly over an unbounded texture with a per-band
+    /// horizontal velocity cycling through `+2 / -2 / +4 / -4` px per
+    /// frame, so every 8x8 block has an exact integer-motion match in
+    /// the previous frame (its whole band translates, and the texture
+    /// continues past the frame edge) while vertically adjacent blocks
+    /// carry DIFFERENT vectors — the §6.5 spatial predictors are wrong
+    /// at every band boundary, and the §6.5.10 previous-frame candidate
+    /// (same position, same persistent motion) is exact everywhere.
+    /// Chroma is flat.
+    fn banded_motion_frames(w: u32, h: u32, n: usize) -> Vec<Vec<u8>> {
+        let wu = w as usize;
+        let hu = h as usize;
+        let cw = w.div_ceil(2) as usize;
+        let ch = h.div_ceil(2) as usize;
+        let tex = |x: i64, y: i64| -> u8 { ((x * 7 + y * 13).rem_euclid(61) * 4 + 8) as u8 };
+        const VELS: [i64; 4] = [2, -2, 4, -4];
+        (0..n)
+            .map(|i| {
+                let mut f = vec![128u8; wu * hu + 2 * cw * ch];
+                for y in 0..hu {
+                    let vel = VELS[(y / 8) % VELS.len()];
+                    for x in 0..wu {
+                        f[y * wu + x] = tex(x as i64 - vel * i as i64, y as i64);
+                    }
+                }
+                f
+            })
+            .collect()
+    }
+
+    /// The chained (non-error-resilient, §7.2.6 `UsePrevFrameMvs == 1`)
+    /// lossless sequence encoder keeps the byte-exact guarantee
+    /// end-to-end: every decoded frame equals its input. The decode side
+    /// derives `UsePrevFrameMvs = 1` for every P-frame here (shown
+    /// same-sized predecessors, non-ER headers), so byte-exactness
+    /// proves the encoder's prev-field model matches the decoder's scan
+    /// — any mismatch desyncs the predictors and corrupts the NEWMV /
+    /// NEARESTMV blocks.
+    #[test]
+    fn lossless_chained_sequence_roundtrips_byte_exact() {
+        use crate::decode_frame::decode_vp9_sequence;
+        let (w, h) = (64u32, 64u32);
+        let frames = banded_motion_frames(w, h, 5);
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        let coded = encode_sequence_lossless_chained_420(&refs, w, h).expect("chained encode");
+        assert_eq!(coded.len(), 5);
+        // Every P-frame header is shown and non-error-resilient — the
+        // §7.2.6 shape whose decode scans the prev motion field.
+        for p in coded.iter().skip(1) {
+            let ref_dims = vec![(w, h); 8];
+            let hdr = crate::header::parse_uncompressed_header_with_refs(
+                p,
+                Some(crate::header::RefFrameState {
+                    ref_dims: &ref_dims,
+                    color_config: crate::header::ColorConfig {
+                        bit_depth: 8,
+                        color_space: crate::header::ColorSpace::Bt601,
+                        color_range_full: false,
+                        subsampling_x: true,
+                        subsampling_y: true,
+                    },
+                }),
+            )
+            .expect("P header");
+            assert!(hdr.show_frame && !hdr.error_resilient_mode);
+        }
+        let coded_refs: Vec<&[u8]> = coded.iter().map(|f| f.as_slice()).collect();
+        let dec = decode_vp9_sequence(&coded_refs).expect("decode");
+        for (i, d) in dec.iter().enumerate() {
+            assert_eq!(
+                d.to_planar_bytes(),
+                frames[i],
+                "frame {i} not byte-exact through the chained encode"
+            );
+        }
+    }
+
+    /// Rate A/B: on banded persistent motion the chained encoder
+    /// codes strictly fewer total bytes than the error-resilient chain —
+    /// the prev-frame candidate turns `NEWMV` blocks whose spatial
+    /// predictors point the wrong way into `NEARESTMV` / `NEARMV`
+    /// (no §6.4.20 mv-diff bits). Both chains decode byte-exact, so the
+    /// delta is pure entropy-path savings.
+    #[test]
+    fn lossless_chained_sequence_beats_error_resilient_rate() {
+        let (w, h) = (64u32, 128u32);
+        let frames = banded_motion_frames(w, h, 6);
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+
+        let chained = encode_sequence_lossless_chained_420(&refs, w, h).expect("chained");
+        let er = encode_sequence_lossless_420(&refs, w, h).expect("er");
+        let chained2 = encode_sequence_lossless_chained_420(&refs, w, h).expect("chained again");
+        assert_eq!(chained, chained2, "chained encode must be deterministic");
+
+        // Keyframes are identical; compare the P-frame totals.
+        assert_eq!(chained[0], er[0], "keyframes must match");
+        let chained_p: usize = chained.iter().skip(1).map(|f| f.len()).sum();
+        let er_p: usize = er.iter().skip(1).map(|f| f.len()).sum();
+        assert!(
+            chained_p < er_p,
+            "chained P-frames ({chained_p} B) must beat the error-resilient \
+             chain ({er_p} B) on persistent banded motion"
         );
     }
 

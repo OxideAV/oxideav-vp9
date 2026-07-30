@@ -754,6 +754,28 @@ pub fn encode_vp9_lossless_sequence(
     pixel_encoder::encode_sequence_lossless_420(frames, width, height)
 }
 
+/// [`encode_vp9_lossless_sequence`] on **non-error-resilient chain
+/// framing**: every P-frame is shown and non-error-resilient, so the
+/// §7.2.6 `UsePrevFrameMvs` derivation is 1 on the decode side — and
+/// the encoder models it, threading each frame's §6.4.4 motion field
+/// into the next frame's §6.5.10 candidate scan. Motion that persists
+/// at the same position across frames reaches the previous-frame
+/// candidate and codes `NEARESTMV` / `NEARMV` (no §6.4.20 mv-diff
+/// bits) even where the spatial neighbours predict it wrongly, so
+/// temporally coherent motion codes fewer bytes than
+/// [`encode_vp9_lossless_sequence`]'s error-resilient framing.
+///
+/// The lossless guarantee is identical: every frame of
+/// `decode_vp9_sequence( encode_vp9_lossless_sequence_chained( frames
+/// ) )` equals its input **byte-exact**.
+pub fn encode_vp9_lossless_sequence_chained(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+) -> Result<Vec<Vec<u8>>, Error> {
+    pixel_encoder::encode_sequence_lossless_chained_420(frames, width, height)
+}
+
 /// Encode an 8-bit 4:2:0 planar frame into a **lossy** VP9 keyframe at
 /// quantizer index `base_q_idx` (`1..=255` — smaller is higher quality;
 /// use [`encode_vp9`] for lossless).

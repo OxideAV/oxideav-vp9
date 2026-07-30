@@ -299,6 +299,16 @@ prediction sees the decoder's exact state. Public entry points:
   drift; only the bounded quantization error separates the result
   from the source. On mixed content the adaptive tree codes fewer
   bytes than the fixed all-4x4 layout at the same quantizer (pinned).
+* [`encode_vp9_lossy_sequence_chained`] — the lossy GOP on
+  **non-error-resilient chain framing** (round 434): shown P-frames
+  decode with §7.2.6 `UsePrevFrameMvs == 1`, the encoder threads each
+  frame's §6.4.4 motion field into every §6.5 predictor derivation of
+  the next frame's search and writer, and — because a
+  non-error-resilient frame keeps its *coded* sign biases — the
+  `[ LAST, ALTREF ]` compound election is **live inside the ordinary
+  shown GOP**: a cross-fade midpoint frame elects compound leaves with
+  no hidden-predecessor construction (the r418 restriction dissolves),
+  pinned on the writer's own per-MI state.
 * [`encode_vp9_lossy_sequence_rc`] — **rate control**: every frame is
   coded at the lowest `base_q_idx` whose size fits a caller-chosen
   per-frame byte budget, via an exact per-frame binary search over the
@@ -495,9 +505,13 @@ carries no forward update for it).
   without a hidden/intra predecessor) are codeable, pinned by a
   NEARMV-only-reachable-through-the-prev-field differential, an
   error-resilient-twin sample-identity, and a compound-average check
-  on a shown chain. Keyframe skip election, and migrating the lossy
-  *sequence* encoders' search off error-resilient framing onto the
-  prev-MV model, are later milestones.
+  on a shown chain — with **chained variants of both sequence
+  encoders** ([`encode_vp9_lossless_sequence_chained`] /
+  [`encode_vp9_lossy_sequence_chained`]) shipping on that model.
+  Keyframe skip election, and promoting the chained framing to the
+  *default* sequence paths (a fixture-restaging round: the staged
+  self-encoded packages pin the classic encoders' exact bytes), are
+  later milestones.
   Lossy encoding is 8-bit 4:2:0 (the lossless path covers all four
   profiles). The inter *writers* now carry compound references and
   **every** `MiSize` — the round-415 sub-8x8 per-(idy, idx) MV walk

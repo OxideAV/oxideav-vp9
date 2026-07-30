@@ -527,6 +527,7 @@ mod tests {
                 PFRAME_SEARCH_RANGE,
                 true,
                 true,
+                None,
             )
             .expect("p1 encode");
             filter_reconstruction(&mut recon, &state, &hdr);

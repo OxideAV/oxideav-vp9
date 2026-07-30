@@ -820,6 +820,33 @@ pub fn encode_vp9_lossy_sequence(
     pixel_encoder::encode_sequence_lossy_420(frames, width, height, base_q_idx)
 }
 
+/// [`encode_vp9_lossy_sequence`] on **non-error-resilient chain
+/// framing**: every P-frame is shown and non-error-resilient, so the
+/// §7.2.6 `UsePrevFrameMvs` derivation is 1 on the decode side — the
+/// encoder models it by threading each frame's §6.4.4 motion field into
+/// the next frame's §6.5 predictor derivations and block writer. Two
+/// consequences over [`encode_vp9_lossy_sequence`]:
+///
+/// * temporally persistent motion that the spatial neighbours
+///   mispredict reaches the §6.5.10 previous-frame candidate and codes
+///   `NEARESTMV` / `NEARMV` instead of paying §6.4.20 mv-diff bits;
+/// * a non-error-resilient frame keeps its **coded** sign biases (§7.2
+///   `setup_past_independence` only zeroes them on error-resilient
+///   frames), so the `[ LAST, ALTREF ]` compound election is live
+///   inside the ordinary shown GOP — cross-fade content codes compound
+///   averages with no hidden-predecessor construction.
+///
+/// The decoder-mirror guarantee is unchanged: the decoded output equals
+/// the encoder's in-loop reconstruction bit-for-bit.
+pub fn encode_vp9_lossy_sequence_chained(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+) -> Result<Vec<Vec<u8>>, Error> {
+    pixel_encoder::encode_sequence_lossy_chained_420(frames, width, height, base_q_idx)
+}
+
 /// **Rate-controlled** lossy sequence encode: like
 /// [`encode_vp9_lossy_sequence`] but instead of a fixed quantizer, every
 /// frame is coded at the *lowest* `base_q_idx` (best quality) whose

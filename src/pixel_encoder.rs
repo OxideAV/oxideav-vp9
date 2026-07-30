@@ -3008,6 +3008,7 @@ fn plan_sub8x8_leaf(
     quant: &QuantizationParams,
     sign_bias: &[bool; 4],
     state: &crate::decode_block::Vp9FrameState,
+    prev_src: Option<crate::inter_decode::PrevFrameMvs<'_>>,
     work: &mut ReconState,
     token_cache: &mut std::collections::HashMap<(usize, u32, u32), Vec<i64>>,
 ) -> crate::frame_writer::InterTreeLeaf {
@@ -3038,8 +3039,8 @@ fn plan_sub8x8_leaf(
         mi_col_start: 0,
         mi_col_end: mi_cols as i32,
     };
-    let src = FrameStateMvSource::new(state, None);
-    let mv_refs = geom.find_mv_refs(&src, LAST_FRAME, -1, sign_bias, false);
+    let src = FrameStateMvSource::new(state, prev_src);
+    let mv_refs = geom.find_mv_refs(&src, LAST_FRAME, -1, sign_bias, prev_src.is_some());
     let best = geom.find_best_ref_mvs(mv_refs.ref_list_mv, allow_high_precision_mv)[0];
     let use_hp = allow_high_precision_mv && use_mv_hp(best);
 
@@ -3222,7 +3223,10 @@ fn plan_sub8x8_leaf(
 /// `TX_4X4`.
 ///
 /// Requires an error-resilient non-key lossy header (see
-/// [`crate::frame_writer::assemble_inter_frame_tree`]).
+/// [`crate::frame_writer::assemble_inter_frame_tree`]) — or a shown
+/// non-error-resilient one with the previous frame's motion field
+/// supplied through the `_with_state` variant's `prev_frame_mvs`
+/// (the §7.2.6 `UsePrevFrameMvs == 1` chain model).
 // Spec-shaped fan-in (header + targets + per-reference planes + search
 // options), matching the crate's encoder-driver style. Bytes+recon
 // convenience over the `_with_state` encoder; the non-test encoders
@@ -3250,13 +3254,22 @@ pub(crate) fn encode_pframe_lossy_tree_motion(
         search_range,
         subpel,
         sub8x8,
+        None,
     )
     .map(|(b, r, _)| (b, r))
 }
 
 /// [`encode_pframe_lossy_tree_motion`] also returning the writer's final
 /// §6.4.4 [`crate::decode_block::Vp9FrameState`] per-MI arrays — the
-/// input the encode-side §8.8 loop-filter mirror consumes.
+/// input the encode-side §8.8 loop-filter mirror consumes — and taking
+/// the §7.2.6 `prev_frame_mvs` chain model: when supplied (shown
+/// non-error-resilient chains), the previous frame's motion field feeds
+/// every §6.5 predictor derivation in the search — the leaf-level
+/// candidate evaluation, the compound second-list re-snap, the final
+/// NEARESTMV / NEARMV mode mapping, and the sub-8x8 cell walk — plus
+/// the block writer itself, so the predictors stay bit-identical to the
+/// decoder's `UsePrevFrameMvs == 1` scan. `None` is byte-identical to
+/// the classic error-resilient model.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_pframe_lossy_tree_motion_with_state(
     hdr: &Vp9FrameHeader,
@@ -3268,6 +3281,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion_with_state(
     search_range: i32,
     subpel: bool,
     sub8x8: bool,
+    prev_frame_mvs: Option<&crate::frame_writer::PrevMotionField>,
 ) -> Result<(Vec<u8>, ReconState, crate::decode_block::Vp9FrameState), Error> {
     use crate::frame_writer::{InterFrameTreePlan, InterTreeLeaf, InterTreePlanner};
     use crate::inter_decode::FrameStateMvSource;
@@ -3299,6 +3313,15 @@ pub(crate) fn encode_pframe_lossy_tree_motion_with_state(
     };
     let seg = hdr.segmentation;
     let quant = hdr.quantization;
+
+    // §7.2.6 prev-motion-field model: the previous frame's §6.4.4
+    // arrays, threaded into every §6.5 scan below (and into the block
+    // writer through the plan) exactly as the decoder reads them.
+    let prev_src = prev_frame_mvs.map(|p| crate::inter_decode::PrevFrameMvs {
+        prev_ref_frames: &p.ref_frames,
+        prev_mvs: &p.mvs,
+    });
+    let use_prev = prev_src.is_some();
 
     let (partitions, _hints, sub_hints) = plan_inter_partitions(
         targets,
@@ -3360,6 +3383,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion_with_state(
                     &quant,
                     &sign_bias,
                     state,
+                    prev_src,
                     &mut work.borrow_mut(),
                     &mut token_cache.borrow_mut(),
                 );
@@ -3400,8 +3424,8 @@ pub(crate) fn encode_pframe_lossy_tree_motion_with_state(
                         mi_col_start: 0,
                         mi_col_end: mi_cols as i32,
                     };
-                    let src = FrameStateMvSource::new(state, None);
-                    let mv_refs = geom.find_mv_refs(&src, ref_frame, -1, &sign_bias, false);
+                    let src = FrameStateMvSource::new(state, prev_src);
+                    let mv_refs = geom.find_mv_refs(&src, ref_frame, -1, &sign_bias, use_prev);
                     let best =
                         geom.find_best_ref_mvs(mv_refs.ref_list_mv, hdr.allow_high_precision_mv)[0];
 
@@ -3533,13 +3557,13 @@ pub(crate) fn encode_pframe_lossy_tree_motion_with_state(
                             mi_col_start: 0,
                             mi_col_end: mi_cols as i32,
                         };
-                        let src = FrameStateMvSource::new(state, None);
+                        let src = FrameStateMvSource::new(state, prev_src);
                         let mv_refs = geom.find_mv_refs(
                             &src,
                             crate::mode_info::ALTREF_FRAME,
                             -1,
                             &sign_bias,
-                            false,
+                            use_prev,
                         );
                         let best_a = geom
                             .find_best_ref_mvs(mv_refs.ref_list_mv, hdr.allow_high_precision_mv)[0];
@@ -3575,12 +3599,12 @@ pub(crate) fn encode_pframe_lossy_tree_motion_with_state(
                     mi_col_start: 0,
                     mi_col_end: mi_cols as i32,
                 };
-                let src = FrameStateMvSource::new(state, None);
+                let src = FrameStateMvSource::new(state, prev_src);
                 let lists = 1 + usize::from(is_compound);
                 let mut nearest_all = true;
                 let mut near_all = true;
                 for j in 0..lists {
-                    let mv_refs = geom.find_mv_refs(&src, choice.0[j], -1, &sign_bias, false);
+                    let mv_refs = geom.find_mv_refs(&src, choice.0[j], -1, &sign_bias, use_prev);
                     let best =
                         geom.find_best_ref_mvs(mv_refs.ref_list_mv, hdr.allow_high_precision_mv);
                     nearest_all &= choice.2[j] == best[0];
@@ -3752,8 +3776,11 @@ pub(crate) fn encode_pframe_lossy_tree_motion_with_state(
         reference_mode,
         partitions,
         prev_segment_ids: None,
-        prev_frame_mvs_absent: !hdr.error_resilient_mode,
-        prev_frame_mvs: None,
+        // Without a supplied prev field, a non-ER header is this
+        // encoder's assertion that §7.2.6 derives 0 (hidden / intra /
+        // resized predecessor); with one, the writer models the scan.
+        prev_frame_mvs_absent: !hdr.error_resilient_mode && prev_frame_mvs.is_none(),
+        prev_frame_mvs: prev_frame_mvs.cloned(),
     };
     let (bytes, state) = crate::frame_writer::assemble_inter_frame_tree_with_state(
         hdr,
@@ -3955,6 +3982,7 @@ pub(crate) fn encode_sequence_lossy_420(
             PFRAME_SEARCH_RANGE,
             true,
             true,
+            None,
         )?;
         let (bytes, recon) =
             finish_frame_with_filter(&hdr, p0, recon0, state0, &targets, w, h, |hdr2| {
@@ -3968,10 +3996,175 @@ pub(crate) fn encode_sequence_lossy_420(
                     PFRAME_SEARCH_RANGE,
                     true,
                     true,
+                    None,
                 )
             })?;
         out.push(bytes);
         prev_recon = recon;
+    }
+    Ok(out)
+}
+
+/// [`encode_sequence_lossy_420`] on **non-error-resilient chain
+/// framing** — the §7.2.6 `UsePrevFrameMvs == 1` model applied to the
+/// lossy GOP: every P-frame is shown and non-error-resilient, the
+/// encoder threads each frame's §6.4.4 motion field into the next
+/// frame's search + writer, and — because a non-error-resilient frame
+/// keeps its coded sign biases (§7.2 `setup_past_independence` only
+/// zeroes them on error-resilient frames) — the `[ LAST, ALTREF ]`
+/// **compound election is live inside the ordinary shown GOP**, with no
+/// hidden/intra predecessor construction (the r418 finding's
+/// restriction dissolves under the chain model).
+pub(crate) fn encode_sequence_lossy_chained_420(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+) -> Result<Vec<Vec<u8>>, Error> {
+    use crate::frame_writer::PrevMotionField;
+
+    if frames.is_empty() || base_q_idx == 0 {
+        return Err(Error::Unsupported);
+    }
+    if width == 0 || height == 0 || width > (1 << 16) || height > (1 << 16) {
+        return Err(Error::Unsupported);
+    }
+    let w = width as usize;
+    let h = height as usize;
+    let cw = width.div_ceil(2) as usize;
+    let ch = height.div_ceil(2) as usize;
+    let need = w * h + 2 * cw * ch;
+    if frames.iter().any(|f| f.len() < need) {
+        return Err(Error::Unsupported);
+    }
+
+    let mi_cols = ((width + 7) >> 3) as usize;
+    let mi_rows = ((height + 7) >> 3) as usize;
+    let y_w = mi_cols * 8;
+    let y_h = mi_rows * 8;
+    let uv_w = y_w >> 1;
+    let uv_h = y_h >> 1;
+
+    let padded_targets = |pixels: &[u8]| -> [Plane; 3] {
+        [
+            padded_plane_from_bytes(&pixels[..w * h], w, h, y_w, y_h),
+            padded_plane_from_bytes(&pixels[w * h..w * h + cw * ch], cw, ch, uv_w, uv_h),
+            padded_plane_from_bytes(&pixels[w * h + cw * ch..], cw, ch, uv_w, uv_h),
+        ]
+    };
+    let visible_crop = |recon: &ReconState| -> [Vec<i32>; 3] {
+        let crop = |p: &Plane, vw: usize, vh: usize| -> Vec<i32> {
+            let mut out = Vec::with_capacity(vw * vh);
+            for y in 0..vh {
+                for x in 0..vw {
+                    out.push(p.get(x, y));
+                }
+            }
+            out
+        };
+        [
+            crop(&recon.planes[0], w, h),
+            crop(&recon.planes[1], cw, ch),
+            crop(&recon.planes[2], cw, ch),
+        ]
+    };
+
+    let kf_targets = padded_targets(frames[0]);
+    let kf_hdr = lossy_keyframe_header_420(width, height, base_q_idx);
+    let kf_plan = plan_keyframe_tree(
+        &kf_targets,
+        mi_rows as u32,
+        mi_cols as u32,
+        true,
+        true,
+        8,
+        base_q_idx,
+    );
+    let (kf0, kf_recon0, kf_state0) =
+        encode_keyframe_lossy_tree_with_state(&kf_hdr, &kf_targets, &kf_plan)?;
+    // The per-MI state is invariant under the filter-level re-encode
+    // (only the fixed-width §6.2.8 header field changes), so kf_state0
+    // is the keyframe's final §6.4.4 motion field.
+    let mut prev_field = PrevMotionField::from_state(&kf_state0);
+    let (kf_bytes, kf_recon) = finish_frame_with_filter(
+        &kf_hdr,
+        kf0,
+        kf_recon0,
+        kf_state0,
+        &kf_targets,
+        w,
+        h,
+        |hdr2| encode_keyframe_lossy_tree_with_state(hdr2, &kf_targets, &kf_plan),
+    )?;
+
+    let mut out = Vec::with_capacity(frames.len());
+    out.push(kf_bytes);
+
+    // Long-term GOLDEN/ALTREF: the keyframe stays parked in §8.10 slot 1
+    // (P-frames refresh only slot 0), `ref_frame_idx = [0, 1, 1]`.
+    let golden = visible_crop(&kf_recon);
+    let golden_ref: [(&[i32], usize); 3] = [
+        (golden[0].as_slice(), w),
+        (golden[1].as_slice(), cw),
+        (golden[2].as_slice(), cw),
+    ];
+    let mut prev_recon = kf_recon;
+
+    for &frame in frames.iter().skip(1) {
+        let targets = padded_targets(frame);
+        let prev = visible_crop(&prev_recon);
+        let reference: [(&[i32], usize); 3] = [
+            (prev[0].as_slice(), w),
+            (prev[1].as_slice(), cw),
+            (prev[2].as_slice(), cw),
+        ];
+        let mut hdr = lossless_pframe_header(width, height);
+        // Shown non-error-resilient chain: §7.2.6 derives
+        // UsePrevFrameMvs = 1 on the decode side, and the effective
+        // sign biases are the CODED ones — the asymmetric ALTREF bias
+        // below genuinely admits compound here, unlike the
+        // error-resilient chain where §7.2 zeroes it.
+        hdr.error_resilient_mode = false;
+        hdr.ref_frame_idx = Some([0, 1, 1]);
+        hdr.ref_frame_sign_bias = [false, false, true];
+        hdr.quantization = QuantizationParams {
+            base_q_idx,
+            delta_q_y_dc: 0,
+            delta_q_uv_dc: 0,
+            delta_q_uv_ac: 0,
+            lossless: false,
+        };
+        let (p0, recon0, state0) = encode_pframe_lossy_tree_motion_with_state(
+            &hdr,
+            &targets,
+            &reference,
+            Some(&golden_ref),
+            width,
+            height,
+            PFRAME_SEARCH_RANGE,
+            true,
+            true,
+            Some(&prev_field),
+        )?;
+        let next_field = PrevMotionField::from_state(&state0);
+        let (bytes, recon) =
+            finish_frame_with_filter(&hdr, p0, recon0, state0, &targets, w, h, |hdr2| {
+                encode_pframe_lossy_tree_motion_with_state(
+                    hdr2,
+                    &targets,
+                    &reference,
+                    Some(&golden_ref),
+                    width,
+                    height,
+                    PFRAME_SEARCH_RANGE,
+                    true,
+                    true,
+                    Some(&prev_field),
+                )
+            })?;
+        out.push(bytes);
+        prev_recon = recon;
+        prev_field = next_field;
     }
     Ok(out)
 }
@@ -4144,6 +4337,7 @@ pub(crate) fn encode_sequence_lossy_rc_420(
                 PFRAME_SEARCH_RANGE,
                 true,
                 true,
+                None,
             )
         };
         let (p0, (recon0, state0, p_q), _) = bisect_q(
@@ -6154,6 +6348,282 @@ mod tests {
         }
     }
 
+    /// The chained lossy sequence encoder (§7.2.6 `UsePrevFrameMvs == 1`
+    /// framing) decodes end-to-end with bounded distortion: every
+    /// P-frame header is shown + non-error-resilient (the decode shape
+    /// that scans the prev motion field — a writer/decoder model
+    /// mismatch desyncs the entropy stream and fails the decode or the
+    /// MSE bound), and the encode is byte-deterministic.
+    #[test]
+    fn lossy_chained_sequence_decodes_with_bounded_distortion() {
+        use crate::decode_frame::decode_vp9_sequence;
+
+        let (w, h) = (48u32, 32u32);
+        let cw = w.div_ceil(2) as usize;
+        let ch = h.div_ceil(2) as usize;
+        let pattern = |x: i64, y: i64| -> u8 { (((x * 5 + y * 11) % 53) * 4 + (x * y) % 23) as u8 };
+        let inputs: Vec<Vec<u8>> = (0..4i64)
+            .map(|t| {
+                let mut px = Vec::with_capacity((w * h) as usize + 2 * cw * ch);
+                for i in 0..h as i64 {
+                    for j in 0..w as i64 {
+                        px.push(pattern(j + 2 * t, i + t));
+                    }
+                }
+                for i in 0..ch as i64 {
+                    for j in 0..cw as i64 {
+                        px.push(pattern(j + t + 30, i));
+                    }
+                }
+                for i in 0..ch as i64 {
+                    for j in 0..cw as i64 {
+                        px.push(pattern(j, i + t + 30));
+                    }
+                }
+                px
+            })
+            .collect();
+        let refs: Vec<&[u8]> = inputs.iter().map(|f| f.as_slice()).collect();
+
+        let coded = encode_sequence_lossy_chained_420(&refs, w, h, 70).expect("chained encode");
+        let coded2 = encode_sequence_lossy_chained_420(&refs, w, h, 70).expect("again");
+        assert_eq!(coded, coded2, "chained lossy encode must be deterministic");
+        assert_eq!(coded.len(), 4);
+
+        // Every P-frame header: shown, non-error-resilient.
+        let ref_dims = vec![(w, h); 8];
+        let cc = crate::header::ColorConfig {
+            bit_depth: 8,
+            color_space: crate::header::ColorSpace::Bt601,
+            color_range_full: false,
+            subsampling_x: true,
+            subsampling_y: true,
+        };
+        for (i, p) in coded.iter().enumerate().skip(1) {
+            let hdr = crate::header::parse_uncompressed_header_with_refs(
+                p,
+                Some(crate::header::RefFrameState {
+                    ref_dims: &ref_dims,
+                    color_config: cc,
+                }),
+            )
+            .expect("P header");
+            assert!(
+                hdr.show_frame && !hdr.error_resilient_mode,
+                "frame {i}: chained shape"
+            );
+        }
+
+        let coded_refs: Vec<&[u8]> = coded.iter().map(|f| f.as_slice()).collect();
+        let decoded = decode_vp9_sequence(&coded_refs).expect("decode");
+        for (i, (frame, input)) in decoded.iter().zip(&inputs).enumerate() {
+            let out = frame.to_planar_bytes();
+            let mse: f64 = out
+                .iter()
+                .zip(input)
+                .map(|(&a, &b)| {
+                    let d = f64::from(a) - f64::from(b);
+                    d * d
+                })
+                .sum::<f64>()
+                / out.len() as f64;
+            assert!(mse < 400.0, "frame {i}: MSE {mse} out of the q=70 regime");
+        }
+    }
+
+    /// Compound prediction **inside an ordinary shown GOP** — the r418
+    /// restriction (compound needed a hidden/intra predecessor to keep
+    /// §7.2.6 at 0) dissolves under the chain model: on a cross-fade
+    /// midpoint frame (target = the pixel average of the previous frame
+    /// and the keyframe), the chained lossy encoder's election picks
+    /// `[ LAST, ALTREF ]` compound leaves — verified on the writer's
+    /// §6.4.4 state — with every frame shown and non-error-resilient,
+    /// and the coded stream decodes with midpoint-accurate samples.
+    #[test]
+    fn lossy_chained_sequence_elects_compound_in_shown_gop() {
+        use crate::decode_frame::decode_vp9_sequence;
+        use crate::frame_writer::PrevMotionField;
+        use crate::mode_info::ALTREF_FRAME;
+
+        let (w, h) = (64u32, 64u32);
+        let w_us = w as usize;
+        let h_us = h as usize;
+        let cw = w.div_ceil(2) as usize;
+        let ch = h.div_ceil(2) as usize;
+        let n = w_us * h_us + 2 * cw * ch;
+        let pattern = |x: i64, y: i64| -> u8 { (((x * 3 + y * 7) % 41) * 6) as u8 };
+        // f0: the pattern. f1: the pattern displaced 8 px right (real
+        // motion, so LAST and ALTREF genuinely differ). f2: the pixel
+        // MIDPOINT of f1 and f0 — the §8.5.2 Round2( LAST + ALTREF, 1 )
+        // compound average predicts it near-exactly, either single
+        // reference is ~half the fade away.
+        let f0: Vec<u8> = {
+            let mut px = Vec::with_capacity(n);
+            for i in 0..h_us as i64 {
+                for j in 0..w_us as i64 {
+                    px.push(pattern(j, i));
+                }
+            }
+            px.resize(n, 128);
+            px
+        };
+        let f1: Vec<u8> = {
+            let mut px = Vec::with_capacity(n);
+            for i in 0..h_us as i64 {
+                for j in 0..w_us as i64 {
+                    px.push(pattern(j - 8, i));
+                }
+            }
+            px.resize(n, 128);
+            px
+        };
+        let f2: Vec<u8> = f0
+            .iter()
+            .zip(&f1)
+            .map(|(&a, &b)| (u16::from(a) + u16::from(b)).div_ceil(2) as u8)
+            .collect();
+        let inputs = [f0.clone(), f1.clone(), f2.clone()];
+        let refs: Vec<&[u8]> = inputs.iter().map(|f| f.as_slice()).collect();
+
+        let q = 60u8;
+        let coded = encode_sequence_lossy_chained_420(&refs, w, h, q).expect("chained encode");
+        let coded_refs: Vec<&[u8]> = coded.iter().map(|f| f.as_slice()).collect();
+        let decoded = decode_vp9_sequence(&coded_refs).expect("decode");
+        assert_eq!(decoded.len(), 3);
+
+        // Rebuild the two P-frame hops with the same inputs the
+        // sequence encoder used (references from the DECODED outputs,
+        // which equal the encoder's reconstructions) to inspect the
+        // writer's §6.4.4 state. The per-MI state is invariant under
+        // the filter-level re-encode, so the level-0 states are the
+        // final ones.
+        let y_w = (((w + 7) >> 3) * 8) as usize;
+        let y_h = (((h + 7) >> 3) * 8) as usize;
+        let pad = |px: &[u8]| -> [Plane; 3] {
+            [
+                padded_plane_from_bytes(&px[..w_us * h_us], w_us, h_us, y_w, y_h),
+                padded_plane_from_bytes(
+                    &px[w_us * h_us..w_us * h_us + cw * ch],
+                    cw,
+                    ch,
+                    y_w >> 1,
+                    y_h >> 1,
+                ),
+                padded_plane_from_bytes(&px[w_us * h_us + cw * ch..], cw, ch, y_w >> 1, y_h >> 1),
+            ]
+        };
+        let planes_of = |d: &crate::decode_frame::Vp9DecodedFrame| -> [Vec<i32>; 3] {
+            [
+                d.y.iter().map(|&s| i32::from(s)).collect(),
+                d.u.iter().map(|&s| i32::from(s)).collect(),
+                d.v.iter().map(|&s| i32::from(s)).collect(),
+            ]
+        };
+
+        let kf_targets = pad(&f0);
+        let kf_hdr = lossy_keyframe_header_420(w, h, q);
+        let mi_rows = ((h + 7) >> 3) as usize;
+        let mi_cols = ((w + 7) >> 3) as usize;
+        let kf_plan = plan_keyframe_tree(
+            &kf_targets,
+            mi_rows as u32,
+            mi_cols as u32,
+            true,
+            true,
+            8,
+            q,
+        );
+        let (_kf0, _kfr, kf_state) =
+            encode_keyframe_lossy_tree_with_state(&kf_hdr, &kf_targets, &kf_plan).expect("kf");
+        let kf_field = PrevMotionField::from_state(&kf_state);
+
+        let golden_planes = planes_of(&decoded[0]);
+        let golden_ref: [(&[i32], usize); 3] = [
+            (golden_planes[0].as_slice(), w_us),
+            (golden_planes[1].as_slice(), cw),
+            (golden_planes[2].as_slice(), cw),
+        ];
+        let mk_p_hdr = || {
+            let mut hdr = lossless_pframe_header(w, h);
+            hdr.error_resilient_mode = false;
+            hdr.ref_frame_idx = Some([0, 1, 1]);
+            hdr.ref_frame_sign_bias = [false, false, true];
+            hdr.quantization = QuantizationParams {
+                base_q_idx: q,
+                delta_q_y_dc: 0,
+                delta_q_uv_dc: 0,
+                delta_q_uv_ac: 0,
+                lossless: false,
+            };
+            hdr
+        };
+
+        let ref1_planes = planes_of(&decoded[0]);
+        let ref1: [(&[i32], usize); 3] = [
+            (ref1_planes[0].as_slice(), w_us),
+            (ref1_planes[1].as_slice(), cw),
+            (ref1_planes[2].as_slice(), cw),
+        ];
+        let (_b1, _r1, state1) = encode_pframe_lossy_tree_motion_with_state(
+            &mk_p_hdr(),
+            &pad(&f1),
+            &ref1,
+            Some(&golden_ref),
+            w,
+            h,
+            PFRAME_SEARCH_RANGE,
+            true,
+            true,
+            Some(&kf_field),
+        )
+        .expect("P1 rebuild");
+        let field1 = PrevMotionField::from_state(&state1);
+
+        let ref2_planes = planes_of(&decoded[1]);
+        let ref2: [(&[i32], usize); 3] = [
+            (ref2_planes[0].as_slice(), w_us),
+            (ref2_planes[1].as_slice(), cw),
+            (ref2_planes[2].as_slice(), cw),
+        ];
+        let (_b2, _r2, state2) = encode_pframe_lossy_tree_motion_with_state(
+            &mk_p_hdr(),
+            &pad(&f2),
+            &ref2,
+            Some(&golden_ref),
+            w,
+            h,
+            PFRAME_SEARCH_RANGE,
+            true,
+            true,
+            Some(&field1),
+        )
+        .expect("P2 rebuild");
+
+        let compound_mis = state2
+            .ref_frames
+            .chunks(2)
+            .filter(|c| c[1] == ALTREF_FRAME)
+            .count();
+        assert!(
+            compound_mis > 0,
+            "the cross-fade midpoint frame must elect [ LAST, ALTREF ] compound \
+             leaves inside a SHOWN non-error-resilient GOP"
+        );
+
+        // And the decoded midpoint frame is midpoint-accurate.
+        let out = decoded[2].to_planar_bytes();
+        let mse: f64 = out
+            .iter()
+            .zip(&f2)
+            .map(|(&a, &b)| {
+                let d = f64::from(a) - f64::from(b);
+                d * d
+            })
+            .sum::<f64>()
+            / out.len() as f64;
+        assert!(mse < 200.0, "midpoint frame MSE {mse} out of regime");
+    }
+
     /// The lossy **sequence** encoder's per-frame in-loop reconstruction
     /// equals the decoder's `decode_vp9_sequence` output bit-for-bit —
     /// the chain-level decoder-mirror pin: prediction references, motion
@@ -6281,6 +6751,7 @@ mod tests {
                 PFRAME_SEARCH_RANGE,
                 true,
                 true, // the sequence encoder runs with sub-8x8 election on
+                None,
             )
         };
         let (p0, recon0, state0) = encode_at(&hdr).expect("re-encode last hop");

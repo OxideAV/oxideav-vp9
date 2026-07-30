@@ -521,7 +521,7 @@ carries no forward update for it).
 
 ## Testing
 
-The crate carries 1055+ lib unit tests plus integration suites in
+The crate carries 1210+ lib unit tests plus integration suites in
 `tests/` (including the keyframe **and inter** encoder writers, each
 round-tripped back through the in-crate decoder; `encode_keyframe`
 exercising the public `encode_vp9` → decode **byte-exact lossless**
@@ -540,9 +540,13 @@ every §8.5.1 intra mode against flat-preservation + `Clip1`-bound
 properties. A `cargo-fuzz` harness lives in `fuzz/` with panic-surface
 targets over the header parsers, the Boolean-decoder walkers, the whole
 `decode_frame` pipeline (single-frame, Annex B split, and the multi-frame
-sequence driver), the `encode_keyframe` encode → decode round-trip, and
+sequence driver), the `encode_keyframe` encode → decode round-trip,
 the `encode_lossy_keyframe` **oracle-carrying** round-trip (a stream the
-lossy encoder emitted — elected §8.8 filter included — MUST decode);
+lossy encoder emitted — elected §8.8 filter included — MUST decode), and
+the `encode_chained_sequence` round-trip carrying the **full lossless
+oracle** over the §7.2.6 chain model (every decoded frame must equal
+its input byte-exact — a 24-case deterministic smoke of the same body
+also runs in standard CI);
 the `decode_robustness` integration suite pins the same
 garbage-in-no-panic contract in standard CI, including a fuzz-found
 OOM regression (headers claiming huge frame geometries are rejected

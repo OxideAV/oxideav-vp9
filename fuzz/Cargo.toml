@@ -57,5 +57,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "encode_chained_sequence"
+path = "fuzz_targets/encode_chained_sequence.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

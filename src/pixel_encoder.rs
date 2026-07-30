@@ -5122,6 +5122,59 @@ mod tests {
         );
     }
 
+    /// Deterministic smoke of the `encode_chained_sequence` fuzz-target
+    /// body: LCG-derived geometries (1..=48 both axes, partial-MI and
+    /// degenerate shapes included), frame counts 2..=4, and cycled
+    /// shifted content run the full chained-encode → decode → byte-exact
+    /// oracle across 24 cases in standard CI, so the §7.2.6 prev-field
+    /// chain model is exercised over arbitrary shapes on every push,
+    /// not only under the out-of-band fuzz harness.
+    #[test]
+    fn chained_sequence_smoke_over_random_geometries() {
+        use crate::decode_frame::decode_vp9_sequence;
+        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        for case in 0..24 {
+            let w = 1 + next() % 48;
+            let h = 1 + next() % 48;
+            let n_frames = 2 + (next() as usize) % 3;
+            let shift = 1 + (next() as usize) % 97;
+            let cw = w.div_ceil(2) as usize;
+            let ch = h.div_ceil(2) as usize;
+            let need = (w as usize) * (h as usize) + 2 * cw * ch;
+            let content: Vec<u8> = (0..251).map(|_| (next() & 0xFF) as u8).collect();
+            let frames: Vec<Vec<u8>> = (0..n_frames)
+                .map(|i| {
+                    content
+                        .iter()
+                        .copied()
+                        .cycle()
+                        .skip((i * shift) % content.len())
+                        .take(need)
+                        .collect()
+                })
+                .collect();
+            let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+            let coded = encode_sequence_lossless_chained_420(&refs, w, h)
+                .unwrap_or_else(|e| panic!("case {case} ({w}x{h}x{n_frames}): encode {e:?}"));
+            let coded_refs: Vec<&[u8]> = coded.iter().map(|f| f.as_slice()).collect();
+            let dec = decode_vp9_sequence(&coded_refs)
+                .unwrap_or_else(|e| panic!("case {case} ({w}x{h}x{n_frames}): decode {e:?}"));
+            for (i, d) in dec.iter().enumerate() {
+                assert_eq!(
+                    d.to_planar_bytes(),
+                    frames[i],
+                    "case {case} ({w}x{h}x{n_frames}): frame {i} not byte-exact"
+                );
+            }
+        }
+    }
+
     /// A budget below the syntax floor returns a best-effort q=255
     /// stream (still decodable) instead of failing.
     #[test]

@@ -1050,6 +1050,25 @@ fn full_corpus_sequences_byte_exact() {
         }
         check_fixture_byte_exact(root, name);
     }
+
+    // Round-434 corpus extension (staged; presence-gated so older docs
+    // checkouts still sweep clean):
+    //
+    // * tiles-2col-4row-inter — the corpus's first `tile_rows_log2 > 0`
+    //   stream, closing the tile-ROWS gap recorded in the
+    //   tiles-2col-inter notes: 512x256 (Sb64Cols=8, Sb64Rows=4) with
+    //   tile_rows_log2=2 AND tile_cols_log2=1 on both frames, so the
+    //   §6.4.1 decode_tiles( ) row-major walk runs 4x2 = 8 genuine tile
+    //   payloads per frame (8 §9.2 coder brackets, per-tile left/above
+    //   context interaction, intra + §8.5.2 inter prediction across
+    //   tile-row boundaries).
+    for name in ["tiles-2col-4row-inter"] {
+        if !root.join(name).is_dir() {
+            eprintln!("{name}: not yet staged; docs-gated");
+            continue;
+        }
+        check_fixture_byte_exact(root, name);
+    }
 }
 
 /// One `full_corpus_sequences_byte_exact` step: IVF demux → superframe
@@ -1158,11 +1177,12 @@ fn round_409_fixture_flags_pin_their_feature_classes() {
             assert!(hdr.quantization.lossless, "frame {i}: lossless=1");
         }),
         ("tiles-2col-inter", |i, hdr| {
-            // NOTE: tile ROWS on inter frames remain an encoder-tooling
-            // gap — the black-box wrapper exposes a tile-rows knob but
-            // emits tile_rows_log2 = 0 regardless (verified with row-mt
-            // and realtime deadlines); a tile-rows fixture needs custom
-            // encoder tooling, like the scaled-reference one did.
+            // Tile ROWS are covered by the round-434
+            // `tiles-2col-4row-inter` fixture (the historical tooling
+            // gap was a threading interaction: the black-box encoder
+            // clamps tile rows to 0 above one thread — see that
+            // fixture's notes.md); this stream stays the pure
+            // tile-COLUMN inter class.
             assert_eq!(hdr.tile_info.tile_cols_log2, 1, "frame {i}: tile cols");
         }),
         ("hbd-backward-adaptation", |i, hdr| {
@@ -1723,6 +1743,45 @@ fn round_420_filtered_gop_fixture_flags_pin_elected_levels() {
         assert!(h.loop_filter.level > 0, "frame {i}: elected non-zero level");
         assert_eq!(h.refresh_frame_flags, 0x01, "frame {i}: refreshes slot 0");
     }
+}
+
+/// Round-434 corpus extension: the `tiles-2col-4row-inter` fixture's
+/// headers carry the flags that make it the corpus's tile-ROWS class —
+/// `tile_rows_log2 = 2` AND `tile_cols_log2 = 1` on both the keyframe
+/// and the P-frame, at 512x256 (Sb64Cols = 8 / Sb64Rows = 4, so each of
+/// the four tile rows is exactly one superblock row tall and the frame
+/// carries 4x2 = 8 genuine tile payloads). Every prior tile fixture has
+/// `tile_rows_log2 = 0`, so without this pin a regenerated stream could
+/// silently drop the row split and the byte-exact sweep would degrade
+/// into re-testing tile columns. Presence-gated on the staged docs.
+#[test]
+fn round_434_tile_rows_fixture_flags_pin_row_split() {
+    let base = std::path::Path::new("../../docs/video/vp9/fixtures/tiles-2col-4row-inter");
+    if !base.is_dir() {
+        eprintln!("tiles-2col-4row-inter not yet staged; docs-gated");
+        return;
+    }
+    let ivf = std::fs::read(base.join("input.ivf")).expect("ivf");
+    let chunks = ivf_chunks(&ivf);
+    assert_eq!(chunks.len(), 2, "keyframe + 1 P-frame");
+    let h0 = oxideav_vp9::parse_uncompressed_header(&chunks[0]).expect("F0");
+    assert_eq!(h0.frame_type, oxideav_vp9::FrameType::KeyFrame);
+    assert_eq!((h0.frame_width, h0.frame_height), (512, 256));
+    assert_eq!(h0.tile_info.tile_rows_log2, 2, "keyframe: four tile rows");
+    assert_eq!(h0.tile_info.tile_cols_log2, 1, "keyframe: two tile cols");
+    let ref_dims = vec![(512u32, 256u32); 8];
+    let h1 = oxideav_vp9::parse_uncompressed_header_with_refs(
+        &chunks[1],
+        Some(oxideav_vp9::RefFrameState {
+            ref_dims: &ref_dims,
+            color_config: h0.color_config,
+        }),
+    )
+    .expect("F1");
+    assert_eq!(h1.frame_type, oxideav_vp9::FrameType::NonKeyFrame);
+    assert!(!h1.intra_only, "F1 is a real inter frame");
+    assert_eq!(h1.tile_info.tile_rows_log2, 2, "P-frame: four tile rows");
+    assert_eq!(h1.tile_info.tile_cols_log2, 1, "P-frame: two tile cols");
 }
 
 /// §6.4.14 / §8.1 segment-map threading + §7.2.10 segmentation feature

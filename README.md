@@ -36,7 +36,7 @@ motion field, the §6.1.2 / §7.2 `FrameContext[ 4 ]` entropy probability
 banks (`load_probs( )` / `save_probs( )` — **including the full §6.1.2
 `refresh_probs( )` backward adaptation on non-frame-parallel streams**,
 see below), and the §6.4.14 PrevSegmentIds
-map across frames. **All 41 staged corpus fixtures reconstruct fully
+map across frames. **All 43 staged corpus fixtures reconstruct fully
 byte-exact against their `expected.yuv` through `decode_vp9_sequence`**
 (pinned by `full_corpus_sequences_byte_exact`), including the
 profile-1/2/3 P-frames (§8.5.2 motion compensation at 4:4:4 chroma and
@@ -99,13 +99,19 @@ where `sub8x8-inter-mvs` is hand-planned), and `lossy-compound-elected`
 round-418 §7.2 `setup_past_independence` finding: error-resilient
 frames zero their effective `ref_frame_sign_bias`, so compound is
 uncodeable there).
-A **round-420 extension is built and awaiting docs staging**:
-`lossy-filtered-gop` — the corpus's first stream whose non-zero
-`loop_filter_level`s are *elected by this crate's own encoder*
-(per-frame levels 19/27/19/24 through the public lossy sequence API;
-the staged package is verified byte-exact through a black-box
-reference decode against the crate's own output; presence-gated
-sweep/flags/identity tests pick it up the moment it lands).
+The **round-420 extension** `lossy-filtered-gop` is now staged — the
+corpus's first stream whose non-zero `loop_filter_level`s are *elected
+by this crate's own encoder* (per-frame levels 19/27/19/24 through the
+public lossy sequence API; the staged package is verified byte-exact
+through a black-box reference decode against the crate's own output) —
+and the **round-434 extension** `tiles-2col-4row-inter` closes the
+corpus's last fixture-less axis: 512x256 with `tile_rows_log2 = 2`
+**and** `tile_cols_log2 = 1` on both the keyframe and the P-frame
+(`Sb64Cols = 8`, `Sb64Rows = 4`, so the §6.4.1 row-major tile walk runs
+4x2 = 8 genuine tile payloads per frame — eight §9.2 coder brackets,
+per-tile context resets interacting with the row traversal, and intra +
+§8.5.2 inter prediction across tile-row boundaries), byte-exact with no
+code change — the §6.4 tile-row walk was already correct.
 Highlights: `i-frame-then-p-frame-64x64`
 (keyframe + single-reference LAST P-frame, high-precision MVs,
 8-tap-smooth filter), `frame-parallel-mode` (keyframe + three
@@ -431,22 +437,23 @@ carries no forward update for it).
   reference decode, covering the 2x conformance extreme, a 1/2x
   upscale, the fractional 4/3 ratio, and a scaled `NEWMV`; two
   closed-form §8.5.2.3 phase-0 identities are pinned in-crate.
-* Tile **rows** (`tile_rows_log2 >= 1`) remain fixture-less: the
-  black-box encoder wrapper emits `tile_rows_log2 = 0` regardless of
-  its tile-rows knob (verified with row-mt / realtime deadlines), so a
-  tile-rows stream needs custom encoder tooling — recorded in
-  `docs/video/vp9/fixtures/tiles-2col-inter/notes.md`. The decode-side
-  tile-row walk itself is exercised by the §6.4 offset unit tests.
-  The three other round-412-verified wrapper gaps were closed by
-  self-encoding: non-zero `loop_filter_sharpness` and the per-segment
-  `SEG_LVL_SKIP` / `SEG_LVL_REF_FRAME` / `SEG_LVL_ALT_L` features (the
-  wrapper only ever emits `SEG_LVL_ALT_Q`) are corpus-validated via the
-  `seg-features-skip-ref-altl` fixture (round 412), and
-  `render_and_frame_size_different = 1` (SAR signalling doesn't mint
-  the bitstream field) is corpus-validated via the round-415
-  `render-size-128x72` fixture across all three §6.2.3 `render_size( )`
-  call sites — tile rows are now the ledger's only remaining
-  fixture-less axis (docs ask #270).
+* ~~Tile **rows** (`tile_rows_log2 >= 1`)~~ — **corpus-validated as of
+  round 434**: the staged `tiles-2col-4row-inter` fixture (docs ask
+  #270) decodes byte-exact with no code change. The long-standing
+  "custom encoder tooling needed" conclusion was wrong: the black-box
+  encoder clamps tile rows to 0 whenever it runs more than one thread,
+  and a single-threaded encode emits them (see the fixture's
+  `notes.md`), so the gap was a threading interaction, not a missing
+  feature. The three other round-412-verified wrapper gaps were closed
+  by self-encoding: non-zero `loop_filter_sharpness` and the
+  per-segment `SEG_LVL_SKIP` / `SEG_LVL_REF_FRAME` / `SEG_LVL_ALT_L`
+  features (the wrapper only ever emits `SEG_LVL_ALT_Q`) are
+  corpus-validated via the `seg-features-skip-ref-altl` fixture
+  (round 412), and `render_and_frame_size_different = 1` (SAR
+  signalling doesn't mint the bitstream field) is corpus-validated via
+  the round-415 `render-size-128x72` fixture across all three §6.2.3
+  `render_size( )` call sites — the encoder-tooling-gap ledger is now
+  fully closed.
 * §9.2.4 multi-coder tile parallelism (tiles decode sequentially).
 * Encoder depth beyond the planner-driven baseline. Keyframes **and
   P-frames** plan partitions `BLOCK_4X4`..`BLOCK_64X64` with

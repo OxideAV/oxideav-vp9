@@ -372,9 +372,22 @@ external encoder consulted):
   error ≤ `quant / 2`) and clamps tokens into the §6.4.26-codeable
   CAT6 range per bit depth;
 * the top-level **frame assemblers** (`frame_writer`) — thread the
-  uncompressed + compressed headers and the single-tile §6.4 partition /
-  block walk into a complete frame, with `header_size_in_bytes` set to
-  the compressed-header length. The **tree-plan keyframe assembler**
+  uncompressed + compressed headers and the §6.4 partition / block walk
+  into a complete frame, with `header_size_in_bytes` set to the
+  compressed-header length. The tree assemblers accept **any §6.2.13
+  tiling** (round 434): they mirror the §6.4 `decode_tiles( )`
+  row-major walk — one §9.2 coder bracket per tile, f(32) `tile_size`
+  prefixes on every tile but the last, above-context strips carrying
+  across tiles with per-tile-row left resets, the §6.5 candidate scans
+  clamped to each tile's `MiColStart` / `MiColEnd` window, and the
+  §6.4.4 `AvailL = MiCol > MiColStart` intra clamp at column edges —
+  pinned by reconstruction-identity across row splits at the staged
+  fixture's 2col x 4row tiling (tile rows never change the §8
+  reconstruction), a degenerate empty-tile-row geometry, an
+  all-inter tiled P-frame equal to its single-tile assembly, and a
+  pinned reconstruction *difference* across a column split (the
+  writer must lose the left neighbour exactly where the decoder
+  does). The **tree-plan keyframe assembler**
   (`assemble_keyframe_tree`) codes an arbitrary partition tree with
   per-leaf `tx_size` (coded through the §6.4.10 tree under
   `TX_MODE_SELECT`, or validated against the inferred size otherwise),

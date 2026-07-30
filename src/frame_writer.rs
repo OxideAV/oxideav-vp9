@@ -10,11 +10,15 @@
 //!    length;
 //! 2. the §6.3 compressed header ([`crate::compressed_writer`]) — the
 //!    intra default-probability path;
-//! 3. the §6.4 tile data — a single tile (`tile_cols_log2 ==
-//!    tile_rows_log2 == 0`, so no `tile_size` prefix), a §9.2 bool-coded
-//!    payload produced by walking the §6.4.3 partition recursion
-//!    ([`crate::partition_writer`]) and writing each leaf block's §6.4.4
-//!    mode info + §6.4.21 residual ([`crate::block_writer`]).
+//! 3. the §6.4 tile data — §9.2 bool-coded payloads produced by walking
+//!    the §6.4.3 partition recursion ([`crate::partition_writer`]) and
+//!    writing each leaf block's §6.4.4 mode info + §6.4.21 residual
+//!    ([`crate::block_writer`]). The legacy all-8x8 assembler emits a
+//!    single tile (`tile_cols_log2 == tile_rows_log2 == 0`, so no
+//!    `tile_size` prefix); the tree assemblers accept any §6.2.13
+//!    tiling and mirror the §6.4 `decode_tiles( )` row-major walk (one
+//!    coder bracket per tile, f(32) `tile_size` prefixes on every tile
+//!    but the last, per-tile-row left-context resets).
 //!
 //! The §6.4.3 partition layout the assembler emits is the all-`BLOCK_8X8`
 //! layout ([`crate::partition_writer::write_partition_8x8`]); every leaf
@@ -266,9 +270,6 @@ pub(crate) fn assemble_keyframe_tree_with_state(
     if !header_is_intra_frame(hdr) {
         return Err(Error::Unsupported);
     }
-    if hdr.tile_info.tile_cols_log2 != 0 || hdr.tile_info.tile_rows_log2 != 0 {
-        return Err(Error::Unsupported);
-    }
 
     let mi_cols = (hdr.frame_width + 7) >> 3;
     let mi_rows = (hdr.frame_height + 7) >> 3;
@@ -277,18 +278,20 @@ pub(crate) fn assemble_keyframe_tree_with_state(
     let chdr_bytes = write_compressed_header_intra(plan.tx_mode, hdr.quantization.lossless)?;
 
     // §6.2 uncompressed header with header_size_in_bytes = compressed len.
+    // (`write_tile_info` validates `tile_cols_log2` against the §6.2.14
+    // min/max derivation and `tile_rows_log2 <= 2`.)
     let mut hdr2 = *hdr;
     hdr2.header_size_in_bytes = u16::try_from(chdr_bytes.len()).map_err(|_| Error::Unsupported)?;
     let uhdr_bytes = write_uncompressed_header(&hdr2)?;
 
-    // §6.4 tile data: a single bool-coded payload over the plan's tree.
+    // §6.4 tile data: one bool-coded payload per tile over the plan's
+    // tree, walked in the decoder's row-major tile order.
     let ssx = hdr.color_config.subsampling_x;
     let ssy = hdr.color_config.subsampling_y;
     let bit_depth = u32::from(hdr.color_config.bit_depth);
     let sb64_cols = ((mi_cols + 7) >> 3) * 8;
     let sb64_rows = ((mi_rows + 7) >> 3) * 8;
 
-    let mut enc = BoolEncoder::new();
     let mut state = Vp9FrameState::new(mi_rows, mi_cols);
     let mut nz = [
         NonzeroContext::new((2 * mi_cols) as usize, (2 * mi_rows) as usize),
@@ -317,100 +320,150 @@ pub(crate) fn assemble_keyframe_tree_with_state(
     };
     let tree_probs = hdr.segmentation.tree_probs;
 
+    // §6.4 / §7.4.1: clear_above_context( ) once per frame — the above
+    // strips carry ACROSS tiles (a lower tile row reads what the tile
+    // above it wrote), only the left strips reset per tile row.
     pctx.clear_above();
 
-    let mut r = 0u32;
-    while r < mi_rows {
-        pctx.clear_left();
-        let mut c = 0u32;
-        while c < mi_cols {
-            let mut layout = |lr: u32, lc: u32, bsize: u8| -> u8 {
-                plan.partitions
-                    .get(&(lr, lc, bsize))
-                    .copied()
-                    .unwrap_or(if bsize == BLOCK_8X8 {
-                        PARTITION_NONE
-                    } else {
-                        PARTITION_SPLIT
-                    })
-            };
-            let mut leaf =
-                |enc: &mut BoolEncoder, lr: u32, lc: u32, subsize: u8| -> Result<(), Error> {
-                    let lp = plan
-                        .leaves
-                        .get(&(lr, lc))
-                        .copied()
-                        .ok_or(Error::Unsupported)?;
-                    // The plan's leaf size must match the tree's subsize
-                    // (the coefficient source predicts at lp.mi_size).
-                    if lp.mi_size != subsize {
-                        return Err(Error::Unsupported);
-                    }
-                    // tx-size codeability / inference validation.
-                    let max_tx = MAX_TXSIZE_LOOKUP[subsize as usize];
-                    if lp.tx_size > max_tx {
-                        return Err(Error::Unsupported);
-                    }
-                    if !tx_size_is_coded(true, plan.tx_mode, subsize >= BLOCK_8X8)
-                        && lp.tx_size != inferred_tx_size(max_tx, plan.tx_mode)
-                    {
-                        return Err(Error::Unsupported);
-                    }
-                    let spec = IntraBlockSpec {
-                        r: lr,
-                        mi_col_start: 0,
-                        c: lc,
-                        mi_size: subsize,
-                        segment_id: lp.segment_id,
-                        skip: lp.skip,
-                        tx_size: lp.tx_size,
-                        y_mode: lp.y_mode,
-                        uv_mode: lp.uv_mode,
+    let tile_cols_log2 = u32::from(hdr.tile_info.tile_cols_log2);
+    let tile_rows_log2 = u32::from(hdr.tile_info.tile_rows_log2);
+    let mut tiles: Vec<Vec<u8>> = Vec::new();
+    for tile_row in 0..(1u32 << tile_rows_log2) {
+        for tile_col in 0..(1u32 << tile_cols_log2) {
+            // §6.4 decode_tiles( ): the four get_tile_offset( ) extents.
+            let mi_row_start = crate::partition::get_tile_offset(tile_row, mi_rows, tile_rows_log2);
+            let mi_row_end =
+                crate::partition::get_tile_offset(tile_row + 1, mi_rows, tile_rows_log2);
+            let mi_col_start = crate::partition::get_tile_offset(tile_col, mi_cols, tile_cols_log2);
+            let mi_col_end =
+                crate::partition::get_tile_offset(tile_col + 1, mi_cols, tile_cols_log2);
+
+            // §6.4 line 2326: one fresh §9.2 coder bracket per tile.
+            let mut enc = BoolEncoder::new();
+
+            let mut r = mi_row_start;
+            while r < mi_row_end {
+                // §7.4.2 clear_left_context( ) per superblock row —
+                // including the tile's first row, so a right-hand tile
+                // never reads partition context its left neighbour wrote.
+                pctx.clear_left();
+                for plane_nz in nz.iter_mut() {
+                    plane_nz.left.fill(0);
+                }
+                let mut c = mi_col_start;
+                while c < mi_col_end {
+                    let mut layout = |lr: u32, lc: u32, bsize: u8| -> u8 {
+                        plan.partitions.get(&(lr, lc, bsize)).copied().unwrap_or(
+                            if bsize == BLOCK_8X8 {
+                                PARTITION_NONE
+                            } else {
+                                PARTITION_SPLIT
+                            },
+                        )
                     };
-                    let mut src = |plane: usize, tx_sz: u32, sx: u32, sy: u32, b: usize| {
-                        let n0 = 1usize << (tx_sz + 2);
-                        let mut v = coeffs(lr, lc, plane, sx, sy, b);
-                        v.resize(n0 * n0, 0);
-                        v
+                    let mut leaf = |enc: &mut BoolEncoder,
+                                    lr: u32,
+                                    lc: u32,
+                                    subsize: u8|
+                     -> Result<(), Error> {
+                        let lp = plan
+                            .leaves
+                            .get(&(lr, lc))
+                            .copied()
+                            .ok_or(Error::Unsupported)?;
+                        // The plan's leaf size must match the tree's subsize
+                        // (the coefficient source predicts at lp.mi_size).
+                        if lp.mi_size != subsize {
+                            return Err(Error::Unsupported);
+                        }
+                        // tx-size codeability / inference validation.
+                        let max_tx = MAX_TXSIZE_LOOKUP[subsize as usize];
+                        if lp.tx_size > max_tx {
+                            return Err(Error::Unsupported);
+                        }
+                        if !tx_size_is_coded(true, plan.tx_mode, subsize >= BLOCK_8X8)
+                            && lp.tx_size != inferred_tx_size(max_tx, plan.tx_mode)
+                        {
+                            return Err(Error::Unsupported);
+                        }
+                        let spec = IntraBlockSpec {
+                            r: lr,
+                            mi_col_start,
+                            c: lc,
+                            mi_size: subsize,
+                            segment_id: lp.segment_id,
+                            skip: lp.skip,
+                            tx_size: lp.tx_size,
+                            y_mode: lp.y_mode,
+                            uv_mode: lp.uv_mode,
+                        };
+                        let mut src = |plane: usize, tx_sz: u32, sx: u32, sy: u32, b: usize| {
+                            let n0 = 1usize << (tx_sz + 2);
+                            let mut v = coeffs(lr, lc, plane, sx, sy, b);
+                            v.resize(n0 * n0, 0);
+                            v
+                        };
+                        write_keyframe_intra_block(
+                            enc,
+                            &fctx,
+                            &spec,
+                            &mut state,
+                            &mut nz,
+                            &mut token_cache,
+                            tree_probs.as_ref(),
+                            &DEFAULT_SKIP_PROB,
+                            &DEFAULT_TX_PROBS,
+                            &DEFAULT_COEF_PROBS,
+                            &mut src,
+                        )
                     };
-                    write_keyframe_intra_block(
-                        enc,
-                        &fctx,
-                        &spec,
-                        &mut state,
-                        &mut nz,
-                        &mut token_cache,
-                        tree_probs.as_ref(),
-                        &DEFAULT_SKIP_PROB,
-                        &DEFAULT_TX_PROBS,
-                        &DEFAULT_COEF_PROBS,
-                        &mut src,
-                    )
-                };
-            write_partition_tree(
-                &mut enc,
-                r,
-                c,
-                BLOCK_64X64,
-                mi_rows,
-                mi_cols,
-                &mut pctx,
-                PartitionProbsKind::Keyframe,
-                &mut layout,
-                &mut leaf,
-            )?;
-            c += 8;
+                    write_partition_tree(
+                        &mut enc,
+                        r,
+                        c,
+                        BLOCK_64X64,
+                        mi_rows,
+                        mi_cols,
+                        &mut pctx,
+                        PartitionProbsKind::Keyframe,
+                        &mut layout,
+                        &mut leaf,
+                    )?;
+                    c += 8;
+                }
+                r += 8;
+            }
+
+            tiles.push(enc.finish());
         }
-        r += 8;
     }
 
-    let tile_bytes = enc.finish();
-
-    let mut out = Vec::with_capacity(uhdr_bytes.len() + chdr_bytes.len() + tile_bytes.len());
-    out.extend_from_slice(&uhdr_bytes);
-    out.extend_from_slice(&chdr_bytes);
-    out.extend_from_slice(&tile_bytes);
+    let out = concat_frame_bytes(&uhdr_bytes, &chdr_bytes, &tiles)?;
     Ok((out, state))
+}
+
+/// Concatenate uncompressed header + compressed header + the §6.4 tile
+/// payloads: every tile except the last is prefixed with its f(32)
+/// big-endian `tile_size` (§6.4 line 2318 — the last tile's size is
+/// implied by the remaining frame bytes).
+fn concat_frame_bytes(
+    uhdr_bytes: &[u8],
+    chdr_bytes: &[u8],
+    tiles: &[Vec<u8>],
+) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::with_capacity(
+        uhdr_bytes.len() + chdr_bytes.len() + tiles.iter().map(|t| t.len() + 4).sum::<usize>(),
+    );
+    out.extend_from_slice(uhdr_bytes);
+    out.extend_from_slice(chdr_bytes);
+    for (i, tile) in tiles.iter().enumerate() {
+        if i + 1 != tiles.len() {
+            let sz = u32::try_from(tile.len()).map_err(|_| Error::Unsupported)?;
+            out.extend_from_slice(&sz.to_be_bytes());
+        }
+        out.extend_from_slice(tile);
+    }
+    Ok(out)
 }
 
 /// Assemble a complete VP9 keyframe from `hdr` + `plan`, returning the
@@ -907,9 +960,14 @@ pub(crate) struct InterFrameTreePlan {
 /// it), and per-block switchable interpolation filters.
 ///
 /// `hdr` must be a non-key frame (`FrameType::NonKeyFrame`,
-/// `!intra_only`, shown, `tile_cols_log2 == tile_rows_log2 == 0`)
-/// carrying a valid `ref_frame_idx`; the `header_size_in_bytes` field is
-/// overwritten with the actual compressed-header length.
+/// `!intra_only`) carrying a valid `ref_frame_idx`; the
+/// `header_size_in_bytes` field is overwritten with the actual
+/// compressed-header length. Any §6.2.13-codeable tiling is accepted:
+/// the writer mirrors the §6.4 `decode_tiles( )` row-major walk — one
+/// §9.2 coder bracket per tile, f(32) `tile_size` prefixes on every
+/// tile but the last, above-context strips carrying across tiles with
+/// the left strips resetting per tile row, and the §6.5 candidate scans
+/// clamped to each tile's `MiColStart` / `MiColEnd` window.
 ///
 /// The writer models §6.5 `UsePrevFrameMvs == 0` (it holds no
 /// previous-frame motion field), which matches the decoder's §7.2.6
@@ -968,9 +1026,6 @@ pub(crate) fn assemble_inter_frame_tree_with_state(
     // serve as reference-building frames (e.g. the predecessor of a
     // compound frame, keeping §7.2.6 UsePrevFrameMvs at 0).
     if hdr.frame_type != FrameType::NonKeyFrame || hdr.intra_only {
-        return Err(Error::Unsupported);
-    }
-    if hdr.tile_info.tile_cols_log2 != 0 || hdr.tile_info.tile_rows_log2 != 0 {
         return Err(Error::Unsupported);
     }
     if hdr.ref_frame_idx.is_none() {
@@ -1037,7 +1092,6 @@ pub(crate) fn assemble_inter_frame_tree_with_state(
         u8::from(sign_bias[3]),
     ));
 
-    let mut enc = BoolEncoder::new();
     let mut state = Vp9FrameState::new(mi_rows, mi_cols);
     let mut nz = [
         NonzeroContext::new((2 * mi_cols) as usize, (2 * mi_rows) as usize),
@@ -1077,24 +1131,6 @@ pub(crate) fn assemble_inter_frame_tree_with_state(
     }
     let mut seg_pred_ctx = crate::mode_info::SegPredContextState::new(mi_cols, mi_rows);
 
-    let fctx = InterBlockFrameCtx {
-        mi_cols,
-        mi_rows,
-        mi_col_end: mi_cols,
-        subsampling_x: ssx,
-        subsampling_y: ssy,
-        bit_depth,
-        lossless: hdr.quantization.lossless,
-        tx_mode,
-        seg: hdr.segmentation,
-        reference_mode,
-        comp_config,
-        sign_bias: &sign_bias,
-        interpolation_filter: hdr.interpolation_filter,
-        allow_high_precision_mv: hdr.allow_high_precision_mv,
-        use_prev_frame_mvs: false,
-        prev_segment_ids: plan.prev_segment_ids.as_deref(),
-    };
     let probs = InterBlockProbs {
         skip_prob: &ctx.skip_prob,
         tx_probs: &ctx.tx_probs,
@@ -1110,122 +1146,173 @@ pub(crate) fn assemble_inter_frame_tree_with_state(
         pred_prob: hdr.segmentation.pred_prob.as_ref(),
     };
 
+    // §6.4 / §7.4.1: clear_above_context( ) once per frame — the above
+    // strips (partition, nonzero, seg-pred) carry ACROSS tiles; only the
+    // left strips reset per tile row.
     pctx.clear_above();
 
-    let mut r = 0u32;
-    while r < mi_rows {
-        pctx.clear_left();
-        // §7.4.2: LeftSegPredContext resets per superblock row.
-        seg_pred_ctx.clear_left();
-        let mut c = 0u32;
-        while c < mi_cols {
-            let mut layout = |lr: u32, lc: u32, bsize: u8| -> u8 {
-                plan.partitions
-                    .get(&(lr, lc, bsize))
-                    .copied()
-                    .unwrap_or(if bsize == BLOCK_8X8 {
-                        PARTITION_NONE
-                    } else {
-                        PARTITION_SPLIT
-                    })
-            };
-            let mut leaf =
-                |enc: &mut BoolEncoder, lr: u32, lc: u32, subsize: u8| -> Result<(), Error> {
-                    let lp = planner(lr, lc, subsize, &state);
-                    if lp.mi_size != subsize {
-                        return Err(Error::Unsupported);
-                    }
-                    // §7.2.6: a non-ZEROMV leaf (block-level, or any
-                    // visited sub-8x8 cell) reaches the coded syntax
-                    // through the §6.5 predictors, which this writer only
-                    // models with UsePrevFrameMvs == 0 — see the function
-                    // docs.
-                    let any_non_zeromv = if subsize < BLOCK_8X8 {
-                        match lp.sub {
-                            Some(sub) => sub.modes.iter().any(|&m| m != ZEROMV),
-                            None => return Err(Error::Unsupported),
-                        }
-                    } else {
-                        lp.y_mode != ZEROMV
-                    };
-                    if any_non_zeromv && !hdr.error_resilient_mode && !plan.prev_frame_mvs_absent {
-                        return Err(Error::Unsupported);
-                    }
-                    if lp.ref_frame[1] > crate::mode_info::INTRA_FRAME
-                        && reference_mode == ReferenceMode::SingleReference
-                    {
-                        return Err(Error::Unsupported);
-                    }
-                    // tx-size codeability / inference validation, per the
-                    // §6.4.10 `read_tx_size( allowSelect = !skip )` gate.
-                    let max_tx = MAX_TXSIZE_LOOKUP[subsize as usize];
-                    if lp.tx_size > max_tx {
-                        return Err(Error::Unsupported);
-                    }
-                    if !tx_size_is_coded(!lp.skip, tx_mode, subsize >= BLOCK_8X8)
-                        && lp.tx_size != inferred_tx_size(max_tx, tx_mode)
-                    {
-                        return Err(Error::Unsupported);
-                    }
-                    let spec = InterBlockSpec {
-                        r: lr,
-                        mi_col_start: 0,
-                        c: lc,
-                        mi_size: subsize,
-                        segment_id: lp.segment_id,
-                        skip: lp.skip,
-                        tx_size: lp.tx_size,
-                        ref_frame: lp.ref_frame,
-                        y_mode: lp.y_mode,
-                        interp_filter: lp.interp_filter,
-                        mv: lp.mv,
-                        sub: lp.sub,
-                    };
-                    let mut src = |p: usize, tx_sz: u32, sx: u32, sy: u32, b: usize| {
-                        let n0 = 1usize << (tx_sz + 2);
-                        if lp.skip {
-                            vec![0i64; n0 * n0]
-                        } else {
-                            let mut v = coeffs(lr, lc, p, sx, sy, b);
-                            v.resize(n0 * n0, 0);
-                            v
-                        }
-                    };
-                    write_inter_block(
-                        enc,
-                        &fctx,
-                        &spec,
-                        &probs,
-                        &mut state,
-                        Some(&mut seg_pred_ctx),
-                        &mut nz,
-                        &mut token_cache,
-                        &mut src,
-                    )
-                };
-            write_partition_tree(
-                &mut enc,
-                r,
-                c,
-                BLOCK_64X64,
-                mi_rows,
+    let tile_cols_log2 = u32::from(hdr.tile_info.tile_cols_log2);
+    let tile_rows_log2 = u32::from(hdr.tile_info.tile_rows_log2);
+    let mut tiles: Vec<Vec<u8>> = Vec::new();
+    for tile_row in 0..(1u32 << tile_rows_log2) {
+        for tile_col in 0..(1u32 << tile_cols_log2) {
+            // §6.4 decode_tiles( ): the four get_tile_offset( ) extents.
+            let mi_row_start = crate::partition::get_tile_offset(tile_row, mi_rows, tile_rows_log2);
+            let mi_row_end =
+                crate::partition::get_tile_offset(tile_row + 1, mi_rows, tile_rows_log2);
+            let mi_col_start = crate::partition::get_tile_offset(tile_col, mi_cols, tile_cols_log2);
+            let mi_col_end =
+                crate::partition::get_tile_offset(tile_col + 1, mi_cols, tile_cols_log2);
+
+            // Per-tile frame ctx: the §6.5 candidate scans clamp their
+            // column window to THIS tile's extents (`MiColStart` /
+            // `MiColEnd`), exactly as the decoder's per-tile
+            // `BlockDecoder` does.
+            let fctx = InterBlockFrameCtx {
                 mi_cols,
-                &mut pctx,
-                PartitionProbsKind::Inter(&ctx.partition_probs),
-                &mut layout,
-                &mut leaf,
-            )?;
-            c += 8;
+                mi_rows,
+                mi_col_end,
+                subsampling_x: ssx,
+                subsampling_y: ssy,
+                bit_depth,
+                lossless: hdr.quantization.lossless,
+                tx_mode,
+                seg: hdr.segmentation,
+                reference_mode,
+                comp_config,
+                sign_bias: &sign_bias,
+                interpolation_filter: hdr.interpolation_filter,
+                allow_high_precision_mv: hdr.allow_high_precision_mv,
+                use_prev_frame_mvs: false,
+                prev_segment_ids: plan.prev_segment_ids.as_deref(),
+            };
+
+            // §6.4 line 2326: one fresh §9.2 coder bracket per tile.
+            let mut enc = BoolEncoder::new();
+
+            let mut r = mi_row_start;
+            while r < mi_row_end {
+                // §7.4.2: the left strips reset per superblock row —
+                // including the tile's first row, so a right-hand tile
+                // never reads context its left neighbour wrote.
+                pctx.clear_left();
+                seg_pred_ctx.clear_left();
+                for plane_nz in nz.iter_mut() {
+                    plane_nz.left.fill(0);
+                }
+                let mut c = mi_col_start;
+                while c < mi_col_end {
+                    let mut layout = |lr: u32, lc: u32, bsize: u8| -> u8 {
+                        plan.partitions.get(&(lr, lc, bsize)).copied().unwrap_or(
+                            if bsize == BLOCK_8X8 {
+                                PARTITION_NONE
+                            } else {
+                                PARTITION_SPLIT
+                            },
+                        )
+                    };
+                    let mut leaf = |enc: &mut BoolEncoder,
+                                    lr: u32,
+                                    lc: u32,
+                                    subsize: u8|
+                     -> Result<(), Error> {
+                        let lp = planner(lr, lc, subsize, &state);
+                        if lp.mi_size != subsize {
+                            return Err(Error::Unsupported);
+                        }
+                        // §7.2.6: a non-ZEROMV leaf (block-level, or any
+                        // visited sub-8x8 cell) reaches the coded syntax
+                        // through the §6.5 predictors, which this writer only
+                        // models with UsePrevFrameMvs == 0 — see the function
+                        // docs.
+                        let any_non_zeromv = if subsize < BLOCK_8X8 {
+                            match lp.sub {
+                                Some(sub) => sub.modes.iter().any(|&m| m != ZEROMV),
+                                None => return Err(Error::Unsupported),
+                            }
+                        } else {
+                            lp.y_mode != ZEROMV
+                        };
+                        if any_non_zeromv
+                            && !hdr.error_resilient_mode
+                            && !plan.prev_frame_mvs_absent
+                        {
+                            return Err(Error::Unsupported);
+                        }
+                        if lp.ref_frame[1] > crate::mode_info::INTRA_FRAME
+                            && reference_mode == ReferenceMode::SingleReference
+                        {
+                            return Err(Error::Unsupported);
+                        }
+                        // tx-size codeability / inference validation, per the
+                        // §6.4.10 `read_tx_size( allowSelect = !skip )` gate.
+                        let max_tx = MAX_TXSIZE_LOOKUP[subsize as usize];
+                        if lp.tx_size > max_tx {
+                            return Err(Error::Unsupported);
+                        }
+                        if !tx_size_is_coded(!lp.skip, tx_mode, subsize >= BLOCK_8X8)
+                            && lp.tx_size != inferred_tx_size(max_tx, tx_mode)
+                        {
+                            return Err(Error::Unsupported);
+                        }
+                        let spec = InterBlockSpec {
+                            r: lr,
+                            mi_col_start,
+                            c: lc,
+                            mi_size: subsize,
+                            segment_id: lp.segment_id,
+                            skip: lp.skip,
+                            tx_size: lp.tx_size,
+                            ref_frame: lp.ref_frame,
+                            y_mode: lp.y_mode,
+                            interp_filter: lp.interp_filter,
+                            mv: lp.mv,
+                            sub: lp.sub,
+                        };
+                        let mut src = |p: usize, tx_sz: u32, sx: u32, sy: u32, b: usize| {
+                            let n0 = 1usize << (tx_sz + 2);
+                            if lp.skip {
+                                vec![0i64; n0 * n0]
+                            } else {
+                                let mut v = coeffs(lr, lc, p, sx, sy, b);
+                                v.resize(n0 * n0, 0);
+                                v
+                            }
+                        };
+                        write_inter_block(
+                            enc,
+                            &fctx,
+                            &spec,
+                            &probs,
+                            &mut state,
+                            Some(&mut seg_pred_ctx),
+                            &mut nz,
+                            &mut token_cache,
+                            &mut src,
+                        )
+                    };
+                    write_partition_tree(
+                        &mut enc,
+                        r,
+                        c,
+                        BLOCK_64X64,
+                        mi_rows,
+                        mi_cols,
+                        &mut pctx,
+                        PartitionProbsKind::Inter(&ctx.partition_probs),
+                        &mut layout,
+                        &mut leaf,
+                    )?;
+                    c += 8;
+                }
+                r += 8;
+            }
+
+            tiles.push(enc.finish());
         }
-        r += 8;
     }
 
-    let tile_bytes = enc.finish();
-
-    let mut out = Vec::with_capacity(uhdr_bytes.len() + chdr_bytes.len() + tile_bytes.len());
-    out.extend_from_slice(&uhdr_bytes);
-    out.extend_from_slice(&chdr_bytes);
-    out.extend_from_slice(&tile_bytes);
+    let out = concat_frame_bytes(&uhdr_bytes, &chdr_bytes, &tiles)?;
     Ok((out, state))
 }
 
@@ -2454,5 +2541,240 @@ mod tests {
         let b = assemble_inter_frame_tree(&h, &plan, &mut *p, &mut *no_coeffs()).expect("b");
         assert_eq!(a, b, "tree assembly not byte-stable");
         assert_eq!(a, legacy, "empty-map tree != all-8x8 layout");
+    }
+
+    /// Multi-tile KEYFRAME assembly at the staged tile-rows fixture's
+    /// exact tiling (`tile_cols_log2 = 1`, `tile_rows_log2 = 2` — 4x2 =
+    /// 8 tiles at 512x256): the same [`KeyframeTreePlan`] (mixed intra
+    /// modes, live per-block residual) decodes through the in-crate §6.4
+    /// `decode_tiles( )` walk to the **identical reconstruction** as the
+    /// `tile_rows_log2 = 0` assembly of the same plan at the same column
+    /// split. Tile ROWS never change the §8 reconstruction — §6.4.4
+    /// `AvailU` is the frame-wide `MiRow > 0`, so prediction reads
+    /// across a tile-row edge — while the entropy layout changes
+    /// completely (8 fresh §9.2 brackets, per-tile-row left resets), so
+    /// row-split sample-identity pins the writer's whole tile-row walk.
+    /// Tile COLUMNS are *not* reconstruction-invariant (`AvailL` is
+    /// `MiCol > MiColStart`: the left neighbour vanishes at a column
+    /// boundary), which is why the baseline carries the same column
+    /// split — and why a genuinely different single-tile reconstruction
+    /// is additionally asserted, pinning that the writer models the
+    /// clamped `AvailL` exactly like the decoder rather than predicting
+    /// across the column edge.
+    #[test]
+    fn keyframe_tile_row_split_reconstructs_identically() {
+        use crate::partition::tile_payload_sizes;
+
+        let (w, h) = (512u32, 256u32);
+        let (mi_rows, mi_cols) = (h / 8, w / 8);
+        let mut plan = KeyframeTreePlan::uniform(mi_rows, mi_cols, BLOCK_16X16, 1);
+        for (&(lr, lc), leaf) in plan.leaves.iter_mut() {
+            // Mixed intra modes: the §6.4.6 default_intra_mode ctx is
+            // (abovemode, leftmode) — at a tile-row edge the above MI is
+            // still read from the frame-wide state written by the tile
+            // above, so varied modes exercise that threading.
+            leaf.y_mode = ((lr / 2 + lc / 2) % 10) as u8;
+            leaf.uv_mode = ((lr / 2) % 10) as u8;
+            leaf.skip = false;
+        }
+        // A varying DC token per luma transform block: live §6.4.21
+        // residual in every tile (AboveNonzeroContext carries across
+        // tile rows; LeftNonzeroContext resets per tile row).
+        let mk_coeffs = || -> Box<FrameCoefSource<'static>> {
+            Box::new(|r, c, p, sx, sy, _b| {
+                if p == 0 {
+                    vec![1 + ((r + c + sx + sy) % 3) as i64]
+                } else {
+                    Vec::new()
+                }
+            })
+        };
+
+        // Baseline: two tile columns, ONE tile row.
+        let mut hdr_cols = keyframe_header(w, h);
+        hdr_cols.tile_info = TileInfo {
+            tile_cols_log2: 1,
+            tile_rows_log2: 0,
+        };
+        let cols_only = assemble_keyframe_tree(&hdr_cols, &plan, &mut *mk_coeffs()).expect("2-col");
+
+        // The fixture tiling: two tile columns x FOUR tile rows.
+        let mut hdr_tiled = keyframe_header(w, h);
+        hdr_tiled.tile_info = TileInfo {
+            tile_cols_log2: 1,
+            tile_rows_log2: 2,
+        };
+        let tiled = assemble_keyframe_tree(&hdr_tiled, &plan, &mut *mk_coeffs()).expect("tiled");
+
+        // Structural pin: the coded header carries the tiling, and the
+        // §6.4.1 tile-size walk consumes the tile data exactly (7 f(32)
+        // prefixes + 8 payloads, no residue) — the same walk the staged
+        // fixture's notes validate.
+        let phdr = crate::header::parse_uncompressed_header(&tiled).expect("tiled header");
+        assert_eq!(phdr.tile_info.tile_cols_log2, 1);
+        assert_eq!(phdr.tile_info.tile_rows_log2, 2);
+        let body_start =
+            phdr.uncompressed_header_size_bytes + usize::from(phdr.header_size_in_bytes);
+        let body = &tiled[body_start..];
+        let sizes = tile_payload_sizes(body, body.len() as u32, 2, 1).expect("tile sizes");
+        assert_eq!(sizes.len(), 8, "4x2 = 8 tile payloads");
+        let accounted: usize = sizes.iter().map(|&s| s as usize).sum::<usize>() + 7 * 4;
+        assert_eq!(accounted, body.len(), "tile walk must consume exactly");
+
+        let f_cols = decode_intra_frame(&cols_only).expect("decode 2-col");
+        let f_tiled = decode_intra_frame(&tiled).expect("decode tiled");
+        assert_eq!(f_tiled.y, f_cols.y, "luma differs across a row split");
+        assert_eq!(f_tiled.u, f_cols.u, "U differs across a row split");
+        assert_eq!(f_tiled.v, f_cols.v, "V differs across a row split");
+
+        // And the column split is genuinely reconstruction-changing:
+        // the single-tile assembly of the same plan predicts across
+        // MI col 32 (AvailL present), the tiled ones must not.
+        let hdr_single = keyframe_header(w, h);
+        let single = assemble_keyframe_tree(&hdr_single, &plan, &mut *mk_coeffs()).expect("single");
+        let f_single = decode_intra_frame(&single).expect("decode single");
+        assert_ne!(
+            f_single.y, f_cols.y,
+            "a tile-column split must change intra AvailL at the boundary"
+        );
+    }
+
+    /// Degenerate tile rows: at 64x192 (`Sb64Rows = 3`),
+    /// `tile_rows_log2 = 2` makes the §6.4.1 `get_tile_offset( )` ladder
+    /// produce an EMPTY first tile row (`MiRowStart == MiRowEnd == 0`).
+    /// The §6.4 walk still brackets it with its own §9.2 coder (init /
+    /// exit around zero superblocks), so the writer must emit a valid
+    /// empty-tile payload — and the reconstruction must equal the
+    /// single-tile assembly's.
+    #[test]
+    fn keyframe_degenerate_empty_tile_row_round_trips() {
+        let (w, h) = (64u32, 192u32);
+        let (mi_rows, mi_cols) = (h / 8, w / 8);
+        let plan = KeyframeTreePlan::uniform(mi_rows, mi_cols, BLOCK_32X32, 2);
+
+        let hdr_single = keyframe_header(w, h);
+        let single =
+            assemble_keyframe_tree(&hdr_single, &plan, &mut *no_coeffs()).expect("single-tile");
+
+        let mut hdr_tiled = keyframe_header(w, h);
+        hdr_tiled.tile_info = TileInfo {
+            tile_cols_log2: 0,
+            tile_rows_log2: 2,
+        };
+        let tiled = assemble_keyframe_tree(&hdr_tiled, &plan, &mut *no_coeffs()).expect("tiled");
+
+        let f_single = decode_intra_frame(&single).expect("decode single");
+        let f_tiled = decode_intra_frame(&tiled).expect("decode tiled");
+        assert_eq!(f_tiled.y, f_single.y, "luma differs across tilings");
+        assert_eq!(f_tiled.u, f_single.u, "U differs across tilings");
+        assert_eq!(f_tiled.v, f_single.v, "V differs across tilings");
+    }
+
+    /// Multi-tile INTER assembly at the staged fixture's tiling
+    /// (`tile_cols_log2 = 1`, `tile_rows_log2 = 2`, 512x256): a P-frame
+    /// mixing `NEWMV` leaves (the §6.5 candidate scans run under each
+    /// tile's clamped `MiColStart` / `MiColEnd` window), non-skip
+    /// residual, and `ZEROMV` copies reconstructs **identically** to the
+    /// single-tile assembly of the same plan through
+    /// `decode_vp9_sequence` — and the writer's returned per-MI state
+    /// matches across tilings (the §6.4.4 write-back is
+    /// tiling-invariant).
+    #[test]
+    fn inter_tiled_2col_4row_reconstructs_identically_to_single_tile() {
+        use crate::decode_frame::decode_vp9_sequence;
+        use crate::mode_info::{NEWMV, ZEROMV};
+
+        let (w, h) = (512u32, 256u32);
+        let (mi_rows, mi_cols) = (h / 8, w / 8);
+
+        // A non-flat keyframe (varying DC per 16x16 leaf) so motion is
+        // observable.
+        let mut kf_plan = KeyframeTreePlan::uniform(mi_rows, mi_cols, BLOCK_16X16, 1);
+        for leaf in kf_plan.leaves.values_mut() {
+            leaf.skip = false;
+        }
+        let mut kf_coeffs: Box<FrameCoefSource> = Box::new(|r, c, p, _sx, _sy, _b| {
+            if p == 0 {
+                vec![((r * 7 + c * 3) % 11) as i64]
+            } else {
+                Vec::new()
+            }
+        });
+        let kf_hdr = keyframe_header(w, h);
+        let kf = assemble_keyframe_tree(&kf_hdr, &kf_plan, &mut *kf_coeffs).expect("keyframe");
+
+        // Error-resilient P-frame (§7.2.6 UsePrevFrameMvs == 0 on both
+        // sides) with NEWMV leaves along the tile-boundary rows/cols.
+        let mut p_hdr = inter_header(w, h);
+        p_hdr.error_resilient_mode = true;
+        let mk_planner = || -> Box<InterTreePlanner<'static>> {
+            Box::new(|r, c, subsize, _s| {
+                let mut leaf = skip_leaf(subsize, TxMode::Only4x4);
+                // Tile-row boundaries sit at MI rows 8/16/24; the tile-col
+                // boundary at MI col 32. Put NEWMV blocks around them.
+                if (r % 8 == 0 && c % 16 == 0) || ((28..36).contains(&c) && r % 4 == 0) {
+                    leaf.y_mode = NEWMV;
+                    leaf.mv = [[16, -8], [0, 0]];
+                    leaf.skip = false;
+                } else {
+                    leaf.y_mode = ZEROMV;
+                }
+                leaf
+            })
+        };
+        let mk_coeffs = || -> Box<FrameCoefSource<'static>> {
+            Box::new(|r, c, p, _sx, _sy, _b| {
+                if p == 0 {
+                    vec![((r + 2 * c) % 5) as i64]
+                } else {
+                    Vec::new()
+                }
+            })
+        };
+        let plan = InterFrameTreePlan {
+            tx_mode: TxMode::Only4x4,
+            reference_mode: ReferenceMode::SingleReference,
+            partitions: HashMap::new(),
+            prev_segment_ids: None,
+            prev_frame_mvs_absent: false,
+        };
+
+        let (pf_single, st_single) = assemble_inter_frame_tree_with_state(
+            &p_hdr,
+            &plan,
+            &mut *mk_planner(),
+            &mut *mk_coeffs(),
+        )
+        .expect("single-tile p-frame");
+
+        let mut p_hdr_tiled = p_hdr;
+        p_hdr_tiled.tile_info = TileInfo {
+            tile_cols_log2: 1,
+            tile_rows_log2: 2,
+        };
+        let (pf_tiled, st_tiled) = assemble_inter_frame_tree_with_state(
+            &p_hdr_tiled,
+            &plan,
+            &mut *mk_planner(),
+            &mut *mk_coeffs(),
+        )
+        .expect("tiled p-frame");
+
+        assert_eq!(
+            st_tiled.mi_sizes, st_single.mi_sizes,
+            "per-MI write-back must be tiling-invariant"
+        );
+        assert_eq!(st_tiled.skips, st_single.skips);
+
+        let f_single = decode_vp9_sequence(&[&kf, &pf_single]).expect("decode single");
+        let f_tiled = decode_vp9_sequence(&[&kf, &pf_tiled]).expect("decode tiled");
+        // The NEWMV blocks moved real content (not a pure copy).
+        assert_ne!(f_single[1].y, f_single[0].y, "motion must be observable");
+        assert_eq!(
+            f_tiled[1].y, f_single[1].y,
+            "P-frame luma differs across tilings"
+        );
+        assert_eq!(f_tiled[1].u, f_single[1].u);
+        assert_eq!(f_tiled[1].v, f_single[1].v);
     }
 }

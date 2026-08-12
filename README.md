@@ -25,7 +25,18 @@ threading the *filtered* reconstructions per the §8.10 post-filter
 store) whose output equals the
 encoder's in-loop reconstruction bit-for-bit, and
 `encode_vp9_lossy_sequence_rc` adds per-frame byte-budget rate control
-(see the "Encoder" section). [`decode_vp9`]
+(see the "Encoder" section). **Round 441 drives the lossy pipeline
+across the full §7.2 format matrix** — `encode_vp9_lossy_444` /
+`encode_vp9_lossy_422` / `encode_vp9_lossy_hbd` /
+`encode_vp9_lossy_hbd_422` keyframes plus the matching
+`encode_vp9_lossy_sequence_*` chain-framed GOPs (profiles 1/2/3,
+10/12-bit native `u16`, 4:4:4 / 4:2:2), every stream black-box
+validated byte-exact — and adds **keyframe skip election** (§6.4.2:
+all-zero-residual leaves code `skip = 1`, a strict rate win at
+bit-exact identical reconstruction) and **loop-filter delta election**
+(the six §6.2.8 / §8.8.1 `ref_deltas` / `mode_deltas` axes elected on
+chain-framed P-frames on strict SSE wins, with the §7.2.8 persistent
+baseline threaded writer-side exactly as the decoder folds it). [`decode_vp9`]
 and [`decode_intra_frame`] decode a complete VP9 keyframe to packed
 planar samples, byte-exact against a 13-fixture staged corpus covering
 4:2:0 and 4:4:4 chroma, 8/10/12-bit depth, RGB, multiple tile columns,
@@ -112,6 +123,13 @@ corpus's last fixture-less axis: 512x256 with `tile_rows_log2 = 2`
 per-tile context resets interacting with the row traversal, and intra +
 §8.5.2 inter prediction across tile-row boundaries), byte-exact with no
 code change — the §6.4 tile-row walk was already correct.
+Three **round-441 packages** are built, black-box verified, and wired
+(presence-gated) but not yet staged: `lossy-444-gop` (the first
+self-encoded non-4:2:0 lossy stream), `lossy-hbd10-gop` (the first
+self-encoded high-bit-depth lossy stream), and `lossy-lf-deltas-gop`
+(the first stream with a `loop_filter_delta_update = 1` frame — a
+mid-GOP mode-delta update plus a later frame filtering on the §7.2.8
+*persisted* value, so the byte-exact sweep pins the persistence fold).
 Highlights: `i-frame-then-p-frame-64x64`
 (keyframe + single-reference LAST P-frame, high-precision MVs,
 8-tap-smooth filter), `frame-parallel-mode` (keyframe + three
@@ -291,6 +309,21 @@ prediction sees the decoder's exact state. Public entry points:
   `FrameStore[ ]`. A/B pin: keyframe elects level 49 on graded
   content at `q = 140` and the decoded GOP's SSE drops 7.6% at an
   identical 443-byte total rate vs filtering forced off.
+  The standalone lossy keyframe APIs (every format) also run the
+  round-441 **keyframe skip election**: leaves whose entire quantized
+  residual is zero code `skip = 1` — §6.4.2 drops the residual syntax
+  while a non-skip all-zero block still pays the §6.4.24 EOB token
+  per coded block, and the keyframe's §6.4.6 `read_tx_size( 1 )`
+  keeps coding the planned transform — a strict rate win at bit-exact
+  identical reconstruction (a flat 256x192 keyframe drops 59 → 36
+  bytes, 704/768 MIs elected).
+  [`encode_vp9_lossy_444`] / [`encode_vp9_lossy_422`] (8-bit profile
+  1) and [`encode_vp9_lossy_hbd`] / [`encode_vp9_lossy_hbd_422`]
+  (10/12-bit profiles 2/3, native `u16`) extend the same keyframe
+  pipeline — planner, decoder-mirror, both elections — to the full
+  §7.2 format matrix (round 441), pinned by a 9-format decoder-mirror
+  sweep (4:4:0 included) and black-box byte-exact validation of all
+  nine matrix keyframe streams.
   The decoder's output equals the encoder's reconstruction
   bit-for-bit at every partition / transform size (pinned
   sample-for-sample on all three planes across `TX_8X8` / `TX_16X16` /
@@ -309,6 +342,25 @@ prediction sees the decoder's exact state. Public entry points:
   shown GOP**: a cross-fade midpoint frame elects compound leaves with
   no hidden-predecessor construction (the r418 restriction dissolves),
   pinned on the writer's own per-MI state.
+  Round 441 adds two chain-framing elections: the **keyframe skip
+  election** (above) and the **§6.2.8 loop-filter delta election** —
+  every P-frame runs bounded coordinate descent over the six §8.8.1
+  delta axes (`loop_filter_ref_deltas[ 4 ]` per reference frame,
+  `loop_filter_mode_deltas[ 2 ]` per mode class) after the
+  `(level, sharpness)` election, so mixed content reaches per-class
+  strengths the single frame level cannot express (a static-vs-moving
+  probe elects LAST +16 / ZEROMV-class −16); a moved slot costs a
+  coded §6.2.8 update (1 + 7 bits), so the election only moves on a
+  strict SSE win, codes exactly the slots that moved off the §7.2.8
+  persistent baseline, and threads that baseline across the chain
+  exactly as the decoder's persistent fold does — pinned by a
+  decoder-mirror at coded deltas *plus* an update-free successor
+  frame, and black-box byte-exact validation of a delta-electing GOP.
+  [`encode_vp9_lossy_sequence_444`] / [`encode_vp9_lossy_sequence_422`]
+  / [`encode_vp9_lossy_sequence_hbd`] /
+  [`encode_vp9_lossy_sequence_hbd_422`] (round 441) run this whole
+  chain-framed pipeline at every §7.2 format, each GOP black-box
+  validated byte-exact.
 * [`encode_vp9_lossy_sequence_rc`] — **rate control**: every frame is
   coded at the lowest `base_q_idx` whose size fits a caller-chosen
   per-frame byte budget, via an exact per-frame binary search over the
@@ -508,12 +560,22 @@ carries no forward update for it).
   on a shown chain — with **chained variants of both sequence
   encoders** ([`encode_vp9_lossless_sequence_chained`] /
   [`encode_vp9_lossy_sequence_chained`]) shipping on that model.
-  Keyframe skip election, and promoting the chained framing to the
+  **Keyframe skip election landed in round 441** (standalone keyframes
+  at every format + the chain-framed sequences; the classic sequence
+  paths keep their staged-fixture-pinned bytes), as did the **§6.2.8
+  loop-filter delta election** on chain-framed P-frames (per-segment
+  `SEG_LVL_ALT_L` election stays out of scope while the lossy encoders
+  code single-segment frames). Promoting the chained framing to the
   *default* sequence paths (a fixture-restaging round: the staged
-  self-encoded packages pin the classic encoders' exact bytes), are
-  later milestones.
-  Lossy encoding is 8-bit 4:2:0 (the lossless path covers all four
-  profiles). The inter *writers* now carry compound references and
+  self-encoded packages pin the classic encoders' exact bytes) is a
+  later milestone.
+  **Lossy encoding covers the full §7.2 format matrix as of round
+  441** — 8-bit 4:2:0/4:4:4/4:2:2 (profiles 0/1) and 10/12-bit
+  4:2:0/4:4:4/4:2:2 (profiles 2/3) on both standalone keyframes and
+  chain-framed sequences, every stream black-box validated; 4:4:0 has
+  no dedicated public entry, but the internals are
+  subsampling-generic and the 9-format decoder-mirror sweep pins it.
+  The inter *writers* carry compound references and
   **every** `MiSize` — the round-415 sub-8x8 per-(idy, idx) MV walk
   included, driven by `encode_pframe_lossless_layout` over arbitrary
   §6.4.3 layouts; the partition search simply does not *elect*
@@ -521,8 +583,8 @@ carries no forward update for it).
 
 ## Testing
 
-The crate carries 1210+ lib unit tests plus integration suites in
-`tests/` (including the keyframe **and inter** encoder writers, each
+The crate carries 1230+ tests (lib unit tests plus integration suites
+in `tests/`, including the keyframe **and inter** encoder writers, each
 round-tripped back through the in-crate decoder; `encode_keyframe`
 exercising the public `encode_vp9` → decode **byte-exact lossless**
 round-trip across a geometry sweep; the lossless / lossy sequence
@@ -546,7 +608,11 @@ lossy encoder emitted — elected §8.8 filter included — MUST decode), and
 the `encode_chained_sequence` round-trip carrying the **full lossless
 oracle** over the §7.2.6 chain model (every decoded frame must equal
 its input byte-exact — a 24-case deterministic smoke of the same body
-also runs in standard CI);
+also runs in standard CI), and the `encode_lossy_matrix`
+oracle-carrying round-trip over all seven public-entry §7.2 formats
+(fuzz-derived format / geometry / quantizer / bit-depth-masked
+content through the matching matrix keyframe entry; a 28-case
+deterministic smoke also runs in standard CI);
 the `decode_robustness` integration suite pins the same
 garbage-in-no-panic contract in standard CI, including a fuzz-found
 OOM regression (headers claiming huge frame geometries are rejected

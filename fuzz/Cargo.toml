@@ -64,5 +64,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "encode_lossy_matrix"
+path = "fuzz_targets/encode_lossy_matrix.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

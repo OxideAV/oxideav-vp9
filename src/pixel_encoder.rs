@@ -9247,6 +9247,63 @@ mod lossy_matrix_tests {
         );
     }
 
+    /// Deterministic smoke of the `encode_lossy_matrix` fuzz-target
+    /// body: LCG-derived formats (all seven public-entry formats),
+    /// geometries (1..=64 both axes, partial-MI and degenerate shapes
+    /// included), quantizers, and cycled content run the
+    /// encode → must-decode oracle across 28 cases in standard CI, so
+    /// the format-matrix entries are exercised over arbitrary shapes
+    /// on every push, not only under the out-of-band fuzz harness.
+    #[test]
+    fn lossy_matrix_smoke_over_random_geometries() {
+        let formats: [(u8, bool, bool); 7] = [
+            (8, true, true),
+            (8, false, false),
+            (8, true, false),
+            (10, true, true),
+            (12, true, true),
+            (10, false, false),
+            (12, true, false),
+        ];
+        let mut lcg = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (lcg >> 33) as u32
+        };
+        for case in 0..28u32 {
+            let (bd, ssx, ssy) = formats[(next() as usize) % formats.len()];
+            let w = 1 + next() % 64;
+            let h = 1 + next() % 64;
+            let q = ((next() % 255) + 1) as u8;
+            let fmt = LossyFormat::new(bd, ssx, ssy).unwrap();
+            let need = fmt.planar_len(w, h);
+            let seed = next();
+            let stream = if bd == 8 {
+                let px: Vec<u8> = (0..need)
+                    .map(|i| ((i as u32).wrapping_mul(2654435761).wrapping_add(seed) >> 13) as u8)
+                    .collect();
+                encode_keyframe_lossy_u8(&px, w, h, q, ssx, ssy)
+            } else {
+                let mask = (1u16 << bd) - 1;
+                let px: Vec<u16> = (0..need)
+                    .map(|i| {
+                        (((i as u32).wrapping_mul(2654435761).wrapping_add(seed) >> 11) as u16)
+                            & mask
+                    })
+                    .collect();
+                encode_keyframe_lossy_u16(&px, w, h, bd, q, ssx, ssy)
+            };
+            let bytes = stream.unwrap_or_else(|e| {
+                panic!("case {case}: encode bd={bd} ssx={ssx} ssy={ssy} {w}x{h} q={q}: {e}")
+            });
+            crate::decode_frame::decode_intra_frame(&bytes).unwrap_or_else(|e| {
+                panic!("case {case}: self-encoded stream must decode ({bd},{ssx},{ssy}): {e}")
+            });
+        }
+    }
+
     /// The profile derivation matches §7.2 exactly.
     #[test]
     fn lossy_format_profile_derivation() {

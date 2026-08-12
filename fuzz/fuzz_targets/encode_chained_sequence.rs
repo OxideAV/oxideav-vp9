@@ -55,11 +55,11 @@ fuzz_target!(|data: &[u8]| {
         .collect();
     let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
 
-    let coded = encode_vp9_lossless_sequence_chained(&refs, w, h)
-        .expect("bounded valid input must encode");
+    let coded =
+        encode_vp9_lossless_sequence_chained(&refs, w, h).expect("bounded valid input must encode");
     let coded_refs: Vec<&[u8]> = coded.iter().map(|f| f.as_slice()).collect();
-    let decoded = decode_vp9_sequence(&coded_refs)
-        .expect("self-encoded chained sequence must decode");
+    let decoded =
+        decode_vp9_sequence(&coded_refs).expect("self-encoded chained sequence must decode");
     assert_eq!(decoded.len(), frames.len());
     for (i, d) in decoded.iter().enumerate() {
         assert_eq!(

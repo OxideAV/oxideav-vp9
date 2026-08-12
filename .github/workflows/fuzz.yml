@@ -4,18 +4,20 @@ name: Fuzz
 # workflow auto-discovers targets from fuzz/fuzz_targets/*.rs and splits
 # the 30-minute budget across them:
 #
-#   * frame_header — panic-surface fuzz for the §6.2 uncompressed-
-#     header walker plus the frame-walk that hangs off it (§6.3
-#     compressed-header slice + §6.4 tile-size prefix chain).
-#   * compressed_header — panic-surface fuzz for the §6.3 intra and
-#     inter compressed-header walkers over the §9.2 Boolean decoder,
-#     with a leading control byte steering the caller-supplied flags.
+#   * frame_header / compressed_header / decode_frame — panic-surface
+#     fuzz over the §6.2 / §6.3 header walkers and the whole decode
+#     pipeline (single frame, Annex B split, sequence driver): garbage
+#     in, "no panic / no overflow / no OOM" out; Err is a correct
+#     answer.
+#   * encode_keyframe / encode_lossy_keyframe / encode_lossy_matrix /
+#     encode_chained_sequence — oracle-carrying round-trips: a stream
+#     the encoder DID emit must decode (byte-exact back to the input
+#     on the lossless targets), across fuzz-derived geometries,
+#     quantizers, formats (the full §7.2 profile matrix), and content.
 #
-# No oracle harnesses — arbitrary bytes in, "no panic / no overflow /
-# no OOM" out; Err is a correct answer for garbage input. Seed corpus
-# entries (corpus/*/seed-*) are derived from the crate's synthetic
-# test vectors and tracked in git; fuzz-grown corpus persists across
-# runs via the workflow's actions/cache step.
+# Seed corpus entries (corpus/*/seed-*) are derived from the crate's
+# synthetic test vectors and tracked in git; fuzz-grown corpus persists
+# across runs via the workflow's actions/cache step.
 
 on:
   schedule:

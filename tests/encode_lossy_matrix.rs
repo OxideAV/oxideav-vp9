@@ -584,6 +584,34 @@ fn dump_matrix_streams_for_black_box_validation() {
                 )
                 .expect("gop 422-10"),
             ),
+            // Mixed static/moving content at a coarse quantizer: the
+            // chained encoder's §6.2.8 loop-filter **delta election**
+            // codes a mode-delta update mid-GOP and a later frame
+            // relies on the §7.2.8 persisted value — the black-box
+            // decode pins both against the reference decoder.
+            ("gop-420-8bit-lfdeltas", {
+                let tex = |x: i64, y: i64| -> u8 { (((x * 7 + y * 13) % 61) * 4 % 251) as u8 };
+                let mixed: Vec<Vec<u8>> = (0..4i64)
+                    .map(|k| {
+                        let cw = w.div_ceil(2);
+                        let ch = h.div_ceil(2);
+                        let mut px = vec![128u8; w * h + 2 * cw * ch];
+                        for y in 0..h as i64 {
+                            for x in 0..w as i64 {
+                                px[(y * w as i64 + x) as usize] = if x < (w as i64) / 2 {
+                                    tex(x, y)
+                                } else {
+                                    tex(x + 3 * k, y + 2 * k)
+                                };
+                            }
+                        }
+                        px
+                    })
+                    .collect();
+                let refs: Vec<&[u8]> = mixed.iter().map(|f| f.as_slice()).collect();
+                oxideav_vp9::encode_vp9_lossy_sequence_chained(&refs, w as u32, h as u32, 170)
+                    .expect("gop lfdeltas")
+            }),
         ]
     };
     for (name, frames) in gop_cases {

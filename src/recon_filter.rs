@@ -138,19 +138,37 @@ fn run_filter(
 ///   zero `loop_filter_level` skips the process entirely (the §8.8.1
 ///   deltas can NOT lift a zero frame level into filtering).
 ///
-/// The §7.2 delta resolution matches the decoder: this crate's writers
-/// never code `loop_filter_delta_update`, so the
-/// `setup_past_independence( )` defaults are the persistent values on
-/// both sides of any GOP shape these encoders emit.
+/// The §7.2 delta resolution here is defaults + this header's coded
+/// updates — correct wherever no *earlier* frame's `delta_update`
+/// persists (keyframes, error-resilient chains, and the first update
+/// of a chain). Chain-framing callers whose previous frames coded
+/// updates must use [`filter_reconstruction_with_deltas`] with the
+/// §7.2.8-folded values instead.
 pub(crate) fn filter_reconstruction(
     recon: &mut ReconState,
     state: &Vp9FrameState,
     hdr: &Vp9FrameHeader,
 ) {
+    let (ref_deltas, mode_deltas) = resolve_lf_deltas(&hdr.loop_filter);
+    filter_reconstruction_with_deltas(recon, state, hdr, ref_deltas, mode_deltas);
+}
+
+/// [`filter_reconstruction`] with the §7.2.8 **resolved** delta arrays
+/// supplied by the caller — the form the chain-framing sequence
+/// encoders use, where a previous frame's coded `delta_update` leaves
+/// persistent values a bare header resolve (defaults + this frame's
+/// updates) would miss. The values must equal what the decoder's
+/// persistent-delta fold yields for this frame.
+pub(crate) fn filter_reconstruction_with_deltas(
+    recon: &mut ReconState,
+    state: &Vp9FrameState,
+    hdr: &Vp9FrameHeader,
+    ref_deltas: [i8; 4],
+    mode_deltas: [i8; 2],
+) {
     if hdr.loop_filter.level == 0 {
         return;
     }
-    let (ref_deltas, mode_deltas) = resolve_lf_deltas(&hdr.loop_filter);
     let lvl_lookup =
         loop_filter_frame_init(&hdr.loop_filter, &hdr.segmentation, ref_deltas, mode_deltas);
     let arrays = FilterMiArrays::from_state(state);
@@ -248,12 +266,39 @@ pub(crate) fn elect_filter_params(
     vis_w: usize,
     vis_h: usize,
 ) -> (u8, u8) {
+    let (ref_deltas, mode_deltas) = resolve_lf_deltas(&hdr.loop_filter);
+    elect_filter_params_at(
+        recon,
+        state,
+        hdr,
+        targets,
+        vis_w,
+        vis_h,
+        ref_deltas,
+        mode_deltas,
+    )
+}
+
+/// [`elect_filter_params`] scored at caller-supplied **resolved**
+/// §7.2.8 delta arrays (the chain-framing baseline: a previous frame's
+/// coded updates persist, so the probes must run at the values the
+/// decoder will actually hold for this frame).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn elect_filter_params_at(
+    recon: &ReconState,
+    state: &Vp9FrameState,
+    hdr: &Vp9FrameHeader,
+    targets: &[Plane; 3],
+    vis_w: usize,
+    vis_h: usize,
+    ref_deltas: [i8; 4],
+    mode_deltas: [i8; 2],
+) -> (u8, u8) {
     let ssx = hdr.color_config.subsampling_x;
     let ssy = hdr.color_config.subsampling_y;
     let arrays = FilterMiArrays::from_state(state);
 
     let probe_sse = |cand_hdr: &Vp9FrameHeader| -> u64 {
-        let (ref_deltas, mode_deltas) = resolve_lf_deltas(&cand_hdr.loop_filter);
         let lvl_lookup = loop_filter_frame_init(
             &cand_hdr.loop_filter,
             &cand_hdr.segmentation,
@@ -300,6 +345,85 @@ pub(crate) fn elect_filter_params(
         }
     }
     (best_level, best_sharpness)
+}
+
+/// Per-delta candidate values the §6.2.8 delta election probes on each
+/// axis — a coarse-to-fine ladder over the s(6)-codeable `-63..=63`
+/// range keeping the search bounded (6 axes x ≤11 probes of a full
+/// §8.8 replay).
+const LF_DELTA_CANDIDATES: [i8; 11] = [-16, -8, -4, -2, -1, 0, 1, 2, 4, 8, 16];
+
+/// Elect the §6.2.8 / §8.8.1 **loop-filter delta** arrays — per
+/// reference frame (`loop_filter_ref_deltas[ 4 ]`: INTRA / LAST /
+/// GOLDEN / ALTREF) and per mode class (`loop_filter_mode_deltas[ 2 ]`:
+/// `ZEROMV` vs other inter modes) — that minimise the filtered
+/// reconstruction's SSE against the source at the already-elected
+/// `(level, sharpness)` in `hdr`.
+///
+/// §8.8.1 derives each block's filter strength as `lvlSeg +
+/// (ref_deltas[ ref ] << nShift) + (mode_deltas[ mode ] << nShift)`
+/// (intra blocks take only the INTRA ref delta), so on a frame whose
+/// block classes want *different* strengths — static `ZEROMV` regions
+/// that any smoothing degrades next to moving `NEWMV` regions the
+/// filter helps — the deltas reach per-class strengths the single
+/// frame level cannot express. Unlike the level/sharpness fields the
+/// deltas are **not** rate-free: a moved slot codes a §6.2.8 update
+/// (1 + 7 bits), so the caller only codes slots that changed and the
+/// election accepts only strict SSE wins.
+///
+/// One pass of per-axis coordinate descent from `baseline` (the §7.2.8
+/// resolved persistent values for this frame), each axis sweeping
+/// [`LF_DELTA_CANDIDATES`]; ties keep the baseline.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn elect_lf_deltas(
+    recon: &ReconState,
+    state: &Vp9FrameState,
+    hdr: &Vp9FrameHeader,
+    targets: &[Plane; 3],
+    vis_w: usize,
+    vis_h: usize,
+    baseline_ref: [i8; 4],
+    baseline_mode: [i8; 2],
+) -> ([i8; 4], [i8; 2]) {
+    debug_assert!(hdr.loop_filter.level > 0, "deltas are dead at level 0");
+    let ssx = hdr.color_config.subsampling_x;
+    let ssy = hdr.color_config.subsampling_y;
+    let arrays = FilterMiArrays::from_state(state);
+
+    let probe_sse = |ref_deltas: [i8; 4], mode_deltas: [i8; 2]| -> u64 {
+        let lvl_lookup =
+            loop_filter_frame_init(&hdr.loop_filter, &hdr.segmentation, ref_deltas, mode_deltas);
+        let mut probe = recon.planes.clone();
+        run_filter(&mut probe, &arrays, state, hdr, &lvl_lookup);
+        visible_sse(&probe, targets, vis_w, vis_h, ssx, ssy)
+    };
+
+    let mut best_ref = baseline_ref;
+    let mut best_mode = baseline_mode;
+    let mut best_sse = probe_sse(best_ref, best_mode);
+
+    for axis in 0..6usize {
+        for &cand in &LF_DELTA_CANDIDATES {
+            let mut ref_d = best_ref;
+            let mut mode_d = best_mode;
+            let slot = if axis < 4 {
+                &mut ref_d[axis]
+            } else {
+                &mut mode_d[axis - 4]
+            };
+            if *slot == cand {
+                continue;
+            }
+            *slot = cand;
+            let sse = probe_sse(ref_d, mode_d);
+            if sse < best_sse {
+                best_sse = sse;
+                best_ref = ref_d;
+                best_mode = mode_d;
+            }
+        }
+    }
+    (best_ref, best_mode)
 }
 
 #[cfg(test)]

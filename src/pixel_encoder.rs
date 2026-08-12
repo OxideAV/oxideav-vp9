@@ -4212,6 +4212,116 @@ fn finish_frame_with_filter(
     Ok((bytes, recon))
 }
 
+/// The §7.2 / §7.2.8 persistent loop-filter delta state the
+/// chain-framing sequence encoders thread between frames — the
+/// writer-side twin of the decoder's persistent
+/// `loop_filter_ref_deltas` / `loop_filter_mode_deltas` fold: a coded
+/// `delta_update` slot persists to every following frame until a key /
+/// intra-only / error-resilient frame's `setup_past_independence( )`
+/// resets it to the defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LfDeltaState {
+    pub ref_deltas: [i8; 4],
+    pub mode_deltas: [i8; 2],
+}
+
+impl Default for LfDeltaState {
+    fn default() -> Self {
+        Self {
+            ref_deltas: crate::loop_filter::DEFAULT_LOOP_FILTER_REF_DELTAS,
+            mode_deltas: crate::loop_filter::DEFAULT_LOOP_FILTER_MODE_DELTAS,
+        }
+    }
+}
+
+/// [`finish_frame_with_filter`] extended with the round-441 §6.2.8
+/// **loop-filter delta election**: after the `(level, sharpness)`
+/// election (scored at the frame's persistent baseline deltas), the
+/// six §8.8.1 delta axes are elected by bounded coordinate descent
+/// ([`crate::recon_filter::elect_lf_deltas`]) and any slot that moved
+/// away from `persist` is coded as a §6.2.8 `delta_update` (the only
+/// non-rate-free piece — 1 + 7 bits per moved slot — so the election
+/// only moves on a strict SSE win). `persist` is updated to the coded
+/// outcome exactly as the decoder's §7.2.8 fold will be; the caller
+/// resets it to [`LfDeltaState::default`] wherever the decoder runs
+/// §7.2 `setup_past_independence( )` (keyframes, error-resilient
+/// frames).
+#[allow(clippy::too_many_arguments)]
+fn finish_frame_with_filter_deltas(
+    hdr: &Vp9FrameHeader,
+    bytes0: Vec<u8>,
+    recon0: ReconState,
+    state0: crate::decode_block::Vp9FrameState,
+    targets: &[Plane; 3],
+    vis_w: usize,
+    vis_h: usize,
+    persist: &mut LfDeltaState,
+    re_encode: impl FnOnce(
+        &Vp9FrameHeader,
+    )
+        -> Result<(Vec<u8>, ReconState, crate::decode_block::Vp9FrameState), Error>,
+) -> Result<(Vec<u8>, ReconState), Error> {
+    use crate::recon_filter::{
+        elect_filter_params_at, elect_lf_deltas, filter_reconstruction_with_deltas,
+    };
+
+    let (level, sharpness) = elect_filter_params_at(
+        &recon0,
+        &state0,
+        hdr,
+        targets,
+        vis_w,
+        vis_h,
+        persist.ref_deltas,
+        persist.mode_deltas,
+    );
+    if level == 0 {
+        // §8.1 step 2: level 0 codes no filtering (the §8.8.1 deltas
+        // cannot lift a zero frame level), and coding no update leaves
+        // the decoder's persistent deltas untouched.
+        return Ok((bytes0, recon0));
+    }
+    let mut hdr2 = *hdr;
+    hdr2.loop_filter.level = level;
+    hdr2.loop_filter.sharpness = sharpness;
+
+    let (ref_deltas, mode_deltas) = elect_lf_deltas(
+        &recon0,
+        &state0,
+        &hdr2,
+        targets,
+        vis_w,
+        vis_h,
+        persist.ref_deltas,
+        persist.mode_deltas,
+    );
+
+    // Code exactly the slots that moved off the persistent values —
+    // an absent §6.2.8 slot keeps the prior value on the decode side
+    // (§7.2.8), so the decoder's fold lands on the elected arrays.
+    let mut any_update = false;
+    for (i, slot) in hdr2.loop_filter.ref_deltas.iter_mut().enumerate() {
+        if ref_deltas[i] != persist.ref_deltas[i] {
+            *slot = Some(ref_deltas[i]);
+            any_update = true;
+        }
+    }
+    for (i, slot) in hdr2.loop_filter.mode_deltas.iter_mut().enumerate() {
+        if mode_deltas[i] != persist.mode_deltas[i] {
+            *slot = Some(mode_deltas[i]);
+            any_update = true;
+        }
+    }
+    hdr2.loop_filter.delta_enabled = true;
+    hdr2.loop_filter.delta_update = any_update;
+
+    let (bytes, mut recon, state) = re_encode(&hdr2)?;
+    filter_reconstruction_with_deltas(&mut recon, &state, &hdr2, ref_deltas, mode_deltas);
+    persist.ref_deltas = ref_deltas;
+    persist.mode_deltas = mode_deltas;
+    Ok((bytes, recon))
+}
+
 /// Encode a sequence of 8-bit 4:2:0 planar frames into a **lossy** VP9
 /// stream at quantizer index `base_q_idx` (`1..=255`): a lossy keyframe
 /// followed by lossy P-frames with per-block `ZEROMV` / `NEWMV` motion,
@@ -4391,6 +4501,12 @@ pub(crate) fn encode_sequence_lossy_planes(
         &kf_hdr, kf0, kf_recon0, kf_state0, kf_targets, w, h, encode_kf,
     )?;
 
+    // §7.2 setup_past_independence( ) runs on the keyframe (and, for
+    // the classic framing, on every error-resilient P-frame), so the
+    // chain's persistent §7.2.8 delta baseline starts at the defaults;
+    // the keyframe itself codes no update.
+    let mut lf_persist = LfDeltaState::default();
+
     let mut out = Vec::with_capacity(frame_targets.len());
     out.push(kf_bytes);
 
@@ -4452,21 +4568,40 @@ pub(crate) fn encode_sequence_lossy_planes(
         } else {
             None
         };
-        let (bytes, recon) =
-            finish_frame_with_filter(&hdr, p0, recon0, state0, targets, w, h, |hdr2| {
-                encode_pframe_lossy_tree_motion_with_state(
-                    hdr2,
-                    targets,
-                    &reference,
-                    Some(&golden_ref),
-                    width,
-                    height,
-                    PFRAME_SEARCH_RANGE,
-                    true,
-                    true,
-                    prev_field.as_ref(),
-                )
-            })?;
+        let re_encode = |hdr2: &Vp9FrameHeader| {
+            encode_pframe_lossy_tree_motion_with_state(
+                hdr2,
+                targets,
+                &reference,
+                Some(&golden_ref),
+                width,
+                height,
+                PFRAME_SEARCH_RANGE,
+                true,
+                true,
+                prev_field.as_ref(),
+            )
+        };
+        // Chain-model P-frames elect the §6.2.8 loop-filter deltas on
+        // top of (level, sharpness), threading the §7.2.8 persistent
+        // baseline; the classic framing keeps its exact historical
+        // bytes (staged-fixture pins) and its error-resilient headers
+        // reset the deltas every frame anyway.
+        let (bytes, recon) = if chained {
+            finish_frame_with_filter_deltas(
+                &hdr,
+                p0,
+                recon0,
+                state0,
+                targets,
+                w,
+                h,
+                &mut lf_persist,
+                re_encode,
+            )?
+        } else {
+            finish_frame_with_filter(&hdr, p0, recon0, state0, targets, w, h, re_encode)?
+        };
         out.push(bytes);
         prev_recon = recon;
         prev_field = next_field;
@@ -8813,6 +8948,303 @@ mod lossy_matrix_tests {
             let mse = sse / f64::from(w * h);
             assert!(mse < 400.0, "frame {i}: MSE {mse}");
         }
+    }
+
+    /// Encode one lossy chained-model P-frame after a lossy keyframe,
+    /// returning `(kf_bytes, p_bytes, p_recon, p_state)` — the shared
+    /// scaffolding of the loop-filter delta tests. `p_hdr` must be a
+    /// non-error-resilient P-frame header; the writer models the
+    /// decoder's §7.2.6 `UsePrevFrameMvs == 1` derivation through the
+    /// keyframe's motion field.
+    fn encode_kf_then_p(
+        px0: &[u8],
+        px1: &[u8],
+        w: u32,
+        h: u32,
+        q: u8,
+        p_hdr: &Vp9FrameHeader,
+    ) -> (
+        Vec<u8>,
+        Vec<u8>,
+        ReconState,
+        crate::decode_block::Vp9FrameState,
+    ) {
+        let fmt = LossyFormat::YUV420_8;
+        let kf_targets = padded_targets_from_u8(px0, w, h, fmt);
+        let kf_hdr = lossy_keyframe_header_fmt(w, h, q, fmt);
+        let kf_plan = plan_keyframe_tree(&kf_targets, (h + 7) >> 3, (w + 7) >> 3, true, true, 8, q);
+        let (kf_bytes, kf_recon, kf_state) =
+            encode_keyframe_lossy_tree_with_state(&kf_hdr, &kf_targets, &kf_plan).expect("kf");
+        let prev_field = crate::frame_writer::PrevMotionField::from_state(&kf_state);
+
+        let (cw, ch) = fmt.chroma_dims(w, h);
+        let crop = |p: &Plane, vw: usize, vh: usize| -> Vec<i32> {
+            let mut out = Vec::with_capacity(vw * vh);
+            for y in 0..vh {
+                for x in 0..vw {
+                    out.push(p.get(x, y));
+                }
+            }
+            out
+        };
+        let ref_planes = [
+            crop(&kf_recon.planes[0], w as usize, h as usize),
+            crop(&kf_recon.planes[1], cw, ch),
+            crop(&kf_recon.planes[2], cw, ch),
+        ];
+        let reference: [(&[i32], usize); 3] = [
+            (ref_planes[0].as_slice(), w as usize),
+            (ref_planes[1].as_slice(), cw),
+            (ref_planes[2].as_slice(), cw),
+        ];
+        let p_targets = padded_targets_from_u8(px1, w, h, fmt);
+        let (p_bytes, p_recon, p_state) = encode_pframe_lossy_tree_motion_with_state(
+            p_hdr,
+            &p_targets,
+            &reference,
+            None,
+            w,
+            h,
+            PFRAME_SEARCH_RANGE,
+            true,
+            true,
+            Some(&prev_field),
+        )
+        .expect("p1");
+        (kf_bytes, p_bytes, p_recon, p_state)
+    }
+
+    /// Decoder mirror at **coded §6.2.8 loop-filter deltas** plus the
+    /// §7.2.8 **persistence** rule: P1 codes a `delta_update` (LAST
+    /// +8, ZEROMV-class −4), P2 codes none — the decoder must filter
+    /// P2 with P1's persisted values, and the encode-side chain
+    /// ([`filter_reconstruction_with_deltas`]) mirrors both frames
+    /// sample-exactly.
+    #[test]
+    fn pframe_mirror_with_coded_lf_deltas_and_persistence() {
+        use crate::recon_filter::filter_reconstruction_with_deltas;
+
+        let (w, h) = (48u32, 32u32);
+        let fmt = LossyFormat::YUV420_8;
+        let px0: Vec<u8> = textured_planar_u16(w as usize, h as usize, fmt, 1)
+            .iter()
+            .map(|&s| s as u8)
+            .collect();
+        let px1: Vec<u8> = textured_planar_u16(w as usize, h as usize, fmt, 2)
+            .iter()
+            .map(|&s| s as u8)
+            .collect();
+        let px2: Vec<u8> = textured_planar_u16(w as usize, h as usize, fmt, 3)
+            .iter()
+            .map(|&s| s as u8)
+            .collect();
+        let q = 140u8;
+
+        // P1: non-error-resilient, level 24, coded delta update.
+        let mut hdr1 = lossless_pframe_header_fmt(w, h, fmt);
+        hdr1.error_resilient_mode = false;
+        hdr1.quantization = QuantizationParams {
+            base_q_idx: q,
+            delta_q_y_dc: 0,
+            delta_q_uv_dc: 0,
+            delta_q_uv_ac: 0,
+            lossless: false,
+        };
+        hdr1.loop_filter.level = 24;
+        hdr1.loop_filter.delta_enabled = true;
+        hdr1.loop_filter.delta_update = true;
+        hdr1.loop_filter.ref_deltas = [None, Some(8), None, None];
+        hdr1.loop_filter.mode_deltas = [Some(-4), None];
+
+        let (kf_bytes, p1_bytes, mut p1_recon, p1_state) =
+            encode_kf_then_p(&px0, &px1, w, h, q, &hdr1);
+        // Decoder-resolved values for P1: defaults + coded updates.
+        let ref_d1 = [1i8, 8, -1, -1];
+        let mode_d1 = [-4i8, 0];
+        filter_reconstruction_with_deltas(&mut p1_recon, &p1_state, &hdr1, ref_d1, mode_d1);
+
+        // P2: same shape, NO update — §7.2.8 keeps P1's values live.
+        let mut hdr2 = hdr1;
+        hdr2.loop_filter.delta_update = false;
+        hdr2.loop_filter.ref_deltas = [None; 4];
+        hdr2.loop_filter.mode_deltas = [None; 2];
+        hdr2.loop_filter.level = 30;
+
+        // Re-encode the chain so P2 references P1's filtered recon.
+        let fmt = LossyFormat::YUV420_8;
+        let (cw, ch) = fmt.chroma_dims(w, h);
+        let crop = |p: &Plane, vw: usize, vh: usize| -> Vec<i32> {
+            let mut out = Vec::with_capacity(vw * vh);
+            for y in 0..vh {
+                for x in 0..vw {
+                    out.push(p.get(x, y));
+                }
+            }
+            out
+        };
+        let ref_planes = [
+            crop(&p1_recon.planes[0], w as usize, h as usize),
+            crop(&p1_recon.planes[1], cw, ch),
+            crop(&p1_recon.planes[2], cw, ch),
+        ];
+        let reference: [(&[i32], usize); 3] = [
+            (ref_planes[0].as_slice(), w as usize),
+            (ref_planes[1].as_slice(), cw),
+            (ref_planes[2].as_slice(), cw),
+        ];
+        let p2_targets = padded_targets_from_u8(&px2, w, h, fmt);
+        let prev_field = crate::frame_writer::PrevMotionField::from_state(&p1_state);
+        let (p2_bytes, mut p2_recon, p2_state) = encode_pframe_lossy_tree_motion_with_state(
+            &hdr2,
+            &p2_targets,
+            &reference,
+            None,
+            w,
+            h,
+            PFRAME_SEARCH_RANGE,
+            true,
+            true,
+            Some(&prev_field),
+        )
+        .expect("p2");
+        // Writer-side persistence model: P2 filters at P1's values.
+        filter_reconstruction_with_deltas(&mut p2_recon, &p2_state, &hdr2, ref_d1, mode_d1);
+
+        let decoded = crate::decode_frame::decode_vp9_sequence(&[
+            kf_bytes.as_slice(),
+            p1_bytes.as_slice(),
+            p2_bytes.as_slice(),
+        ])
+        .expect("decode");
+        assert_eq!(decoded.len(), 3);
+        for (idx, recon) in [(1usize, &p1_recon), (2usize, &p2_recon)] {
+            let out = &decoded[idx];
+            for row in 0..h as usize {
+                for col in 0..w as usize {
+                    assert_eq!(
+                        i32::from(out.y[row * w as usize + col]),
+                        recon.planes[0].get(col, row),
+                        "frame {idx}: luma mirror ({col},{row})"
+                    );
+                }
+            }
+            for (plane, samples) in [(1usize, &out.u), (2usize, &out.v)] {
+                for row in 0..ch {
+                    for col in 0..cw {
+                        assert_eq!(
+                            i32::from(samples[row * cw + col]),
+                            recon.planes[plane].get(col, row),
+                            "frame {idx}: chroma {plane} mirror ({col},{row})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The delta election never regresses: at the elected deltas the
+    /// filtered SSE is ≤ the baseline-delta SSE at the same
+    /// `(level, sharpness)`, and strictly < whenever the election
+    /// moved an axis. Probed on mixed static/moving content whose
+    /// block classes want different strengths.
+    #[test]
+    fn lf_delta_election_never_regresses_and_moves_on_mixed_content() {
+        use crate::loop_filter::{DEFAULT_LOOP_FILTER_MODE_DELTAS, DEFAULT_LOOP_FILTER_REF_DELTAS};
+        use crate::recon_filter::{elect_lf_deltas, filter_reconstruction_with_deltas};
+
+        let (w, h) = (64u32, 48u32);
+        // F0: fine texture. F1: left half static, right half shifted
+        // (the static half codes skip/ZEROMV, the moving half NEWMV —
+        // distinct §8.8.1 classes).
+        let fmt = LossyFormat::YUV420_8;
+        let tex = |x: i64, y: i64| -> u8 { (((x * 7 + y * 13) % 61) * 4 % 251) as u8 };
+        let mut px0 = vec![0u8; fmt.planar_len(w, h)];
+        let mut px1 = vec![0u8; fmt.planar_len(w, h)];
+        for y in 0..h as i64 {
+            for x in 0..w as i64 {
+                px0[(y * w as i64 + x) as usize] = tex(x, y);
+                px1[(y * w as i64 + x) as usize] = if x < (w as i64) / 2 {
+                    tex(x, y)
+                } else {
+                    tex(x + 3, y + 2)
+                };
+            }
+        }
+        for i in (w * h) as usize..px0.len() {
+            px0[i] = 128;
+            px1[i] = 128;
+        }
+        let q = 170u8;
+
+        let mut hdr1 = lossless_pframe_header_fmt(w, h, fmt);
+        hdr1.error_resilient_mode = false;
+        hdr1.quantization = QuantizationParams {
+            base_q_idx: q,
+            delta_q_y_dc: 0,
+            delta_q_uv_dc: 0,
+            delta_q_uv_ac: 0,
+            lossless: false,
+        };
+        hdr1.loop_filter.level = 32;
+
+        let (_kf, _p1, p1_recon, p1_state) = encode_kf_then_p(&px0, &px1, w, h, q, &hdr1);
+
+        let base_ref = DEFAULT_LOOP_FILTER_REF_DELTAS;
+        let base_mode = DEFAULT_LOOP_FILTER_MODE_DELTAS;
+        let p1_targets = padded_targets_from_u8(&px1, w, h, fmt);
+        let (elect_ref, elect_mode) = elect_lf_deltas(
+            &p1_recon,
+            &p1_state,
+            &hdr1,
+            &p1_targets,
+            w as usize,
+            h as usize,
+            base_ref,
+            base_mode,
+        );
+
+        let sse_at = |rd: [i8; 4], md: [i8; 2]| -> u64 {
+            let mut probe = ReconState {
+                planes: p1_recon.planes.clone(),
+                mi_cols: p1_recon.mi_cols,
+                mi_rows: p1_recon.mi_rows,
+                subsampling_x: p1_recon.subsampling_x,
+                subsampling_y: p1_recon.subsampling_y,
+                bit_depth: p1_recon.bit_depth,
+            };
+            filter_reconstruction_with_deltas(&mut probe, &p1_state, &hdr1, rd, md);
+            let mut sse = 0u64;
+            for (plane, t) in probe.planes.iter().zip(p1_targets.iter()) {
+                for (a, b) in plane.samples().iter().zip(t.samples()) {
+                    let d = i64::from(*a) - i64::from(*b);
+                    sse += (d * d) as u64;
+                }
+            }
+            sse
+        };
+        let sse_base = sse_at(base_ref, base_mode);
+        let sse_elect = sse_at(elect_ref, elect_mode);
+        assert!(sse_elect <= sse_base, "election must never regress");
+        if (elect_ref, elect_mode) != (base_ref, base_mode) {
+            assert!(
+                sse_elect < sse_base,
+                "a moved axis must be a strict SSE win"
+            );
+        }
+        // Determinism.
+        assert_eq!(
+            elect_lf_deltas(
+                &p1_recon,
+                &p1_state,
+                &hdr1,
+                &p1_targets,
+                w as usize,
+                h as usize,
+                base_ref,
+                base_mode,
+            ),
+            (elect_ref, elect_mode)
+        );
     }
 
     /// The profile derivation matches §7.2 exactly.

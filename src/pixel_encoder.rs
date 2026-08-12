@@ -940,10 +940,12 @@ pub(crate) fn encode_keyframe_lossy_planes_with_state(
 }
 
 /// Public-path lossy keyframe encode at any [`LossyFormat`]: the
-/// level-0 tree encode, then the §8.8 `(level, sharpness)` election —
-/// a standalone keyframe's decoded output IS its filtered
-/// reconstruction, so the election lifts display quality rate-free
-/// (both §6.2.8 fields are fixed-width).
+/// level-0 tree encode **with per-leaf skip election** (round 441 —
+/// all-zero-residual leaves code `skip = 1`, a strict rate win at
+/// identical reconstruction), then the §8.8 `(level, sharpness)`
+/// election — a standalone keyframe's decoded output IS its filtered
+/// reconstruction, so the filter election lifts display quality
+/// rate-free (both §6.2.8 fields are fixed-width).
 pub(crate) fn encode_keyframe_lossy_planes(
     targets: &[Plane; 3],
     width: u32,
@@ -951,9 +953,18 @@ pub(crate) fn encode_keyframe_lossy_planes(
     base_q_idx: u8,
     fmt: LossyFormat,
 ) -> Result<Vec<u8>, Error> {
-    let (bytes0, recon0, state0) =
-        encode_keyframe_lossy_planes_with_state(targets, width, height, base_q_idx, fmt)?;
     let hdr = lossy_keyframe_header_fmt(width, height, base_q_idx, fmt);
+    let plan = plan_keyframe_tree(
+        targets,
+        (height + 7) >> 3,
+        (width + 7) >> 3,
+        fmt.ssx,
+        fmt.ssy,
+        u32::from(fmt.bit_depth),
+        base_q_idx,
+    );
+    let (bytes0, recon0, state0) =
+        encode_keyframe_lossy_tree_elect_skip_with_state(&hdr, targets, &plan)?;
     let (bytes, _recon) = finish_frame_with_filter(
         &hdr,
         bytes0,
@@ -962,18 +973,7 @@ pub(crate) fn encode_keyframe_lossy_planes(
         targets,
         width as usize,
         height as usize,
-        |hdr2| {
-            let plan = plan_keyframe_tree(
-                targets,
-                (height + 7) >> 3,
-                (width + 7) >> 3,
-                fmt.ssx,
-                fmt.ssy,
-                u32::from(fmt.bit_depth),
-                base_q_idx,
-            );
-            encode_keyframe_lossy_tree_with_state(hdr2, targets, &plan)
-        },
+        |hdr2| encode_keyframe_lossy_tree_elect_skip_with_state(hdr2, targets, &plan),
     )?;
     Ok(bytes)
 }
@@ -1505,6 +1505,160 @@ pub(crate) fn encode_keyframe_lossy_tree_with_state(
         );
         crate::frame_writer::assemble_keyframe_tree_with_state(hdr, plan, &mut *coeffs)?
     };
+
+    Ok((bytes, recon, state))
+}
+
+/// [`encode_keyframe_lossy_tree_with_state`] with **per-leaf skip
+/// election** (round 441): leaves whose entire quantized residual —
+/// every coded block of all three planes — is zero code `skip = 1`
+/// instead of a run of all-zero token blocks.
+///
+/// §6.4.2: a `skip == 1` block codes no `residual( )` syntax at all,
+/// while a non-skip block still pays the §6.4.24 `more_coefs`
+/// EOB-at-zero token per coded block — so on any leaf whose residual
+/// quantizes away (flat / DC-exact content) skip is a **strict rate
+/// win at identical reconstruction**: §8.6.2 adds a zero residual, so
+/// the decoder reconstructs the prediction either way and every later
+/// block's §8.5.1 prediction context is unchanged. Only the frame's
+/// entropy layout and the §6.4.4 `Skips` array move — unlike the inter
+/// §6.4.11 `read_tx_size( !skip || !is_inter )` gate, the keyframe's
+/// §6.4.6 `intra_frame_mode_info( )` calls `read_tx_size( 1 )`, so a
+/// skip leaf keeps coding its planned `tx_size` bits and the
+/// transform-block prediction walk is untouched.
+///
+/// Implementation: the plan is first encoded exactly as
+/// [`encode_keyframe_lossy_tree_with_state`] does while caching every
+/// block's tokens; all-zero leaves are flipped to `skip = 1` in a
+/// second plan and the frame is re-assembled draining the cache (skip
+/// leaves are never queried). Both passes are byte-deterministic and
+/// share the identical reconstruction.
+pub(crate) fn encode_keyframe_lossy_tree_elect_skip_with_state(
+    hdr: &Vp9FrameHeader,
+    targets: &[Plane; 3],
+    plan: &crate::frame_writer::KeyframeTreePlan,
+) -> Result<(Vec<u8>, ReconState, crate::decode_block::Vp9FrameState), Error> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    if hdr.frame_type != FrameType::KeyFrame || hdr.quantization.lossless {
+        return Err(Error::Unsupported);
+    }
+    if plan.leaves.values().any(|lp| lp.skip) {
+        return Err(Error::Unsupported);
+    }
+    let mi_cols = (hdr.frame_width + 7) >> 3;
+    let mi_rows = (hdr.frame_height + 7) >> 3;
+    let ssx = hdr.color_config.subsampling_x;
+    let ssy = hdr.color_config.subsampling_y;
+    let bit_depth = u32::from(hdr.color_config.bit_depth);
+
+    let mut recon = ReconState::new(mi_cols, mi_rows, ssx, ssy, bit_depth);
+    let seg = hdr.segmentation;
+    let quant = hdr.quantization;
+    let bd8 = hdr.color_config.bit_depth;
+
+    // Pass 1 — the identical decoder-mirror encode, caching every
+    // block's tokens and folding each leaf's "all tokens zero" flag.
+    let token_cache: RefCell<HashMap<(usize, u32, u32), Vec<i64>>> = RefCell::new(HashMap::new());
+    let leaf_all_zero: RefCell<HashMap<(u32, u32), bool>> = RefCell::new(HashMap::new());
+    {
+        let recon_ref = &mut recon;
+        let mut coeffs: Box<FrameCoefSource<'_>> = Box::new(
+            |mi_r: u32, mi_c: u32, plane: usize, sx: u32, sy: u32, _b: usize| -> Vec<i64> {
+                let lp = plan
+                    .leaves
+                    .get(&(mi_r, mi_c))
+                    .copied()
+                    .expect("assembler validated the leaf exists");
+                let tx_sz = if plane == 0 {
+                    lp.tx_size
+                } else {
+                    crate::residual::get_uv_tx_size(lp.tx_size, lp.mi_size, ssx, ssy)
+                };
+                let mode_raw = if plane == 0 { lp.y_mode } else { lp.uv_mode };
+                let mode = PredMode::from_raw(mode_raw).expect("plan mode in range");
+                let tx_type = if plane > 0 || tx_sz == 3 {
+                    DCT_DCT
+                } else {
+                    crate::reconstruct::tx_type_for_intra(mode)
+                };
+
+                recon_ref.predict_block(mi_r, mi_c, lp.mi_size, plane, tx_sz, sx, sy, mode);
+
+                let n0 = 4usize << tx_sz;
+                let mut block = vec![0i64; n0 * n0];
+                for i in 0..n0 {
+                    for j in 0..n0 {
+                        let t = targets[plane].get(sx as usize + j, sy as usize + i);
+                        let p = recon_ref.planes[plane].get(sx as usize + j, sy as usize + i);
+                        block[i * n0 + j] = i64::from(t) - i64::from(p);
+                    }
+                }
+
+                let dc_q = get_dc_quant(plane, &seg, &quant, 0, bd8);
+                let ac_q = get_ac_quant(plane, &seg, &quant, 0, bd8);
+                crate::fwd_transform::forward_transform_2d(&mut block, tx_sz + 2, tx_type);
+                crate::fwd_transform::quantize_block_tx(&mut block, dc_q, ac_q, tx_sz, bit_depth);
+
+                reconstruct_block(
+                    &mut recon_ref.planes[plane],
+                    sx as usize,
+                    sy as usize,
+                    tx_sz,
+                    &block,
+                    dc_q,
+                    ac_q,
+                    tx_type,
+                    false,
+                    bit_depth,
+                );
+
+                let zero = block.iter().all(|&t| t == 0);
+                leaf_all_zero
+                    .borrow_mut()
+                    .entry((mi_r, mi_c))
+                    .and_modify(|z| *z &= zero)
+                    .or_insert(zero);
+                token_cache
+                    .borrow_mut()
+                    .insert((plane, sx, sy), block.clone());
+                block
+            },
+        );
+        crate::frame_writer::assemble_keyframe_tree_with_state(hdr, plan, &mut *coeffs)?;
+    }
+
+    // Skip election: an all-zero leaf codes skip = 1. (The keyframe's
+    // §6.4.6 read_tx_size( 1 ) codes the planned tx either way — no
+    // inferred-size constraint applies, unlike the inter arm.)
+    let mut plan2 = crate::frame_writer::KeyframeTreePlan {
+        tx_mode: plan.tx_mode,
+        partitions: plan.partitions.clone(),
+        leaves: plan.leaves.clone(),
+    };
+    let zeros = leaf_all_zero.into_inner();
+    for (key, lp) in plan2.leaves.iter_mut() {
+        if zeros.get(key).copied() == Some(true) {
+            lp.skip = true;
+        }
+    }
+
+    // Pass 2 — re-assemble draining the cache. Skip leaves are never
+    // queried (§6.4.2 codes no residual); their §8.6.2 reconstruction
+    // is the prediction, which pass 1 already produced (adding the
+    // zero residual moved nothing), so `recon` is the frame's exact
+    // decoder output either way.
+    let mut cache = token_cache.into_inner();
+    let mut drain: Box<FrameCoefSource<'_>> = Box::new(
+        move |_mi_r: u32, _mi_c: u32, plane: usize, sx: u32, sy: u32, _b: usize| -> Vec<i64> {
+            cache
+                .remove(&(plane, sx, sy))
+                .expect("pass 1 cached this block's tokens")
+        },
+    );
+    let (bytes, state) =
+        crate::frame_writer::assemble_keyframe_tree_with_state(hdr, &plan2, &mut *drain)?;
 
     Ok((bytes, recon, state))
 }
@@ -4212,8 +4366,19 @@ pub(crate) fn encode_sequence_lossy_planes(
         u32::from(fmt.bit_depth),
         base_q_idx,
     );
-    let (kf0, kf_recon0, kf_state0) =
-        encode_keyframe_lossy_tree_with_state(&kf_hdr, kf_targets, &kf_plan)?;
+    // Chain-model sequences take the round-441 keyframe skip election
+    // (all-zero-residual leaves code skip = 1 — identical
+    // reconstruction, strictly fewer bytes); the classic framing keeps
+    // its exact historical bytes (the staged self-encoded fixtures pin
+    // them).
+    let encode_kf = |hdr2: &Vp9FrameHeader| {
+        if chained {
+            encode_keyframe_lossy_tree_elect_skip_with_state(hdr2, kf_targets, &kf_plan)
+        } else {
+            encode_keyframe_lossy_tree_with_state(hdr2, kf_targets, &kf_plan)
+        }
+    };
+    let (kf0, kf_recon0, kf_state0) = encode_kf(&kf_hdr)?;
     // Chain model: the per-MI state is invariant under the filter-level
     // re-encode (only the fixed-width §6.2.8 header fields change), so
     // kf_state0 is the keyframe's final §6.4.4 motion field.
@@ -4223,14 +4388,7 @@ pub(crate) fn encode_sequence_lossy_planes(
         None
     };
     let (kf_bytes, kf_recon) = finish_frame_with_filter(
-        &kf_hdr,
-        kf0,
-        kf_recon0,
-        kf_state0,
-        kf_targets,
-        w,
-        h,
-        |hdr2| encode_keyframe_lossy_tree_with_state(hdr2, kf_targets, &kf_plan),
+        &kf_hdr, kf0, kf_recon0, kf_state0, kf_targets, w, h, encode_kf,
     )?;
 
     let mut out = Vec::with_capacity(frame_targets.len());
@@ -8517,6 +8675,144 @@ mod lossy_matrix_tests {
             Error::Unsupported,
             "sample exceeds the bit-depth range"
         );
+    }
+
+    /// Half-flat / half-textured 4:2:0 frame: the flat half's residual
+    /// quantizes to zero at a mid quantizer (DC prediction is exact on
+    /// constant content), the textured half keeps coding tokens.
+    fn half_flat_planar(w: usize, h: usize) -> Vec<u8> {
+        let cw = w.div_ceil(2);
+        let ch = h.div_ceil(2);
+        let mut px = Vec::with_capacity(w * h + 2 * cw * ch);
+        for y in 0..h {
+            for x in 0..w {
+                px.push(if x < w / 2 {
+                    128
+                } else {
+                    ((x * 31 + y * 17) % 223) as u8
+                });
+            }
+        }
+        px.resize(w * h + 2 * cw * ch, 128);
+        px
+    }
+
+    /// Keyframe skip election (round 441): on half-flat content the
+    /// elected frame codes **strictly fewer bytes** at a **bit-exact
+    /// identical reconstruction** (§6.4.2: skip drops the all-zero
+    /// residual syntax; §8.6.2 adds zero either way), the §6.4.4
+    /// `Skips` array records the elected leaves, and the decoder
+    /// mirror holds on the elected stream.
+    #[test]
+    fn keyframe_skip_election_rate_win_at_identical_recon() {
+        let (w, h) = (64u32, 48u32);
+        let px = half_flat_planar(w as usize, h as usize);
+        let fmt = LossyFormat::YUV420_8;
+        let targets = padded_targets_from_u8(&px, w, h, fmt);
+        let hdr = lossy_keyframe_header_fmt(w, h, 120, fmt);
+        let plan = plan_keyframe_tree(&targets, (h + 7) >> 3, (w + 7) >> 3, true, true, 8, 120);
+
+        let (b_plain, recon_plain, state_plain) =
+            encode_keyframe_lossy_tree_with_state(&hdr, &targets, &plan).expect("plain");
+        let (b_elect, recon_elect, state_elect) =
+            encode_keyframe_lossy_tree_elect_skip_with_state(&hdr, &targets, &plan).expect("elect");
+
+        assert!(
+            b_elect.len() < b_plain.len(),
+            "skip election must strictly shrink the frame ({} vs {})",
+            b_elect.len(),
+            b_plain.len()
+        );
+        for (p, q) in recon_elect.planes.iter().zip(recon_plain.planes.iter()) {
+            assert_eq!(p.samples(), q.samples(), "reconstruction must be identical");
+        }
+        assert!(
+            state_plain.skips.iter().all(|&s| s == 0),
+            "plain path codes no skip"
+        );
+        assert!(
+            state_elect.skips.iter().any(|&s| s != 0),
+            "election must actually code skip leaves on the flat half"
+        );
+
+        // Decoder mirror on the elected stream.
+        let frame = crate::decode_frame::decode_intra_frame(&b_elect).expect("decode");
+        for row in 0..h as usize {
+            for col in 0..w as usize {
+                assert_eq!(
+                    i32::from(frame.y[row * w as usize + col]),
+                    recon_elect.planes[0].get(col, row),
+                    "luma mirror ({col},{row})"
+                );
+            }
+        }
+        // And both streams decode to the same output.
+        let frame_plain = crate::decode_frame::decode_intra_frame(&b_plain).expect("decode plain");
+        assert_eq!(frame.y, frame_plain.y);
+        assert_eq!(frame.u, frame_plain.u);
+        assert_eq!(frame.v, frame_plain.v);
+    }
+
+    /// Content with no all-zero leaf codes byte-identically through the
+    /// election path (the election is a pure no-op there — pass 2
+    /// re-assembles the identical plan from the cache).
+    #[test]
+    fn keyframe_skip_election_is_noop_on_dense_content() {
+        let (w, h) = (48u32, 40u32);
+        let fmt = LossyFormat::YUV420_8;
+        let px = textured_planar_u16(w as usize, h as usize, fmt, 3);
+        let px8: Vec<u8> = px.iter().map(|&s| s as u8).collect();
+        let targets = padded_targets_from_u8(&px8, w, h, fmt);
+        let hdr = lossy_keyframe_header_fmt(w, h, 40, fmt); // fine q: no leaf zeroes out
+        let plan = plan_keyframe_tree(&targets, (h + 7) >> 3, (w + 7) >> 3, true, true, 8, 40);
+
+        let (b_plain, _, state_plain) =
+            encode_keyframe_lossy_tree_with_state(&hdr, &targets, &plan).expect("plain");
+        let (b_elect, _, state_elect) =
+            encode_keyframe_lossy_tree_elect_skip_with_state(&hdr, &targets, &plan).expect("elect");
+        if state_elect.skips.iter().all(|&s| s == 0) {
+            assert_eq!(b_elect, b_plain, "no elected leaf ⇒ byte-identical");
+            assert_eq!(state_plain.skips, state_elect.skips);
+        } else {
+            // If this content ever quantizes a leaf to zero, the
+            // election must still be a strict rate win.
+            assert!(b_elect.len() < b_plain.len());
+        }
+    }
+
+    /// The chain-framing sequence keyframe takes the skip election: on
+    /// a static GOP the chained keyframe codes strictly fewer bytes
+    /// than the classic (fixture-pinned, non-electing) keyframe, and
+    /// the whole chained GOP still decodes within the quantizer
+    /// regime.
+    #[test]
+    fn chained_sequence_keyframe_elects_skip() {
+        let (w, h) = (64u32, 48u32);
+        let px = half_flat_planar(w as usize, h as usize);
+        let frames: Vec<&[u8]> = vec![&px, &px, &px];
+        let classic = encode_sequence_lossy_420(&frames, w, h, 120).expect("classic");
+        let chained = encode_sequence_lossy_chained_420(&frames, w, h, 120).expect("chained");
+        assert!(
+            chained[0].len() < classic[0].len(),
+            "chained keyframe must take the skip election ({} vs {})",
+            chained[0].len(),
+            classic[0].len()
+        );
+
+        let refs: Vec<&[u8]> = chained.iter().map(|f| f.as_slice()).collect();
+        let decoded = crate::decode_frame::decode_vp9_sequence(&refs).expect("decode");
+        assert_eq!(decoded.len(), 3);
+        for (i, frame) in decoded.iter().enumerate() {
+            let mut sse = 0f64;
+            for (row, chunk) in frame.y.chunks_exact(w as usize).enumerate() {
+                for (col, &s) in chunk.iter().enumerate() {
+                    let d = f64::from(s) - f64::from(px[row * w as usize + col]);
+                    sse += d * d;
+                }
+            }
+            let mse = sse / f64::from(w * h);
+            assert!(mse < 400.0, "frame {i}: MSE {mse}");
+        }
     }
 
     /// The profile derivation matches §7.2 exactly.

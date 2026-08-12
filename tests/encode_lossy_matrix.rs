@@ -387,6 +387,24 @@ fn dump_matrix_streams_for_black_box_validation() {
     // (name, encoded bytes) per matrix format — sizes chosen MI-exact
     // so external raw-frame comparisons need no crop handling beyond
     // the coded dimensions.
+    // Half-flat content: the flat half's leaves quantize to zero and
+    // take the round-441 keyframe **skip election** — this stream's
+    // black-box decode pins the elected skip syntax externally.
+    let half_flat: Vec<u8> = {
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let mut px = Vec::with_capacity(w * h + 2 * cw * ch);
+        for y in 0..h {
+            for x in 0..w {
+                px.push(if x < w / 2 {
+                    128
+                } else {
+                    ((x * 31 + y * 17) % 223) as u8
+                });
+            }
+        }
+        px.resize(w * h + 2 * cw * ch, 128);
+        px
+    };
     let cases: Vec<(&str, Vec<u8>)> = vec![
         (
             "lossy-420-8bit",
@@ -397,6 +415,10 @@ fn dump_matrix_streams_for_black_box_validation() {
                 q,
             )
             .expect("420"),
+        ),
+        (
+            "lossy-420-8bit-skipkf",
+            oxideav_vp9::encode_vp9_lossy(&half_flat, w as u32, h as u32, 120).expect("skipkf"),
         ),
         (
             "lossy-444-8bit",

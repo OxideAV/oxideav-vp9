@@ -756,34 +756,7 @@ pub(crate) fn encode_keyframe_lossy_420(
     // rate cost exactly as in the sequence encoders. (The `_with_recon`
     // variants stay level-0: they are the sequence/fixture primitives
     // whose callers run their own election.)
-    let (bytes0, recon0, state0) =
-        encode_keyframe_lossy_420_with_recon_state(pixels, width, height, base_q_idx)?;
-    let w = width as usize;
-    let h = height as usize;
-    let cw = width.div_ceil(2) as usize;
-    let ch = height.div_ceil(2) as usize;
-    let y_w = w.div_ceil(8) * 8;
-    let y_h = h.div_ceil(8) * 8;
-    let targets = [
-        padded_plane_from_bytes(&pixels[..w * h], w, h, y_w, y_h),
-        padded_plane_from_bytes(&pixels[w * h..w * h + cw * ch], cw, ch, y_w >> 1, y_h >> 1),
-        padded_plane_from_bytes(&pixels[w * h + cw * ch..], cw, ch, y_w >> 1, y_h >> 1),
-    ];
-    let hdr = lossy_keyframe_header_420(width, height, base_q_idx);
-    let (bytes, _recon) =
-        finish_frame_with_filter(&hdr, bytes0, recon0, state0, &targets, w, h, |hdr2| {
-            let plan = plan_keyframe_tree(
-                &targets,
-                (height + 7) >> 3,
-                (width + 7) >> 3,
-                true,
-                true,
-                8,
-                base_q_idx,
-            );
-            encode_keyframe_lossy_tree_with_state(hdr2, &targets, &plan)
-        })?;
-    Ok(bytes)
+    encode_keyframe_lossy_u8(pixels, width, height, base_q_idx, true, true)
 }
 
 /// The §6.2 header for a **lossy** 8-bit 4:2:0 keyframe at `base_q_idx`
@@ -791,7 +764,19 @@ pub(crate) fn encode_keyframe_lossy_420(
 /// (`loop_filter.level` stays 0; the sequence encoders overwrite it
 /// with the elected level before assembly).
 pub(crate) fn lossy_keyframe_header_420(width: u32, height: u32, base_q_idx: u8) -> Vp9FrameHeader {
-    let mut hdr = lossless_keyframe_header(width, height);
+    lossy_keyframe_header_fmt(width, height, base_q_idx, LossyFormat::YUV420_8)
+}
+
+/// [`lossy_keyframe_header_420`] generalised over the §6.2 profile /
+/// bit-depth / chroma-subsampling triple (see [`LossyFormat`]).
+pub(crate) fn lossy_keyframe_header_fmt(
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+    fmt: LossyFormat,
+) -> Vp9FrameHeader {
+    let mut hdr =
+        lossless_keyframe_header_ex(width, height, fmt.profile, fmt.bit_depth, fmt.ssx, fmt.ssy);
     hdr.quantization = QuantizationParams {
         base_q_idx,
         delta_q_y_dc: 0,
@@ -800,6 +785,250 @@ pub(crate) fn lossy_keyframe_header_420(width: u32, height: u32, base_q_idx: u8)
         lossless: false,
     };
     hdr
+}
+
+/// The §6.2 / §7.2 profile–format triple of an encode: `profile` is
+/// fully determined by `(bit_depth, subsampling)` per the §7.2 profile
+/// constraints —
+///
+/// * profile 0 — 8-bit 4:2:0;
+/// * profile 1 — 8-bit, any non-4:2:0 subsampling (4:4:4 / 4:2:2 /
+///   4:4:0);
+/// * profile 2 — 10/12-bit 4:2:0;
+/// * profile 3 — 10/12-bit, any non-4:2:0 subsampling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LossyFormat {
+    /// §6.2 `profile` (0..=3), derived — see [`LossyFormat::new`].
+    pub profile: u8,
+    /// §7.2.2 `BitDepth` (8, 10 or 12).
+    pub bit_depth: u8,
+    /// §7.2.2 `subsampling_x`.
+    pub ssx: bool,
+    /// §7.2.2 `subsampling_y`.
+    pub ssy: bool,
+}
+
+impl LossyFormat {
+    /// The profile-0 baseline: 8-bit 4:2:0.
+    pub const YUV420_8: Self = Self {
+        profile: 0,
+        bit_depth: 8,
+        ssx: true,
+        ssy: true,
+    };
+
+    /// Derive the format (and its §7.2 profile) from the bit depth and
+    /// chroma subsampling. Returns [`Error::Unsupported`] when
+    /// `bit_depth` is not 8, 10 or 12.
+    pub fn new(bit_depth: u8, ssx: bool, ssy: bool) -> Result<Self, Error> {
+        if bit_depth != 8 && bit_depth != 10 && bit_depth != 12 {
+            return Err(Error::Unsupported);
+        }
+        let profile = match (bit_depth > 8, ssx && ssy) {
+            (false, true) => 0,
+            (false, false) => 1,
+            (true, true) => 2,
+            (true, false) => 3,
+        };
+        Ok(Self {
+            profile,
+            bit_depth,
+            ssx,
+            ssy,
+        })
+    }
+
+    /// Visible chroma-plane dimensions for a `width × height` frame —
+    /// the §8.10 subsampled extents (`ceil` halving on each subsampled
+    /// axis).
+    pub fn chroma_dims(&self, width: u32, height: u32) -> (usize, usize) {
+        (
+            if self.ssx { width.div_ceil(2) } else { width } as usize,
+            if self.ssy { height.div_ceil(2) } else { height } as usize,
+        )
+    }
+
+    /// Total planar sample count of one `width × height` input frame
+    /// (`Y` then `U` then `V`).
+    pub fn planar_len(&self, width: u32, height: u32) -> usize {
+        let (cw, ch) = self.chroma_dims(width, height);
+        (width as usize) * (height as usize) + 2 * cw * ch
+    }
+}
+
+/// Build the three MI-padded target [`Plane`]s from a planar 8-bit
+/// input frame (`Y` then `U` then `V` at the format's §8.10 extents).
+/// The caller has validated the buffer length.
+pub(crate) fn padded_targets_from_u8(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    fmt: LossyFormat,
+) -> [Plane; 3] {
+    let w = width as usize;
+    let h = height as usize;
+    let (cw, ch) = fmt.chroma_dims(width, height);
+    let y_w = ((width + 7) >> 3) as usize * 8;
+    let y_h = ((height + 7) >> 3) as usize * 8;
+    let uv_w = y_w >> usize::from(fmt.ssx);
+    let uv_h = y_h >> usize::from(fmt.ssy);
+    [
+        padded_plane_from_bytes(&pixels[..w * h], w, h, y_w, y_h),
+        padded_plane_from_bytes(&pixels[w * h..w * h + cw * ch], cw, ch, uv_w, uv_h),
+        padded_plane_from_bytes(&pixels[w * h + cw * ch..], cw, ch, uv_w, uv_h),
+    ]
+}
+
+/// [`padded_targets_from_u8`] over native `u16` samples (10/12-bit
+/// content).
+pub(crate) fn padded_targets_from_u16(
+    samples: &[u16],
+    width: u32,
+    height: u32,
+    fmt: LossyFormat,
+) -> [Plane; 3] {
+    let w = width as usize;
+    let h = height as usize;
+    let (cw, ch) = fmt.chroma_dims(width, height);
+    let y_w = ((width + 7) >> 3) as usize * 8;
+    let y_h = ((height + 7) >> 3) as usize * 8;
+    let uv_w = y_w >> usize::from(fmt.ssx);
+    let uv_h = y_h >> usize::from(fmt.ssy);
+    [
+        padded_plane_from_u16(&samples[..w * h], w, h, y_w, y_h),
+        padded_plane_from_u16(&samples[w * h..w * h + cw * ch], cw, ch, uv_w, uv_h),
+        padded_plane_from_u16(&samples[w * h + cw * ch..], cw, ch, uv_w, uv_h),
+    ]
+}
+
+/// Shared validation for the lossy entry points: dimensions in
+/// `1..=65536` and a non-lossless quantizer.
+fn validate_lossy_args(width: u32, height: u32, base_q_idx: u8) -> Result<(), Error> {
+    if width == 0 || height == 0 || width > (1 << 16) || height > (1 << 16) {
+        return Err(Error::Unsupported);
+    }
+    if base_q_idx == 0 {
+        return Err(Error::Unsupported); // qindex 0 is the lossless path.
+    }
+    Ok(())
+}
+
+/// Encode one lossy keyframe over MI-padded `targets` at any
+/// [`LossyFormat`] — the content-adaptive tree plan
+/// ([`plan_keyframe_tree`]) at the format's geometry, then the
+/// decoder-mirror tree encoder — returning the level-0 products
+/// (bytes, reconstruction, §6.4.4 state). The caller runs the §8.8
+/// filter election ([`finish_frame_with_filter`]) where wanted.
+pub(crate) fn encode_keyframe_lossy_planes_with_state(
+    targets: &[Plane; 3],
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+    fmt: LossyFormat,
+) -> Result<(Vec<u8>, ReconState, crate::decode_block::Vp9FrameState), Error> {
+    let hdr = lossy_keyframe_header_fmt(width, height, base_q_idx, fmt);
+    let plan = plan_keyframe_tree(
+        targets,
+        (height + 7) >> 3,
+        (width + 7) >> 3,
+        fmt.ssx,
+        fmt.ssy,
+        u32::from(fmt.bit_depth),
+        base_q_idx,
+    );
+    encode_keyframe_lossy_tree_with_state(&hdr, targets, &plan)
+}
+
+/// Public-path lossy keyframe encode at any [`LossyFormat`]: the
+/// level-0 tree encode, then the §8.8 `(level, sharpness)` election —
+/// a standalone keyframe's decoded output IS its filtered
+/// reconstruction, so the election lifts display quality rate-free
+/// (both §6.2.8 fields are fixed-width).
+pub(crate) fn encode_keyframe_lossy_planes(
+    targets: &[Plane; 3],
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+    fmt: LossyFormat,
+) -> Result<Vec<u8>, Error> {
+    let (bytes0, recon0, state0) =
+        encode_keyframe_lossy_planes_with_state(targets, width, height, base_q_idx, fmt)?;
+    let hdr = lossy_keyframe_header_fmt(width, height, base_q_idx, fmt);
+    let (bytes, _recon) = finish_frame_with_filter(
+        &hdr,
+        bytes0,
+        recon0,
+        state0,
+        targets,
+        width as usize,
+        height as usize,
+        |hdr2| {
+            let plan = plan_keyframe_tree(
+                targets,
+                (height + 7) >> 3,
+                (width + 7) >> 3,
+                fmt.ssx,
+                fmt.ssy,
+                u32::from(fmt.bit_depth),
+                base_q_idx,
+            );
+            encode_keyframe_lossy_tree_with_state(hdr2, targets, &plan)
+        },
+    )?;
+    Ok(bytes)
+}
+
+/// Encode an 8-bit planar frame at any chroma subsampling into a lossy
+/// keyframe (profile 0 at 4:2:0, profile 1 otherwise) — the
+/// [`encode_keyframe_lossy_420`] pipeline generalised over the §6.2
+/// format triple, §8.8 filter election included.
+pub(crate) fn encode_keyframe_lossy_u8(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+    ssx: bool,
+    ssy: bool,
+) -> Result<Vec<u8>, Error> {
+    validate_lossy_args(width, height, base_q_idx)?;
+    let fmt = LossyFormat::new(8, ssx, ssy)?;
+    if pixels.len() < fmt.planar_len(width, height) {
+        return Err(Error::Unsupported);
+    }
+    let targets = padded_targets_from_u8(pixels, width, height, fmt);
+    encode_keyframe_lossy_planes(&targets, width, height, base_q_idx, fmt)
+}
+
+/// Encode a 10/12-bit planar frame (native `u16` samples) at any
+/// chroma subsampling into a lossy keyframe (profile 2 at 4:2:0,
+/// profile 3 otherwise), §8.8 filter election included. Every sample
+/// must fit `[0, (1 << bit_depth) - 1]`.
+pub(crate) fn encode_keyframe_lossy_u16(
+    samples: &[u16],
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    base_q_idx: u8,
+    ssx: bool,
+    ssy: bool,
+) -> Result<Vec<u8>, Error> {
+    validate_lossy_args(width, height, base_q_idx)?;
+    if bit_depth != 10 && bit_depth != 12 {
+        return Err(Error::Unsupported);
+    }
+    let fmt = LossyFormat::new(bit_depth, ssx, ssy)?;
+    if samples.len() < fmt.planar_len(width, height) {
+        return Err(Error::Unsupported);
+    }
+    let max = (1u16 << bit_depth) - 1;
+    if samples[..fmt.planar_len(width, height)]
+        .iter()
+        .any(|&s| s > max)
+    {
+        return Err(Error::Unsupported);
+    }
+    let targets = padded_targets_from_u16(samples, width, height, fmt);
+    encode_keyframe_lossy_planes(&targets, width, height, base_q_idx, fmt)
 }
 
 /// [`encode_keyframe_lossy_420`] at level 0, also returning the
@@ -827,44 +1056,13 @@ pub(crate) fn encode_keyframe_lossy_420_with_recon_state(
     height: u32,
     base_q_idx: u8,
 ) -> Result<(Vec<u8>, ReconState, crate::decode_block::Vp9FrameState), Error> {
-    if width == 0 || height == 0 || width > (1 << 16) || height > (1 << 16) {
+    validate_lossy_args(width, height, base_q_idx)?;
+    let fmt = LossyFormat::YUV420_8;
+    if pixels.len() < fmt.planar_len(width, height) {
         return Err(Error::Unsupported);
     }
-    if base_q_idx == 0 {
-        return Err(Error::Unsupported); // qindex 0 is the lossless path.
-    }
-    let w = width as usize;
-    let h = height as usize;
-    let cw = width.div_ceil(2) as usize;
-    let ch = height.div_ceil(2) as usize;
-    if pixels.len() < w * h + 2 * cw * ch {
-        return Err(Error::Unsupported);
-    }
-
-    let hdr = lossy_keyframe_header_420(width, height, base_q_idx);
-
-    let mi_cols = ((width + 7) >> 3) as usize;
-    let mi_rows = ((height + 7) >> 3) as usize;
-    let y_w = mi_cols * 8;
-    let y_h = mi_rows * 8;
-    let uv_w = y_w >> 1;
-    let uv_h = y_h >> 1;
-
-    let y_plane = padded_plane_from_bytes(&pixels[..w * h], w, h, y_w, y_h);
-    let u_plane = padded_plane_from_bytes(&pixels[w * h..w * h + cw * ch], cw, ch, uv_w, uv_h);
-    let v_plane = padded_plane_from_bytes(&pixels[w * h + cw * ch..], cw, ch, uv_w, uv_h);
-    let targets = [y_plane, u_plane, v_plane];
-
-    let plan = plan_keyframe_tree(
-        &targets,
-        mi_rows as u32,
-        mi_cols as u32,
-        true,
-        true,
-        8,
-        base_q_idx,
-    );
-    encode_keyframe_lossy_tree_with_state(&hdr, &targets, &plan)
+    let targets = padded_targets_from_u8(pixels, width, height, fmt);
+    encode_keyframe_lossy_planes_with_state(&targets, width, height, base_q_idx, fmt)
 }
 
 /// Plan a content-adaptive partition + transform-size tree for a lossy
@@ -8156,5 +8354,214 @@ mod tests {
         assert_eq!(p.get(4, 0), 3); // right padding replicates col 2
         assert_eq!(p.get(1, 3), 5); // bottom padding replicates row 1
         assert_eq!(p.get(4, 3), 6); // corner
+    }
+}
+
+/// Round-441 lossy format-matrix tests: the lossy keyframe encoder at
+/// every §7.2 profile / bit-depth / chroma-subsampling combination the
+/// decoder covers, pinned decoder-mirror sample-exact.
+#[cfg(test)]
+mod lossy_matrix_tests {
+    use super::*;
+    use crate::decode_frame::decode_intra_frame;
+
+    /// The §7.2 format matrix under test: every (bit_depth, ssx, ssy)
+    /// the four profiles admit, 4:4:0 included (profile 1/3 code both
+    /// subsampling flags).
+    const MATRIX: [(u8, bool, bool); 9] = [
+        (8, true, true),    // profile 0, 4:2:0
+        (8, false, false),  // profile 1, 4:4:4
+        (8, true, false),   // profile 1, 4:2:2
+        (8, false, true),   // profile 1, 4:4:0
+        (10, true, true),   // profile 2, 4:2:0 10-bit
+        (12, true, true),   // profile 2, 4:2:0 12-bit
+        (10, false, false), // profile 3, 4:4:4 10-bit
+        (12, true, false),  // profile 3, 4:2:2 12-bit
+        (10, false, true),  // profile 3, 4:4:0 10-bit
+    ];
+
+    /// Deterministic textured planar frame at any format — enough
+    /// structure that mid-range quantizers produce non-trivial trees,
+    /// scaled into the bit-depth range.
+    fn textured_planar_u16(w: usize, h: usize, fmt: LossyFormat, seed: i64) -> Vec<u16> {
+        let (cw, ch) = fmt.chroma_dims(w as u32, h as u32);
+        let shift = u32::from(fmt.bit_depth) - 8;
+        let f = |x: i64, y: i64, s: i64| -> u16 {
+            let v8 = ((((x + s) * 7 + y * 13) % 61) * 4 + ((x + s) * y) % 19).min(255);
+            ((v8 as u16) << shift) | ((x as u16 ^ y as u16) & ((1 << shift) - 1))
+        };
+        let mut px = Vec::with_capacity(w * h + 2 * cw * ch);
+        for y in 0..h as i64 {
+            for x in 0..w as i64 {
+                px.push(f(x, y, seed));
+            }
+        }
+        for y in 0..ch as i64 {
+            for x in 0..cw as i64 {
+                px.push(f(x + 40, y, seed + 3));
+            }
+        }
+        for y in 0..ch as i64 {
+            for x in 0..cw as i64 {
+                px.push(f(x, y + 70, seed + 5));
+            }
+        }
+        px
+    }
+
+    fn targets_for(px: &[u16], w: u32, h: u32, fmt: LossyFormat) -> [Plane; 3] {
+        padded_targets_from_u16(px, w, h, fmt)
+    }
+
+    /// Level-0 decoder mirror across the whole matrix: the decoded
+    /// output equals the encoder's in-loop reconstruction sample-exact
+    /// on all three planes, and the coded header carries the format.
+    #[test]
+    fn lossy_keyframe_mirror_across_format_matrix() {
+        for &(bd, ssx, ssy) in &MATRIX {
+            let fmt = LossyFormat::new(bd, ssx, ssy).unwrap();
+            let (w, h) = (41u32, 29u32); // partial-MI both axes
+            let px = textured_planar_u16(w as usize, h as usize, fmt, 7);
+            let targets = targets_for(&px, w, h, fmt);
+            let (bytes, recon, _state) =
+                encode_keyframe_lossy_planes_with_state(&targets, w, h, 120, fmt)
+                    .unwrap_or_else(|e| panic!("encode {fmt:?}: {e}"));
+
+            let frame =
+                decode_intra_frame(&bytes).unwrap_or_else(|e| panic!("decode {fmt:?}: {e}"));
+            assert_eq!(frame.bit_depth, bd, "{fmt:?}");
+            assert_eq!(frame.subsampling_x, ssx, "{fmt:?}");
+            assert_eq!(frame.subsampling_y, ssy, "{fmt:?}");
+            assert_eq!((frame.width, frame.height), (w, h), "{fmt:?}");
+
+            let (cw, ch) = fmt.chroma_dims(w, h);
+            for row in 0..h as usize {
+                for col in 0..w as usize {
+                    assert_eq!(
+                        i32::from(frame.y[row * w as usize + col]),
+                        recon.planes[0].get(col, row),
+                        "{fmt:?}: luma mirror ({col},{row})"
+                    );
+                }
+            }
+            for (plane, samples) in [(1usize, &frame.u), (2usize, &frame.v)] {
+                for row in 0..ch {
+                    for col in 0..cw {
+                        assert_eq!(
+                            i32::from(samples[row * cw + col]),
+                            recon.planes[plane].get(col, row),
+                            "{fmt:?}: chroma {plane} mirror ({col},{row})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Public-path encode (filter election included) across the
+    /// matrix: byte-deterministic, decodes at the coded format, and
+    /// distortion stays within the §8.6.1 quantizer regime of each
+    /// bit depth.
+    #[test]
+    fn lossy_keyframe_public_path_quality_and_determinism() {
+        let q = 120u8;
+        for &(bd, ssx, ssy) in &MATRIX {
+            let fmt = LossyFormat::new(bd, ssx, ssy).unwrap();
+            let (w, h) = (48u32, 40u32);
+            let px = textured_planar_u16(w as usize, h as usize, fmt, 11);
+            let encode = || -> Vec<u8> {
+                if bd == 8 {
+                    let px8: Vec<u8> = px.iter().map(|&s| s as u8).collect();
+                    encode_keyframe_lossy_u8(&px8, w, h, q, ssx, ssy).expect("encode u8")
+                } else {
+                    encode_keyframe_lossy_u16(&px, w, h, bd, q, ssx, ssy).expect("encode u16")
+                }
+            };
+            let bytes = encode();
+            assert_eq!(bytes, encode(), "{fmt:?}: byte-determinism");
+
+            let frame = decode_intra_frame(&bytes).expect("decode");
+            assert_eq!(
+                (frame.bit_depth, frame.subsampling_x, frame.subsampling_y),
+                (bd, ssx, ssy),
+                "{fmt:?}"
+            );
+
+            // Distortion regime: bounded by the squared AC quantizer
+            // step at this depth (loose 4x margin over the ±step/2
+            // quantization bound).
+            let quant = QuantizationParams {
+                base_q_idx: q,
+                delta_q_y_dc: 0,
+                delta_q_uv_dc: 0,
+                delta_q_uv_ac: 0,
+                lossless: false,
+            };
+            let seg = SegmentationParams::default_disabled();
+            let ac = f64::from(get_ac_quant(0, &seg, &quant, 0, bd));
+            let (cw, ch) = fmt.chroma_dims(w, h);
+            let mut sse = 0f64;
+            let mut n = 0usize;
+            let mut at = |dec: &[u16], src: &[u16]| {
+                for (a, b) in dec.iter().zip(src) {
+                    let d = f64::from(*a) - f64::from(*b);
+                    sse += d * d;
+                    n += 1;
+                }
+            };
+            let wh = (w * h) as usize;
+            at(&frame.y, &px[..wh]);
+            at(&frame.u, &px[wh..wh + cw * ch]);
+            at(&frame.v, &px[wh + cw * ch..]);
+            let mse = sse / n as f64;
+            assert!(
+                mse < ac * ac,
+                "{fmt:?}: MSE {mse} out of the q={q} regime (ac step {ac})"
+            );
+        }
+    }
+
+    /// Entry-point rejections: lossless quantizer, bad bit depth,
+    /// short buffers, out-of-range samples.
+    #[test]
+    fn lossy_matrix_entry_points_reject_bad_args() {
+        let px8 = vec![0u8; 64 * 64 * 3];
+        let px16 = vec![0u16; 64 * 64 * 3];
+        assert_eq!(
+            encode_keyframe_lossy_u8(&px8, 64, 64, 0, false, false).unwrap_err(),
+            Error::Unsupported,
+            "q == 0 is the lossless path"
+        );
+        assert_eq!(
+            encode_keyframe_lossy_u16(&px16, 64, 64, 9, 120, true, true).unwrap_err(),
+            Error::Unsupported,
+            "bit_depth 9 is not a §7.2.2 depth"
+        );
+        assert_eq!(
+            encode_keyframe_lossy_u8(&px8[..100], 64, 64, 120, false, false).unwrap_err(),
+            Error::Unsupported,
+            "short buffer"
+        );
+        let mut hot = vec![0u16; 64 * 64 * 3];
+        hot[10] = 1 << 10; // out of the 10-bit range
+        assert_eq!(
+            encode_keyframe_lossy_u16(&hot, 64, 64, 10, 120, false, false).unwrap_err(),
+            Error::Unsupported,
+            "sample exceeds the bit-depth range"
+        );
+    }
+
+    /// The profile derivation matches §7.2 exactly.
+    #[test]
+    fn lossy_format_profile_derivation() {
+        assert_eq!(LossyFormat::new(8, true, true).unwrap().profile, 0);
+        assert_eq!(LossyFormat::new(8, false, false).unwrap().profile, 1);
+        assert_eq!(LossyFormat::new(8, true, false).unwrap().profile, 1);
+        assert_eq!(LossyFormat::new(8, false, true).unwrap().profile, 1);
+        assert_eq!(LossyFormat::new(10, true, true).unwrap().profile, 2);
+        assert_eq!(LossyFormat::new(12, true, true).unwrap().profile, 2);
+        assert_eq!(LossyFormat::new(10, false, false).unwrap().profile, 3);
+        assert_eq!(LossyFormat::new(12, true, false).unwrap().profile, 3);
+        assert!(LossyFormat::new(9, true, true).is_err());
     }
 }

@@ -798,6 +798,89 @@ pub fn encode_vp9_lossy(
     pixel_encoder::encode_keyframe_lossy_420(pixels, width, height, base_q_idx)
 }
 
+/// Encode an 8-bit **4:4:4** planar frame (`Y` then `U` then `V`, each
+/// plane `width × height`) into a **lossy** profile-1 VP9 keyframe at
+/// quantizer index `base_q_idx` (`1..=255`; use
+/// [`encode_vp9_lossless_444`] for lossless).
+///
+/// Same decoder-mirror guarantee as [`encode_vp9_lossy`]: the decoded
+/// output equals the encoder's in-loop reconstruction bit-for-bit
+/// (elected §8.8 loop filter included), with distortion against the
+/// source bounded by the §8.6.1 quantizer step. Returns
+/// [`Error::Unsupported`] for `base_q_idx == 0`, degenerate dimensions,
+/// or a too-short buffer.
+pub fn encode_vp9_lossy_444(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+) -> Result<Vec<u8>, Error> {
+    pixel_encoder::encode_keyframe_lossy_u8(pixels, width, height, base_q_idx, false, false)
+}
+
+/// Encode an 8-bit **4:2:2** planar frame (`Y` then `U` then `V`,
+/// chroma planes `ceil(w/2) × height`) into a **lossy** profile-1 VP9
+/// keyframe at quantizer index `base_q_idx` (`1..=255`).
+///
+/// 4:2:2 is the `subsampling_x = 1, subsampling_y = 0` §7.2.2 geometry
+/// (profile 1 codes both subsampling flags in its §6.2.2
+/// `color_config( )`). Same decoder-mirror guarantee and error cases
+/// as [`encode_vp9_lossy_444`].
+pub fn encode_vp9_lossy_422(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+) -> Result<Vec<u8>, Error> {
+    pixel_encoder::encode_keyframe_lossy_u8(pixels, width, height, base_q_idx, true, false)
+}
+
+/// Encode a 10/12-bit planar frame (native `u16` samples, `Y` then `U`
+/// then `V`) into a **lossy** high-bit-depth VP9 keyframe at quantizer
+/// index `base_q_idx` (`1..=255`; use [`encode_vp9_lossless_hbd`] for
+/// lossless).
+///
+/// `subsample == true` selects 4:2:0 (profile 2, chroma planes
+/// `ceil(w/2) × ceil(h/2)`); `false` selects 4:4:4 (profile 3, chroma
+/// at full resolution) — mirroring [`encode_vp9_lossless_hbd`]'s
+/// layout. The decoded output (compare [`Vp9DecodedFrame`]'s native
+/// `u16` planes) equals the encoder's in-loop reconstruction
+/// bit-for-bit, elected §8.8 loop filter included. Returns
+/// [`Error::Unsupported`] when `bit_depth` is not 10 or 12, any sample
+/// exceeds the bit-depth range, `base_q_idx == 0`, the buffer is too
+/// short, or the dimensions are degenerate.
+pub fn encode_vp9_lossy_hbd(
+    samples: &[u16],
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    subsample: bool,
+    base_q_idx: u8,
+) -> Result<Vec<u8>, Error> {
+    pixel_encoder::encode_keyframe_lossy_u16(
+        samples, width, height, bit_depth, base_q_idx, subsample, subsample,
+    )
+}
+
+/// Encode a 10/12-bit **4:2:2** planar frame (native `u16` samples,
+/// chroma planes `ceil(w/2) × height`) into a **lossy** profile-3 VP9
+/// keyframe at quantizer index `base_q_idx` (`1..=255`).
+///
+/// The `subsampling_x = 1, subsampling_y = 0` high-bit-depth geometry
+/// [`encode_vp9_lossy_hbd`]'s two-way `subsample` flag cannot express.
+/// Same guarantees and error cases as [`encode_vp9_lossy_hbd`].
+pub fn encode_vp9_lossy_hbd_422(
+    samples: &[u16],
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    base_q_idx: u8,
+) -> Result<Vec<u8>, Error> {
+    pixel_encoder::encode_keyframe_lossy_u16(
+        samples, width, height, bit_depth, base_q_idx, true, false,
+    )
+}
+
 /// Encode a **sequence** of 8-bit 4:2:0 planar frames into a lossy VP9
 /// stream at quantizer index `base_q_idx` (`1..=255`): a lossy keyframe
 /// followed by lossy inter (P-)frames with per-block `ZEROMV` / `NEWMV`

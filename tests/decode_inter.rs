@@ -1069,6 +1069,30 @@ fn full_corpus_sequences_byte_exact() {
         }
         check_fixture_byte_exact(root, name);
     }
+
+    // Round-441 corpus extensions (self-encoded; presence-gated until
+    // the staged bytes land in docs — builders + docs-gated identity
+    // tests live in the crate already):
+    //
+    // * lossy-444-gop — the corpus's first self-encoded non-4:2:0
+    //   lossy stream (profile 1, chain framing: §7.2.6 prev-MV
+    //   modeling, per-frame §8.8 election, keyframe skip election).
+    // * lossy-hbd10-gop — the corpus's first self-encoded
+    //   high-bit-depth lossy stream (profile 2, 10-bit, chain
+    //   framing).
+    // * lossy-lf-deltas-gop — the corpus's first stream with a
+    //   `loop_filter_delta_update = 1` frame: the §6.2.8 delta
+    //   election codes a mode-delta update mid-GOP and a later frame
+    //   filters on the §7.2.8 PERSISTED value while coding no update,
+    //   so the byte-exact sweep pins the persistence fold against the
+    //   reference decode.
+    for name in ["lossy-444-gop", "lossy-hbd10-gop", "lossy-lf-deltas-gop"] {
+        if !root.join(name).is_dir() {
+            eprintln!("{name}: not yet staged; docs-gated");
+            continue;
+        }
+        check_fixture_byte_exact(root, name);
+    }
 }
 
 /// One `full_corpus_sequences_byte_exact` step: IVF demux → superframe
@@ -1782,6 +1806,58 @@ fn round_434_tile_rows_fixture_flags_pin_row_split() {
     assert!(!h1.intra_only, "F1 is a real inter frame");
     assert_eq!(h1.tile_info.tile_rows_log2, 2, "P-frame: four tile rows");
     assert_eq!(h1.tile_info.tile_cols_log2, 1, "P-frame: two tile cols");
+}
+
+/// Round-441 corpus extension: the `lossy-lf-deltas-gop` fixture's
+/// headers carry the flags that make it the corpus's
+/// **loop-filter-delta** class — a mid-GOP P-frame codes
+/// `loop_filter_delta_update = 1` with a moved slot, and a LATER
+/// P-frame codes `level > 0` with NO update, so its §8.8 run depends on
+/// the §7.2.8 persisted values (every prior fixture either codes no
+/// update or resets per §7.2). Without this pin a regenerated stream
+/// could silently drop the update and the byte-exact sweep would stop
+/// covering the persistence fold. Presence-gated on the staged docs.
+#[test]
+fn round_441_lf_deltas_fixture_flags_pin_update_then_persist() {
+    let base = std::path::Path::new("../../docs/video/vp9/fixtures/lossy-lf-deltas-gop");
+    if !base.is_dir() {
+        eprintln!("lossy-lf-deltas-gop not yet staged; docs-gated");
+        return;
+    }
+    let ivf = std::fs::read(base.join("input.ivf")).expect("ivf");
+    let chunks = ivf_chunks(&ivf);
+    assert_eq!(chunks.len(), 4, "4 coded packets");
+    let h0 = oxideav_vp9::parse_uncompressed_header(&chunks[0]).expect("F0");
+    assert_eq!(h0.frame_type, oxideav_vp9::FrameType::KeyFrame);
+    let ref_dims = vec![(64u32, 48u32); 8];
+    let mut update_at: Option<usize> = None;
+    let mut persist_after = false;
+    for (i, p) in chunks.iter().enumerate().skip(1) {
+        let h = oxideav_vp9::parse_uncompressed_header_with_refs(
+            p,
+            Some(oxideav_vp9::RefFrameState {
+                ref_dims: &ref_dims,
+                color_config: h0.color_config,
+            }),
+        )
+        .expect("inter header");
+        assert!(!h.error_resilient_mode, "frame {i}: chain framing");
+        if h.loop_filter.delta_update {
+            assert!(
+                h.loop_filter.ref_deltas.iter().any(Option::is_some)
+                    || h.loop_filter.mode_deltas.iter().any(Option::is_some),
+                "frame {i}: an update must move a slot"
+            );
+            update_at.get_or_insert(i);
+        } else if update_at.is_some() && h.loop_filter.level > 0 {
+            persist_after = true;
+        }
+    }
+    assert!(update_at.is_some(), "a frame must code the delta update");
+    assert!(
+        persist_after,
+        "a post-update frame must filter on the persisted values"
+    );
 }
 
 /// §6.4.14 / §8.1 segment-map threading + §7.2.10 segmentation feature

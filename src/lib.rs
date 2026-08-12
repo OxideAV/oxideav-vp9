@@ -3018,13 +3018,19 @@ mod encode_roundtrip_tests {
     /// Wrap coded frames in a minimal 64x64 IVF container (the layout
     /// every 64x64 staging generator in this module emits).
     fn ivf_wrap_64x64(frames: &[Vec<u8>]) -> Vec<u8> {
+        ivf_wrap_dims(frames, 64, 64)
+    }
+
+    /// [`ivf_wrap_64x64`] at arbitrary display dimensions (the
+    /// round-441 fixtures are 64x48).
+    fn ivf_wrap_dims(frames: &[Vec<u8>], w: u16, h: u16) -> Vec<u8> {
         let mut ivf = Vec::new();
         ivf.extend_from_slice(b"DKIF");
         ivf.extend_from_slice(&0u16.to_le_bytes());
         ivf.extend_from_slice(&32u16.to_le_bytes());
         ivf.extend_from_slice(b"VP90");
-        ivf.extend_from_slice(&64u16.to_le_bytes());
-        ivf.extend_from_slice(&64u16.to_le_bytes());
+        ivf.extend_from_slice(&w.to_le_bytes());
+        ivf.extend_from_slice(&h.to_le_bytes());
         ivf.extend_from_slice(&25u32.to_le_bytes());
         ivf.extend_from_slice(&1u32.to_le_bytes());
         ivf.extend_from_slice(&(frames.len() as u32).to_le_bytes());
@@ -3035,5 +3041,241 @@ mod encode_roundtrip_tests {
             ivf.extend_from_slice(f);
         }
         ivf
+    }
+
+    // ----- round-441 fixtures: lossy format matrix + LF-delta election -----
+
+    /// Translating 8-bit texture frame `k` at any chroma geometry —
+    /// shared content of the round-441 format-matrix fixtures (motion
+    /// (2, 1) px/frame, so P-frames elect genuine `NEWMV` leaves).
+    fn matrix_gop_frame_u8(w: usize, h: usize, cw: usize, ch: usize, k: usize) -> Vec<u8> {
+        let f = |x: usize, y: usize, s: usize| (((x + 2 * k) * 7 + (y + k) * 13 + s) % 251) as u8;
+        let mut px = Vec::with_capacity(w * h + 2 * cw * ch);
+        for y in 0..h {
+            for x in 0..w {
+                px.push(f(x, y, 0));
+            }
+        }
+        for y in 0..ch {
+            for x in 0..cw {
+                px.push(f(x, y, 40));
+            }
+        }
+        for y in 0..ch {
+            for x in 0..cw {
+                px.push(f(x, y, 90));
+            }
+        }
+        px
+    }
+
+    /// Build the round-441 **lossy 4:4:4 GOP** (profile 1, 8-bit,
+    /// 64x48, `base_q_idx = 110`) through the public
+    /// [`encode_vp9_lossy_sequence_444`] API — the corpus's first
+    /// **self-encoded non-4:2:0 lossy** stream, on the §7.2.6 chain
+    /// framing (shown non-error-resilient P-frames, prev-MV modeling,
+    /// per-frame §8.8 election, keyframe skip election).
+    fn build_lossy_444_gop_stream() -> Vec<Vec<u8>> {
+        let inputs: Vec<Vec<u8>> = (0..4)
+            .map(|k| matrix_gop_frame_u8(64, 48, 64, 48, k))
+            .collect();
+        let refs: Vec<&[u8]> = inputs.iter().map(|f| f.as_slice()).collect();
+        encode_vp9_lossy_sequence_444(&refs, 64, 48, 110).expect("444 GOP encode")
+    }
+
+    /// Build the round-441 **lossy 10-bit GOP** (profile 2, 4:2:0,
+    /// 64x48, `base_q_idx = 110`) through the public
+    /// [`encode_vp9_lossy_sequence_hbd`] API — the corpus's first
+    /// **self-encoded high-bit-depth lossy** stream (the existing HBD
+    /// streams are black-box encodes or lossless self-encodes).
+    fn build_lossy_hbd10_gop_stream() -> Vec<Vec<u8>> {
+        let (w, h, cw, ch) = (64usize, 48usize, 32usize, 24usize);
+        let inputs: Vec<Vec<u16>> = (0..4usize)
+            .map(|k| {
+                let f = |x: usize, y: usize, s: usize| {
+                    (((x + 2 * k) * 29 + (y + k) * 53 + s * 17) % 1024) as u16
+                };
+                let mut px = Vec::with_capacity(w * h + 2 * cw * ch);
+                for y in 0..h {
+                    for x in 0..w {
+                        px.push(f(x, y, 0));
+                    }
+                }
+                for y in 0..ch {
+                    for x in 0..cw {
+                        px.push(f(x, y, 3));
+                    }
+                }
+                for y in 0..ch {
+                    for x in 0..cw {
+                        px.push(f(x, y, 7));
+                    }
+                }
+                px
+            })
+            .collect();
+        let refs: Vec<&[u16]> = inputs.iter().map(|f| f.as_slice()).collect();
+        encode_vp9_lossy_sequence_hbd(&refs, 64, 48, 10, true, 110).expect("hbd10 GOP encode")
+    }
+
+    /// Build the round-441 **loop-filter-delta GOP** (profile 0, 8-bit
+    /// 4:2:0, 64x48, `base_q_idx = 170`) through the public
+    /// [`encode_vp9_lossy_sequence_chained`] API over mixed
+    /// static/moving content (left half static texture — skip/`ZEROMV`
+    /// blocks; right half translating — `NEWMV` blocks): the §6.2.8
+    /// **delta election** codes a `loop_filter_mode_deltas` update on a
+    /// mid-GOP frame and a later frame filters with the §7.2.8
+    /// **persisted** value while coding no update — the corpus's first
+    /// stream carrying a `loop_filter_delta_update = 1` frame.
+    fn build_lossy_lf_deltas_gop_stream() -> Vec<Vec<u8>> {
+        let (w, h) = (64i64, 48i64);
+        let tex = |x: i64, y: i64| -> u8 { (((x * 7 + y * 13) % 61) * 4 % 251) as u8 };
+        let inputs: Vec<Vec<u8>> = (0..4i64)
+            .map(|k| {
+                let cw = (w as usize).div_ceil(2);
+                let ch = (h as usize).div_ceil(2);
+                let mut px = vec![128u8; (w * h) as usize + 2 * cw * ch];
+                for y in 0..h {
+                    for x in 0..w {
+                        px[(y * w + x) as usize] = if x < w / 2 {
+                            tex(x, y)
+                        } else {
+                            tex(x + 3 * k, y + 2 * k)
+                        };
+                    }
+                }
+                px
+            })
+            .collect();
+        let refs: Vec<&[u8]> = inputs.iter().map(|f| f.as_slice()).collect();
+        encode_vp9_lossy_sequence_chained(&refs, 64, 48, 170).expect("lf-deltas GOP encode")
+    }
+
+    /// The 4:4:4 GOP decodes end-to-end at profile 1 with full-res
+    /// chroma on every frame; byte-deterministic.
+    #[test]
+    fn lossy_444_gop_decodes_at_profile_1() {
+        let frames = build_lossy_444_gop_stream();
+        assert_eq!(frames.len(), 4);
+        let h0 = crate::header::parse_uncompressed_header(&frames[0]).expect("kf header");
+        assert_eq!(h0.profile, 1);
+        assert!(!h0.color_config.subsampling_x && !h0.color_config.subsampling_y);
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        let decoded = decode_vp9_sequence(&refs).expect("decode");
+        assert_eq!(decoded.len(), 4);
+        for f in &decoded {
+            assert_eq!((f.bit_depth, f.u.len()), (8, 64 * 48));
+        }
+        assert_eq!(frames, build_lossy_444_gop_stream());
+    }
+
+    /// The 10-bit GOP decodes end-to-end at profile 2 / 10-bit on
+    /// every frame; byte-deterministic.
+    #[test]
+    fn lossy_hbd10_gop_decodes_at_profile_2() {
+        let frames = build_lossy_hbd10_gop_stream();
+        assert_eq!(frames.len(), 4);
+        let h0 = crate::header::parse_uncompressed_header(&frames[0]).expect("kf header");
+        assert_eq!(h0.profile, 2);
+        assert_eq!(h0.color_config.bit_depth, 10);
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        let decoded = decode_vp9_sequence(&refs).expect("decode");
+        assert_eq!(decoded.len(), 4);
+        for f in &decoded {
+            assert_eq!((f.bit_depth, f.u.len()), (10, 32 * 24));
+        }
+        assert_eq!(frames, build_lossy_hbd10_gop_stream());
+    }
+
+    /// The LF-delta GOP carries the round-441 election shape: at least
+    /// one P-frame codes `loop_filter_delta_update = 1` with a moved
+    /// slot, and a LATER P-frame codes level > 0 with NO update — its
+    /// filter runs on the §7.2.8 persisted values, so the byte-exact
+    /// corpus sweep pins the persistence model against the reference
+    /// decoder. Byte-deterministic.
+    #[test]
+    fn lossy_lf_deltas_gop_codes_update_then_persists() {
+        let frames = build_lossy_lf_deltas_gop_stream();
+        assert_eq!(frames.len(), 4);
+        let h0 = crate::header::parse_uncompressed_header(&frames[0]).expect("kf header");
+        let ref_dims = vec![(64u32, 48u32); 8];
+        let mut update_at: Option<usize> = None;
+        let mut persist_after = false;
+        for (i, f) in frames.iter().enumerate().skip(1) {
+            let h = crate::header::parse_uncompressed_header_with_refs(
+                f,
+                Some(crate::header::RefFrameState {
+                    ref_dims: &ref_dims,
+                    color_config: h0.color_config,
+                }),
+            )
+            .expect("p header");
+            assert!(!h.error_resilient_mode, "frame {i}: chain framing");
+            if h.loop_filter.delta_update {
+                assert!(
+                    h.loop_filter.ref_deltas.iter().any(Option::is_some)
+                        || h.loop_filter.mode_deltas.iter().any(Option::is_some),
+                    "frame {i}: an update must move a slot"
+                );
+                update_at.get_or_insert(i);
+            } else if update_at.is_some() && h.loop_filter.level > 0 {
+                persist_after = true;
+            }
+        }
+        assert!(update_at.is_some(), "the election must code an update");
+        assert!(
+            persist_after,
+            "a post-update frame must filter on the persisted values"
+        );
+
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        assert_eq!(decode_vp9_sequence(&refs).expect("decode").len(), 4);
+        assert_eq!(frames, build_lossy_lf_deltas_gop_stream());
+    }
+
+    /// Fixture-staging generator (round 441): stages the three
+    /// format-matrix / delta-election GOPs under
+    /// `OXIDEAV_VP9_STAGE_DIR`.
+    #[test]
+    fn stage_round_441_fixtures_when_requested() {
+        let Some(dir) = std::env::var_os("OXIDEAV_VP9_STAGE_DIR") else {
+            return;
+        };
+        for (name, frames) in [
+            ("lossy-444-gop", build_lossy_444_gop_stream()),
+            ("lossy-hbd10-gop", build_lossy_hbd10_gop_stream()),
+            ("lossy-lf-deltas-gop", build_lossy_lf_deltas_gop_stream()),
+        ] {
+            let ivf = ivf_wrap_dims(&frames, 64, 48);
+            let subdir = std::path::Path::new(&dir).join(name);
+            std::fs::create_dir_all(&subdir).expect("create stage dir");
+            std::fs::write(subdir.join("input.ivf"), &ivf).expect("write input.ivf");
+        }
+    }
+
+    /// The staged round-441 fixtures are byte-identical to the
+    /// builders' output — each fixture IS this crate's writer output
+    /// (docs-gated, per-fixture presence-gated).
+    #[test]
+    fn staged_round_441_fixtures_match_builders() {
+        for (name, frames) in [
+            ("lossy-444-gop", build_lossy_444_gop_stream()),
+            ("lossy-hbd10-gop", build_lossy_hbd10_gop_stream()),
+            ("lossy-lf-deltas-gop", build_lossy_lf_deltas_gop_stream()),
+        ] {
+            let path = std::path::Path::new("../../docs/video/vp9/fixtures")
+                .join(name)
+                .join("input.ivf");
+            if !path.is_file() {
+                eprintln!("{name}: not yet staged; docs-gated");
+                continue;
+            }
+            let staged = std::fs::read(&path).expect("staged input.ivf");
+            assert_eq!(
+                staged,
+                ivf_wrap_dims(&frames, 64, 48),
+                "{name}: staged fixture bytes != builder output"
+            );
+        }
     }
 }

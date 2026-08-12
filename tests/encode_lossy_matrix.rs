@@ -178,13 +178,185 @@ fn lossy_hbd_422_encodes_and_decodes() {
     }
 }
 
+/// 8-bit planar GOP frame `k`: the [`planar_u8`] texture translating
+/// by (2, 1) px per frame — P-frames earn genuine `NEWMV` leaves.
+fn planar_u8_frame(w: usize, h: usize, cw: usize, ch: usize, k: usize) -> Vec<u8> {
+    let f = |x: usize, y: usize, s: usize| (((x + 2 * k) * 7 + (y + k) * 13 + s) % 251) as u8;
+    let mut px = Vec::with_capacity(w * h + 2 * cw * ch);
+    for y in 0..h {
+        for x in 0..w {
+            px.push(f(x, y, 0));
+        }
+    }
+    for y in 0..ch {
+        for x in 0..cw {
+            px.push(f(x, y, 40));
+        }
+    }
+    for y in 0..ch {
+        for x in 0..cw {
+            px.push(f(x, y, 90));
+        }
+    }
+    px
+}
+
+/// HBD planar GOP frame `k` (translating like [`planar_u8_frame`]).
+fn planar_u16_frame(
+    w: usize,
+    h: usize,
+    cw: usize,
+    ch: usize,
+    bit_depth: u32,
+    k: usize,
+) -> Vec<u16> {
+    let max = (1u32 << bit_depth) - 1;
+    let f = |x: usize, y: usize, s: usize| {
+        (((x + 2 * k) * 29 + (y + k) * 53 + s * 17) as u32 % (max + 1)) as u16
+    };
+    let mut px = Vec::with_capacity(w * h + 2 * cw * ch);
+    for y in 0..h {
+        for x in 0..w {
+            px.push(f(x, y, 0));
+        }
+    }
+    for y in 0..ch {
+        for x in 0..cw {
+            px.push(f(x, y, 3));
+        }
+    }
+    for y in 0..ch {
+        for x in 0..cw {
+            px.push(f(x, y, 7));
+        }
+    }
+    px
+}
+
+/// The lossy **sequence** encoders across the format matrix: a 4-frame
+/// translating GOP per format decodes through
+/// [`oxideav_vp9::decode_vp9_sequence`] with every frame inside the
+/// quantizer's distortion regime (reference-chain drift would blow the
+/// later frames' MSE), at the coded format, byte-deterministically.
+#[test]
+fn lossy_sequence_matrix_decodes_without_drift() {
+    let (w, h) = (48usize, 32usize);
+    let q = 110u8;
+    // (name, bit_depth, ssx, ssy, encode closure)
+    type SeqEncode = Box<dyn Fn(&[Vec<u16>]) -> Vec<Vec<u8>>>;
+    let seq_u8 = |frames: &[Vec<u16>],
+                  enc: &dyn Fn(&[&[u8]]) -> Result<Vec<Vec<u8>>, Error>|
+     -> Vec<Vec<u8>> {
+        let frames8: Vec<Vec<u8>> = frames
+            .iter()
+            .map(|f| f.iter().map(|&s| s as u8).collect())
+            .collect();
+        let refs: Vec<&[u8]> = frames8.iter().map(|f| f.as_slice()).collect();
+        enc(&refs).expect("encode")
+    };
+    let cases: Vec<(&str, u8, bool, bool, SeqEncode)> = vec![
+        (
+            "seq-444-8bit",
+            8,
+            false,
+            false,
+            Box::new(move |frames| {
+                seq_u8(frames, &|refs| {
+                    oxideav_vp9::encode_vp9_lossy_sequence_444(refs, w as u32, h as u32, q)
+                })
+            }),
+        ),
+        (
+            "seq-422-8bit",
+            8,
+            true,
+            false,
+            Box::new(move |frames| {
+                seq_u8(frames, &|refs| {
+                    oxideav_vp9::encode_vp9_lossy_sequence_422(refs, w as u32, h as u32, q)
+                })
+            }),
+        ),
+        (
+            "seq-420-10bit",
+            10,
+            true,
+            true,
+            Box::new(move |frames| {
+                let refs: Vec<&[u16]> = frames.iter().map(|f| f.as_slice()).collect();
+                oxideav_vp9::encode_vp9_lossy_sequence_hbd(&refs, w as u32, h as u32, 10, true, q)
+                    .expect("encode")
+            }),
+        ),
+        (
+            "seq-444-12bit",
+            12,
+            false,
+            false,
+            Box::new(move |frames| {
+                let refs: Vec<&[u16]> = frames.iter().map(|f| f.as_slice()).collect();
+                oxideav_vp9::encode_vp9_lossy_sequence_hbd(&refs, w as u32, h as u32, 12, false, q)
+                    .expect("encode")
+            }),
+        ),
+        (
+            "seq-422-10bit",
+            10,
+            true,
+            false,
+            Box::new(move |frames| {
+                let refs: Vec<&[u16]> = frames.iter().map(|f| f.as_slice()).collect();
+                oxideav_vp9::encode_vp9_lossy_sequence_hbd_422(&refs, w as u32, h as u32, 10, q)
+                    .expect("encode")
+            }),
+        ),
+    ];
+
+    for (name, bd, ssx, ssy, encode) in cases {
+        let cw = if ssx { w.div_ceil(2) } else { w };
+        let ch = if ssy { h.div_ceil(2) } else { h };
+        let frames: Vec<Vec<u16>> = (0..4)
+            .map(|k| planar_u16_frame(w, h, cw, ch, u32::from(bd), k))
+            .collect();
+        let coded = encode(&frames);
+        assert_eq!(coded, encode(&frames), "{name}: byte-determinism");
+        assert_eq!(coded.len(), 4, "{name}");
+
+        let refs: Vec<&[u8]> = coded.iter().map(|f| f.as_slice()).collect();
+        let decoded = oxideav_vp9::decode_vp9_sequence(&refs).expect("decode");
+        assert_eq!(decoded.len(), 4, "{name}");
+        let scale = f64::from(1u32 << (bd - 8));
+        for (i, (frame, src)) in decoded.iter().zip(&frames).enumerate() {
+            assert_eq!(
+                (frame.bit_depth, frame.subsampling_x, frame.subsampling_y),
+                (bd, ssx, ssy),
+                "{name} frame {i}"
+            );
+            let dec: Vec<u16> = frame
+                .y
+                .iter()
+                .chain(&frame.u)
+                .chain(&frame.v)
+                .copied()
+                .collect();
+            let mse = mse_u16(&dec, src);
+            assert!(
+                mse < 2000.0 * scale * scale,
+                "{name} frame {i}: MSE {mse} — reference-chain drift?"
+            );
+        }
+    }
+}
+
 /// Env-gated dump for **black-box validation**: writes each matrix
 /// format's coded keyframe as `input.ivf` plus this crate's decode as
 /// `crate-decode.yuv` (the [`oxideav_vp9::decode_vp9`] packed layout:
 /// one byte per 8-bit sample, little-endian `u16` pairs at 10/12-bit)
 /// under `$OXIDEAV_VP9_MATRIX_DUMP_DIR/<name>/`, so an external
 /// reference decoder can be run as an opaque process against the same
-/// bytes and byte-compared. No-op unless the env var is set.
+/// bytes and byte-compared. Multi-frame GOP dumps per sequence entry
+/// point ride along (concatenated per-frame decodes). No-op unless the
+/// env var is set.
 #[test]
 fn dump_matrix_streams_for_black_box_validation() {
     let Some(dir) = std::env::var_os("OXIDEAV_VP9_MATRIX_DUMP_DIR") else {
@@ -315,6 +487,96 @@ fn dump_matrix_streams_for_black_box_validation() {
         std::fs::write(sub.join("input.ivf"), ivf).expect("write ivf");
         let decoded = oxideav_vp9::decode_vp9(&bytes).expect("crate decode");
         std::fs::write(sub.join("crate-decode.yuv"), decoded).expect("write yuv");
+    }
+
+    // Multi-frame GOPs through the new sequence entry points (chain
+    // framing: prev-MV modeling + compound election live at every
+    // format).
+    let n = 4usize;
+    let gop_u8 = |ssx: bool, ssy: bool| -> Vec<Vec<u8>> {
+        let cw = if ssx { w.div_ceil(2) } else { w };
+        let ch = if ssy { h.div_ceil(2) } else { h };
+        (0..n).map(|k| planar_u8_frame(w, h, cw, ch, k)).collect()
+    };
+    let gop_u16 = |bd: u32, ssx: bool, ssy: bool| -> Vec<Vec<u16>> {
+        let cw = if ssx { w.div_ceil(2) } else { w };
+        let ch = if ssy { h.div_ceil(2) } else { h };
+        (0..n)
+            .map(|k| planar_u16_frame(w, h, cw, ch, bd, k))
+            .collect()
+    };
+    let gop_cases: Vec<(&str, Vec<Vec<u8>>)> = {
+        let f444 = gop_u8(false, false);
+        let f422 = gop_u8(true, false);
+        let f420_10 = gop_u16(10, true, true);
+        let f444_12 = gop_u16(12, false, false);
+        let f422_10 = gop_u16(10, true, false);
+        fn refs8(v: &[Vec<u8>]) -> Vec<&[u8]> {
+            v.iter().map(|f| f.as_slice()).collect()
+        }
+        fn refs16(v: &[Vec<u16>]) -> Vec<&[u16]> {
+            v.iter().map(|f| f.as_slice()).collect()
+        }
+        vec![
+            (
+                "gop-444-8bit",
+                oxideav_vp9::encode_vp9_lossy_sequence_444(&refs8(&f444), w as u32, h as u32, q)
+                    .expect("gop 444"),
+            ),
+            (
+                "gop-422-8bit",
+                oxideav_vp9::encode_vp9_lossy_sequence_422(&refs8(&f422), w as u32, h as u32, q)
+                    .expect("gop 422"),
+            ),
+            (
+                "gop-420-10bit",
+                oxideav_vp9::encode_vp9_lossy_sequence_hbd(
+                    &refs16(&f420_10),
+                    w as u32,
+                    h as u32,
+                    10,
+                    true,
+                    q,
+                )
+                .expect("gop 420-10"),
+            ),
+            (
+                "gop-444-12bit",
+                oxideav_vp9::encode_vp9_lossy_sequence_hbd(
+                    &refs16(&f444_12),
+                    w as u32,
+                    h as u32,
+                    12,
+                    false,
+                    q,
+                )
+                .expect("gop 444-12"),
+            ),
+            (
+                "gop-422-10bit",
+                oxideav_vp9::encode_vp9_lossy_sequence_hbd_422(
+                    &refs16(&f422_10),
+                    w as u32,
+                    h as u32,
+                    10,
+                    q,
+                )
+                .expect("gop 422-10"),
+            ),
+        ]
+    };
+    for (name, frames) in gop_cases {
+        let sub = std::path::Path::new(&dir).join(name);
+        std::fs::create_dir_all(&sub).expect("create dump dir");
+        std::fs::write(sub.join("input.ivf"), ivf_wrap(&frames, w as u16, h as u16))
+            .expect("write ivf");
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        let decoded = oxideav_vp9::decode_vp9_sequence(&refs).expect("crate decode");
+        let mut yuv = Vec::new();
+        for f in &decoded {
+            yuv.extend_from_slice(&f.to_planar_bytes());
+        }
+        std::fs::write(sub.join("crate-decode.yuv"), yuv).expect("write yuv");
     }
 }
 

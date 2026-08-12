@@ -1526,7 +1526,22 @@ pub(crate) fn encode_keyframe_lossy_tree_with_state(
 /// eighth-pel MV differences are codeable whenever the §6.5.13
 /// `use_mv_hp` gate allows.
 pub(crate) fn lossless_pframe_header(width: u32, height: u32) -> Vp9FrameHeader {
-    let mut hdr = lossless_keyframe_header(width, height);
+    lossless_pframe_header_fmt(width, height, LossyFormat::YUV420_8)
+}
+
+/// [`lossless_pframe_header`] generalised over the §6.2 profile /
+/// bit-depth / chroma-subsampling triple (see [`LossyFormat`]). A
+/// non-keyframe codes no `color_config( )` — the decoder inherits the
+/// keyframe's — but the writer-side header still carries the format so
+/// every geometry derivation (§6.4.22 chroma tx sizes, §8.6.1
+/// quantizers, §8.5.2 chroma MV rounding) keys off the right values.
+pub(crate) fn lossless_pframe_header_fmt(
+    width: u32,
+    height: u32,
+    fmt: LossyFormat,
+) -> Vp9FrameHeader {
+    let mut hdr =
+        lossless_keyframe_header_ex(width, height, fmt.profile, fmt.bit_depth, fmt.ssx, fmt.ssy);
     hdr.frame_type = FrameType::NonKeyFrame;
     hdr.error_resilient_mode = true;
     hdr.refresh_frame_context = false;
@@ -4060,35 +4075,112 @@ pub(crate) fn encode_sequence_lossy_420(
     height: u32,
     base_q_idx: u8,
 ) -> Result<Vec<Vec<u8>>, Error> {
-    if frames.is_empty() || base_q_idx == 0 {
+    encode_sequence_lossy_u8(frames, width, height, base_q_idx, true, true, false)
+}
+
+/// Encode a lossy GOP from 8-bit planar frames at any chroma
+/// subsampling (profile 0 at 4:2:0, profile 1 otherwise) —
+/// [`encode_sequence_lossy_420`] / [`encode_sequence_lossy_chained_420`]
+/// generalised over the §6.2 format triple via
+/// [`encode_sequence_lossy_planes`].
+pub(crate) fn encode_sequence_lossy_u8(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+    ssx: bool,
+    ssy: bool,
+    chained: bool,
+) -> Result<Vec<Vec<u8>>, Error> {
+    if frames.is_empty() {
         return Err(Error::Unsupported);
     }
-    if width == 0 || height == 0 || width > (1 << 16) || height > (1 << 16) {
-        return Err(Error::Unsupported);
-    }
-    let w = width as usize;
-    let h = height as usize;
-    let cw = width.div_ceil(2) as usize;
-    let ch = height.div_ceil(2) as usize;
-    let need = w * h + 2 * cw * ch;
+    validate_lossy_args(width, height, base_q_idx)?;
+    let fmt = LossyFormat::new(8, ssx, ssy)?;
+    let need = fmt.planar_len(width, height);
     if frames.iter().any(|f| f.len() < need) {
         return Err(Error::Unsupported);
     }
+    let frame_targets: Vec<[Plane; 3]> = frames
+        .iter()
+        .map(|f| padded_targets_from_u8(f, width, height, fmt))
+        .collect();
+    encode_sequence_lossy_planes(&frame_targets, width, height, base_q_idx, fmt, chained)
+}
 
-    let mi_cols = ((width + 7) >> 3) as usize;
-    let mi_rows = ((height + 7) >> 3) as usize;
-    let y_w = mi_cols * 8;
-    let y_h = mi_rows * 8;
-    let uv_w = y_w >> 1;
-    let uv_h = y_h >> 1;
+/// [`encode_sequence_lossy_u8`] over native 10/12-bit `u16` planar
+/// frames (profile 2 at 4:2:0, profile 3 otherwise). Every sample must
+/// fit `[0, (1 << bit_depth) - 1]`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_sequence_lossy_u16(
+    frames: &[&[u16]],
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    base_q_idx: u8,
+    ssx: bool,
+    ssy: bool,
+    chained: bool,
+) -> Result<Vec<Vec<u8>>, Error> {
+    if frames.is_empty() {
+        return Err(Error::Unsupported);
+    }
+    validate_lossy_args(width, height, base_q_idx)?;
+    if bit_depth != 10 && bit_depth != 12 {
+        return Err(Error::Unsupported);
+    }
+    let fmt = LossyFormat::new(bit_depth, ssx, ssy)?;
+    let need = fmt.planar_len(width, height);
+    let max = (1u16 << bit_depth) - 1;
+    if frames
+        .iter()
+        .any(|f| f.len() < need || f[..need].iter().any(|&s| s > max))
+    {
+        return Err(Error::Unsupported);
+    }
+    let frame_targets: Vec<[Plane; 3]> = frames
+        .iter()
+        .map(|f| padded_targets_from_u16(f, width, height, fmt))
+        .collect();
+    encode_sequence_lossy_planes(&frame_targets, width, height, base_q_idx, fmt, chained)
+}
 
-    let padded_targets = |pixels: &[u8]| -> [Plane; 3] {
-        [
-            padded_plane_from_bytes(&pixels[..w * h], w, h, y_w, y_h),
-            padded_plane_from_bytes(&pixels[w * h..w * h + cw * ch], cw, ch, uv_w, uv_h),
-            padded_plane_from_bytes(&pixels[w * h + cw * ch..], cw, ch, uv_w, uv_h),
-        ]
-    };
+/// The unified lossy GOP encoder over MI-padded per-frame targets at
+/// any [`LossyFormat`], on either framing model:
+///
+/// * `chained == false` — the classic **error-resilient** P-frame
+///   chain: §7.2.6 derives `UsePrevFrameMvs == 0` on the decode side
+///   and §7.2 `setup_past_independence( )` zeroes the effective sign
+///   biases (no compound).
+/// * `chained == true` — shown **non-error-resilient** P-frames: the
+///   decoder's §7.2.6 derivation is 1, the writer threads each frame's
+///   §6.4.4 motion field into the next frame's §6.5 scans, and the
+///   coded sign biases stay live (the `[ LAST, ALTREF ]` compound
+///   election runs inside the ordinary shown GOP).
+///
+/// Both models: content-adaptive keyframe tree, per-frame §8.8
+/// `(level, sharpness)` election ([`finish_frame_with_filter`]), the
+/// keyframe parked as long-term GOLDEN/ALTREF in §8.10 slot 1
+/// (`ref_frame_idx = [0, 1, 1]`), and the reference chain threading
+/// the **filtered** reconstructions per the §8.10 post-filter store.
+pub(crate) fn encode_sequence_lossy_planes(
+    frame_targets: &[[Plane; 3]],
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+    fmt: LossyFormat,
+    chained: bool,
+) -> Result<Vec<Vec<u8>>, Error> {
+    use crate::frame_writer::PrevMotionField;
+
+    if frame_targets.is_empty() {
+        return Err(Error::Unsupported);
+    }
+    validate_lossy_args(width, height, base_q_idx)?;
+    let w = width as usize;
+    let h = height as usize;
+    let (cw, ch) = fmt.chroma_dims(width, height);
+
     // §8.10 FrameStore crop of a reconstruction: the visible extents.
     let visible_crop = |recon: &ReconState| -> [Vec<i32>; 3] {
         let crop = |p: &Plane, vw: usize, vh: usize| -> Vec<i32> {
@@ -4108,32 +4200,40 @@ pub(crate) fn encode_sequence_lossy_420(
     };
 
     // Lossy keyframe over the content-adaptive partition/tx tree, with
-    // the elected §8.8 filter level and the filtered reconstruction.
-    let kf_targets = padded_targets(frames[0]);
-    let kf_hdr = lossy_keyframe_header_420(width, height, base_q_idx);
+    // the elected §8.8 filter params and the filtered reconstruction.
+    let kf_targets = &frame_targets[0];
+    let kf_hdr = lossy_keyframe_header_fmt(width, height, base_q_idx, fmt);
     let kf_plan = plan_keyframe_tree(
-        &kf_targets,
-        mi_rows as u32,
-        mi_cols as u32,
-        true,
-        true,
-        8,
+        kf_targets,
+        (height + 7) >> 3,
+        (width + 7) >> 3,
+        fmt.ssx,
+        fmt.ssy,
+        u32::from(fmt.bit_depth),
         base_q_idx,
     );
     let (kf0, kf_recon0, kf_state0) =
-        encode_keyframe_lossy_tree_with_state(&kf_hdr, &kf_targets, &kf_plan)?;
+        encode_keyframe_lossy_tree_with_state(&kf_hdr, kf_targets, &kf_plan)?;
+    // Chain model: the per-MI state is invariant under the filter-level
+    // re-encode (only the fixed-width §6.2.8 header fields change), so
+    // kf_state0 is the keyframe's final §6.4.4 motion field.
+    let mut prev_field = if chained {
+        Some(PrevMotionField::from_state(&kf_state0))
+    } else {
+        None
+    };
     let (kf_bytes, kf_recon) = finish_frame_with_filter(
         &kf_hdr,
         kf0,
         kf_recon0,
         kf_state0,
-        &kf_targets,
+        kf_targets,
         w,
         h,
-        |hdr2| encode_keyframe_lossy_tree_with_state(hdr2, &kf_targets, &kf_plan),
+        |hdr2| encode_keyframe_lossy_tree_with_state(hdr2, kf_targets, &kf_plan),
     )?;
 
-    let mut out = Vec::with_capacity(frames.len());
+    let mut out = Vec::with_capacity(frame_targets.len());
     out.push(kf_bytes);
 
     // Long-term GOLDEN reference: the keyframe's reconstruction stays
@@ -4149,15 +4249,22 @@ pub(crate) fn encode_sequence_lossy_420(
     ];
     let mut prev_recon = kf_recon;
 
-    for &frame in frames.iter().skip(1) {
-        let targets = padded_targets(frame);
+    for targets in frame_targets.iter().skip(1) {
         let prev = visible_crop(&prev_recon);
         let reference: [(&[i32], usize); 3] = [
             (prev[0].as_slice(), w),
             (prev[1].as_slice(), cw),
             (prev[2].as_slice(), cw),
         ];
-        let mut hdr = lossless_pframe_header(width, height);
+        let mut hdr = lossless_pframe_header_fmt(width, height, fmt);
+        if chained {
+            // Shown non-error-resilient chain: §7.2.6 derives
+            // UsePrevFrameMvs = 1 on the decode side, and the effective
+            // sign biases are the CODED ones — the asymmetric ALTREF
+            // bias below genuinely admits compound here, unlike the
+            // error-resilient chain where §7.2 zeroes it.
+            hdr.error_resilient_mode = false;
+        }
         hdr.ref_frame_idx = Some([0, 1, 1]);
         // ALTREF (also slot 1) carries the opposite sign bias so the
         // §6.3.12 compoundReferenceAllowed derivation admits the
@@ -4172,7 +4279,7 @@ pub(crate) fn encode_sequence_lossy_420(
         };
         let (p0, recon0, state0) = encode_pframe_lossy_tree_motion_with_state(
             &hdr,
-            &targets,
+            targets,
             &reference,
             Some(&golden_ref),
             width,
@@ -4180,13 +4287,18 @@ pub(crate) fn encode_sequence_lossy_420(
             PFRAME_SEARCH_RANGE,
             true,
             true,
-            None,
+            prev_field.as_ref(),
         )?;
+        let next_field = if chained {
+            Some(PrevMotionField::from_state(&state0))
+        } else {
+            None
+        };
         let (bytes, recon) =
-            finish_frame_with_filter(&hdr, p0, recon0, state0, &targets, w, h, |hdr2| {
+            finish_frame_with_filter(&hdr, p0, recon0, state0, targets, w, h, |hdr2| {
                 encode_pframe_lossy_tree_motion_with_state(
                     hdr2,
-                    &targets,
+                    targets,
                     &reference,
                     Some(&golden_ref),
                     width,
@@ -4194,11 +4306,12 @@ pub(crate) fn encode_sequence_lossy_420(
                     PFRAME_SEARCH_RANGE,
                     true,
                     true,
-                    None,
+                    prev_field.as_ref(),
                 )
             })?;
         out.push(bytes);
         prev_recon = recon;
+        prev_field = next_field;
     }
     Ok(out)
 }
@@ -4219,152 +4332,7 @@ pub(crate) fn encode_sequence_lossy_chained_420(
     height: u32,
     base_q_idx: u8,
 ) -> Result<Vec<Vec<u8>>, Error> {
-    use crate::frame_writer::PrevMotionField;
-
-    if frames.is_empty() || base_q_idx == 0 {
-        return Err(Error::Unsupported);
-    }
-    if width == 0 || height == 0 || width > (1 << 16) || height > (1 << 16) {
-        return Err(Error::Unsupported);
-    }
-    let w = width as usize;
-    let h = height as usize;
-    let cw = width.div_ceil(2) as usize;
-    let ch = height.div_ceil(2) as usize;
-    let need = w * h + 2 * cw * ch;
-    if frames.iter().any(|f| f.len() < need) {
-        return Err(Error::Unsupported);
-    }
-
-    let mi_cols = ((width + 7) >> 3) as usize;
-    let mi_rows = ((height + 7) >> 3) as usize;
-    let y_w = mi_cols * 8;
-    let y_h = mi_rows * 8;
-    let uv_w = y_w >> 1;
-    let uv_h = y_h >> 1;
-
-    let padded_targets = |pixels: &[u8]| -> [Plane; 3] {
-        [
-            padded_plane_from_bytes(&pixels[..w * h], w, h, y_w, y_h),
-            padded_plane_from_bytes(&pixels[w * h..w * h + cw * ch], cw, ch, uv_w, uv_h),
-            padded_plane_from_bytes(&pixels[w * h + cw * ch..], cw, ch, uv_w, uv_h),
-        ]
-    };
-    let visible_crop = |recon: &ReconState| -> [Vec<i32>; 3] {
-        let crop = |p: &Plane, vw: usize, vh: usize| -> Vec<i32> {
-            let mut out = Vec::with_capacity(vw * vh);
-            for y in 0..vh {
-                for x in 0..vw {
-                    out.push(p.get(x, y));
-                }
-            }
-            out
-        };
-        [
-            crop(&recon.planes[0], w, h),
-            crop(&recon.planes[1], cw, ch),
-            crop(&recon.planes[2], cw, ch),
-        ]
-    };
-
-    let kf_targets = padded_targets(frames[0]);
-    let kf_hdr = lossy_keyframe_header_420(width, height, base_q_idx);
-    let kf_plan = plan_keyframe_tree(
-        &kf_targets,
-        mi_rows as u32,
-        mi_cols as u32,
-        true,
-        true,
-        8,
-        base_q_idx,
-    );
-    let (kf0, kf_recon0, kf_state0) =
-        encode_keyframe_lossy_tree_with_state(&kf_hdr, &kf_targets, &kf_plan)?;
-    // The per-MI state is invariant under the filter-level re-encode
-    // (only the fixed-width §6.2.8 header field changes), so kf_state0
-    // is the keyframe's final §6.4.4 motion field.
-    let mut prev_field = PrevMotionField::from_state(&kf_state0);
-    let (kf_bytes, kf_recon) = finish_frame_with_filter(
-        &kf_hdr,
-        kf0,
-        kf_recon0,
-        kf_state0,
-        &kf_targets,
-        w,
-        h,
-        |hdr2| encode_keyframe_lossy_tree_with_state(hdr2, &kf_targets, &kf_plan),
-    )?;
-
-    let mut out = Vec::with_capacity(frames.len());
-    out.push(kf_bytes);
-
-    // Long-term GOLDEN/ALTREF: the keyframe stays parked in §8.10 slot 1
-    // (P-frames refresh only slot 0), `ref_frame_idx = [0, 1, 1]`.
-    let golden = visible_crop(&kf_recon);
-    let golden_ref: [(&[i32], usize); 3] = [
-        (golden[0].as_slice(), w),
-        (golden[1].as_slice(), cw),
-        (golden[2].as_slice(), cw),
-    ];
-    let mut prev_recon = kf_recon;
-
-    for &frame in frames.iter().skip(1) {
-        let targets = padded_targets(frame);
-        let prev = visible_crop(&prev_recon);
-        let reference: [(&[i32], usize); 3] = [
-            (prev[0].as_slice(), w),
-            (prev[1].as_slice(), cw),
-            (prev[2].as_slice(), cw),
-        ];
-        let mut hdr = lossless_pframe_header(width, height);
-        // Shown non-error-resilient chain: §7.2.6 derives
-        // UsePrevFrameMvs = 1 on the decode side, and the effective
-        // sign biases are the CODED ones — the asymmetric ALTREF bias
-        // below genuinely admits compound here, unlike the
-        // error-resilient chain where §7.2 zeroes it.
-        hdr.error_resilient_mode = false;
-        hdr.ref_frame_idx = Some([0, 1, 1]);
-        hdr.ref_frame_sign_bias = [false, false, true];
-        hdr.quantization = QuantizationParams {
-            base_q_idx,
-            delta_q_y_dc: 0,
-            delta_q_uv_dc: 0,
-            delta_q_uv_ac: 0,
-            lossless: false,
-        };
-        let (p0, recon0, state0) = encode_pframe_lossy_tree_motion_with_state(
-            &hdr,
-            &targets,
-            &reference,
-            Some(&golden_ref),
-            width,
-            height,
-            PFRAME_SEARCH_RANGE,
-            true,
-            true,
-            Some(&prev_field),
-        )?;
-        let next_field = PrevMotionField::from_state(&state0);
-        let (bytes, recon) =
-            finish_frame_with_filter(&hdr, p0, recon0, state0, &targets, w, h, |hdr2| {
-                encode_pframe_lossy_tree_motion_with_state(
-                    hdr2,
-                    &targets,
-                    &reference,
-                    Some(&golden_ref),
-                    width,
-                    height,
-                    PFRAME_SEARCH_RANGE,
-                    true,
-                    true,
-                    Some(&prev_field),
-                )
-            })?;
-        out.push(bytes);
-        prev_recon = recon;
-        prev_field = next_field;
-    }
-    Ok(out)
+    encode_sequence_lossy_u8(frames, width, height, base_q_idx, true, true, true)
 }
 
 /// Bisect `base_q_idx` for the **lowest** quantizer whose coded frame

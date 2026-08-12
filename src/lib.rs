@@ -930,6 +930,79 @@ pub fn encode_vp9_lossy_sequence_chained(
     pixel_encoder::encode_sequence_lossy_chained_420(frames, width, height, base_q_idx)
 }
 
+/// Encode a **sequence** of 8-bit **4:4:4** planar frames (each plane
+/// `width × height`) into a lossy profile-1 VP9 stream at quantizer
+/// index `base_q_idx` (`1..=255`).
+///
+/// Runs on the §7.2.6 **chain framing** (shown non-error-resilient
+/// P-frames — the [`encode_vp9_lossy_sequence_chained`] model), with
+/// the same motion search / multi-reference / compound election /
+/// per-frame §8.8 filter election pipeline as the 4:2:0 encoders and
+/// the identical decoder-mirror guarantee: every decoded frame equals
+/// the encoder's in-loop reconstruction bit-for-bit.
+pub fn encode_vp9_lossy_sequence_444(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+) -> Result<Vec<Vec<u8>>, Error> {
+    pixel_encoder::encode_sequence_lossy_u8(frames, width, height, base_q_idx, false, false, true)
+}
+
+/// [`encode_vp9_lossy_sequence_444`] at **4:2:2** (chroma planes
+/// `ceil(w/2) × height`, the `subsampling_x = 1, subsampling_y = 0`
+/// profile-1 geometry). Chain framing; same guarantees.
+pub fn encode_vp9_lossy_sequence_422(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+) -> Result<Vec<Vec<u8>>, Error> {
+    pixel_encoder::encode_sequence_lossy_u8(frames, width, height, base_q_idx, true, false, true)
+}
+
+/// Encode a **sequence** of 10/12-bit planar frames (native `u16`
+/// samples) into a lossy high-bit-depth VP9 stream at quantizer index
+/// `base_q_idx` (`1..=255`) — profile 2 when `subsample == true`
+/// (4:2:0), profile 3 when `false` (4:4:4), mirroring
+/// [`encode_vp9_lossless_hbd`]'s layout.
+///
+/// Chain framing ([`encode_vp9_lossy_sequence_chained`] model) with
+/// the full lossy pipeline — motion search, LAST/GOLDEN + compound
+/// election, per-frame §8.8 filter election — and the decoder-mirror
+/// guarantee against [`Vp9DecodedFrame`]'s native `u16` planes.
+/// Returns [`Error::Unsupported`] when `bit_depth` is not 10 or 12,
+/// any sample exceeds the bit-depth range, `base_q_idx == 0`, the
+/// sequence is empty, or any buffer is too short.
+pub fn encode_vp9_lossy_sequence_hbd(
+    frames: &[&[u16]],
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    subsample: bool,
+    base_q_idx: u8,
+) -> Result<Vec<Vec<u8>>, Error> {
+    pixel_encoder::encode_sequence_lossy_u16(
+        frames, width, height, bit_depth, base_q_idx, subsample, subsample, true,
+    )
+}
+
+/// [`encode_vp9_lossy_sequence_hbd`] at **4:2:2** (profile 3, chroma
+/// planes `ceil(w/2) × height`) — the high-bit-depth geometry the
+/// two-way `subsample` flag cannot express. Chain framing; same
+/// guarantees.
+pub fn encode_vp9_lossy_sequence_hbd_422(
+    frames: &[&[u16]],
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    base_q_idx: u8,
+) -> Result<Vec<Vec<u8>>, Error> {
+    pixel_encoder::encode_sequence_lossy_u16(
+        frames, width, height, bit_depth, base_q_idx, true, false, true,
+    )
+}
+
 /// **Rate-controlled** lossy sequence encode: like
 /// [`encode_vp9_lossy_sequence`] but instead of a fixed quantizer, every
 /// frame is coded at the *lowest* `base_q_idx` (best quality) whose

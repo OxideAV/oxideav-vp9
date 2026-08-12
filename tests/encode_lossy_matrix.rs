@@ -244,9 +244,8 @@ fn lossy_sequence_matrix_decodes_without_drift() {
     let q = 110u8;
     // (name, bit_depth, ssx, ssy, encode closure)
     type SeqEncode = Box<dyn Fn(&[Vec<u16>]) -> Vec<Vec<u8>>>;
-    let seq_u8 = |frames: &[Vec<u16>],
-                  enc: &dyn Fn(&[&[u8]]) -> Result<Vec<Vec<u8>>, Error>|
-     -> Vec<Vec<u8>> {
+    type SeqEncodeU8<'e> = &'e dyn Fn(&[&[u8]]) -> Result<Vec<Vec<u8>>, Error>;
+    let seq_u8 = |frames: &[Vec<u16>], enc: SeqEncodeU8<'_>| -> Vec<Vec<u8>> {
         let frames8: Vec<Vec<u8>> = frames
             .iter()
             .map(|f| f.iter().map(|&s| s as u8).collect())

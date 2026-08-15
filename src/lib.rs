@@ -735,9 +735,30 @@ pub fn encode_vp9_lossless_hbd(
 }
 
 /// Encode a **sequence** of 8-bit 4:2:0 planar frames into a lossless
-/// VP9 stream: a keyframe followed by `ZEROMV` inter (P-)frames, each
-/// coding the exact `frame − prediction` residual against the previous
-/// frame (single `LAST` reference, §8.10 slot 0 refreshed per frame).
+/// VP9 stream: a keyframe followed by inter (P-)frames, each coding
+/// the exact `frame − prediction` residual against the previous frame
+/// with `ZEROMV` / `NEWMV` integer motion search (single `LAST`
+/// reference, §8.10 slot 0 refreshed per frame).
+///
+/// **Chain framing (default since round 445):** every P-frame is shown
+/// and non-error-resilient, so the §7.2.6 `UsePrevFrameMvs` derivation
+/// is 1 on the decode side — and the encoder models it, threading each
+/// frame's §6.4.4 motion field into the next frame's §6.5.10 candidate
+/// scan. Motion that persists at the same position across frames
+/// reaches the previous-frame candidate and codes `NEARESTMV` /
+/// `NEARMV` (no §6.4.20 mv-diff bits) even where the spatial
+/// neighbours predict it wrongly, so temporally coherent motion codes
+/// fewer bytes than the error-resilient framing. Callers that need
+/// per-frame decode independence (§6.2 `error_resilient_mode = 1`)
+/// opt out via [`encode_vp9_lossless_sequence_error_resilient`].
+///
+/// **Byte stability:** the coded bytes of this entry changed in round
+/// 445 when the chain framing became the default; the pre-445 bytes
+/// remain available, frozen, through the explicit
+/// [`encode_vp9_lossless_sequence_error_resilient`] opt-out (the
+/// staged self-encoded corpus fixtures pin that path's exact output).
+/// Within one crate version every entry point remains
+/// byte-deterministic: identical inputs give identical bytes.
 ///
 /// Every frame of `decode_vp9_sequence( encode_vp9_lossless_sequence(
 /// frames ) )` equals its input **byte-exact**. Each element of `frames`
@@ -751,29 +772,43 @@ pub fn encode_vp9_lossless_sequence(
     width: u32,
     height: u32,
 ) -> Result<Vec<Vec<u8>>, Error> {
+    pixel_encoder::encode_sequence_lossless_chained_420(frames, width, height)
+}
+
+/// [`encode_vp9_lossless_sequence`] on the **classic error-resilient
+/// framing** — the explicit opt-out from the round-445
+/// chained-as-default promotion: every P-frame codes §6.2
+/// `error_resilient_mode = 1`, so the §7.2.6 `UsePrevFrameMvs`
+/// derivation is 0 on the decode side (no previous-frame motion
+/// candidates; each frame's entropy state is independent per §7.2
+/// `setup_past_independence( )`), and any single P-frame can be
+/// decoded after a reference loss without entropy-state drift.
+///
+/// This path's coded bytes are **frozen**: they are the exact bytes
+/// [`encode_vp9_lossless_sequence`] produced before round 445, and the
+/// staged self-encoded corpus fixtures (e.g. `odd-dims-59x37`) pin
+/// them byte-for-byte.
+///
+/// The lossless guarantee is identical to the default entry: every
+/// frame of the decoded sequence equals its input **byte-exact**.
+pub fn encode_vp9_lossless_sequence_error_resilient(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+) -> Result<Vec<Vec<u8>>, Error> {
     pixel_encoder::encode_sequence_lossless_420(frames, width, height)
 }
 
-/// [`encode_vp9_lossless_sequence`] on **non-error-resilient chain
-/// framing**: every P-frame is shown and non-error-resilient, so the
-/// §7.2.6 `UsePrevFrameMvs` derivation is 1 on the decode side — and
-/// the encoder models it, threading each frame's §6.4.4 motion field
-/// into the next frame's §6.5.10 candidate scan. Motion that persists
-/// at the same position across frames reaches the previous-frame
-/// candidate and codes `NEARESTMV` / `NEARMV` (no §6.4.20 mv-diff
-/// bits) even where the spatial neighbours predict it wrongly, so
-/// temporally coherent motion codes fewer bytes than
-/// [`encode_vp9_lossless_sequence`]'s error-resilient framing.
-///
-/// The lossless guarantee is identical: every frame of
-/// `decode_vp9_sequence( encode_vp9_lossless_sequence_chained( frames
-/// ) )` equals its input **byte-exact**.
+/// Historical alias of [`encode_vp9_lossless_sequence`]: since round
+/// 445 the §7.2.6 chain framing IS the default sequence path, so the
+/// two entries are the same encoder (kept so pre-445 callers of the
+/// explicit `_chained` name keep their exact behavior and bytes).
 pub fn encode_vp9_lossless_sequence_chained(
     frames: &[&[u8]],
     width: u32,
     height: u32,
 ) -> Result<Vec<Vec<u8>>, Error> {
-    pixel_encoder::encode_sequence_lossless_chained_420(frames, width, height)
+    encode_vp9_lossless_sequence(frames, width, height)
 }
 
 /// Encode an 8-bit 4:2:0 planar frame into a **lossy** VP9 keyframe at
@@ -889,6 +924,36 @@ pub fn encode_vp9_lossy_hbd_422(
 /// decoder's exact output, replayed by the encoder), so encoder and
 /// decoder never drift across the chain.
 ///
+/// **Chain framing (default since round 445):** every P-frame is shown
+/// and non-error-resilient, so the §7.2.6 `UsePrevFrameMvs` derivation
+/// is 1 on the decode side — the encoder models it by threading each
+/// frame's §6.4.4 motion field into the next frame's §6.5 predictor
+/// derivations and block writer. Consequences over the classic
+/// error-resilient framing
+/// ([`encode_vp9_lossy_sequence_error_resilient`]):
+///
+/// * temporally persistent motion that the spatial neighbours
+///   mispredict reaches the §6.5.10 previous-frame candidate and codes
+///   `NEARESTMV` / `NEARMV` instead of paying §6.4.20 mv-diff bits;
+/// * a non-error-resilient frame keeps its **coded** sign biases (§7.2
+///   `setup_past_independence` only zeroes them on error-resilient
+///   frames), so the `[ LAST, ALTREF ]` compound election is live
+///   inside the ordinary shown GOP — cross-fade content codes compound
+///   averages with no hidden-predecessor construction;
+/// * the round-441 elections run: the keyframe's §6.4.2 **skip
+///   election** (all-zero-residual leaves code `skip = 1` — identical
+///   reconstruction, strictly fewer bytes) and the §6.2.8 **loop-filter
+///   delta election** on every P-frame, threading the §7.2.8 persistent
+///   delta baseline exactly as the decoder folds it.
+///
+/// **Byte stability:** the coded bytes of this entry changed in round
+/// 445 when the chain framing became the default; the pre-445 bytes
+/// remain available, frozen, through the explicit
+/// [`encode_vp9_lossy_sequence_error_resilient`] opt-out (the staged
+/// `lossy-filtered-gop` corpus fixture pins that path's exact output).
+/// Within one crate version every entry point remains
+/// byte-deterministic.
+///
 /// The decoded output of every frame equals the encoder's in-loop
 /// reconstruction bit-for-bit; distortion against the source is bounded
 /// by the quantizer step. Returns [`Error::Unsupported`] for an empty
@@ -900,34 +965,44 @@ pub fn encode_vp9_lossy_sequence(
     height: u32,
     base_q_idx: u8,
 ) -> Result<Vec<Vec<u8>>, Error> {
+    pixel_encoder::encode_sequence_lossy_chained_420(frames, width, height, base_q_idx)
+}
+
+/// [`encode_vp9_lossy_sequence`] on the **classic error-resilient
+/// framing** — the explicit opt-out from the round-445
+/// chained-as-default promotion: every P-frame codes §6.2
+/// `error_resilient_mode = 1`, so §7.2.6 derives `UsePrevFrameMvs == 0`
+/// and §7.2 `setup_past_independence( )` zeroes the effective sign
+/// biases (no compound prediction) and resets the entropy state per
+/// frame — any single P-frame stays decodable after a reference loss.
+/// The round-441 keyframe skip and §6.2.8 delta elections do NOT run
+/// here: this path's coded bytes are **frozen** as the exact pre-445
+/// output of `encode_vp9_lossy_sequence`, pinned byte-for-byte by the
+/// staged `lossy-filtered-gop` corpus fixture.
+///
+/// The decoder-mirror guarantee is identical to the default entry: the
+/// decoded output equals the encoder's in-loop reconstruction
+/// bit-for-bit.
+pub fn encode_vp9_lossy_sequence_error_resilient(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+) -> Result<Vec<Vec<u8>>, Error> {
     pixel_encoder::encode_sequence_lossy_420(frames, width, height, base_q_idx)
 }
 
-/// [`encode_vp9_lossy_sequence`] on **non-error-resilient chain
-/// framing**: every P-frame is shown and non-error-resilient, so the
-/// §7.2.6 `UsePrevFrameMvs` derivation is 1 on the decode side — the
-/// encoder models it by threading each frame's §6.4.4 motion field into
-/// the next frame's §6.5 predictor derivations and block writer. Two
-/// consequences over [`encode_vp9_lossy_sequence`]:
-///
-/// * temporally persistent motion that the spatial neighbours
-///   mispredict reaches the §6.5.10 previous-frame candidate and codes
-///   `NEARESTMV` / `NEARMV` instead of paying §6.4.20 mv-diff bits;
-/// * a non-error-resilient frame keeps its **coded** sign biases (§7.2
-///   `setup_past_independence` only zeroes them on error-resilient
-///   frames), so the `[ LAST, ALTREF ]` compound election is live
-///   inside the ordinary shown GOP — cross-fade content codes compound
-///   averages with no hidden-predecessor construction.
-///
-/// The decoder-mirror guarantee is unchanged: the decoded output equals
-/// the encoder's in-loop reconstruction bit-for-bit.
+/// Historical alias of [`encode_vp9_lossy_sequence`]: since round 445
+/// the §7.2.6 chain framing IS the default lossy sequence path, so the
+/// two entries are the same encoder (kept so pre-445 callers of the
+/// explicit `_chained` name keep their exact behavior and bytes).
 pub fn encode_vp9_lossy_sequence_chained(
     frames: &[&[u8]],
     width: u32,
     height: u32,
     base_q_idx: u8,
 ) -> Result<Vec<Vec<u8>>, Error> {
-    pixel_encoder::encode_sequence_lossy_chained_420(frames, width, height, base_q_idx)
+    encode_vp9_lossy_sequence(frames, width, height, base_q_idx)
 }
 
 /// Encode a **sequence** of 8-bit **4:4:4** planar frames (each plane
@@ -1531,7 +1606,12 @@ mod encode_roundtrip_tests {
         };
         let content: Vec<Vec<u8>> = (0..4).map(frame_at).collect();
         let refs: Vec<&[u8]> = content.iter().map(|f| f.as_slice()).collect();
-        encode_vp9_lossless_sequence(&refs, w, h).expect("odd-dims lossless sequence")
+        // The staged fixture pins the classic error-resilient framing's
+        // exact bytes (this WAS the default path when the fixture was
+        // staged in round 412; round 445 promoted the chain framing to
+        // the default, so the builder names the frozen opt-out).
+        encode_vp9_lossless_sequence_error_resilient(&refs, w, h)
+            .expect("odd-dims lossless sequence")
     }
 
     /// The odd-dimensions stream decodes byte-exact back to its source
@@ -2914,7 +2994,8 @@ mod encode_roundtrip_tests {
 
     /// Build the round-420 **lossy filtered GOP** stream (profile 0,
     /// 8-bit 4:2:0, 64x64, `base_q_idx = 140`) through the public
-    /// [`encode_vp9_lossy_sequence`] API: a lossy keyframe + three lossy
+    /// [`encode_vp9_lossy_sequence_error_resilient`] API (the default
+    /// sequence path at staging time): a lossy keyframe + three lossy
     /// P-frames over gently-graded translating content, every frame
     /// closing out through the encode-side §8.8 loop-filter chain with
     /// a per-frame **elected** non-zero `loop_filter_level` — the
@@ -2928,7 +3009,11 @@ mod encode_roundtrip_tests {
     fn build_lossy_filtered_gop_stream() -> Vec<Vec<u8>> {
         let inputs: Vec<Vec<u8>> = (0..4).map(filtered_gop_frame).collect();
         let refs: Vec<&[u8]> = inputs.iter().map(|f| f.as_slice()).collect();
-        encode_vp9_lossy_sequence(&refs, 64, 64, 140).expect("filtered GOP encode")
+        // The staged fixture pins the classic error-resilient framing's
+        // exact bytes (the default path at staging time, round 420;
+        // round 445 promoted the chain framing to the default, so the
+        // builder names the frozen opt-out).
+        encode_vp9_lossy_sequence_error_resilient(&refs, 64, 64, 140).expect("filtered GOP encode")
     }
 
     /// The filtered GOP decodes end-to-end with every header carrying a
@@ -3275,6 +3360,102 @@ mod encode_roundtrip_tests {
                 staged,
                 ivf_wrap_dims(&frames, 64, 48),
                 "{name}: staged fixture bytes != builder output"
+            );
+        }
+    }
+
+    // ----- round 445: chained framing IS the default sequence path -----
+
+    /// Parse the P-frame headers of a coded 64x48 4:2:0 sequence and
+    /// return each frame's §6.2 `error_resilient_mode` flag.
+    fn pframe_er_flags(frames: &[Vec<u8>]) -> Vec<bool> {
+        let h0 = crate::header::parse_uncompressed_header(&frames[0]).expect("kf header");
+        let ref_dims = vec![(64u32, 48u32); 8];
+        frames
+            .iter()
+            .skip(1)
+            .map(|f| {
+                crate::header::parse_uncompressed_header_with_refs(
+                    f,
+                    Some(crate::header::RefFrameState {
+                        ref_dims: &ref_dims,
+                        color_config: h0.color_config,
+                    }),
+                )
+                .expect("p header")
+                .error_resilient_mode
+            })
+            .collect()
+    }
+
+    /// Round-445 default-promotion pin (lossless): the default sequence
+    /// entry codes shown NON-error-resilient P-frames (§7.2.6
+    /// `UsePrevFrameMvs == 1` chain framing), the `_chained` alias is
+    /// byte-identical to it, the `_error_resilient` opt-out codes the
+    /// classic §6.2 `error_resilient_mode = 1` framing, and both decode
+    /// byte-exact back to the source.
+    #[test]
+    fn default_lossless_sequence_rides_chain_framing() {
+        let inputs: Vec<Vec<u8>> = (0..3)
+            .map(|k| matrix_gop_frame_u8(64, 48, 32, 24, k))
+            .collect();
+        let refs: Vec<&[u8]> = inputs.iter().map(|f| f.as_slice()).collect();
+
+        let default = encode_vp9_lossless_sequence(&refs, 64, 48).expect("default");
+        let alias = encode_vp9_lossless_sequence_chained(&refs, 64, 48).expect("alias");
+        let er = encode_vp9_lossless_sequence_error_resilient(&refs, 64, 48).expect("opt-out");
+
+        assert_eq!(default, alias, "the _chained alias IS the default path");
+        assert!(
+            pframe_er_flags(&default).iter().all(|&f| !f),
+            "default P-frames must be non-error-resilient (chain framing)"
+        );
+        assert!(
+            pframe_er_flags(&er).iter().all(|&f| f),
+            "opt-out P-frames must code error_resilient_mode = 1"
+        );
+
+        // Both framings keep the lossless byte-exact guarantee.
+        for coded in [&default, &er] {
+            let coded_refs: Vec<&[u8]> = coded.iter().map(|f| f.as_slice()).collect();
+            let decoded = decode_vp9_sequence(&coded_refs).expect("decode");
+            assert_eq!(decoded.len(), inputs.len());
+            for (frame, src) in decoded.iter().zip(&inputs) {
+                assert_eq!(&frame.to_planar_bytes(), src, "lossless round-trip");
+            }
+        }
+    }
+
+    /// Round-445 default-promotion pin (lossy): chain framing on the
+    /// default entry, byte-identity of the `_chained` alias, classic
+    /// framing on the `_error_resilient` opt-out, and the
+    /// decoder-mirror end-to-end decode on both.
+    #[test]
+    fn default_lossy_sequence_rides_chain_framing() {
+        let inputs: Vec<Vec<u8>> = (0..3)
+            .map(|k| matrix_gop_frame_u8(64, 48, 32, 24, k))
+            .collect();
+        let refs: Vec<&[u8]> = inputs.iter().map(|f| f.as_slice()).collect();
+
+        let default = encode_vp9_lossy_sequence(&refs, 64, 48, 120).expect("default");
+        let alias = encode_vp9_lossy_sequence_chained(&refs, 64, 48, 120).expect("alias");
+        let er = encode_vp9_lossy_sequence_error_resilient(&refs, 64, 48, 120).expect("opt-out");
+
+        assert_eq!(default, alias, "the _chained alias IS the default path");
+        assert!(
+            pframe_er_flags(&default).iter().all(|&f| !f),
+            "default P-frames must be non-error-resilient (chain framing)"
+        );
+        assert!(
+            pframe_er_flags(&er).iter().all(|&f| f),
+            "opt-out P-frames must code error_resilient_mode = 1"
+        );
+
+        for coded in [&default, &er] {
+            let coded_refs: Vec<&[u8]> = coded.iter().map(|f| f.as_slice()).collect();
+            assert_eq!(
+                decode_vp9_sequence(&coded_refs).expect("decode").len(),
+                inputs.len()
             );
         }
     }

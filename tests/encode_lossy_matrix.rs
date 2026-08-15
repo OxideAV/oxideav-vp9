@@ -612,6 +612,39 @@ fn dump_matrix_streams_for_black_box_validation() {
                 oxideav_vp9::encode_vp9_lossy_sequence_chained(&refs, w as u32, h as u32, 170)
                     .expect("gop lfdeltas")
             }),
+            // Round-445 default-path streams: the promoted chained
+            // defaults themselves (4:2:0 lossy, lossless with the
+            // skip-elected keyframe) and the rate-controlled chain
+            // (bisected per-frame q + budget-guarded delta election).
+            ("gop-420-8bit-default", {
+                let f420 = gop_u8(true, true);
+                oxideav_vp9::encode_vp9_lossy_sequence(&refs8(&f420), w as u32, h as u32, q)
+                    .expect("gop 420 default")
+            }),
+            ("gop-lossless-chained", {
+                let flat_patch: Vec<Vec<u8>> = (0..4usize)
+                    .map(|k| {
+                        let cw = w.div_ceil(2);
+                        let ch = h.div_ceil(2);
+                        let mut px = vec![100u8; w * h + 2 * cw * ch];
+                        for y in 0..16usize {
+                            for x in 0..16usize {
+                                px[(y + 12) * w + x + 8 + 3 * k] =
+                                    ((x * 31 + y * 17 + 7) % 251) as u8;
+                            }
+                        }
+                        px
+                    })
+                    .collect();
+                let refs: Vec<&[u8]> = flat_patch.iter().map(|f| f.as_slice()).collect();
+                oxideav_vp9::encode_vp9_lossless_sequence(&refs, w as u32, h as u32)
+                    .expect("gop lossless chained")
+            }),
+            ("gop-420-8bit-rc", {
+                let f420 = gop_u8(true, true);
+                oxideav_vp9::encode_vp9_lossy_sequence_rc(&refs8(&f420), w as u32, h as u32, 1200)
+                    .expect("gop rc")
+            }),
         ]
     };
     for (name, frames) in gop_cases {

@@ -1539,14 +1539,48 @@ fn decode_single_frame(
 /// process; single + compound prediction, segmentation, and the §8.10
 /// reference-buffer update are all wired.
 pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Error> {
-    let mut bufs = RefBuffers::new();
+    let mut decoder = Vp9SequenceDecoder::new();
     let mut out = Vec::new();
+    for &frame in frames {
+        if let Some(f) = decoder.push_frame(frame)? {
+            out.push(f);
+        }
+    }
+    Ok(out)
+}
+
+/// Incremental multi-frame VP9 stream decoder — the stateful form of
+/// [`decode_vp9_sequence`], threading the identical cross-frame state
+/// one coded frame at a time.
+///
+/// Feed coded frames in decode order via [`Self::push_frame`] (the
+/// first must be a key frame). The struct owns every piece of §-defined
+/// persistent decode state:
+///
+/// * the §8.10 reference buffers + `FrameStore[ ]` display copies
+///   (`refresh_frame_flags` updates, §8.9 `show_existing_frame`);
+/// * the §6.5 previous-frame motion field feeding the §7.2.6
+///   `UsePrevFrameMvs` derivation;
+/// * the §6.1.2 / §7.2 `FrameContext[ 4 ]` entropy probability banks
+///   (`load_probs( )` / `save_probs( )`, including the full §6.1.2
+///   `refresh_probs( )` backward adaptation on non-frame-parallel
+///   streams);
+/// * the §7.2.10 persistent segmentation feature table, the §7.2.8
+///   persistent loop-filter deltas, and the §6.4.14
+///   `PrevSegmentIds[ ][ ]` map.
+///
+/// A caller feeding the same frames in the same order gets exactly the
+/// [`decode_vp9_sequence`] outputs (that function is a thin loop over
+/// this struct). Superframes (Annex B) must be split *before* pushing
+/// — see [`crate::split_superframe`].
+pub struct Vp9SequenceDecoder {
+    bufs: RefBuffers,
     // The most-recently-decoded color config + frame dims (for the §6.2
     // inter header's inherited color config + §8.10 ref dims).
-    let mut last_color: Option<ColorConfig> = None;
+    last_color: Option<ColorConfig>,
     // The previous decoded frame's §6.4.4 state + show/size for the §6.5
     // prev-MV scan + §7.2.6 UsePrevFrameMvs derivation.
-    let mut prev_state: Option<(Vp9FrameState, u32, u32, bool)> = None;
+    prev_state: Option<(Vp9FrameState, u32, u32, bool)>,
     // §8.10 `FrameStore[ ]`: the eight reference slots as displayable
     // frames, for a later §8.9 `show_existing_frame` output. Per §8.10
     // step 1, EVERY decoded frame writes the slots `refresh_frame_flags`
@@ -1555,23 +1589,20 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
     // that stored frame's own §8.9 dimensions / bit depth. `RefBuffers`
     // already tracks the sample planes; this parallel array keeps the
     // crop + packing metadata needed to re-emit the frame verbatim.
-    let mut frame_store: [Option<Vp9DecodedFrame>; 8] = Default::default();
-
+    frame_store: [Option<Vp9DecodedFrame>; 8],
     // §6.1.2 / §7.2 `FrameContext[ 4 ]` — the persistent entropy
     // probability banks `load_probs( )` / `save_probs( )` thread across
     // frames. Initialised to the §10.5 defaults; a key / intra-only /
     // error-resilient frame's §7.2 `setup_past_independence( )` resets
     // the bank(s) again before the frame folds its own compressed-header
     // forward updates on top.
-    let mut frame_contexts: [FrameContext; 4] = Default::default();
-
+    frame_contexts: [FrameContext; 4],
     // §7.2 `LastFrameType` — the previous (non-show-existing) frame's
     // `frame_type`, feeding the §8.4.3 `updateFactor` selection. The
     // uncompressed-header listing sets `LastFrameType = frame_type`
     // BEFORE reading the new `frame_type`, and a `show_existing_frame`
     // packet returns earlier, leaving it untouched.
-    let mut last_frame_type_was_key = false;
-
+    last_frame_type_was_key: bool,
     // §7.2.10 / §7.2 persistent segmentation feature table: per §7.2.10
     // "segmentation_update_data equal to 0 indicates that the
     // segmentation parameters should keep their existing values", so
@@ -1581,17 +1612,15 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
     // intra-only / error-resilient frame) clears them to zero. The
     // per-frame header parse alone cannot see this state, so it is
     // threaded here and substituted into the parsed header below.
-    let mut persist_feature_enabled = [[false; SEG_LVL_MAX]; MAX_SEGMENTS];
-    let mut persist_feature_data = [[0i16; SEG_LVL_MAX]; MAX_SEGMENTS];
-    let mut persist_abs_or_delta = false;
-
+    persist_feature_enabled: [[bool; SEG_LVL_MAX]; MAX_SEGMENTS],
+    persist_feature_data: [[i16; SEG_LVL_MAX]; MAX_SEGMENTS],
+    persist_abs_or_delta: bool,
     // §7.2.8 persistent loop-filter deltas: `loop_filter_delta_update ==
     // 0` (or an individual update flag of 0) keeps the existing
     // `loop_filter_ref_deltas` / `loop_filter_mode_deltas`; §7.2
     // `setup_past_independence( )` resets them to the defaults.
-    let mut persist_ref_deltas = DEFAULT_LOOP_FILTER_REF_DELTAS;
-    let mut persist_mode_deltas = DEFAULT_LOOP_FILTER_MODE_DELTAS;
-
+    persist_ref_deltas: [i8; 4],
+    persist_mode_deltas: [i8; 2],
     // §6.4.14 `PrevSegmentIds[ ][ ]` — the persistent segmentation map a
     // §6.4.12 `temporal_update` / `update_map == 0` frame predicts from.
     // §8.1 step 3 only refreshes it after a frame with
@@ -1600,9 +1629,71 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
     // frame, NOT its own (possibly Min-collapsed) `SegmentIds`. Tracking
     // it separately from the per-frame `prev_state` snapshot is what keeps
     // a run of `update_map == 0` inter frames reading the original map.
-    let mut prev_segment_ids_map: Option<(Vec<u8>, u32, u32)> = None;
+    prev_segment_ids_map: Option<(Vec<u8>, u32, u32)>,
+}
 
-    for &frame in frames {
+impl std::fmt::Debug for Vp9SequenceDecoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The banks/buffers are megabyte-scale working state; summarise.
+        f.debug_struct("Vp9SequenceDecoder")
+            .field("last_color", &self.last_color)
+            .field("has_prev_frame", &self.prev_state.is_some())
+            .field("persist_ref_deltas", &self.persist_ref_deltas)
+            .field("persist_mode_deltas", &self.persist_mode_deltas)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for Vp9SequenceDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Vp9SequenceDecoder {
+    /// Fresh decoder state: empty §8.10 buffers, default §10.5
+    /// probability banks, default §7.2.8 deltas, no previous frame.
+    pub fn new() -> Self {
+        Self {
+            bufs: RefBuffers::new(),
+            last_color: None,
+            prev_state: None,
+            frame_store: Default::default(),
+            frame_contexts: Default::default(),
+            last_frame_type_was_key: false,
+            persist_feature_enabled: [[false; SEG_LVL_MAX]; MAX_SEGMENTS],
+            persist_feature_data: [[0i16; SEG_LVL_MAX]; MAX_SEGMENTS],
+            persist_abs_or_delta: false,
+            persist_ref_deltas: DEFAULT_LOOP_FILTER_REF_DELTAS,
+            persist_mode_deltas: DEFAULT_LOOP_FILTER_MODE_DELTAS,
+            prev_segment_ids_map: None,
+        }
+    }
+
+    /// Decode one coded frame (one §6.2 uncompressed header + §6.3
+    /// compressed header + §6.4 tile data — e.g. the body of one IVF
+    /// packet, after any Annex B superframe split), threading every
+    /// piece of persistent state exactly as [`decode_vp9_sequence`]
+    /// does.
+    ///
+    /// Returns `Ok( Some( frame ) )` when the pushed frame is *shown*
+    /// (`show_frame == 1`, or a §8.9 `show_existing_frame` re-display)
+    /// and `Ok( None )` for a hidden reference-only frame.
+    pub fn push_frame(&mut self, frame: &[u8]) -> Result<Option<Vp9DecodedFrame>, Error> {
+        let Self {
+            bufs,
+            last_color,
+            prev_state,
+            frame_store,
+            frame_contexts,
+            last_frame_type_was_key,
+            persist_feature_enabled,
+            persist_feature_data,
+            persist_abs_or_delta,
+            persist_ref_deltas,
+            persist_mode_deltas,
+            prev_segment_ids_map,
+        } = self;
         // Peek the uncompressed header (with inherited ref state so inter
         // frames parse).
         let ref_dims: Vec<(u32, u32)> = (0..8)
@@ -1624,11 +1715,10 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
                 .get(idx)
                 .and_then(|s| s.clone())
                 .ok_or(Error::InvalidBitstream)?;
-            out.push(f);
             // §7.2.6 NOTE: compute_image_size is not invoked for a
             // show_existing_frame packet, so it leaves `prev_state` (the
             // §7.2.6 "previous invocation" record) untouched.
-            continue;
+            return Ok(Some(f));
         }
 
         let frame_is_intra = matches!(hdr.frame_type, FrameType::KeyFrame) || hdr.intra_only;
@@ -1639,11 +1729,11 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
         // defaults BEFORE its own loop_filter_params( ) /
         // segmentation_params( ) apply on top.
         if frame_is_intra || hdr.error_resilient_mode {
-            persist_feature_enabled = [[false; SEG_LVL_MAX]; MAX_SEGMENTS];
-            persist_feature_data = [[0i16; SEG_LVL_MAX]; MAX_SEGMENTS];
-            persist_abs_or_delta = false;
-            persist_ref_deltas = DEFAULT_LOOP_FILTER_REF_DELTAS;
-            persist_mode_deltas = DEFAULT_LOOP_FILTER_MODE_DELTAS;
+            *persist_feature_enabled = [[false; SEG_LVL_MAX]; MAX_SEGMENTS];
+            *persist_feature_data = [[0i16; SEG_LVL_MAX]; MAX_SEGMENTS];
+            *persist_abs_or_delta = false;
+            *persist_ref_deltas = DEFAULT_LOOP_FILTER_REF_DELTAS;
+            *persist_mode_deltas = DEFAULT_LOOP_FILTER_MODE_DELTAS;
             // §7.2: `ref_frame_sign_bias[ i ] = 0 for i = 0..3`. The
             // §6.2 ref-frames loop consumes the sign-bias *bits* before
             // setup_past_independence( ) runs (the reset sits after the
@@ -1685,13 +1775,13 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
         // feature table (even across `segmentation_enabled == 0`
         // frames); `segmentation_update_data == 1` rewrites it.
         if hdr.segmentation.update_data {
-            persist_feature_enabled = hdr.segmentation.feature_enabled;
-            persist_feature_data = hdr.segmentation.feature_data;
-            persist_abs_or_delta = hdr.segmentation.abs_or_delta_update;
+            *persist_feature_enabled = hdr.segmentation.feature_enabled;
+            *persist_feature_data = hdr.segmentation.feature_data;
+            *persist_abs_or_delta = hdr.segmentation.abs_or_delta_update;
         } else {
-            hdr.segmentation.feature_enabled = persist_feature_enabled;
-            hdr.segmentation.feature_data = persist_feature_data;
-            hdr.segmentation.abs_or_delta_update = persist_abs_or_delta;
+            hdr.segmentation.feature_enabled = *persist_feature_enabled;
+            hdr.segmentation.feature_data = *persist_feature_data;
+            hdr.segmentation.abs_or_delta_update = *persist_abs_or_delta;
         }
 
         let lossless = hdr.quantization.lossless;
@@ -1758,7 +1848,7 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
                 || hdr.error_resilient_mode
                 || hdr.reset_frame_context == 3;
             if reset_all {
-                frame_contexts = Default::default();
+                *frame_contexts = Default::default();
             } else if hdr.reset_frame_context == 2 {
                 frame_contexts[hdr.frame_context_idx as usize] = FrameContext::default();
             }
@@ -1798,7 +1888,7 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
                 frame_contexts[frame_context_idx].apply_intra(&chdr_parsed);
             }
             let chdr = ChdrKind::Intra(Box::new(chdr_parsed));
-            let products = decode_single_frame(frame, &hdr, ch_end, chdr, Some(&bufs), prev)?;
+            let products = decode_single_frame(frame, &hdr, ch_end, chdr, Some(bufs), prev)?;
             if hdr.refresh_frame_context && non_parallel {
                 // refresh_probs( ), FrameIsIntra == 1 arm:
                 //   load_probs( idx ) ; adapt_coef_probs( ) ;
@@ -1811,7 +1901,7 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
                     &products.counts.token,
                     &products.counts.more_coefs,
                     true,
-                    last_frame_type_was_key,
+                    *last_frame_type_was_key,
                 );
                 frame_contexts[frame_context_idx] = work;
             }
@@ -1838,7 +1928,7 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
                 frame_contexts[frame_context_idx].apply_inter(&chdr_parsed);
             }
             let chdr = ChdrKind::Inter(Box::new(chdr_parsed));
-            let products = decode_single_frame(frame, &hdr, ch_end, chdr, Some(&bufs), prev)?;
+            let products = decode_single_frame(frame, &hdr, ch_end, chdr, Some(bufs), prev)?;
             if hdr.refresh_frame_context && non_parallel {
                 // refresh_probs( ), FrameIsIntra == 0 arm:
                 //   load_probs( idx ) ; adapt_coef_probs( ) ;
@@ -1853,7 +1943,7 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
                     &products.counts.token,
                     &products.counts.more_coefs,
                     false,
-                    last_frame_type_was_key,
+                    *last_frame_type_was_key,
                 );
                 crate::prob_adapt::adapt_noncoef_probs(
                     &mut work,
@@ -1869,7 +1959,7 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
 
         // §7.2: LastFrameType tracks the just-decoded frame's type for
         // the next frame's §8.4.3 updateFactor selection.
-        last_frame_type_was_key = matches!(hdr.frame_type, FrameType::KeyFrame);
+        *last_frame_type_was_key = matches!(hdr.frame_type, FrameType::KeyFrame);
 
         // §8.10 reference frame update: store the (loop-filtered) working
         // planes into the slots `refresh_frame_flags` names.
@@ -1892,14 +1982,14 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
         // tolerate it by adopting its own config) + the prev-frame motion
         // field.
         if frame_is_intra || last_color.is_none() {
-            last_color = Some(hdr.color_config);
+            *last_color = Some(hdr.color_config);
         }
         // §8.1 step 3: refresh PrevSegmentIds only after a frame that
         // built a fresh map (`segmentation_enabled && update_map`). A
         // frame reusing the map leaves the persistent copy untouched so
         // the *next* frame still predicts from the original.
         if hdr.segmentation.enabled && hdr.segmentation.update_map {
-            prev_segment_ids_map = Some((
+            *prev_segment_ids_map = Some((
                 products.state.segment_ids.clone(),
                 hdr.frame_width,
                 hdr.frame_height,
@@ -1907,7 +1997,7 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
         }
 
         let shown = hdr.show_frame;
-        prev_state = Some((products.state, hdr.frame_width, hdr.frame_height, shown));
+        *prev_state = Some((products.state, hdr.frame_width, hdr.frame_height, shown));
 
         // §8.10 step 1: store the decoded frame into the `FrameStore[ ]`
         // slots `refresh_frame_flags` names. This happens for every decoded
@@ -1922,12 +2012,8 @@ pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Err
 
         // §8.9: a hidden (`show_frame == 0`) frame is decoded as a reference
         // but not emitted; only shown frames are output here.
-        if shown {
-            out.push(products.out);
-        }
+        Ok(if shown { Some(products.out) } else { None })
     }
-
-    Ok(out)
 }
 
 /// `SWITCHABLE = 4` per §7.4.10 — the frame-level interpolation-filter

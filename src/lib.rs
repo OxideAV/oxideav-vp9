@@ -494,6 +494,7 @@ mod block_inter_pred;
 mod block_writer;
 mod bool_coder;
 mod bool_encoder;
+mod codec;
 mod coef_probs;
 mod compressed;
 // The §6.3 compressed-header writer is built ahead of the keyframe
@@ -553,7 +554,11 @@ mod wide_filter;
 
 // Stable entry points: single-frame + multi-frame decode and the
 // decoded-frame type in their visible signatures.
-pub use decode_frame::{decode_intra_frame, decode_vp9_sequence, Vp9DecodedFrame};
+pub use codec::{make_decoder, make_encoder, Vp9Decoder, Vp9Encoder, Vp9EncoderOptions};
+
+pub use decode_frame::{
+    decode_intra_frame, decode_vp9_sequence, Vp9DecodedFrame, Vp9SequenceDecoder,
+};
 // Stable container utility: the Annex B superframe split that a caller
 // runs before feeding frames to `decode_vp9_sequence`.
 pub use superframe::split_superframe;
@@ -1142,9 +1147,14 @@ pub fn encode_vp9_pframe_sequence(
     Ok(frames)
 }
 
-/// No-op codec registration — round 1 has nothing to register into the
-/// runtime context until the decode / encode paths land.
-pub fn register(_ctx: &mut RuntimeContext) {}
+/// Codec registration: install the [`Vp9Decoder`] / [`Vp9Encoder`]
+/// factories, capability description, §7.2 format-matrix pixel
+/// formats, and container tag claims into the runtime context
+/// ([`make_decoder`] / [`make_encoder`] are the matching direct
+/// factories).
+pub fn register(ctx: &mut RuntimeContext) {
+    codec::register(ctx);
+}
 
 oxideav_core::register!("vp9", register);
 

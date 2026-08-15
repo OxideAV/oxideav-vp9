@@ -4435,18 +4435,75 @@ pub(crate) fn encode_sequence_lossy_planes(
     fmt: LossyFormat,
     chained: bool,
 ) -> Result<Vec<Vec<u8>>, Error> {
-    use crate::frame_writer::PrevMotionField;
-
     if frame_targets.is_empty() {
         return Err(Error::Unsupported);
     }
-    validate_lossy_args(width, height, base_q_idx)?;
-    let w = width as usize;
-    let h = height as usize;
-    let (cw, ch) = fmt.chroma_dims(width, height);
+    let mut enc = LossyGopEncoder::new(width, height, base_q_idx, fmt, chained)?;
+    let mut out = Vec::with_capacity(frame_targets.len());
+    for targets in frame_targets {
+        out.push(enc.push(targets)?);
+    }
+    Ok(out)
+}
 
-    // §8.10 FrameStore crop of a reconstruction: the visible extents.
-    let visible_crop = |recon: &ReconState| -> [Vec<i32>; 3] {
+/// The **stateful** form of [`encode_sequence_lossy_planes`]: one coded
+/// frame per [`Self::push`] call, threading the identical chain state —
+/// so a caller can stream a GOP frame-by-frame (the registry
+/// [`oxideav_core::registry::Encoder`] rides this) and the batch
+/// function is a thin loop over it, byte-for-byte.
+///
+/// The state owned here is exactly the encoder-side twin of what the
+/// decoder persists between frames:
+///
+/// * the previous frame's **filtered** reconstruction (the §8.10
+///   post-filter `FrameStore[ 0 ]` the next P-frame references);
+/// * the keyframe's filtered reconstruction parked as the long-term
+///   GOLDEN / ALTREF (§8.10 slot 1, `ref_frame_idx = [0, 1, 1]`);
+/// * on the chain framing, the previous frame's §6.4.4 motion field
+///   (the §7.2.6 `UsePrevFrameMvs == 1` model) and the §7.2.8
+///   persistent loop-filter delta baseline ([`LfDeltaState`]).
+pub(crate) struct LossyGopEncoder {
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+    fmt: LossyFormat,
+    chained: bool,
+    // Chain state — `None` / default until the keyframe push.
+    golden: Option<[Vec<i32>; 3]>,
+    prev_recon: Option<ReconState>,
+    prev_field: Option<crate::frame_writer::PrevMotionField>,
+    lf_persist: LfDeltaState,
+}
+
+impl LossyGopEncoder {
+    /// Validate the geometry / quantizer and build an encoder with no
+    /// frames pushed yet (the first [`Self::push`] codes the keyframe).
+    pub fn new(
+        width: u32,
+        height: u32,
+        base_q_idx: u8,
+        fmt: LossyFormat,
+        chained: bool,
+    ) -> Result<Self, Error> {
+        validate_lossy_args(width, height, base_q_idx)?;
+        Ok(Self {
+            width,
+            height,
+            base_q_idx,
+            fmt,
+            chained,
+            golden: None,
+            prev_recon: None,
+            prev_field: None,
+            lf_persist: LfDeltaState::default(),
+        })
+    }
+
+    /// §8.10 FrameStore crop of a reconstruction: the visible extents.
+    fn visible_crop(&self, recon: &ReconState) -> [Vec<i32>; 3] {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let (cw, ch) = self.fmt.chroma_dims(self.width, self.height);
         let crop = |p: &Plane, vw: usize, vh: usize| -> Vec<i32> {
             let mut out = Vec::with_capacity(vw * vh);
             for y in 0..vh {
@@ -4461,70 +4518,100 @@ pub(crate) fn encode_sequence_lossy_planes(
             crop(&recon.planes[1], cw, ch),
             crop(&recon.planes[2], cw, ch),
         ]
-    };
+    }
 
-    // Lossy keyframe over the content-adaptive partition/tx tree, with
-    // the elected §8.8 filter params and the filtered reconstruction.
-    let kf_targets = &frame_targets[0];
-    let kf_hdr = lossy_keyframe_header_fmt(width, height, base_q_idx, fmt);
-    let kf_plan = plan_keyframe_tree(
-        kf_targets,
-        (height + 7) >> 3,
-        (width + 7) >> 3,
-        fmt.ssx,
-        fmt.ssy,
-        u32::from(fmt.bit_depth),
-        base_q_idx,
-    );
-    // Chain-model sequences take the round-441 keyframe skip election
-    // (all-zero-residual leaves code skip = 1 — identical
-    // reconstruction, strictly fewer bytes); the classic framing keeps
-    // its exact historical bytes (the staged self-encoded fixtures pin
-    // them).
-    let encode_kf = |hdr2: &Vp9FrameHeader| {
-        if chained {
-            encode_keyframe_lossy_tree_elect_skip_with_state(hdr2, kf_targets, &kf_plan)
-        } else {
-            encode_keyframe_lossy_tree_with_state(hdr2, kf_targets, &kf_plan)
-        }
-    };
-    let (kf0, kf_recon0, kf_state0) = encode_kf(&kf_hdr)?;
-    // Chain model: the per-MI state is invariant under the filter-level
-    // re-encode (only the fixed-width §6.2.8 header fields change), so
-    // kf_state0 is the keyframe's final §6.4.4 motion field.
-    let mut prev_field = if chained {
-        Some(PrevMotionField::from_state(&kf_state0))
-    } else {
-        None
-    };
-    let (kf_bytes, kf_recon) = finish_frame_with_filter(
-        &kf_hdr, kf0, kf_recon0, kf_state0, kf_targets, w, h, encode_kf,
-    )?;
+    /// Encode the next frame of the GOP over MI-padded targets: the
+    /// first call codes the keyframe, every later call a P-frame
+    /// referencing the previous push's filtered reconstruction.
+    pub fn push(&mut self, targets: &[Plane; 3]) -> Result<Vec<u8>, Error> {
+        use crate::frame_writer::PrevMotionField;
 
-    // §7.2 setup_past_independence( ) runs on the keyframe (and, for
-    // the classic framing, on every error-resilient P-frame), so the
-    // chain's persistent §7.2.8 delta baseline starts at the defaults;
-    // the keyframe itself codes no update.
-    let mut lf_persist = LfDeltaState::default();
+        let (width, height) = (self.width, self.height);
+        let (base_q_idx, fmt, chained) = (self.base_q_idx, self.fmt, self.chained);
+        let w = width as usize;
+        let h = height as usize;
+        let (cw, ch) = fmt.chroma_dims(width, height);
 
-    let mut out = Vec::with_capacity(frame_targets.len());
-    out.push(kf_bytes);
+        let Some(prev_recon) = self.prev_recon.as_ref() else {
+            // Lossy keyframe over the content-adaptive partition/tx
+            // tree, with the elected §8.8 filter params and the
+            // filtered reconstruction.
+            let kf_hdr = lossy_keyframe_header_fmt(width, height, base_q_idx, fmt);
+            let kf_plan = plan_keyframe_tree(
+                targets,
+                (height + 7) >> 3,
+                (width + 7) >> 3,
+                fmt.ssx,
+                fmt.ssy,
+                u32::from(fmt.bit_depth),
+                base_q_idx,
+            );
+            // Chain-model sequences take the round-441 keyframe skip
+            // election (all-zero-residual leaves code skip = 1 —
+            // identical reconstruction, strictly fewer bytes); the
+            // classic framing keeps its exact historical bytes (the
+            // staged self-encoded fixtures pin them).
+            let encode_kf = |hdr2: &Vp9FrameHeader| {
+                if chained {
+                    encode_keyframe_lossy_tree_elect_skip_with_state(hdr2, targets, &kf_plan)
+                } else {
+                    encode_keyframe_lossy_tree_with_state(hdr2, targets, &kf_plan)
+                }
+            };
+            let (kf0, kf_recon0, kf_state0) = encode_kf(&kf_hdr)?;
+            // Chain model: the per-MI state is invariant under the
+            // filter-level re-encode (only the fixed-width §6.2.8
+            // header fields change), so kf_state0 is the keyframe's
+            // final §6.4.4 motion field.
+            self.prev_field = if chained {
+                Some(PrevMotionField::from_state(&kf_state0))
+            } else {
+                None
+            };
+            let (kf_bytes, kf_recon) = finish_frame_with_filter(
+                &kf_hdr, kf0, kf_recon0, kf_state0, targets, w, h, encode_kf,
+            )?;
 
-    // Long-term GOLDEN reference: the keyframe's reconstruction stays
-    // parked in §8.10 slot 1 (the keyframe refreshes every slot; the
-    // P-frames refresh only slot 0), so `ref_frame_idx = [0, 1, 1]`
-    // resolves LAST to the previous frame and GOLDEN to the keyframe.
-    // Post-filter, per §8.10: the store happens after §8.1 step 2.
-    let golden = visible_crop(&kf_recon);
-    let golden_ref: [(&[i32], usize); 3] = [
-        (golden[0].as_slice(), w),
-        (golden[1].as_slice(), cw),
-        (golden[2].as_slice(), cw),
-    ];
-    let mut prev_recon = kf_recon;
+            // §7.2 setup_past_independence( ) runs on the keyframe
+            // (and, for the classic framing, on every error-resilient
+            // P-frame), so the chain's persistent §7.2.8 delta baseline
+            // starts at the defaults; the keyframe itself codes no
+            // update.
+            self.lf_persist = LfDeltaState::default();
 
-    for targets in frame_targets.iter().skip(1) {
-        let prev = visible_crop(&prev_recon);
+            // Long-term GOLDEN reference: the keyframe's reconstruction
+            // stays parked in §8.10 slot 1 (the keyframe refreshes
+            // every slot; the P-frames refresh only slot 0), so
+            // `ref_frame_idx = [0, 1, 1]` resolves LAST to the previous
+            // frame and GOLDEN to the keyframe. Post-filter, per §8.10:
+            // the store happens after §8.1 step 2.
+            self.golden = Some(self.visible_crop(&kf_recon));
+            self.prev_recon = Some(kf_recon);
+            return Ok(kf_bytes);
+        };
+
+        let golden = self.golden.as_ref().expect("golden set with prev_recon");
+        let golden_ref: [(&[i32], usize); 3] = [
+            (golden[0].as_slice(), w),
+            (golden[1].as_slice(), cw),
+            (golden[2].as_slice(), cw),
+        ];
+        let prev = {
+            let crop = |p: &Plane, vw: usize, vh: usize| -> Vec<i32> {
+                let mut out = Vec::with_capacity(vw * vh);
+                for y in 0..vh {
+                    for x in 0..vw {
+                        out.push(p.get(x, y));
+                    }
+                }
+                out
+            };
+            [
+                crop(&prev_recon.planes[0], w, h),
+                crop(&prev_recon.planes[1], cw, ch),
+                crop(&prev_recon.planes[2], cw, ch),
+            ]
+        };
         let reference: [(&[i32], usize); 3] = [
             (prev[0].as_slice(), w),
             (prev[1].as_slice(), cw),
@@ -4551,6 +4638,7 @@ pub(crate) fn encode_sequence_lossy_planes(
             delta_q_uv_ac: 0,
             lossless: false,
         };
+        let prev_field = self.prev_field.as_ref();
         let (p0, recon0, state0) = encode_pframe_lossy_tree_motion_with_state(
             &hdr,
             targets,
@@ -4561,7 +4649,7 @@ pub(crate) fn encode_sequence_lossy_planes(
             PFRAME_SEARCH_RANGE,
             true,
             true,
-            prev_field.as_ref(),
+            prev_field,
         )?;
         let next_field = if chained {
             Some(PrevMotionField::from_state(&state0))
@@ -4579,7 +4667,7 @@ pub(crate) fn encode_sequence_lossy_planes(
                 PFRAME_SEARCH_RANGE,
                 true,
                 true,
-                prev_field.as_ref(),
+                prev_field,
             )
         };
         // Chain-model P-frames elect the §6.2.8 loop-filter deltas on
@@ -4596,17 +4684,16 @@ pub(crate) fn encode_sequence_lossy_planes(
                 targets,
                 w,
                 h,
-                &mut lf_persist,
+                &mut self.lf_persist,
                 re_encode,
             )?
         } else {
             finish_frame_with_filter(&hdr, p0, recon0, state0, targets, w, h, re_encode)?
         };
-        out.push(bytes);
-        prev_recon = recon;
-        prev_field = next_field;
+        self.prev_recon = Some(recon);
+        self.prev_field = next_field;
+        Ok(bytes)
     }
-    Ok(out)
 }
 
 /// [`encode_sequence_lossy_420`] on **non-error-resilient chain
@@ -4920,60 +5007,104 @@ pub(crate) fn encode_sequence_lossless_chained_420(
     width: u32,
     height: u32,
 ) -> Result<Vec<Vec<u8>>, Error> {
-    use crate::frame_writer::PrevMotionField;
-
     if frames.is_empty() {
         return Err(Error::Unsupported);
     }
-    if width == 0 || height == 0 || width > (1 << 16) || height > (1 << 16) {
-        return Err(Error::Unsupported);
+    let mut enc = LosslessGopEncoder420::new(width, height)?;
+    let mut out = Vec::with_capacity(frames.len());
+    for &frame in frames {
+        out.push(enc.push(frame)?);
     }
-    let w = width as usize;
-    let h = height as usize;
-    let cw = width.div_ceil(2) as usize;
-    let ch = height.div_ceil(2) as usize;
-    let need = w * h + 2 * cw * ch;
-    if frames.iter().any(|f| f.len() < need) {
-        return Err(Error::Unsupported);
+    Ok(out)
+}
+
+/// The **stateful** form of [`encode_sequence_lossless_chained_420`]:
+/// one coded frame per [`Self::push`] call on the §7.2.6
+/// `UsePrevFrameMvs == 1` chain model — the registry
+/// [`oxideav_core::registry::Encoder`]'s lossless path streams through
+/// this, and the batch function is a thin loop over it (byte-for-byte).
+///
+/// The threaded state is the previous frame's *source* pixels (a
+/// lossless frame reconstructs to its target exactly, so the §8.10
+/// `FrameStore[ 0 ]` reference IS the source) plus the previous frame's
+/// §6.4.4 motion field for the next frame's §6.5.10 candidate scan
+/// (the keyframe leaves an all-intra field).
+pub(crate) struct LosslessGopEncoder420 {
+    width: u32,
+    height: u32,
+    prev_pixels: Option<Vec<u8>>,
+    prev_field: Option<crate::frame_writer::PrevMotionField>,
+}
+
+impl LosslessGopEncoder420 {
+    /// Validate the geometry and build an encoder with no frames pushed
+    /// yet (the first [`Self::push`] codes the lossless keyframe).
+    pub fn new(width: u32, height: u32) -> Result<Self, Error> {
+        if width == 0 || height == 0 || width > (1 << 16) || height > (1 << 16) {
+            return Err(Error::Unsupported);
+        }
+        Ok(Self {
+            width,
+            height,
+            prev_pixels: None,
+            prev_field: None,
+        })
     }
 
-    let mi_cols = ((width + 7) >> 3) as usize;
-    let mi_rows = ((height + 7) >> 3) as usize;
-    let y_w = mi_cols * 8;
-    let y_h = mi_rows * 8;
-    let uv_w = y_w >> 1;
-    let uv_h = y_h >> 1;
+    /// Encode the next frame of the lossless chain: the first call
+    /// codes the keyframe, every later call a shown non-error-resilient
+    /// P-frame coding the exact `frame − prediction` residual against
+    /// the previous push's pixels.
+    pub fn push(&mut self, pixels: &[u8]) -> Result<Vec<u8>, Error> {
+        use crate::frame_writer::PrevMotionField;
 
-    let padded_targets = |pixels: &[u8]| -> [Plane; 3] {
-        [
+        let (width, height) = (self.width, self.height);
+        let w = width as usize;
+        let h = height as usize;
+        let cw = width.div_ceil(2) as usize;
+        let ch = height.div_ceil(2) as usize;
+        let need = w * h + 2 * cw * ch;
+        if pixels.len() < need {
+            return Err(Error::Unsupported);
+        }
+
+        let mi_cols = ((width + 7) >> 3) as usize;
+        let mi_rows = ((height + 7) >> 3) as usize;
+        let y_w = mi_cols * 8;
+        let y_h = mi_rows * 8;
+        let uv_w = y_w >> 1;
+        let uv_h = y_h >> 1;
+
+        let Some(prev_pixels) = self.prev_pixels.as_deref() else {
+            let bytes = encode_keyframe_lossless_420(pixels, width, height)?;
+            // The keyframe leaves an all-intra §6.4.4 motion field.
+            self.prev_field = Some(PrevMotionField::after_intra_frame(
+                mi_rows as u32,
+                mi_cols as u32,
+            ));
+            self.prev_pixels = Some(pixels[..need].to_vec());
+            return Ok(bytes);
+        };
+
+        let targets = [
             padded_plane_from_bytes(&pixels[..w * h], w, h, y_w, y_h),
             padded_plane_from_bytes(&pixels[w * h..w * h + cw * ch], cw, ch, uv_w, uv_h),
             padded_plane_from_bytes(&pixels[w * h + cw * ch..], cw, ch, uv_w, uv_h),
-        ]
-    };
-    let visible_ref = |pixels: &[u8]| -> [Vec<i32>; 3] {
-        [
-            pixels[..w * h].iter().map(|&s| i32::from(s)).collect(),
-            pixels[w * h..w * h + cw * ch]
+        ];
+        // Visible-extent reference planes (the §8.10 FrameStore crop):
+        // the previous frame's source samples, since a lossless frame
+        // reconstructs to its target exactly.
+        let prev: [Vec<i32>; 3] = [
+            prev_pixels[..w * h].iter().map(|&s| i32::from(s)).collect(),
+            prev_pixels[w * h..w * h + cw * ch]
                 .iter()
                 .map(|&s| i32::from(s))
                 .collect(),
-            pixels[w * h + cw * ch..w * h + 2 * cw * ch]
+            prev_pixels[w * h + cw * ch..w * h + 2 * cw * ch]
                 .iter()
                 .map(|&s| i32::from(s))
                 .collect(),
-        ]
-    };
-
-    let mut out = Vec::with_capacity(frames.len());
-    out.push(encode_keyframe_lossless_420(frames[0], width, height)?);
-
-    // The keyframe leaves an all-intra §6.4.4 motion field.
-    let mut prev_field = PrevMotionField::after_intra_frame(mi_rows as u32, mi_cols as u32);
-
-    for i in 1..frames.len() {
-        let targets = padded_targets(frames[i]);
-        let prev = visible_ref(frames[i - 1]);
+        ];
         let reference: [(&[i32], usize); 3] = [
             (prev[0].as_slice(), w),
             (prev[1].as_slice(), cw),
@@ -4991,12 +5122,12 @@ pub(crate) fn encode_sequence_lossless_chained_420(
             height,
             PFRAME_SEARCH_RANGE,
             true,
-            Some(&prev_field),
+            self.prev_field.as_ref(),
         )?;
-        out.push(bytes);
-        prev_field = PrevMotionField::from_state(&state);
+        self.prev_field = Some(PrevMotionField::from_state(&state));
+        self.prev_pixels = Some(pixels[..need].to_vec());
+        Ok(bytes)
     }
-    Ok(out)
 }
 
 #[cfg(test)]

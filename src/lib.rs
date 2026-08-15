@@ -3385,6 +3385,299 @@ mod encode_roundtrip_tests {
         }
     }
 
+    // ----- round-445 fixtures: chained-default stream classes -----
+
+    /// Build the round-445 **chain-framed lossless GOP** (profile 0,
+    /// 8-bit 4:2:0, 64x48, 4 frames) through the public — now
+    /// chained-by-default — [`encode_vp9_lossless_sequence`] API: a
+    /// skip-electing lossless keyframe (flat background = exact §8.5.1
+    /// DC prediction ⇒ `skip = 1` MIs) followed by shown
+    /// non-error-resilient lossless P-frames (§7.2.6
+    /// `UsePrevFrameMvs == 1` with §8.7.2 WHT residuals and prev-MV
+    /// modeling — a moving textured patch codes real motion). The
+    /// corpus's first **chain-framed lossless** stream and its first
+    /// skip-elected lossless keyframe (`lossless-inter` is
+    /// error-resilient framing; `odd-dims-59x37` is the classic
+    /// self-encoded chain).
+    fn build_lossless_chained_gop_stream() -> Vec<Vec<u8>> {
+        let (w, h) = (64usize, 48usize);
+        let n = w * h + 2 * 32 * 24;
+        let inputs: Vec<Vec<u8>> = (0..4usize)
+            .map(|k| {
+                let mut px = vec![100u8; n];
+                for y in 0..16usize {
+                    for x in 0..16usize {
+                        px[(y + 12) * w + x + 8 + 3 * k] = ((x * 31 + y * 17 + 7) % 251) as u8;
+                    }
+                }
+                px
+            })
+            .collect();
+        let refs: Vec<&[u8]> = inputs.iter().map(|f| f.as_slice()).collect();
+        encode_vp9_lossless_sequence(&refs, 64, 48).expect("lossless chained GOP encode")
+    }
+
+    /// The lossless chained GOP's source frames (for byte-exact
+    /// round-trip assertions).
+    fn lossless_chained_gop_sources() -> Vec<Vec<u8>> {
+        let (w, h) = (64usize, 48usize);
+        let n = w * h + 2 * 32 * 24;
+        (0..4usize)
+            .map(|k| {
+                let mut px = vec![100u8; n];
+                for y in 0..16usize {
+                    for x in 0..16usize {
+                        px[(y + 12) * w + x + 8 + 3 * k] = ((x * 31 + y * 17 + 7) % 251) as u8;
+                    }
+                }
+                px
+            })
+            .collect()
+    }
+
+    /// Build the round-445 **12-bit 4:2:2 GOP** (profile 3, 64x48,
+    /// `base_q_idx = 110`) through the public
+    /// [`encode_vp9_lossy_sequence_hbd_422`] API — the §7.2 matrix's
+    /// deepest corner (12-bit × the `ssx = 1, ssy = 0` geometry) as a
+    /// self-encoded chain-framed stream: CAT6 18-bit tokens through
+    /// the full lossy chain (motion search, compound-capable framing,
+    /// §8.8 + §6.2.8 elections). The staged
+    /// `profile-3-yuv422-12bit-inter` covers this format as a
+    /// black-box encode; this is the first **self-encoded** one.
+    fn build_lossy_hbd12_422_gop_stream() -> Vec<Vec<u8>> {
+        let (w, h, cw, ch) = (64usize, 48usize, 32usize, 48usize);
+        let inputs: Vec<Vec<u16>> = (0..4usize)
+            .map(|k| {
+                let f = |x: usize, y: usize, s: usize| {
+                    (((x + 2 * k) * 61 + (y + k) * 113 + s * 29) % 4096) as u16
+                };
+                let mut px = Vec::with_capacity(w * h + 2 * cw * ch);
+                for y in 0..h {
+                    for x in 0..w {
+                        px.push(f(x, y, 0));
+                    }
+                }
+                for y in 0..ch {
+                    for x in 0..cw {
+                        px.push(f(x, y, 5));
+                    }
+                }
+                for y in 0..ch {
+                    for x in 0..cw {
+                        px.push(f(x, y, 11));
+                    }
+                }
+                px
+            })
+            .collect();
+        let refs: Vec<&[u16]> = inputs.iter().map(|f| f.as_slice()).collect();
+        encode_vp9_lossy_sequence_hbd_422(&refs, 64, 48, 12, 110).expect("hbd12-422 GOP encode")
+    }
+
+    /// Build the round-445 **rate-controlled GOP** (profile 0, 8-bit
+    /// 4:2:0, 64x48, `target_bytes_per_frame = 1000`) through the
+    /// public [`encode_vp9_lossy_sequence_rc`] API — since round 445
+    /// the RC chain rides the §7.2.6 chain framing with the keyframe
+    /// skip election inside the quantizer bisection and the §6.2.8
+    /// delta election under the byte budget. Mixed static/moving
+    /// halves (the r441 delta-election probe shape) so the per-class
+    /// delta axes genuinely diverge. The corpus's first
+    /// rate-controlled stream.
+    fn build_lossy_rc_gop_stream() -> Vec<Vec<u8>> {
+        let (w, h) = (64i64, 48i64);
+        let tex = |x: i64, y: i64| -> u8 { (((x * 7 + y * 13) % 61) * 4 % 251) as u8 };
+        let inputs: Vec<Vec<u8>> = (0..4i64)
+            .map(|k| {
+                let cw = (w as usize).div_ceil(2);
+                let ch = (h as usize).div_ceil(2);
+                let mut px = vec![128u8; (w * h) as usize + 2 * cw * ch];
+                for y in 0..h {
+                    for x in 0..w {
+                        px[(y * w + x) as usize] = if x < w / 2 {
+                            tex(x, y)
+                        } else {
+                            tex(x + 3 * k, y + 2 * k)
+                        };
+                    }
+                }
+                px
+            })
+            .collect();
+        let refs: Vec<&[u8]> = inputs.iter().map(|f| f.as_slice()).collect();
+        encode_vp9_lossy_sequence_rc(&refs, 64, 48, 1000).expect("rc GOP encode")
+    }
+
+    /// The lossless chained GOP pins the r445 default-path shape:
+    /// shown non-error-resilient P-frames, a skip-electing keyframe
+    /// (strictly smaller than the classic writer's on this content),
+    /// byte-exact lossless round-trip, and byte-determinism.
+    #[test]
+    fn lossless_chained_gop_fixture_shape() {
+        let frames = build_lossless_chained_gop_stream();
+        assert_eq!(frames.len(), 4);
+
+        let h0 = crate::header::parse_uncompressed_header(&frames[0]).expect("kf header");
+        assert_eq!(h0.frame_type, FrameType::KeyFrame);
+        assert!(h0.quantization.lossless, "lossless keyframe");
+        let ref_dims = vec![(64u32, 48u32); 8];
+        for (i, f) in frames.iter().enumerate().skip(1) {
+            let hdr = crate::header::parse_uncompressed_header_with_refs(
+                f,
+                Some(crate::header::RefFrameState {
+                    ref_dims: &ref_dims,
+                    color_config: h0.color_config,
+                }),
+            )
+            .expect("p header");
+            assert!(
+                hdr.show_frame && !hdr.error_resilient_mode,
+                "frame {i}: chain framing"
+            );
+            assert!(hdr.quantization.lossless, "frame {i}: lossless P-frame");
+        }
+
+        // The keyframe skip election bites on the flat background.
+        let sources = lossless_chained_gop_sources();
+        let refs: Vec<&[u8]> = sources.iter().map(|f| f.as_slice()).collect();
+        let classic = encode_vp9_lossless_sequence_error_resilient(&refs, 64, 48).expect("classic");
+        assert!(
+            frames[0].len() < classic[0].len(),
+            "skip-elected keyframe must be strictly smaller"
+        );
+
+        // Lossless byte-exact round-trip.
+        let coded_refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        let decoded = decode_vp9_sequence(&coded_refs).expect("decode");
+        assert_eq!(decoded.len(), 4);
+        for (frame, src) in decoded.iter().zip(&sources) {
+            assert_eq!(&frame.to_planar_bytes(), src, "lossless round-trip");
+        }
+
+        assert_eq!(frames, build_lossless_chained_gop_stream());
+    }
+
+    /// The 12-bit 4:2:2 GOP decodes end-to-end at profile 3 with the
+    /// `ssx = 1, ssy = 0` geometry on every frame; chain-framed;
+    /// byte-deterministic.
+    #[test]
+    fn lossy_hbd12_422_gop_fixture_shape() {
+        let frames = build_lossy_hbd12_422_gop_stream();
+        assert_eq!(frames.len(), 4);
+        let h0 = crate::header::parse_uncompressed_header(&frames[0]).expect("kf header");
+        assert_eq!(h0.profile, 3);
+        assert_eq!(h0.color_config.bit_depth, 12);
+        assert!(h0.color_config.subsampling_x && !h0.color_config.subsampling_y);
+        let ref_dims = vec![(64u32, 48u32); 8];
+        for (i, f) in frames.iter().enumerate().skip(1) {
+            let hdr = crate::header::parse_uncompressed_header_with_refs(
+                f,
+                Some(crate::header::RefFrameState {
+                    ref_dims: &ref_dims,
+                    color_config: h0.color_config,
+                }),
+            )
+            .expect("p header");
+            assert!(
+                hdr.show_frame && !hdr.error_resilient_mode,
+                "frame {i}: chain framing"
+            );
+        }
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        let decoded = decode_vp9_sequence(&refs).expect("decode");
+        assert_eq!(decoded.len(), 4);
+        for f in &decoded {
+            assert_eq!((f.bit_depth, f.u.len()), (12, 32 * 48));
+        }
+        assert_eq!(frames, build_lossy_hbd12_422_gop_stream());
+    }
+
+    /// The RC GOP holds its per-frame byte budget, rides the chain
+    /// framing, decodes end-to-end, and is byte-deterministic.
+    #[test]
+    fn lossy_rc_gop_fixture_shape() {
+        let frames = build_lossy_rc_gop_stream();
+        assert_eq!(frames.len(), 4);
+        let h0 = crate::header::parse_uncompressed_header(&frames[0]).expect("kf header");
+        let ref_dims = vec![(64u32, 48u32); 8];
+        for (i, f) in frames.iter().enumerate() {
+            assert!(f.len() <= 1000, "frame {i}: budget overflow ({})", f.len());
+            if i > 0 {
+                let hdr = crate::header::parse_uncompressed_header_with_refs(
+                    f,
+                    Some(crate::header::RefFrameState {
+                        ref_dims: &ref_dims,
+                        color_config: h0.color_config,
+                    }),
+                )
+                .expect("p header");
+                assert!(
+                    hdr.show_frame && !hdr.error_resilient_mode,
+                    "frame {i}: chain framing"
+                );
+            }
+        }
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        assert_eq!(decode_vp9_sequence(&refs).expect("decode").len(), 4);
+        assert_eq!(frames, build_lossy_rc_gop_stream());
+    }
+
+    /// Fixture-staging generator (round 445): stages the three
+    /// chained-default stream classes under `OXIDEAV_VP9_STAGE_DIR`.
+    /// Alongside each `input.ivf` it writes `crate-decode.yuv` — the
+    /// crate's own [`decode_vp9_sequence`] output in the corpus
+    /// `expected.yuv` packing (shown frames concatenated, planar,
+    /// little-endian pairs at 10/12-bit) — so the black-box
+    /// verification step is a byte compare between a reference decode
+    /// of `input.ivf` and this file.
+    #[test]
+    fn stage_round_445_fixtures_when_requested() {
+        let Some(dir) = std::env::var_os("OXIDEAV_VP9_STAGE_DIR") else {
+            return;
+        };
+        for (name, frames) in [
+            ("lossless-chained-gop", build_lossless_chained_gop_stream()),
+            ("lossy-hbd12-422-gop", build_lossy_hbd12_422_gop_stream()),
+            ("lossy-rc-gop", build_lossy_rc_gop_stream()),
+        ] {
+            let ivf = ivf_wrap_dims(&frames, 64, 48);
+            let subdir = std::path::Path::new(&dir).join(name);
+            std::fs::create_dir_all(&subdir).expect("create stage dir");
+            std::fs::write(subdir.join("input.ivf"), &ivf).expect("write input.ivf");
+            let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+            let decoded = decode_vp9_sequence(&refs).expect("crate decode");
+            let mut yuv = Vec::new();
+            for f in &decoded {
+                yuv.extend_from_slice(&f.to_planar_bytes());
+            }
+            std::fs::write(subdir.join("crate-decode.yuv"), &yuv).expect("write crate-decode.yuv");
+        }
+    }
+
+    /// The staged round-445 fixtures are byte-identical to the
+    /// builders' output (docs-gated, per-fixture presence-gated).
+    #[test]
+    fn staged_round_445_fixtures_match_builders() {
+        for (name, frames) in [
+            ("lossless-chained-gop", build_lossless_chained_gop_stream()),
+            ("lossy-hbd12-422-gop", build_lossy_hbd12_422_gop_stream()),
+            ("lossy-rc-gop", build_lossy_rc_gop_stream()),
+        ] {
+            let path = std::path::Path::new("../../docs/video/vp9/fixtures")
+                .join(name)
+                .join("input.ivf");
+            if !path.is_file() {
+                eprintln!("{name}: not yet staged; docs-gated");
+                continue;
+            }
+            let staged = std::fs::read(&path).expect("staged input.ivf");
+            assert_eq!(
+                staged,
+                ivf_wrap_dims(&frames, 64, 48),
+                "{name}: staged fixture bytes != builder output"
+            );
+        }
+    }
+
     // ----- round 445: chained framing IS the default sequence path -----
 
     /// Parse the P-frame headers of a coded 64x48 4:2:0 sequence and

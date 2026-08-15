@@ -1093,6 +1093,33 @@ fn full_corpus_sequences_byte_exact() {
         }
         check_fixture_byte_exact(root, name);
     }
+
+    // Round-445 corpus extensions (self-encoded through the round-445
+    // chained-DEFAULT public entries; presence-gated until the staged
+    // bytes land in docs — builders + docs-gated identity tests live
+    // in the crate already):
+    //
+    // * lossless-chained-gop — the corpus's first chain-framed
+    //   LOSSLESS stream (§7.2.6 UsePrevFrameMvs == 1 over §8.7.2 WHT
+    //   residuals) and its first skip-elected lossless keyframe.
+    // * lossy-hbd12-422-gop — the first self-encoded stream at the
+    //   §7.2 matrix's deepest corner (profile 3, 12-bit, 4:2:2):
+    //   CAT6 18-bit tokens through the whole chained lossy pipeline.
+    // * lossy-rc-gop — the corpus's first rate-controlled stream:
+    //   per-frame bisected base_q_idx on the chain framing, keyframe
+    //   skip election inside the bisection, §6.2.8 delta election
+    //   under the byte budget.
+    for name in [
+        "lossless-chained-gop",
+        "lossy-hbd12-422-gop",
+        "lossy-rc-gop",
+    ] {
+        if !root.join(name).is_dir() {
+            eprintln!("{name}: not yet staged; docs-gated");
+            continue;
+        }
+        check_fixture_byte_exact(root, name);
+    }
 }
 
 /// One `full_corpus_sequences_byte_exact` step: IVF demux → superframe

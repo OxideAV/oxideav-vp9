@@ -15,7 +15,22 @@ decodes byte-exact back to its input, `encode_vp9_lossless_sequence`
 does the same for whole videos (motion-compensated P-frames with
 sub-pel search), and `encode_vp9_lossy` / `encode_vp9_lossy_sequence`
 provide quantized encoding over content-adaptive partition/transform
-trees on **both keyframes and P-frames** (`BLOCK_8X8`..`BLOCK_64X64`,
+trees on **both keyframes and P-frames**. **Round 445 promotes the
+§7.2.6 chain framing to the DEFAULT public GOP path**: both sequence
+encoders emit shown non-error-resilient P-frames (prev-frame-MV
+modeling, live `[ LAST, ALTREF ]` compound election, the r441 keyframe
+skip + §6.2.8 loop-filter delta elections), with the classic
+error-resilient framing kept as the explicit
+`encode_vp9_lossless_sequence_error_resilient` /
+`encode_vp9_lossy_sequence_error_resilient` opt-outs whose bytes are
+**frozen** (the staged self-encoded fixtures pin them), and — also
+round 445 — the crate registers real framework codec factories:
+[`Vp9Encoder`] rides the chained default GOP path byte-identically to
+the batch entries, [`Vp9Decoder`] streams packets through the new
+incremental [`Vp9SequenceDecoder`] (per-packet Annex B split), and
+`register( )` / [`make_decoder`] / [`make_encoder`] expose both halves
+of the dual-API convention. The lossy planner covers
+(`BLOCK_8X8`..`BLOCK_64X64`,
 `TX_4X4`..`TX_32X32`, per-block inter transform-size selection,
 quarter/eighth-pel motion search, multi-reference LAST/GOLDEN election,
 `[ LAST, ALTREF ]` compound prediction, and — round 420 — the
@@ -123,13 +138,23 @@ corpus's last fixture-less axis: 512x256 with `tile_rows_log2 = 2`
 per-tile context resets interacting with the row traversal, and intra +
 §8.5.2 inter prediction across tile-row boundaries), byte-exact with no
 code change — the §6.4 tile-row walk was already correct.
-Three **round-441 packages** are built, black-box verified, and wired
-(presence-gated) but not yet staged: `lossy-444-gop` (the first
-self-encoded non-4:2:0 lossy stream), `lossy-hbd10-gop` (the first
-self-encoded high-bit-depth lossy stream), and `lossy-lf-deltas-gop`
-(the first stream with a `loop_filter_delta_update = 1` frame — a
-mid-GOP mode-delta update plus a later frame filtering on the §7.2.8
-*persisted* value, so the byte-exact sweep pins the persistence fold).
+The three **round-441 packages** are staged and byte-exact in the
+sweep: `lossy-444-gop` (the first self-encoded non-4:2:0 lossy
+stream), `lossy-hbd10-gop` (the first self-encoded high-bit-depth
+lossy stream), and `lossy-lf-deltas-gop` (the first stream with a
+`loop_filter_delta_update = 1` frame — a mid-GOP mode-delta update
+plus a later frame filtering on the §7.2.8 *persisted* value, so the
+byte-exact sweep pins the persistence fold).
+Three **round-445 packages** are built, black-box verified byte-exact,
+and wired (presence-gated) but not yet staged — the chained-default
+stream classes: `lossless-chained-gop` (the corpus's first
+chain-framed **lossless** stream — §7.2.6 `UsePrevFrameMvs == 1` over
+§8.7.2 WHT residuals — and its first skip-elected lossless keyframe),
+`lossy-hbd12-422-gop` (the first self-encoded stream at the §7.2
+matrix's deepest corner: profile 3, 12-bit, 4:2:2), and `lossy-rc-gop`
+(the corpus's first **rate-controlled** stream: per-frame bisected
+`base_q_idx` on the chain framing with the budget-guarded §6.2.8
+delta election).
 Highlights: `i-frame-then-p-frame-64x64`
 (keyframe + single-reference LAST P-frame, high-precision MVs,
 8-tap-smooth filter), `frame-parallel-mode` (keyframe + three
@@ -253,17 +278,22 @@ prediction sees the decoder's exact state. Public entry points:
   §6.4.20-codeable grid when the §6.5.13 `use_mv_hp` gate disables the
   eighth-pel bit). Every frame decodes byte-exact through
   [`decode_vp9_sequence`]; on translating content the motion search
-  codes less than half the forced-`ZEROMV` bytes. P-frames use
-  error-resilient framing so the §7.2.6 `UsePrevFrameMvs == 0`
-  derivation is pinned identically on both sides.
-  [`encode_vp9_lossless_sequence_chained`] (round 434) carries the
-  same byte-exact guarantee on **non-error-resilient chain framing**:
-  every P-frame is shown, the decoder's §7.2.6 derivation is 1, and
-  the encoder threads each frame's §6.4.4 motion field into the next
-  frame's §6.5.10 candidate scan — temporally persistent motion that
-  the spatial neighbours mispredict codes `NEARESTMV` / `NEARMV`
-  instead of `NEWMV`, a strict deterministic rate win pinned on a
-  banded-motion probe.
+  codes less than half the forced-`ZEROMV` bytes. **Since round 445
+  this entry rides the §7.2.6 chain framing by default** (the round-434
+  chained model): every P-frame is shown and non-error-resilient, the
+  decoder's §7.2.6 derivation is 1, and the encoder threads each
+  frame's §6.4.4 motion field into the next frame's §6.5.10 candidate
+  scan — temporally persistent motion that the spatial neighbours
+  mispredict codes `NEARESTMV` / `NEARMV` instead of `NEWMV`, a strict
+  deterministic rate win pinned on a banded-motion probe — and the
+  keyframe elects §6.4.2 skip (all-zero-WHT MIs — exact DC prediction —
+  a strict rate win at a still byte-exact reconstruction).
+  [`encode_vp9_lossless_sequence_error_resilient`] is the explicit
+  opt-out: classic §6.2 `error_resilient_mode = 1` framing (the
+  §7.2.6 `UsePrevFrameMvs == 0` model, per-frame entropy independence)
+  with **frozen** pre-445 bytes, pinned by the staged self-encoded
+  fixtures; [`encode_vp9_lossless_sequence_chained`] remains as a
+  byte-identical alias of the default.
 * [`encode_vp9_lossy`] / [`encode_vp9_lossy_sequence`] — **lossy**
   encoding at a caller-chosen `base_q_idx` (1..=255) with a
   **content-adaptive partition + transform-size planner**
@@ -332,16 +362,21 @@ prediction sees the decoder's exact state. Public entry points:
   drift; only the bounded quantization error separates the result
   from the source. On mixed content the adaptive tree codes fewer
   bytes than the fixed all-4x4 layout at the same quantizer (pinned).
-* [`encode_vp9_lossy_sequence_chained`] — the lossy GOP on
-  **non-error-resilient chain framing** (round 434): shown P-frames
-  decode with §7.2.6 `UsePrevFrameMvs == 1`, the encoder threads each
-  frame's §6.4.4 motion field into every §6.5 predictor derivation of
-  the next frame's search and writer, and — because a
-  non-error-resilient frame keeps its *coded* sign biases — the
-  `[ LAST, ALTREF ]` compound election is **live inside the ordinary
-  shown GOP**: a cross-fade midpoint frame elects compound leaves with
-  no hidden-predecessor construction (the r418 restriction dissolves),
-  pinned on the writer's own per-MI state.
+* Since round 445 [`encode_vp9_lossy_sequence`] itself rides the
+  **non-error-resilient chain framing** (the round-434 chained model):
+  shown P-frames decode with §7.2.6 `UsePrevFrameMvs == 1`, the
+  encoder threads each frame's §6.4.4 motion field into every §6.5
+  predictor derivation of the next frame's search and writer, and —
+  because a non-error-resilient frame keeps its *coded* sign biases —
+  the `[ LAST, ALTREF ]` compound election is **live inside the
+  ordinary shown GOP**: a cross-fade midpoint frame elects compound
+  leaves with no hidden-predecessor construction (the r418 restriction
+  dissolves), pinned on the writer's own per-MI state.
+  [`encode_vp9_lossy_sequence_error_resilient`] is the explicit
+  opt-out (classic framing, **frozen** pre-445 bytes — the staged
+  `lossy-filtered-gop` fixture pins them; no compound, no chained
+  elections); [`encode_vp9_lossy_sequence_chained`] remains as a
+  byte-identical alias of the default.
   Round 441 adds two chain-framing elections: the **keyframe skip
   election** (above) and the **§6.2.8 loop-filter delta election** —
   every P-frame runs bounded coordinate descent over the six §8.8.1
@@ -366,8 +401,42 @@ prediction sees the decoder's exact state. Public entry points:
   per-frame byte budget, via an exact per-frame binary search over the
   quantizer range (≤ 8 byte-deterministic trial encodes per frame;
   best-effort `q == 255` when the budget is below the frame's syntax
-  floor). Budget compliance, monotone quality-vs-budget, and
-  end-to-end decodability are pinned.
+  floor). Since round 445 the RC chain rides the §7.2.6 chain framing
+  with the keyframe skip election inside the bisection (a strict rate
+  win, so the fitted quantizer can only improve) and the §6.2.8
+  loop-filter delta election **under the byte budget**: a moved slot
+  costs coded §6.2.8 update bits, so an over-budget update falls back
+  to the update-free frame — same length as the fitted trial, filtered
+  on the §7.2.8 *persisted* baseline exactly as the decoder folds it,
+  persistent state unmoved on both sides. Budget compliance, monotone
+  quality-vs-budget, chain-framing headers, and end-to-end
+  decodability are pinned.
+
+### Framework registry (round 445)
+
+`register( )` installs a real decode+encode registration under the
+`"vp9"` codec id (capabilities: lossy + lossless, the nine §7.2
+format-matrix pixel formats; wire-tag claims `VP90` / `VP09` /
+`V_VP9`; a typed `q` / `lossless` encoder-options schema), and
+[`make_decoder`] / [`make_encoder`] expose the direct-factory half of
+the dual-API convention:
+
+* [`Vp9Encoder`] rides the **chained default GOP path** one frame per
+  `send_frame` (the stateful push forms of the sequence engines):
+  packet bytes are pinned **byte-identical** to the matching batch
+  entry at 8-bit 4:2:0 / 4:4:4, 10/12-bit, and under `lossless=true`
+  (8-bit 4:2:0), with keyframe packet flags and pts passthrough.
+* [`Vp9Decoder`] streams packets through [`Vp9SequenceDecoder`] — the
+  incremental, stateful form of [`decode_vp9_sequence`] (which is now
+  a thin loop over it): the §8.10 reference buffers + `FrameStore[ ]`,
+  the §6.5 previous-frame motion field, the §6.1.2 / §7.2
+  `FrameContext[ 4 ]` banks with §8.4 backward adaptation, and the
+  §7.2.8 / §7.2.10 persistent header state all thread across packets,
+  with the §B.2 Annex B split applied per packet — a whole-corpus
+  packet-by-packet sweep decodes equal to the batch API (superframes,
+  hidden alt-refs, `show_existing_frame` included; the 4:4:0 stream
+  surfaces `Unsupported` at the frame-conversion boundary since the
+  framework has no 4:4:0 pixel-format label).
 
 The encode path composes the bitstream-writer
 primitives — each derived as the exact inverse of the matching decode step
@@ -565,10 +634,13 @@ carries no forward update for it).
   paths keep their staged-fixture-pinned bytes), as did the **§6.2.8
   loop-filter delta election** on chain-framed P-frames (per-segment
   `SEG_LVL_ALT_L` election stays out of scope while the lossy encoders
-  code single-segment frames). Promoting the chained framing to the
-  *default* sequence paths (a fixture-restaging round: the staged
-  self-encoded packages pin the classic encoders' exact bytes) is a
-  later milestone.
+  code single-segment frames). **The chained framing became the
+  default sequence path in round 445** — no fixture restaging was
+  needed: the staged self-encoded packages pin the classic encoders'
+  exact bytes through the explicit `_error_resilient` opt-out entries
+  (whose output is frozen as the pre-445 default bytes), the r441
+  elections + a new lossless keyframe skip election ride the default,
+  and the framework registry Encoder rides the same path.
   **Lossy encoding covers the full §7.2 format matrix as of round
   441** — 8-bit 4:2:0/4:4:4/4:2:2 (profiles 0/1) and 10/12-bit
   4:2:0/4:4:4/4:2:2 (profiles 2/3) on both standalone keyframes and
@@ -583,14 +655,16 @@ carries no forward update for it).
 
 ## Testing
 
-The crate carries 1230+ tests (lib unit tests plus integration suites
+The crate carries 1250+ tests (lib unit tests plus integration suites
 in `tests/`, including the keyframe **and inter** encoder writers, each
 round-tripped back through the in-crate decoder; `encode_keyframe`
 exercising the public `encode_vp9` → decode **byte-exact lossless**
 round-trip across a geometry sweep; the lossless / lossy sequence
 encoders reconstructed through `decode_vp9_sequence` with chain-level
-decoder-mirror pins; and the motion-search / mode-selection rate
-assertions). Tests construct their inputs bit-by-bit; §9.2 golden buffers
+decoder-mirror pins; the `registry_codec` suite pinning the framework
+Encoder byte-identical to the batch entries and the framework Decoder
+equal to the batch decode across the whole staged corpus; and the
+motion-search / mode-selection rate assertions). Tests construct their inputs bit-by-bit; §9.2 golden buffers
 are hand-derived by stepping the decoder, not borrowed from any
 third-party VP9 implementation. Several precision-critical primitives
 also carry *independent* oracles that share no code with the

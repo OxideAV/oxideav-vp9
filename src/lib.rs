@@ -1090,6 +1090,17 @@ pub fn encode_vp9_lossy_sequence_hbd_422(
 /// over the quantizer range (at most 8 trial encodes per frame; every
 /// encoder in the chain is byte-deterministic, so the search is exact).
 ///
+/// Rides the **§7.2.6 chain framing** like the default sequence entry
+/// (round 445): shown non-error-resilient P-frames with prev-frame-MV
+/// modeling and live compound election, the round-441 keyframe skip
+/// election (a strict rate win, so the fitted quantizer can only
+/// improve), and the §6.2.8 loop-filter delta election **under the
+/// byte budget** — a moved delta slot costs coded §6.2.8 update bits,
+/// so whenever the update would overflow `target_bytes_per_frame` the
+/// frame falls back to the update-free encode (identical length to the
+/// fitted trial; the §7.2.8 persistent baseline stays unmoved on both
+/// sides) and the budget guarantee is preserved.
+///
 /// When even the coarsest quantizer (`base_q_idx == 255`) overflows the
 /// budget, that frame is returned **best-effort** at `q == 255` rather
 /// than failing: a budget below the frame's syntax floor is not

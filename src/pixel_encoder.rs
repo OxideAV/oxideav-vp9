@@ -395,6 +395,167 @@ pub(crate) fn encode_keyframe_lossless_420(
     encode_keyframe_lossless(&hdr, &[y_plane, u_plane, v_plane])
 }
 
+/// [`encode_keyframe_lossless`] with the round-441/445 **skip
+/// election**: every MI whose entire residual (all 4x4 WHT blocks,
+/// all three planes) is zero — i.e. the §8.5.1 DC prediction is
+/// already exact — codes `skip = 1`. §6.4.2 drops the whole
+/// `residual( )` syntax for the block while a non-skip all-zero block
+/// still pays one §6.4.24 EOB-at-zero token per coded 4x4, so the
+/// election is a strict rate win; the §8.6.2 reconstruction is the
+/// prediction either way (the residual was zero), so the lossless
+/// byte-exact guarantee is untouched.
+///
+/// Two-pass, mirroring the lossy election: pass 1 runs the identical
+/// decoder-mirror encode caching every block's tokens and folding the
+/// per-MI all-zero flag; pass 2 re-assembles with the elected skip
+/// flags, draining the cache (skip MIs are never queried).
+///
+/// Used by the **chain-framed default** sequence path
+/// ([`LosslessGopEncoder420`]); the classic entries keep their exact
+/// staged-fixture-pinned bytes through the non-electing
+/// [`encode_keyframe_lossless`].
+pub(crate) fn encode_keyframe_lossless_elect_skip(
+    hdr: &Vp9FrameHeader,
+    targets: &[Plane; 3],
+) -> Result<Vec<u8>, Error> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    if hdr.frame_type != FrameType::KeyFrame || !hdr.quantization.lossless {
+        return Err(Error::Unsupported);
+    }
+    let mi_cols = (hdr.frame_width + 7) >> 3;
+    let mi_rows = (hdr.frame_height + 7) >> 3;
+    let ssx = hdr.color_config.subsampling_x;
+    let ssy = hdr.color_config.subsampling_y;
+    let bit_depth = u32::from(hdr.color_config.bit_depth);
+
+    let n = (mi_rows as usize) * (mi_cols as usize);
+    let plan = KeyframePlan {
+        plans: vec![
+            BlockPlan {
+                y_mode: 0,
+                uv_mode: 0,
+                skip: false,
+                segment_id: 0,
+            };
+            n
+        ],
+        tx_mode: crate::compressed::TxMode::Only4x4,
+    };
+
+    let mut recon = ReconState::new(mi_cols, mi_rows, ssx, ssy, bit_depth);
+    let seg = hdr.segmentation;
+    let quant = hdr.quantization;
+    let bd8 = hdr.color_config.bit_depth;
+
+    // Pass 1 — the identical decoder-mirror lossless encode, caching
+    // every block's tokens and folding each MI's all-zero flag.
+    let token_cache: RefCell<HashMap<(usize, u32, u32), Vec<i64>>> = RefCell::new(HashMap::new());
+    let mi_all_zero: RefCell<HashMap<(u32, u32), bool>> = RefCell::new(HashMap::new());
+    {
+        let recon_ref = &mut recon;
+        let mut coeffs: Box<FrameCoefSource<'_>> = Box::new(
+            |mi_r: u32, mi_c: u32, plane: usize, sx: u32, sy: u32, _b: usize| -> Vec<i64> {
+                recon_ref.predict_block(mi_r, mi_c, BLOCK_8X8, plane, 0, sx, sy, PredMode::DcPred);
+                let mut block = vec![0i64; 16];
+                for i in 0..4usize {
+                    for j in 0..4usize {
+                        let t = targets[plane].get(sx as usize + j, sy as usize + i);
+                        let p = recon_ref.planes[plane].get(sx as usize + j, sy as usize + i);
+                        block[i * 4 + j] = i64::from(t) - i64::from(p);
+                    }
+                }
+                forward_wht_2d(&mut block);
+                let dc_q = get_dc_quant(plane, &seg, &quant, 0, bd8);
+                let ac_q = get_ac_quant(plane, &seg, &quant, 0, bd8);
+                reconstruct_block(
+                    &mut recon_ref.planes[plane],
+                    sx as usize,
+                    sy as usize,
+                    0,
+                    &block,
+                    dc_q,
+                    ac_q,
+                    DCT_DCT,
+                    true,
+                    recon_ref.bit_depth,
+                );
+                let zero = block.iter().all(|&t| t == 0);
+                mi_all_zero
+                    .borrow_mut()
+                    .entry((mi_r, mi_c))
+                    .and_modify(|z| *z &= zero)
+                    .or_insert(zero);
+                token_cache
+                    .borrow_mut()
+                    .insert((plane, sx, sy), block.clone());
+                block
+            },
+        );
+        assemble_keyframe(hdr, &plan, &mut *coeffs)?;
+    }
+
+    // Skip election: an all-zero MI codes skip = 1 (the exact-DC-pred
+    // case — §8.7.2 WHT of a zero residual is zero, and the WHT is
+    // invertible, so token-zero ⟺ residual-zero ⟺ prediction exact).
+    let mut plan2 = plan;
+    let zeros = mi_all_zero.into_inner();
+    for (i, bp) in plan2.plans.iter_mut().enumerate() {
+        let mi_r = (i / mi_cols as usize) as u32;
+        let mi_c = (i % mi_cols as usize) as u32;
+        if zeros.get(&(mi_r, mi_c)).copied() == Some(true) {
+            bp.skip = true;
+        }
+    }
+
+    // Pass 2 — re-assemble draining the cache; skip MIs are never
+    // queried (§6.4.2 codes no residual syntax).
+    let mut cache = token_cache.into_inner();
+    let mut drain: Box<FrameCoefSource<'_>> = Box::new(
+        move |_mi_r: u32, _mi_c: u32, plane: usize, sx: u32, sy: u32, _b: usize| -> Vec<i64> {
+            cache
+                .remove(&(plane, sx, sy))
+                .expect("pass 1 cached this block's tokens")
+        },
+    );
+    assemble_keyframe(hdr, &plan2, &mut *drain)
+}
+
+/// [`encode_keyframe_lossless_420`] on the skip-electing keyframe
+/// writer ([`encode_keyframe_lossless_elect_skip`]) — the chain-framed
+/// default sequence keyframe.
+pub(crate) fn encode_keyframe_lossless_420_elect_skip(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, Error> {
+    if width == 0 || height == 0 || width > (1 << 16) || height > (1 << 16) {
+        return Err(Error::Unsupported);
+    }
+    let w = width as usize;
+    let h = height as usize;
+    let cw = width.div_ceil(2) as usize;
+    let ch = height.div_ceil(2) as usize;
+    if pixels.len() < w * h + 2 * cw * ch {
+        return Err(Error::Unsupported);
+    }
+
+    let hdr = lossless_keyframe_header(width, height);
+    let mi_cols = ((width + 7) >> 3) as usize;
+    let mi_rows = ((height + 7) >> 3) as usize;
+    let y_w = mi_cols * 8;
+    let y_h = mi_rows * 8;
+    let uv_w = y_w >> 1;
+    let uv_h = y_h >> 1;
+
+    let y_plane = padded_plane_from_bytes(&pixels[..w * h], w, h, y_w, y_h);
+    let u_plane = padded_plane_from_bytes(&pixels[w * h..w * h + cw * ch], cw, ch, uv_w, uv_h);
+    let v_plane = padded_plane_from_bytes(&pixels[w * h + cw * ch..], cw, ch, uv_w, uv_h);
+
+    encode_keyframe_lossless_elect_skip(&hdr, &[y_plane, u_plane, v_plane])
+}
+
 /// Encode an 8-bit **4:4:4** planar frame (`Y` then `U` then `V`, each
 /// `width × height`) into a lossless profile-1 VP9 keyframe that decodes
 /// byte-exact back to `pixels`.
@@ -4322,6 +4483,122 @@ fn finish_frame_with_filter_deltas(
     Ok((bytes, recon))
 }
 
+/// [`finish_frame_with_filter_deltas`] under a byte budget (the
+/// rate-controlled chain): the `(level, sharpness)` election is free
+/// (§6.2.8 fixed-width fields), but a moved delta slot codes a 1 + 7
+/// bit §6.2.8 update — so when the delta-elected frame overflows
+/// `max_bytes`, the election **falls back to no update**: the frame
+/// re-encodes with only the elected `(level, sharpness)`, filters on
+/// the §7.2.8 *persistent* deltas exactly as the decoder will (an
+/// update-free frame still folds the persisted values into §8.8.1),
+/// and `persist` is left unmoved. The fallback frame codes no §6.2.8
+/// update bits, so its length equals the fitted trial encode's and the
+/// budget guarantee holds.
+#[allow(clippy::too_many_arguments)]
+fn finish_frame_with_filter_deltas_budget(
+    hdr: &Vp9FrameHeader,
+    bytes0: Vec<u8>,
+    recon0: ReconState,
+    state0: crate::decode_block::Vp9FrameState,
+    targets: &[Plane; 3],
+    vis_w: usize,
+    vis_h: usize,
+    persist: &mut LfDeltaState,
+    max_bytes: usize,
+    re_encode: impl Fn(
+        &Vp9FrameHeader,
+    ) -> Result<(Vec<u8>, ReconState, crate::decode_block::Vp9FrameState), Error>,
+) -> Result<(Vec<u8>, ReconState), Error> {
+    use crate::recon_filter::{
+        elect_filter_params_at, elect_lf_deltas, filter_reconstruction_with_deltas,
+    };
+
+    let (level, sharpness) = elect_filter_params_at(
+        &recon0,
+        &state0,
+        hdr,
+        targets,
+        vis_w,
+        vis_h,
+        persist.ref_deltas,
+        persist.mode_deltas,
+    );
+    if level == 0 {
+        // §8.1 step 2: level 0 codes no filtering, and no update leaves
+        // the decoder's persistent deltas untouched.
+        return Ok((bytes0, recon0));
+    }
+    let mut hdr2 = *hdr;
+    hdr2.loop_filter.level = level;
+    hdr2.loop_filter.sharpness = sharpness;
+    hdr2.loop_filter.delta_enabled = true;
+
+    let (ref_deltas, mode_deltas) = elect_lf_deltas(
+        &recon0,
+        &state0,
+        &hdr2,
+        targets,
+        vis_w,
+        vis_h,
+        persist.ref_deltas,
+        persist.mode_deltas,
+    );
+
+    // Code exactly the slots that moved off the persistent values.
+    let mut hdr_delta = hdr2;
+    let mut any_update = false;
+    for (i, slot) in hdr_delta.loop_filter.ref_deltas.iter_mut().enumerate() {
+        if ref_deltas[i] != persist.ref_deltas[i] {
+            *slot = Some(ref_deltas[i]);
+            any_update = true;
+        }
+    }
+    for (i, slot) in hdr_delta.loop_filter.mode_deltas.iter_mut().enumerate() {
+        if mode_deltas[i] != persist.mode_deltas[i] {
+            *slot = Some(mode_deltas[i]);
+            any_update = true;
+        }
+    }
+    hdr_delta.loop_filter.delta_update = any_update;
+
+    if any_update {
+        let (bytes, mut recon, state) = re_encode(&hdr_delta)?;
+        if bytes.len() <= max_bytes {
+            filter_reconstruction_with_deltas(
+                &mut recon,
+                &state,
+                &hdr_delta,
+                ref_deltas,
+                mode_deltas,
+            );
+            persist.ref_deltas = ref_deltas;
+            persist.mode_deltas = mode_deltas;
+            return Ok((bytes, recon));
+        }
+        // The update bits overflow the budget: fall through to the
+        // update-free frame below (persist stays unmoved).
+    }
+
+    // No update (either none elected, or the update overflowed the
+    // budget): the frame codes only the fixed-width (level, sharpness)
+    // and the decoder filters on the folded persistent deltas.
+    hdr2.loop_filter.delta_update = false;
+    let (bytes, mut recon, state) = re_encode(&hdr2)?;
+    debug_assert_eq!(
+        bytes.len(),
+        bytes0.len(),
+        "§6.2.8 filter_level / sharpness are fixed-width; an update-free re-assembly must not change the length"
+    );
+    filter_reconstruction_with_deltas(
+        &mut recon,
+        &state,
+        &hdr2,
+        persist.ref_deltas,
+        persist.mode_deltas,
+    );
+    Ok((bytes, recon))
+}
+
 /// Encode a sequence of 8-bit 4:2:0 planar frames into a **lossy** VP9
 /// stream at quantizer index `base_q_idx` (`1..=255`): a lossy keyframe
 /// followed by lossy P-frames with per-block `ZEROMV` / `NEWMV` motion,
@@ -4809,17 +5086,30 @@ pub(crate) fn encode_sequence_lossy_rc_420(
         ]
     };
 
-    // Keyframe: bisect q over the planner-driven encoder, then elect
-    // the §8.8 filter level at the chosen q (the level is a fixed-width
-    // §6.2.8 field, so the election never disturbs the fitted size).
+    // Keyframe: bisect q over the planner-driven encoder — on the
+    // round-441 skip election (all-zero-residual leaves code skip = 1:
+    // strictly fewer bytes at identical reconstruction, so the fitted
+    // quantizer can only improve) — then elect the §8.8 filter at the
+    // chosen q (level / sharpness are fixed-width §6.2.8 fields, so
+    // the election never disturbs the fitted size).
+    let mi_cols = (width + 7) >> 3;
+    let mi_rows = (height + 7) >> 3;
+    let kf_targets = padded_targets(frames[0]);
+    let kf_encode_at = |hdr: &Vp9FrameHeader, q: u8| {
+        let plan = plan_keyframe_tree(&kf_targets, mi_rows, mi_cols, true, true, 8, q);
+        encode_keyframe_lossy_tree_elect_skip_with_state(hdr, &kf_targets, &plan)
+    };
     let (kf0, (kf_recon0, kf_state0, kf_q), _) = bisect_q(
         |q| {
-            encode_keyframe_lossy_420_with_recon_state(frames[0], width, height, q)
+            kf_encode_at(&lossy_keyframe_header_420(width, height, q), q)
                 .map(|(b, r, s)| (b, (r, s, q)))
         },
         target_bytes_per_frame,
     )?;
-    let kf_targets = padded_targets(frames[0]);
+    // Chain framing (round 445): the keyframe's §6.4.4 motion field
+    // (invariant under the filter-level re-encode) seeds the §7.2.6
+    // UsePrevFrameMvs model for the first P-frame.
+    let mut prev_field = Some(crate::frame_writer::PrevMotionField::from_state(&kf_state0));
     let kf_hdr = lossy_keyframe_header_420(width, height, kf_q);
     let (kf_bytes, kf_recon) = finish_frame_with_filter(
         &kf_hdr,
@@ -4829,13 +5119,12 @@ pub(crate) fn encode_sequence_lossy_rc_420(
         &kf_targets,
         w,
         h,
-        |hdr2| {
-            let mi_cols = (width + 7) >> 3;
-            let mi_rows = (height + 7) >> 3;
-            let plan = plan_keyframe_tree(&kf_targets, mi_rows, mi_cols, true, true, 8, kf_q);
-            encode_keyframe_lossy_tree_with_state(hdr2, &kf_targets, &plan)
-        },
+        |hdr2| kf_encode_at(hdr2, kf_q),
     )?;
+
+    // §7.2 setup_past_independence( ) on the keyframe: the chain's
+    // persistent §7.2.8 delta baseline starts at the defaults.
+    let mut lf_persist = LfDeltaState::default();
 
     let mut out = Vec::with_capacity(frames.len());
     out.push(kf_bytes);
@@ -4861,6 +5150,10 @@ pub(crate) fn encode_sequence_lossy_rc_420(
         ];
         let pframe_hdr = |q: u8| -> Vp9FrameHeader {
             let mut hdr = lossless_pframe_header(width, height);
+            // Chain framing (round 445): shown non-error-resilient
+            // P-frames — §7.2.6 derives UsePrevFrameMvs = 1 and the
+            // coded sign biases stay live (compound election).
+            hdr.error_resilient_mode = false;
             hdr.ref_frame_idx = Some([0, 1, 1]);
             hdr.ref_frame_sign_bias = [false, false, true];
             hdr.quantization = QuantizationParams {
@@ -4883,14 +5176,22 @@ pub(crate) fn encode_sequence_lossy_rc_420(
                 PFRAME_SEARCH_RANGE,
                 true,
                 true,
-                None,
+                prev_field.as_ref(),
             )
         };
         let (p0, (recon0, state0, p_q), _) = bisect_q(
             |q| encode_at(&pframe_hdr(q)).map(|(b, r, s)| (b, (r, s, q))),
             target_bytes_per_frame,
         )?;
-        let (bytes, recon) = finish_frame_with_filter(
+        // The per-MI state is invariant under the filter re-encodes, so
+        // state0 is this frame's final §6.4.4 motion field.
+        let next_field = Some(crate::frame_writer::PrevMotionField::from_state(&state0));
+        // §6.2.8 delta election under the byte budget: a moved slot
+        // costs coded update bits, so the election falls back to the
+        // update-free frame whenever the update would overflow the
+        // budget (the §7.2.8 persistent baseline then stays unmoved on
+        // both sides).
+        let (bytes, recon) = finish_frame_with_filter_deltas_budget(
             &pframe_hdr(p_q),
             p0,
             recon0,
@@ -4898,10 +5199,13 @@ pub(crate) fn encode_sequence_lossy_rc_420(
             &targets,
             w,
             h,
+            &mut lf_persist,
+            target_bytes_per_frame,
             |hdr2| encode_at(hdr2),
         )?;
         out.push(bytes);
         prev_recon = recon;
+        prev_field = next_field;
     }
     Ok(out)
 }
@@ -5076,7 +5380,12 @@ impl LosslessGopEncoder420 {
         let uv_h = y_h >> 1;
 
         let Some(prev_pixels) = self.prev_pixels.as_deref() else {
-            let bytes = encode_keyframe_lossless_420(pixels, width, height)?;
+            // Round 445: the chain-framed default keyframe elects skip
+            // (all-zero-residual MIs — exact DC prediction — code
+            // skip = 1: strictly fewer bytes, identical lossless
+            // reconstruction). The classic entries keep the
+            // non-electing keyframe (staged-fixture-pinned bytes).
+            let bytes = encode_keyframe_lossless_420_elect_skip(pixels, width, height)?;
             // The keyframe leaves an all-intra §6.4.4 motion field.
             self.prev_field = Some(PrevMotionField::after_intra_frame(
                 mi_rows as u32,
@@ -5734,6 +6043,182 @@ mod tests {
     }
 
     // ----- rate control -----
+
+    /// Round 445: the lossless keyframe **skip election** — on content
+    /// with exactly-DC-predictable regions the electing writer codes
+    /// strictly fewer bytes than the classic writer, both decode
+    /// byte-exact to the source, and on noise (no electable MI) the
+    /// two writers are byte-identical.
+    #[test]
+    fn lossless_keyframe_skip_election_wins_on_flat_content() {
+        use crate::decode_frame::decode_intra_frame;
+        let (w, h) = (64u32, 48u32);
+        let n = (w * h) as usize + 2 * 32 * 24;
+
+        // Flat fill: after the first blocks, DC prediction is exact
+        // almost everywhere.
+        let flat = vec![128u8; n];
+        let classic = encode_keyframe_lossless_420(&flat, w, h).expect("classic");
+        let elected = encode_keyframe_lossless_420_elect_skip(&flat, w, h).expect("elected");
+        assert!(
+            elected.len() < classic.len(),
+            "flat content must elect skip: {} !< {}",
+            elected.len(),
+            classic.len()
+        );
+        for coded in [&classic, &elected] {
+            let out = decode_intra_frame(coded).expect("decode").to_planar_bytes();
+            assert_eq!(out, flat, "lossless byte-exact");
+        }
+
+        // Noise: no MI's residual is all-zero, the election is a no-op
+        // and the two writers emit identical bytes.
+        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        let noise: Vec<u8> = (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as u8
+            })
+            .collect();
+        assert_eq!(
+            encode_keyframe_lossless_420(&noise, w, h).expect("classic"),
+            encode_keyframe_lossless_420_elect_skip(&noise, w, h).expect("elected"),
+            "no elected MI ⇒ byte-identical streams"
+        );
+    }
+
+    /// Round 445: the chain-framed default lossless sequence carries
+    /// the keyframe skip election end-to-end — flat-plus-motion content
+    /// still round-trips byte-exact through the public path, and its
+    /// keyframe is strictly smaller than the classic (error-resilient)
+    /// entry's keyframe on the same content.
+    #[test]
+    fn chained_lossless_sequence_elects_keyframe_skip() {
+        use crate::decode_frame::decode_vp9_sequence;
+        let (w, h) = (64u32, 48u32);
+        let n = (w * h) as usize + 2 * 32 * 24;
+        // Flat background with a small moving textured patch.
+        let frames: Vec<Vec<u8>> = (0..3usize)
+            .map(|k| {
+                let mut px = vec![100u8; n];
+                for y in 0..12usize {
+                    for x in 0..12usize {
+                        px[(y + 8) * w as usize + x + 8 + 2 * k] = ((x * 31 + y * 17) % 251) as u8;
+                    }
+                }
+                px
+            })
+            .collect();
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+
+        let chained = encode_sequence_lossless_chained_420(&refs, w, h).expect("chained");
+        let classic = encode_sequence_lossless_420(&refs, w, h).expect("classic");
+        assert!(
+            chained[0].len() < classic[0].len(),
+            "the chained default keyframe must elect skip on the flat region"
+        );
+
+        let coded_refs: Vec<&[u8]> = chained.iter().map(|f| f.as_slice()).collect();
+        let decoded = decode_vp9_sequence(&coded_refs).expect("decode");
+        assert_eq!(decoded.len(), 3);
+        for (frame, src) in decoded.iter().zip(&frames) {
+            assert_eq!(&frame.to_planar_bytes(), src, "lossless round-trip");
+        }
+    }
+
+    /// Round 445: the rate-controlled chain rides the §7.2.6 chain
+    /// framing — every P-frame header is shown and NON-error-resilient
+    /// (the decode-side `UsePrevFrameMvs` derivation is 1), the whole
+    /// stream decodes, and the encode stays byte-deterministic.
+    #[test]
+    fn rc_sequence_rides_chain_framing() {
+        use crate::decode_frame::decode_vp9_sequence;
+        use crate::header::{
+            parse_uncompressed_header, parse_uncompressed_header_with_refs, RefFrameState,
+        };
+        let (w, h) = (64u32, 48u32);
+        let n = (w * h) as usize + 2 * 32 * 24;
+        let frames: Vec<Vec<u8>> = (0..4u64)
+            .map(|t| {
+                (0..n)
+                    .map(|i| ((i as u64 * 73 + 19 + 5 * t) % 256) as u8)
+                    .collect()
+            })
+            .collect();
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        let budget = 1500usize;
+        let coded = encode_sequence_lossy_rc_420(&refs, w, h, budget).expect("rc encode");
+        assert_eq!(coded.len(), 4);
+
+        let kf_hdr = parse_uncompressed_header(&coded[0]).expect("kf header");
+        let ref_dims = vec![(w, h); 8];
+        for (i, f) in coded.iter().enumerate().skip(1) {
+            assert!(f.len() <= budget, "frame {i} over budget");
+            let hdr = parse_uncompressed_header_with_refs(
+                f,
+                Some(RefFrameState {
+                    ref_dims: &ref_dims,
+                    color_config: kf_hdr.color_config,
+                }),
+            )
+            .expect("p header");
+            assert!(
+                hdr.show_frame && !hdr.error_resilient_mode,
+                "frame {i}: chain framing"
+            );
+        }
+        let coded_refs: Vec<&[u8]> = coded.iter().map(|f| f.as_slice()).collect();
+        assert_eq!(decode_vp9_sequence(&coded_refs).expect("decode").len(), 4);
+        assert_eq!(
+            coded,
+            encode_sequence_lossy_rc_420(&refs, w, h, budget).expect("determinism")
+        );
+    }
+
+    /// Round 445: the RC chain's §6.2.8 delta election stays inside
+    /// the byte budget on content that elects deltas at a generous
+    /// budget (mixed static/moving halves — the r441 delta-election
+    /// probe shape), and the tight-budget encode of the same content
+    /// also holds its budget (the update-free fallback).
+    #[test]
+    fn rc_delta_election_respects_budget_with_fallback() {
+        use crate::decode_frame::decode_vp9_sequence;
+        let (w, h) = (64i64, 48i64);
+        let tex = |x: i64, y: i64| -> u8 { (((x * 7 + y * 13) % 61) * 4 % 251) as u8 };
+        let frames: Vec<Vec<u8>> = (0..4i64)
+            .map(|k| {
+                let cw = (w as usize).div_ceil(2);
+                let ch = (h as usize).div_ceil(2);
+                let mut px = vec![128u8; (w * h) as usize + 2 * cw * ch];
+                for y in 0..h {
+                    for x in 0..w {
+                        px[(y * w + x) as usize] = if x < w / 2 {
+                            tex(x, y)
+                        } else {
+                            tex(x + 3 * k, y + 2 * k)
+                        };
+                    }
+                }
+                px
+            })
+            .collect();
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        for budget in [400usize, 2500usize] {
+            let coded =
+                encode_sequence_lossy_rc_420(&refs, w as u32, h as u32, budget).expect("rc");
+            for (i, f) in coded.iter().enumerate() {
+                assert!(
+                    f.len() <= budget,
+                    "budget {budget}: frame {i} size {} overflows",
+                    f.len()
+                );
+            }
+            let coded_refs: Vec<&[u8]> = coded.iter().map(|f| f.as_slice()).collect();
+            assert_eq!(decode_vp9_sequence(&coded_refs).expect("decode").len(), 4);
+        }
+    }
 
     /// Every frame of a rate-controlled sequence fits the byte budget
     /// (when the budget is above the syntax floor), and the stream

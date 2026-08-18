@@ -264,6 +264,89 @@ impl Vp9FrameState {
         }
     }
 
+    /// Copy the MI column range `[c0, c1)` of every row from `src` (a
+    /// same-dimension state) into this state — the tile-parallel merge
+    /// step for the §6.4.4 frame-wide arrays: each tile-column worker
+    /// fans its per-MI values into its own full-extent arrays and only
+    /// its disjoint column range is folded back.
+    ///
+    /// Exhaustively destructures both sides so a future field cannot be
+    /// silently dropped from the merge. Panics on a geometry mismatch
+    /// or an out-of-bounds range.
+    pub(crate) fn merge_cols_from(&mut self, src: &Self, c0: u32, c1: u32) {
+        // Per-MI slot multiplicity: 1 for the scalar arrays, 2 for the
+        // per-refList pairs, 2 * 4 for SubMvs, 4 for SubModes.
+        fn cols<T: Copy>(
+            dst: &mut [T],
+            src: &[T],
+            rows: usize,
+            cols: usize,
+            c0: usize,
+            c1: usize,
+            m: usize,
+        ) {
+            debug_assert_eq!(dst.len(), rows * cols * m);
+            debug_assert_eq!(src.len(), dst.len());
+            for r in 0..rows {
+                let lo = (r * cols + c0) * m;
+                let hi = (r * cols + c1) * m;
+                dst[lo..hi].copy_from_slice(&src[lo..hi]);
+            }
+        }
+
+        assert_eq!(
+            (self.mi_rows, self.mi_cols),
+            (src.mi_rows, src.mi_cols),
+            "state geometry mismatch"
+        );
+        assert!(
+            c0 <= c1 && c1 <= self.mi_cols,
+            "MI column range out of bounds"
+        );
+        let (rows, n_cols) = (self.mi_rows as usize, self.mi_cols as usize);
+        let (c0, c1) = (c0 as usize, c1 as usize);
+
+        let Self {
+            mi_cols: _,
+            mi_rows: _,
+            skips,
+            tx_sizes,
+            mi_sizes,
+            y_modes,
+            segment_ids,
+            ref_frames,
+            interp_filters,
+            mvs,
+            sub_mvs,
+            sub_modes,
+        } = self;
+        let Self {
+            mi_cols: _,
+            mi_rows: _,
+            skips: s_skips,
+            tx_sizes: s_tx_sizes,
+            mi_sizes: s_mi_sizes,
+            y_modes: s_y_modes,
+            segment_ids: s_segment_ids,
+            ref_frames: s_ref_frames,
+            interp_filters: s_interp_filters,
+            mvs: s_mvs,
+            sub_mvs: s_sub_mvs,
+            sub_modes: s_sub_modes,
+        } = src;
+
+        cols(skips, s_skips, rows, n_cols, c0, c1, 1);
+        cols(tx_sizes, s_tx_sizes, rows, n_cols, c0, c1, 1);
+        cols(mi_sizes, s_mi_sizes, rows, n_cols, c0, c1, 1);
+        cols(y_modes, s_y_modes, rows, n_cols, c0, c1, 1);
+        cols(segment_ids, s_segment_ids, rows, n_cols, c0, c1, 1);
+        cols(ref_frames, s_ref_frames, rows, n_cols, c0, c1, 2);
+        cols(interp_filters, s_interp_filters, rows, n_cols, c0, c1, 1);
+        cols(mvs, s_mvs, rows, n_cols, c0, c1, 2);
+        cols(sub_mvs, s_sub_mvs, rows, n_cols, c0, c1, 2 * 4);
+        cols(sub_modes, s_sub_modes, rows, n_cols, c0, c1, 4);
+    }
+
     /// Row-major MI index for `(row, col)`. Returns `None` if the
     /// coordinate is outside `MiRows × MiCols`.
     fn mi_index(&self, row: u32, col: u32) -> Option<usize> {

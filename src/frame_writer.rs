@@ -2900,6 +2900,186 @@ mod tests {
         assert_eq!(f_tiled[1].v, f_single[1].v);
     }
 
+    /// Tile-parallel §6.4 decode — KEYFRAME: a live-residual 2col x
+    /// 4row 512x256 keyframe (the staged fixture's tiling) decodes
+    /// **byte-identically** under every thread budget, and the §9.3.4
+    /// count bank — the §6.1.2 `refresh_probs( )` input — is equal
+    /// cell-for-cell, pinning the per-worker count merge, not just the
+    /// sample merge. Budgets cover the uneven-chunk case (3 workers
+    /// over 2 columns clamps to 2) and over-provisioning (8 threads,
+    /// 2 columns).
+    #[test]
+    fn tile_parallel_keyframe_decode_matches_serial_samples_and_counts() {
+        use crate::decode_frame::decode_intra_products_for_test;
+        use oxideav_core::ExecutionContext;
+
+        let (w, h) = (512u32, 256u32);
+        let (mi_rows, mi_cols) = (h / 8, w / 8);
+        let mut plan = KeyframeTreePlan::uniform(mi_rows, mi_cols, BLOCK_16X16, 1);
+        for (&(lr, lc), leaf) in plan.leaves.iter_mut() {
+            leaf.y_mode = ((lr / 2 + lc / 2) % 10) as u8;
+            leaf.uv_mode = ((lr / 2) % 10) as u8;
+            leaf.skip = false;
+        }
+        let mut coeffs: Box<FrameCoefSource> = Box::new(|r, c, p, sx, sy, _b| {
+            if p == 0 {
+                vec![1 + ((r + c + sx + sy) % 3) as i64]
+            } else {
+                Vec::new()
+            }
+        });
+        let mut hdr = keyframe_header(w, h);
+        hdr.tile_info = TileInfo {
+            tile_cols_log2: 1,
+            tile_rows_log2: 2,
+        };
+        let bytes = assemble_keyframe_tree(&hdr, &plan, &mut *coeffs).expect("tiled keyframe");
+
+        let (serial, serial_counts) =
+            decode_intra_products_for_test(&bytes, &ExecutionContext::serial()).expect("serial");
+        for threads in [2usize, 3, 8] {
+            let (par, par_counts) =
+                decode_intra_products_for_test(&bytes, &ExecutionContext::with_threads(threads))
+                    .unwrap_or_else(|e| panic!("parallel decode ({threads} threads): {e}"));
+            assert_eq!(par.y, serial.y, "{threads} threads: luma differs");
+            assert_eq!(par.u, serial.u, "{threads} threads: U differs");
+            assert_eq!(par.v, serial.v, "{threads} threads: V differs");
+            assert!(
+                *par_counts == *serial_counts,
+                "{threads} threads: §9.3.4 count bank differs from the serial walk"
+            );
+        }
+    }
+
+    /// Tile-parallel §6.4 decode — INTER: the 2col x 4row P-frame
+    /// stream (NEWMV leaves straddling the tile boundaries, live
+    /// residual) decodes **byte-identically** through
+    /// [`crate::decode_frame::decode_vp9_sequence_with`] at every
+    /// thread budget, packed output compared frame-for-frame against
+    /// the serial [`crate::decode_frame::decode_vp9_sequence`].
+    #[test]
+    fn tile_parallel_inter_sequence_matches_serial() {
+        use crate::decode_frame::{decode_vp9_sequence, decode_vp9_sequence_with};
+        use crate::mode_info::{NEWMV, ZEROMV};
+        use oxideav_core::ExecutionContext;
+
+        let (w, h) = (512u32, 256u32);
+        let (mi_rows, mi_cols) = (h / 8, w / 8);
+
+        let mut kf_plan = KeyframeTreePlan::uniform(mi_rows, mi_cols, BLOCK_16X16, 1);
+        for leaf in kf_plan.leaves.values_mut() {
+            leaf.skip = false;
+        }
+        let mut kf_coeffs: Box<FrameCoefSource> = Box::new(|r, c, p, _sx, _sy, _b| {
+            if p == 0 {
+                vec![((r * 7 + c * 3) % 11) as i64]
+            } else {
+                Vec::new()
+            }
+        });
+        let mut kf_hdr = keyframe_header(w, h);
+        kf_hdr.tile_info = TileInfo {
+            tile_cols_log2: 1,
+            tile_rows_log2: 2,
+        };
+        let kf = assemble_keyframe_tree(&kf_hdr, &kf_plan, &mut *kf_coeffs).expect("keyframe");
+
+        let mut p_hdr = inter_header(w, h);
+        p_hdr.error_resilient_mode = true;
+        p_hdr.tile_info = TileInfo {
+            tile_cols_log2: 1,
+            tile_rows_log2: 2,
+        };
+        let mut planner: Box<InterTreePlanner> = Box::new(|r, c, subsize, _s| {
+            let mut leaf = skip_leaf(subsize, TxMode::Only4x4);
+            if (r % 8 == 0 && c % 16 == 0) || ((28..36).contains(&c) && r % 4 == 0) {
+                leaf.y_mode = NEWMV;
+                leaf.mv = [[16, -8], [0, 0]];
+                leaf.skip = false;
+            } else {
+                leaf.y_mode = ZEROMV;
+            }
+            leaf
+        });
+        let mut p_coeffs: Box<FrameCoefSource> = Box::new(|r, c, p, _sx, _sy, _b| {
+            if p == 0 {
+                vec![((r + 2 * c) % 5) as i64]
+            } else {
+                Vec::new()
+            }
+        });
+        let plan = InterFrameTreePlan {
+            tx_mode: TxMode::Only4x4,
+            reference_mode: ReferenceMode::SingleReference,
+            partitions: HashMap::new(),
+            prev_segment_ids: None,
+            prev_frame_mvs_absent: false,
+            prev_frame_mvs: None,
+        };
+        let pf = assemble_inter_frame_tree(&p_hdr, &plan, &mut *planner, &mut *p_coeffs)
+            .expect("tiled p-frame");
+
+        let serial = decode_vp9_sequence(&[&kf, &pf]).expect("serial decode");
+        assert_ne!(serial[1].y, serial[0].y, "motion must be observable");
+        for threads in [2usize, 3, 8] {
+            let par =
+                decode_vp9_sequence_with(&[&kf, &pf], &ExecutionContext::with_threads(threads))
+                    .unwrap_or_else(|e| panic!("parallel decode ({threads} threads): {e}"));
+            assert_eq!(par.len(), serial.len());
+            for (i, (pf, sf)) in par.iter().zip(&serial).enumerate() {
+                assert_eq!(
+                    pf.to_planar_bytes(),
+                    sf.to_planar_bytes(),
+                    "{threads} threads: frame {i} differs from the serial decode"
+                );
+            }
+        }
+    }
+
+    /// Tile-parallel §6.4 decode — UNEVEN tile columns: 576x64
+    /// (`Sb64Cols = 9`, past the §6.2.14 `MIN_TILE_WIDTH_B64 = 4`
+    /// bound for `tile_cols_log2 = 1`) splits into 32 + 40 MI columns
+    /// per the §6.4.1 `get_tile_offset( )` ladder, which must decode
+    /// byte-identically (samples and counts) under a heavily
+    /// over-provisioned budget (`effective_workers` clamps 16 threads
+    /// to the 2 available columns).
+    #[test]
+    fn tile_parallel_minimal_two_column_frame_matches_serial() {
+        use crate::decode_frame::decode_intra_products_for_test;
+        use oxideav_core::ExecutionContext;
+
+        let (w, h) = (576u32, 64u32);
+        let (mi_rows, mi_cols) = (h / 8, w / 8);
+        let mut plan = KeyframeTreePlan::uniform(mi_rows, mi_cols, BLOCK_16X16, 1);
+        for (&(lr, lc), leaf) in plan.leaves.iter_mut() {
+            leaf.y_mode = ((lr + lc) % 10) as u8;
+            leaf.skip = false;
+        }
+        let mut coeffs: Box<FrameCoefSource> = Box::new(|r, c, p, _sx, _sy, _b| {
+            if p == 0 {
+                vec![((r * 3 + c) % 7) as i64]
+            } else {
+                Vec::new()
+            }
+        });
+        let mut hdr = keyframe_header(w, h);
+        hdr.tile_info = TileInfo {
+            tile_cols_log2: 1,
+            tile_rows_log2: 0,
+        };
+        let bytes = assemble_keyframe_tree(&hdr, &plan, &mut *coeffs).expect("2-col keyframe");
+
+        let (serial, serial_counts) =
+            decode_intra_products_for_test(&bytes, &ExecutionContext::serial()).expect("serial");
+        let (par, par_counts) =
+            decode_intra_products_for_test(&bytes, &ExecutionContext::with_threads(16))
+                .expect("parallel");
+        assert_eq!(par.y, serial.y);
+        assert_eq!(par.u, serial.u);
+        assert_eq!(par.v, serial.v);
+        assert!(*par_counts == *serial_counts, "count bank differs");
+    }
+
     /// [`PrevMotionField::after_intra_frame`] equals the actual §6.4.4
     /// write-back state a keyframe leaves (`ref_frame = [ INTRA, NONE ]`
     /// with zero vectors on every MI cell) — pinned against the keyframe

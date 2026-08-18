@@ -40,6 +40,8 @@
 //! (§6.2, §6.3, §6.4-§6.4.26, §7.2.6, §7.4.1-§7.4.4, §8.5.1, §8.6,
 //! §8.7, §8.8, §8.10).
 
+use oxideav_core::ExecutionContext;
+
 use crate::bool_coder::BoolCoder;
 use crate::compressed::{
     parse_compressed_header, parse_compressed_header_inter_with_ctx,
@@ -1128,6 +1130,359 @@ struct PrevFrameState<'a> {
     segment_ids: &'a [u8],
 }
 
+/// The read-only per-frame inputs every §6.4.2 `decode_tile( )` call
+/// shares — the parsed headers, the §8.10 reference buffers, and the
+/// previous frame's §6.5 / §6.4.14 snapshots. One instance is built per
+/// frame and borrowed by every tile decode (serial or tile-parallel:
+/// nothing in here is written during the §6.4 tile walk).
+struct TileDecodeShared<'a> {
+    hdr: &'a Vp9FrameHeader,
+    chdr: &'a Vp9CompressedHeader,
+    chdr_inter: Option<&'a Vp9CompressedHeaderInter>,
+    refs: Option<&'a RefBuffers>,
+    mi_rows: u32,
+    mi_cols: u32,
+    ssx: bool,
+    ssy: bool,
+    bit_depth: u32,
+    lossless: bool,
+    use_prev_frame_mvs: bool,
+    prev_ref_frames: &'a [i32],
+    prev_mvs: &'a [(i16, i16)],
+    prev_segment_ids: &'a [u8],
+}
+
+/// One `(tileRow, tileCol)` cell of the §6.4 tile grid: its
+/// `get_tile_offset( )` MI window and its §9.2 coder byte slice (the
+/// pure byte-arithmetic prepass over the `tile_payload_sizes( )`
+/// output).
+struct TileTask<'a> {
+    mi_row_start: u32,
+    mi_row_end: u32,
+    mi_col_start: u32,
+    mi_col_end: u32,
+    slice: &'a [u8],
+}
+
+/// The mutable per-frame decode state one §6.4.2 `decode_tile( )` call
+/// writes — the `CurrFrame` planes, the §6.4.4 frame-wide arrays, the
+/// §7.4.1 context strips, the §9.3.4 count bank, and the §6.4.24
+/// scratch buffers. The serial path reborrows the frame-level state per
+/// tile; the tile-parallel path hands each worker its own private
+/// instance (a tile column never reads another column's slice of any of
+/// these — `AvailL = MiCol > MiColStart`, §8.5.1 edge reads bounded by
+/// the block's own extent, §6.5 candidate scans clamped to the tile
+/// window — so a private zero-initialised copy evolves exactly like the
+/// shared serial state over the worker's columns).
+struct TileWorkState<'a> {
+    state: &'a mut Vp9FrameState,
+    plane_y: &'a mut Plane,
+    plane_u: &'a mut Plane,
+    plane_v: &'a mut Plane,
+    nz: &'a mut [NonzeroContext; 3],
+    pctx: &'a mut PartitionContextState,
+    seg_pred_ctx: &'a mut SegPredContextState,
+    counts: &'a mut crate::prob_adapt::FrameCounts,
+    token_cache: &'a mut [u8; 1024],
+    tok_buf: &'a mut [i64; 1024],
+}
+
+/// §6.4.2 `decode_tile( )` with its §6.4 line-2326/2328 coder bracket:
+/// `init_bool( tile_size )`, the superblock raster with the §7.4.2
+/// per-superblock-row left resets, `exit_bool( )`. Both the serial
+/// raster and the tile-parallel workers run tiles through this one
+/// body, so the two paths cannot drift.
+fn decode_one_tile(
+    sh: &TileDecodeShared<'_>,
+    task: &TileTask<'_>,
+    ws: TileWorkState<'_>,
+) -> Result<(), Error> {
+    // §6.4 line 2326: init_bool( tile_size ).
+    let mut coder = BoolCoder::init_bool(task.slice, task.slice.len())?;
+
+    // Build the per-tile inter context (re-borrowing the per-frame /
+    // per-worker `seg_pred_ctx`). On keyframes / intra-only frames
+    // this is `None` and the §6.4.6 intra arm runs.
+    let inter_ctx = match (sh.chdr_inter, sh.refs) {
+        (Some(ci), Some(rb)) => {
+            let comp_config = ci
+                .compound_reference_config
+                .unwrap_or(CompoundReferenceConfig {
+                    fixed_ref: LAST_FRAME,
+                    var_ref: [GOLDEN_FRAME, ALTREF_FRAME],
+                });
+            // §6.2.5 ref_frame_sign_bias[ 4 ] indexed by §3 value.
+            let mut sb = [false; 4];
+            let hdr_sb = sh.hdr.ref_frame_sign_bias;
+            sb[LAST_FRAME as usize] = hdr_sb[0];
+            sb[GOLDEN_FRAME as usize] = hdr_sb[1];
+            sb[ALTREF_FRAME as usize] = hdr_sb[2];
+            Some(InterCtx {
+                chdr: ci,
+                refs: rb,
+                ref_frame_idx: sh.hdr.ref_frame_idx.unwrap_or([0, 1, 2]),
+                sign_bias: sb,
+                interpolation_filter: sh.hdr.interpolation_filter,
+                allow_high_precision_mv: sh.hdr.allow_high_precision_mv,
+                use_prev_frame_mvs: sh.use_prev_frame_mvs,
+                comp_config,
+                frame_width: sh.hdr.frame_width,
+                frame_height: sh.hdr.frame_height,
+                prev_ref_frames: sh.prev_ref_frames,
+                prev_mvs: sh.prev_mvs,
+                prev_segment_ids: sh.prev_segment_ids,
+                seg_pred_ctx: ws.seg_pred_ctx,
+            })
+        }
+        _ => None,
+    };
+
+    let mut block_decoder = BlockDecoder {
+        seg: &sh.hdr.segmentation,
+        quant: &sh.hdr.quantization,
+        chdr: sh.chdr,
+        mi_rows: sh.mi_rows,
+        mi_cols: sh.mi_cols,
+        mi_col_start: task.mi_col_start,
+        mi_col_end: task.mi_col_end,
+        subsampling_x: sh.ssx,
+        subsampling_y: sh.ssy,
+        bit_depth: sh.bit_depth,
+        lossless: sh.lossless,
+        state: ws.state,
+        y: ws.plane_y,
+        u: ws.plane_u,
+        v: ws.plane_v,
+        nz: ws.nz,
+        token_cache: ws.token_cache,
+        tok_buf: ws.tok_buf,
+        counts: ws.counts,
+        inter: inter_ctx,
+    };
+
+    // §6.4.3 partition probs: keyframe fixed table or the inter
+    // running `partition_probs[ ]`.
+    let part_kind = match sh.chdr_inter {
+        Some(ci) => PartitionProbsKind::Inter(&ci.partition_probs),
+        None => PartitionProbsKind::Keyframe,
+    };
+
+    // §6.4.2 decode_tile( ): superblock raster with the
+    // §7.4.2 clear_left_context( ) reset per superblock row
+    // (LeftNonzeroContext + LeftPartitionContext).
+    let mut r = task.mi_row_start;
+    while r < task.mi_row_end {
+        ws.pctx.clear_left();
+        if let Some(ic) = block_decoder.inter.as_mut() {
+            ic.seg_pred_ctx.clear_left();
+        }
+        for plane_nz in block_decoder.nz.iter_mut() {
+            plane_nz.left.fill(0);
+        }
+        let mut c = task.mi_col_start;
+        while c < task.mi_col_end {
+            decode_partition(
+                &mut coder,
+                r,
+                c,
+                BLOCK_64X64,
+                sh.mi_rows,
+                sh.mi_cols,
+                ws.pctx,
+                part_kind,
+                &mut block_decoder,
+            )?;
+            c += 8;
+        }
+        r += 8;
+    }
+
+    // §6.4 line 2328: exit_bool( ).
+    coder.exit_bool()?;
+    Ok(())
+}
+
+/// Tile-parallel §6.4 `decode_tiles( )` over **tile columns** — the
+/// §9.2.4-style multi-coder path (one §9.2 boolean coder is live per
+/// concurrently-decoded tile).
+///
+/// The parallel unit is the tile *column* (every tile row of it, in
+/// row order): VP9 makes tile columns independent — the §6.4.4
+/// `AvailL = MiCol > MiColStart` clamp severs left neighbours at the
+/// column edge, tile boundaries are SB64-aligned so no block or §8.5.1
+/// edge read crosses `MiColEnd` (the §8.5.1 `aboveRow` reads are
+/// bounded by the block's own width, and the above-right extension
+/// fires only for a `txSz == 0` block `notOnRight` of its parent —
+/// still inside the block), and the §6.5 candidate scans are clamped to
+/// the tile's `MiColStart` / `MiColEnd` window — while tile *rows*
+/// within a column stay ordered (the row above supplies §8.5.1 `y - 1`
+/// samples and the §7.4.1 above strips).
+///
+/// Each worker decodes a contiguous chunk of tile columns into its own
+/// private [`TileWorkState`] (full-extent buffers, zero-initialised —
+/// exactly the state the serial walk would show that column, since no
+/// cross-column slice is ever read), and the workers' disjoint MI
+/// column ranges are merged back in column order afterwards. The §9.3.4
+/// count banks are summed (order-independent), so the merged output —
+/// planes, §6.4.4 arrays, counts — is **byte-identical to the serial
+/// walk** regardless of scheduling; on error the lowest raster-order
+/// tile error is returned, which is the error the serial walk would
+/// have hit first.
+#[allow(clippy::too_many_arguments)]
+fn decode_tiles_tile_parallel(
+    sh: &TileDecodeShared<'_>,
+    tasks: &[TileTask<'_>],
+    tile_cols: u32,
+    workers: usize,
+    sb64_cols: u32,
+    sb64_rows: u32,
+    state: &mut Vp9FrameState,
+    plane_y: &mut Plane,
+    plane_u: &mut Plane,
+    plane_v: &mut Plane,
+    counts: &mut crate::prob_adapt::FrameCounts,
+) -> Result<(), Error> {
+    /// One worker's private decode products.
+    struct WorkerOut {
+        col_lo: usize,
+        col_hi: usize,
+        state: Vp9FrameState,
+        plane_y: Plane,
+        plane_u: Plane,
+        plane_v: Plane,
+        counts: Box<crate::prob_adapt::FrameCounts>,
+    }
+
+    let y_w = (sh.mi_cols * 8) as usize;
+    let y_h = (sh.mi_rows * 8) as usize;
+    let uv_w = ((sh.mi_cols * 8) >> u32::from(sh.ssx)) as usize;
+    let uv_h = ((sh.mi_rows * 8) >> u32::from(sh.ssy)) as usize;
+
+    let cols_per_worker = (tile_cols as usize).div_ceil(workers);
+    let results: Vec<Result<WorkerOut, (usize, Error)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|w| {
+                let col_lo = w * cols_per_worker;
+                let col_hi = ((w + 1) * cols_per_worker).min(tile_cols as usize);
+                scope.spawn(move || {
+                    let mut w_state = Vp9FrameState::new(sh.mi_rows, sh.mi_cols);
+                    let mut w_plane_y = Plane::new(y_w, y_h);
+                    let mut w_plane_u = Plane::new(uv_w, uv_h);
+                    let mut w_plane_v = Plane::new(uv_w, uv_h);
+                    let mut w_nz = [
+                        NonzeroContext::new((2 * sh.mi_cols) as usize, (2 * sh.mi_rows) as usize),
+                        NonzeroContext::new(
+                            ((2 * sh.mi_cols) >> u32::from(sh.ssx)) as usize,
+                            ((2 * sh.mi_rows) >> u32::from(sh.ssy)) as usize,
+                        ),
+                        NonzeroContext::new(
+                            ((2 * sh.mi_cols) >> u32::from(sh.ssx)) as usize,
+                            ((2 * sh.mi_rows) >> u32::from(sh.ssy)) as usize,
+                        ),
+                    ];
+                    let mut w_pctx = PartitionContextState::new(
+                        (sb64_cols * 8) as usize,
+                        (sb64_rows * 8) as usize,
+                    );
+                    let mut w_seg_pred = SegPredContextState::new(sh.mi_cols, sh.mi_rows);
+                    let mut w_counts = crate::prob_adapt::FrameCounts::new_boxed();
+                    let mut w_token_cache = [0u8; 1024];
+                    let mut w_tok_buf = [0i64; 1024];
+                    // §7.4.1 clear_above_context( ): the fresh strips
+                    // are already zero (mirrors the serial once-per-
+                    // frame reset).
+                    w_pctx.clear_above();
+
+                    // The worker's tiles in raster order — every tile
+                    // row of each assigned column runs in row order.
+                    for (idx, task) in tasks.iter().enumerate() {
+                        let col = idx % tile_cols as usize;
+                        if col < col_lo || col >= col_hi {
+                            continue;
+                        }
+                        decode_one_tile(
+                            sh,
+                            task,
+                            TileWorkState {
+                                state: &mut w_state,
+                                plane_y: &mut w_plane_y,
+                                plane_u: &mut w_plane_u,
+                                plane_v: &mut w_plane_v,
+                                nz: &mut w_nz,
+                                pctx: &mut w_pctx,
+                                seg_pred_ctx: &mut w_seg_pred,
+                                counts: &mut w_counts,
+                                token_cache: &mut w_token_cache,
+                                tok_buf: &mut w_tok_buf,
+                            },
+                        )
+                        .map_err(|e| (idx, e))?;
+                    }
+                    Ok(WorkerOut {
+                        col_lo,
+                        col_hi,
+                        state: w_state,
+                        plane_y: w_plane_y,
+                        plane_u: w_plane_u,
+                        plane_v: w_plane_v,
+                        counts: w_counts,
+                    })
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("tile worker panicked"))
+            .collect()
+    });
+
+    // Deterministic error surface: the lowest raster-order tile error
+    // is the one the serial §6.4 walk would have hit first (tiles are
+    // independent, so a tile's own outcome is schedule-invariant).
+    if results.iter().any(|r| r.is_err()) {
+        let (_, err) = results
+            .into_iter()
+            .filter_map(|r| r.err())
+            .min_by_key(|(idx, _)| *idx)
+            .expect("checked above");
+        return Err(err);
+    }
+
+    // Merge the workers' disjoint MI column ranges in column order.
+    for out in results
+        .into_iter()
+        .map(|r| r.expect("errors handled above"))
+    {
+        if out.col_lo >= out.col_hi {
+            continue;
+        }
+        // The worker's contiguous MI window (chunk boundaries are tile
+        // boundaries, so the first task of its first column / the last
+        // task's end of its last column bound it).
+        let c0 = tasks[out.col_lo].mi_col_start;
+        let c1 = tasks[out.col_hi - 1].mi_col_end;
+        if c0 >= c1 {
+            continue; // degenerate (empty) tile columns
+        }
+        let x0 = (c0 * 8) as usize;
+        let x1 = (c1 * 8) as usize;
+        plane_y.copy_cols_from(&out.plane_y, x0, x1);
+        plane_u.copy_cols_from(
+            &out.plane_u,
+            x0 >> u32::from(sh.ssx),
+            x1 >> u32::from(sh.ssx),
+        );
+        plane_v.copy_cols_from(
+            &out.plane_v,
+            x0 >> u32::from(sh.ssx),
+            x1 >> u32::from(sh.ssx),
+        );
+        state.merge_cols_from(&out.state, c0, c1);
+        counts.merge_from(&out.counts);
+    }
+    Ok(())
+}
+
 /// Decode one intra (key or intra-only) VP9 frame to planar samples.
 ///
 /// `data` is a single frame's byte payload (uncompressed header +
@@ -1165,8 +1520,50 @@ pub fn decode_intra_frame(data: &[u8]) -> Result<Vp9DecodedFrame, Error> {
         &data[ch_start..ch_end],
         lossless,
     )?));
-    let products = decode_single_frame(data, &hdr, ch_end, chdr, None, None)?;
+    let products = decode_single_frame(data, &hdr, ch_end, chdr, None, None, &EXEC_SERIAL)?;
     Ok(products.out)
+}
+
+/// The default (serial) execution context for the entry points that
+/// take no caller-supplied one.
+const EXEC_SERIAL: ExecutionContext = ExecutionContext::serial();
+
+/// Test-only companion of [`decode_intra_frame`] that decodes under a
+/// caller-supplied [`ExecutionContext`] and also returns the §9.3.4
+/// count bank — the direct pin that the tile-parallel merge reproduces
+/// the serial walk's counts (the §6.1.2 `refresh_probs( )` input)
+/// exactly, not just the output samples.
+#[cfg(test)]
+pub(crate) fn decode_intra_products_for_test(
+    data: &[u8],
+    exec: &ExecutionContext,
+) -> Result<(Vp9DecodedFrame, Box<crate::prob_adapt::FrameCounts>), Error> {
+    let hdr: Vp9FrameHeader = parse_uncompressed_header(data)?;
+    if hdr.show_existing_frame {
+        return Err(Error::Unsupported);
+    }
+    let frame_is_intra = matches!(hdr.frame_type, FrameType::KeyFrame) || hdr.intra_only;
+    if !frame_is_intra {
+        return Err(Error::Unsupported);
+    }
+    let lossless = hdr.quantization.lossless;
+    let ch_start = hdr.uncompressed_header_size_bytes;
+    let ch_size = hdr.header_size_in_bytes as usize;
+    if ch_size == 0 {
+        return Err(Error::InvalidBitstream);
+    }
+    let ch_end = ch_start
+        .checked_add(ch_size)
+        .ok_or(Error::InvalidBitstream)?;
+    if data.len() < ch_end {
+        return Err(Error::UnexpectedEof);
+    }
+    let chdr = ChdrKind::Intra(Box::new(parse_compressed_header(
+        &data[ch_start..ch_end],
+        lossless,
+    )?));
+    let products = decode_single_frame(data, &hdr, ch_end, chdr, None, None, exec)?;
+    Ok((products.out, products.counts))
 }
 
 /// Decoder resource bound on the MI-padded luma picture size, in
@@ -1183,6 +1580,12 @@ const MAX_LUMA_PICTURE_SIZE: u64 = 35_651_584;
 /// compressed header, the optional §8.10 reference buffers, and the
 /// optional previous-frame motion field. Returns the reconstruction
 /// products (cropped output + working planes + §6.4.4 state).
+///
+/// `exec` is the threading authority for the §6.4 tile walk: the tile
+/// fan-out is `exec.effective_workers( tileCols )` (so the default
+/// [`ExecutionContext::serial`] keeps the plain serial raster), and the
+/// tile-parallel output is byte-identical to the serial walk — see
+/// [`decode_tiles_tile_parallel`].
 fn decode_single_frame(
     data: &[u8],
     hdr: &Vp9FrameHeader,
@@ -1190,6 +1593,7 @@ fn decode_single_frame(
     chdr_kind: ChdrKind,
     refs: Option<&RefBuffers>,
     prev: Option<PrevFrameState<'_>>,
+    exec: &ExecutionContext,
 ) -> Result<FrameDecodeProducts, Error> {
     let lossless = hdr.quantization.lossless;
     let chdr = chdr_kind.intra().clone();
@@ -1294,126 +1698,88 @@ fn decode_single_frame(
 
     let tile_cols = 1u32 << tile_cols_log2;
     let tile_rows = 1u32 << tile_rows_log2;
-    let mut byte_cursor = 0usize;
-    let mut size_idx = 0usize;
-    for tile_row in 0..tile_rows {
-        for tile_col in 0..tile_cols {
-            let last_tile = tile_row == tile_rows - 1 && tile_col == tile_cols - 1;
-            if !last_tile {
-                byte_cursor += 4; // the f(32) tile_size prefix
+
+    // Pre-slice every tile payload — the pure §6.4 byte arithmetic
+    // (`tile_payload_sizes( )` has already validated every f(32)
+    // prefix, the running `sz` budget, and every body range).
+    let mut tile_tasks: Vec<TileTask<'_>> = Vec::with_capacity(sizes.len());
+    {
+        let mut byte_cursor = 0usize;
+        let mut size_idx = 0usize;
+        for tile_row in 0..tile_rows {
+            for tile_col in 0..tile_cols {
+                let last_tile = tile_row == tile_rows - 1 && tile_col == tile_cols - 1;
+                if !last_tile {
+                    byte_cursor += 4; // the f(32) tile_size prefix
+                }
+                let tile_size = sizes[size_idx] as usize;
+                size_idx += 1;
+                tile_tasks.push(TileTask {
+                    mi_row_start: get_tile_offset(tile_row, mi_rows, u32::from(tile_rows_log2)),
+                    mi_row_end: get_tile_offset(tile_row + 1, mi_rows, u32::from(tile_rows_log2)),
+                    mi_col_start: get_tile_offset(tile_col, mi_cols, u32::from(tile_cols_log2)),
+                    mi_col_end: get_tile_offset(tile_col + 1, mi_cols, u32::from(tile_cols_log2)),
+                    slice: &tile_data[byte_cursor..byte_cursor + tile_size],
+                });
+                byte_cursor += tile_size;
             }
-            let tile_size = sizes[size_idx] as usize;
-            size_idx += 1;
+        }
+    }
 
-            let mi_row_start = get_tile_offset(tile_row, mi_rows, u32::from(tile_rows_log2));
-            let mi_row_end = get_tile_offset(tile_row + 1, mi_rows, u32::from(tile_rows_log2));
-            let mi_col_start = get_tile_offset(tile_col, mi_cols, u32::from(tile_cols_log2));
-            let mi_col_end = get_tile_offset(tile_col + 1, mi_cols, u32::from(tile_cols_log2));
+    let tile_shared = TileDecodeShared {
+        hdr,
+        chdr: &chdr,
+        chdr_inter: chdr_inter_ref,
+        refs,
+        mi_rows,
+        mi_cols,
+        ssx,
+        ssy,
+        bit_depth,
+        lossless,
+        use_prev_frame_mvs,
+        prev_ref_frames,
+        prev_mvs,
+        prev_segment_ids,
+    };
 
-            // §6.4 line 2326: init_bool( tile_size ).
-            let tile_slice = &tile_data[byte_cursor..byte_cursor + tile_size];
-            let mut coder = BoolCoder::init_bool(tile_slice, tile_size)?;
-
-            // Build the per-tile inter context (re-borrowing the shared
-            // per-frame `seg_pred_ctx`). On keyframes / intra-only frames
-            // this is `None` and the §6.4.6 intra arm runs.
-            let inter_ctx = match (chdr_inter_ref, refs) {
-                (Some(ci), Some(rb)) => {
-                    let comp_config =
-                        ci.compound_reference_config
-                            .unwrap_or(CompoundReferenceConfig {
-                                fixed_ref: LAST_FRAME,
-                                var_ref: [GOLDEN_FRAME, ALTREF_FRAME],
-                            });
-                    // §6.2.5 ref_frame_sign_bias[ 4 ] indexed by §3 value.
-                    let mut sb = [false; 4];
-                    let hdr_sb = hdr.ref_frame_sign_bias;
-                    sb[LAST_FRAME as usize] = hdr_sb[0];
-                    sb[GOLDEN_FRAME as usize] = hdr_sb[1];
-                    sb[ALTREF_FRAME as usize] = hdr_sb[2];
-                    Some(InterCtx {
-                        chdr: ci,
-                        refs: rb,
-                        ref_frame_idx: hdr.ref_frame_idx.unwrap_or([0, 1, 2]),
-                        sign_bias: sb,
-                        interpolation_filter: hdr.interpolation_filter,
-                        allow_high_precision_mv: hdr.allow_high_precision_mv,
-                        use_prev_frame_mvs,
-                        comp_config,
-                        frame_width: hdr.frame_width,
-                        frame_height: hdr.frame_height,
-                        prev_ref_frames,
-                        prev_mvs,
-                        prev_segment_ids,
-                        seg_pred_ctx: &mut seg_pred_ctx,
-                    })
-                }
-                _ => None,
-            };
-
-            let mut block_decoder = BlockDecoder {
-                seg: &hdr.segmentation,
-                quant: &hdr.quantization,
-                chdr: &chdr,
-                mi_rows,
-                mi_cols,
-                mi_col_start,
-                mi_col_end,
-                subsampling_x: ssx,
-                subsampling_y: ssy,
-                bit_depth,
-                lossless,
-                state: &mut state,
-                y: &mut plane_y,
-                u: &mut plane_u,
-                v: &mut plane_v,
-                nz: &mut nz,
-                token_cache: &mut token_cache,
-                tok_buf: &mut tok_buf,
-                counts: &mut counts,
-                inter: inter_ctx,
-            };
-
-            // §6.4.3 partition probs: keyframe fixed table or the inter
-            // running `partition_probs[ ]`.
-            let part_kind = match chdr_inter_ref {
-                Some(ci) => PartitionProbsKind::Inter(&ci.partition_probs),
-                None => PartitionProbsKind::Keyframe,
-            };
-
-            // §6.4.2 decode_tile( ): superblock raster with the
-            // §7.4.2 clear_left_context( ) reset per superblock row
-            // (LeftNonzeroContext + LeftPartitionContext).
-            let mut r = mi_row_start;
-            while r < mi_row_end {
-                pctx.clear_left();
-                if let Some(ic) = block_decoder.inter.as_mut() {
-                    ic.seg_pred_ctx.clear_left();
-                }
-                for plane_nz in block_decoder.nz.iter_mut() {
-                    plane_nz.left.fill(0);
-                }
-                let mut c = mi_col_start;
-                while c < mi_col_end {
-                    decode_partition(
-                        &mut coder,
-                        r,
-                        c,
-                        BLOCK_64X64,
-                        mi_rows,
-                        mi_cols,
-                        &mut pctx,
-                        part_kind,
-                        &mut block_decoder,
-                    )?;
-                    c += 8;
-                }
-                r += 8;
-            }
-
-            // §6.4 line 2328: exit_bool( ).
-            coder.exit_bool()?;
-            byte_cursor += tile_size;
+    // The §9.2.4 multi-coder gate: tile columns are the independent
+    // §6.4 unit, and the ExecutionContext is the single threading
+    // authority — the fan-out is bounded by `effective_workers` over
+    // the column count (1 worker ⇒ the plain serial raster).
+    let workers = exec.effective_workers(tile_cols as usize);
+    if workers > 1 {
+        decode_tiles_tile_parallel(
+            &tile_shared,
+            &tile_tasks,
+            tile_cols,
+            workers,
+            sb64_cols,
+            sb64_rows,
+            &mut state,
+            &mut plane_y,
+            &mut plane_u,
+            &mut plane_v,
+            &mut counts,
+        )?;
+    } else {
+        for task in &tile_tasks {
+            decode_one_tile(
+                &tile_shared,
+                task,
+                TileWorkState {
+                    state: &mut state,
+                    plane_y: &mut plane_y,
+                    plane_u: &mut plane_u,
+                    plane_v: &mut plane_v,
+                    nz: &mut nz,
+                    pctx: &mut pctx,
+                    seg_pred_ctx: &mut seg_pred_ctx,
+                    counts: &mut counts,
+                    token_cache: &mut token_cache,
+                    tok_buf: &mut tok_buf,
+                },
+            )?;
         }
     }
 
@@ -1539,7 +1905,30 @@ fn decode_single_frame(
 /// process; single + compound prediction, segmentation, and the §8.10
 /// reference-buffer update are all wired.
 pub fn decode_vp9_sequence(frames: &[&[u8]]) -> Result<Vec<Vp9DecodedFrame>, Error> {
+    decode_vp9_sequence_with(frames, &EXEC_SERIAL)
+}
+
+/// [`decode_vp9_sequence`] under a caller-supplied
+/// [`ExecutionContext`] — the threading authority for the §6.4 tile
+/// walk of every frame.
+///
+/// Multi-tile-column frames decode their tile columns on up to
+/// `exec.effective_workers( tileCols )` workers (the §9.2.4 multi-coder
+/// path: one §9.2 boolean decoder live per concurrent tile), and the
+/// output is **byte-identical** to [`decode_vp9_sequence`] — tile
+/// columns are independent by construction (§6.4.4
+/// `AvailL = MiCol > MiColStart`, SB64-aligned tile boundaries, §6.5
+/// candidate scans clamped to the tile window), so the merge of the
+/// per-column decodes reproduces the serial raster exactly. Frames with
+/// a single tile column (and every frame under
+/// [`ExecutionContext::serial`], the [`decode_vp9_sequence`] default)
+/// take the plain serial path.
+pub fn decode_vp9_sequence_with(
+    frames: &[&[u8]],
+    exec: &ExecutionContext,
+) -> Result<Vec<Vp9DecodedFrame>, Error> {
     let mut decoder = Vp9SequenceDecoder::new();
+    decoder.set_execution_context(exec);
     let mut out = Vec::new();
     for &frame in frames {
         if let Some(f) = decoder.push_frame(frame)? {
@@ -1630,6 +2019,10 @@ pub struct Vp9SequenceDecoder {
     // it separately from the per-frame `prev_state` snapshot is what keeps
     // a run of `update_map == 0` inter frames reading the original map.
     prev_segment_ids_map: Option<(Vec<u8>, u32, u32)>,
+    // The threading authority for the §6.4 tile walk (serial until told
+    // otherwise, per the framework contract); tile-column fan-out is
+    // bounded by `exec.effective_workers( tileCols )` per frame.
+    exec: ExecutionContext,
 }
 
 impl std::fmt::Debug for Vp9SequenceDecoder {
@@ -1667,7 +2060,19 @@ impl Vp9SequenceDecoder {
             persist_ref_deltas: DEFAULT_LOOP_FILTER_REF_DELTAS,
             persist_mode_deltas: DEFAULT_LOOP_FILTER_MODE_DELTAS,
             prev_segment_ids_map: None,
+            exec: ExecutionContext::serial(),
         }
+    }
+
+    /// Set the threading authority for the §6.4 tile walk of every
+    /// subsequently pushed frame (the framework
+    /// `set_execution_context` contract: serial until told otherwise;
+    /// the per-frame tile-column fan-out is bounded by
+    /// `exec.effective_workers( tileCols )`). Decoded output is
+    /// byte-identical at every budget — see
+    /// [`decode_vp9_sequence_with`].
+    pub fn set_execution_context(&mut self, exec: &ExecutionContext) {
+        self.exec = exec.clone();
     }
 
     /// Decode one coded frame (one §6.2 uncompressed header + §6.3
@@ -1693,6 +2098,7 @@ impl Vp9SequenceDecoder {
             persist_ref_deltas,
             persist_mode_deltas,
             prev_segment_ids_map,
+            exec,
         } = self;
         // Peek the uncompressed header (with inherited ref state so inter
         // frames parse).
@@ -1888,7 +2294,7 @@ impl Vp9SequenceDecoder {
                 frame_contexts[frame_context_idx].apply_intra(&chdr_parsed);
             }
             let chdr = ChdrKind::Intra(Box::new(chdr_parsed));
-            let products = decode_single_frame(frame, &hdr, ch_end, chdr, Some(bufs), prev)?;
+            let products = decode_single_frame(frame, &hdr, ch_end, chdr, Some(bufs), prev, exec)?;
             if hdr.refresh_frame_context && non_parallel {
                 // refresh_probs( ), FrameIsIntra == 1 arm:
                 //   load_probs( idx ) ; adapt_coef_probs( ) ;
@@ -1928,7 +2334,7 @@ impl Vp9SequenceDecoder {
                 frame_contexts[frame_context_idx].apply_inter(&chdr_parsed);
             }
             let chdr = ChdrKind::Inter(Box::new(chdr_parsed));
-            let products = decode_single_frame(frame, &hdr, ch_end, chdr, Some(bufs), prev)?;
+            let products = decode_single_frame(frame, &hdr, ch_end, chdr, Some(bufs), prev, exec)?;
             if hdr.refresh_frame_context && non_parallel {
                 // refresh_probs( ), FrameIsIntra == 0 arm:
                 //   load_probs( idx ) ; adapt_coef_probs( ) ;

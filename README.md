@@ -155,6 +155,14 @@ matrix's deepest corner: profile 3, 12-bit, 4:2:2), and `lossy-rc-gop`
 (the corpus's first **rate-controlled** stream: per-frame bisected
 `base_q_idx` on the chain framing with the budget-guarded §6.2.8
 delta election).
+Two **round-448 packages** are built, black-box verified byte-exact,
+and wired (presence-gated) but not yet staged — the 4:4:0
+public-entry stream classes: `lossy-440-gop` (the corpus's first
+**self-encoded** 4:4:0 stream — the staged
+`profile-1-yuv440-8bit-inter` covers the geometry as a black-box
+encode; this one pins the writer side) and `lossy-hbd12-440-gop`
+(profile 3, 12-bit, 4:4:0 — the only §7.2 format-matrix corner that
+had no corpus fixture at all).
 Highlights: `i-frame-then-p-frame-64x64`
 (keyframe + single-reference LAST P-frame, high-precision MVs,
 8-tap-smooth filter), `frame-parallel-mode` (keyframe + three
@@ -179,6 +187,21 @@ decode order, with the §B.4 single-frame fallback when no valid index is
 present. This is VP9-intrinsic framing (Annex B of the bitstream spec) —
 the split must precede the §6.2 per-frame header walk for any chunk that
 might carry hidden alt-ref frames.
+
+**Tile-parallel decode (round 448):** [`decode_vp9_sequence_with`] and
+`Vp9SequenceDecoder::set_execution_context` accept an
+`oxideav_core::ExecutionContext` — the single threading authority —
+and decode a multi-tile-column frame's tile columns concurrently
+(`effective_workers( tileCols )` workers, the §9.2.4 multi-coder
+model; serial stays the default). Tile columns are independent by
+construction (§6.4.4 `AvailL = MiCol > MiColStart`, SB64-aligned tile
+boundaries bounding every §8.5.1 edge read, §6.5 candidate scans
+clamped to the tile window), so each worker decodes its columns into
+private state and the disjoint MI column ranges merge back
+deterministically — the output (samples *and* the §9.3.4 count bank
+feeding §6.1.2 `refresh_probs( )`) is **byte-identical to the serial
+walk at every thread budget**, pinned by unit, whole-corpus, and
+registry parity sweeps.
 
 The decode path composes:
 
@@ -436,7 +459,12 @@ the dual-API convention:
   packet-by-packet sweep decodes equal to the batch API (superframes,
   hidden alt-refs, `show_existing_frame` included; the 4:4:0 stream
   surfaces `Unsupported` at the frame-conversion boundary since the
-  framework has no 4:4:0 pixel-format label).
+  framework has no 4:4:0 pixel-format label — the crate's direct
+  decode APIs carry the geometry). Since round 448 [`Vp9Decoder`]
+  honors the framework `set_execution_context` hook: multi-tile
+  streams decode tile-parallel under the granted budget,
+  frame-identical to the serial decode, with the budget preserved
+  across `reset( )`.
 
 The encode path composes the bitstream-writer
 primitives — each derived as the exact inverse of the matching decode step
@@ -606,7 +634,19 @@ carries no forward update for it).
   the round-415 `render-size-128x72` fixture across all three §6.2.3
   `render_size( )` call sites — the encoder-tooling-gap ledger is now
   fully closed.
-* §9.2.4 multi-coder tile parallelism (tiles decode sequentially).
+* ~~§9.2.4 multi-coder tile parallelism~~ — **landed in round 448**:
+  multi-tile-column frames decode their tile columns concurrently
+  under `oxideav_core::ExecutionContext` (the single threading
+  authority; fan-out = `effective_workers( tileCols )`, serial until
+  told otherwise) through [`decode_vp9_sequence_with`] /
+  `Vp9SequenceDecoder::set_execution_context` / the framework
+  decoder's `set_execution_context` hook. Output is **byte-identical**
+  to the serial walk at every budget — pinned by sample + §9.3.4
+  count-bank equality on tiled keyframes/P-frames, a whole-corpus
+  4-thread parity sweep, and a registry parity sweep. Measured on
+  1080p 4-tile-column streams (release): 3.10x at 4 threads / 1.78x
+  at 2 on coefficient-heavy content; 1.31x at 4 threads on easy
+  low-rate content (the §8.8 loop filter stays serial).
 * Encoder depth beyond the planner-driven baseline. Keyframes **and
   P-frames** plan partitions `BLOCK_4X4`..`BLOCK_64X64` with
   transforms `TX_4X4`..`TX_32X32` (P-frames select per-block inter tx
@@ -644,9 +684,13 @@ carries no forward update for it).
   **Lossy encoding covers the full §7.2 format matrix as of round
   441** — 8-bit 4:2:0/4:4:4/4:2:2 (profiles 0/1) and 10/12-bit
   4:2:0/4:4:4/4:2:2 (profiles 2/3) on both standalone keyframes and
-  chain-framed sequences, every stream black-box validated; 4:4:0 has
-  no dedicated public entry, but the internals are
-  subsampling-generic and the 9-format decoder-mirror sweep pins it.
+  chain-framed sequences, every stream black-box validated — and
+  **round 448 closes the last geometry**: dedicated public **4:4:0**
+  entries ([`encode_vp9_lossy_440`] / [`encode_vp9_lossy_hbd_440`]
+  keyframes, [`encode_vp9_lossy_sequence_440`] /
+  [`encode_vp9_lossy_sequence_hbd_440`] chain-framed GOPs; `ssx = 0,
+  ssy = 1`, profile 1 at 8-bit / profile 3 at 10/12-bit), black-box
+  validated byte-exact at both depths on keyframes and GOPs.
   The inter *writers* carry compound references and
   **every** `MiSize` — the round-415 sub-8x8 per-(idy, idx) MV walk
   included, driven by `encode_pframe_lossless_layout` over arbitrary
@@ -655,7 +699,7 @@ carries no forward update for it).
 
 ## Testing
 
-The crate carries 1250+ tests (lib unit tests plus integration suites
+The crate carries 1270+ tests (lib unit tests plus integration suites
 in `tests/`, including the keyframe **and inter** encoder writers, each
 round-tripped back through the in-crate decoder; `encode_keyframe`
 exercising the public `encode_vp9` → decode **byte-exact lossless**

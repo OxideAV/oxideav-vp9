@@ -557,7 +557,8 @@ mod wide_filter;
 pub use codec::{make_decoder, make_encoder, Vp9Decoder, Vp9Encoder, Vp9EncoderOptions};
 
 pub use decode_frame::{
-    decode_intra_frame, decode_vp9_sequence, Vp9DecodedFrame, Vp9SequenceDecoder,
+    decode_intra_frame, decode_vp9_sequence, decode_vp9_sequence_with, Vp9DecodedFrame,
+    Vp9SequenceDecoder,
 };
 // Stable container utility: the Annex B superframe split that a caller
 // runs before feeding frames to `decode_vp9_sequence`.

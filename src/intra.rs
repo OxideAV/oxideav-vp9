@@ -155,6 +155,28 @@ impl Plane {
     pub(crate) fn samples(&self) -> &[i32] {
         &self.samples
     }
+
+    /// Copy the column range `[x0, x1)` of every row from `src` (a
+    /// same-dimension plane) into this plane — the tile-parallel merge
+    /// step: each §6.4 tile-column worker reconstructs into its own
+    /// full-extent plane and only its disjoint column range is folded
+    /// back.
+    ///
+    /// Panics if the planes' dimensions differ or the range is out of
+    /// bounds — the §6.2.13 tile geometry guarantees callers stay
+    /// inside `width`.
+    pub(crate) fn copy_cols_from(&mut self, src: &Plane, x0: usize, x1: usize) {
+        assert_eq!(
+            (self.width, self.height),
+            (src.width, src.height),
+            "plane geometry mismatch"
+        );
+        assert!(x0 <= x1 && x1 <= self.width, "column range out of bounds");
+        for y in 0..self.height {
+            let at = y * self.width;
+            self.samples[at + x0..at + x1].copy_from_slice(&src.samples[at + x0..at + x1]);
+        }
+    }
 }
 
 /// `Round2( x, n ) = ( x + (1 << (n - 1)) ) >> n` per §3.

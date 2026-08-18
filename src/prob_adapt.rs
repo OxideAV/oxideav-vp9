@@ -196,6 +196,7 @@ pub(crate) type CountsMoreCoefs = [[[[[CountsMoreCoefsCell; 6]; 6]; 2]; 2]; 4];
 /// the `more_coefs` syntax element is actually decoded** — i.e. inside
 /// the `checkEob` branch of the §6.4.24 `tokens( )` loop — never implied
 /// at `checkEob == 0` positions reached after a `ZERO_TOKEN`.
+#[derive(PartialEq)]
 pub(crate) struct FrameCounts {
     /// `counts_token[txSz][plane>0][is_inter][band][ctx][Min(2,syntax)]`.
     pub token: CountsToken,
@@ -215,6 +216,144 @@ impl FrameCounts {
             more_coefs: [[[[[[0; 2]; 6]; 6]; 2]; 2]; 4],
             noncoef: CountsNonCoef::default(),
         })
+    }
+
+    /// Fold another bank's counts into this one, cell by cell — the
+    /// tile-parallel merge step. Counting is per-tile-independent and
+    /// addition is order-independent, so summing the per-worker banks
+    /// reproduces the serial frame totals exactly. Exhaustively
+    /// destructures every level so a future count table cannot be
+    /// silently dropped from the merge.
+    pub(crate) fn merge_from(&mut self, other: &FrameCounts) {
+        fn add(dst: &mut [u32], src: &[u32]) {
+            for (d, s) in dst.iter_mut().zip(src) {
+                *d += *s;
+            }
+        }
+
+        let Self {
+            token,
+            more_coefs,
+            noncoef,
+        } = self;
+        let Self {
+            token: o_token,
+            more_coefs: o_more_coefs,
+            noncoef: o_noncoef,
+        } = other;
+
+        add(
+            token
+                .as_flattened_mut()
+                .as_flattened_mut()
+                .as_flattened_mut()
+                .as_flattened_mut()
+                .as_flattened_mut(),
+            o_token
+                .as_flattened()
+                .as_flattened()
+                .as_flattened()
+                .as_flattened()
+                .as_flattened(),
+        );
+        add(
+            more_coefs
+                .as_flattened_mut()
+                .as_flattened_mut()
+                .as_flattened_mut()
+                .as_flattened_mut()
+                .as_flattened_mut(),
+            o_more_coefs
+                .as_flattened()
+                .as_flattened()
+                .as_flattened()
+                .as_flattened()
+                .as_flattened(),
+        );
+
+        let CountsNonCoef {
+            is_inter,
+            comp_mode,
+            comp_ref,
+            single_ref,
+            inter_mode,
+            y_mode,
+            uv_mode,
+            partition,
+            skip,
+            interp_filter,
+            tx_size,
+            mv_joint,
+            mv_comp,
+        } = noncoef;
+        let CountsNonCoef {
+            is_inter: o_is_inter,
+            comp_mode: o_comp_mode,
+            comp_ref: o_comp_ref,
+            single_ref: o_single_ref,
+            inter_mode: o_inter_mode,
+            y_mode: o_y_mode,
+            uv_mode: o_uv_mode,
+            partition: o_partition,
+            skip: o_skip,
+            interp_filter: o_interp_filter,
+            tx_size: o_tx_size,
+            mv_joint: o_mv_joint,
+            mv_comp: o_mv_comp,
+        } = o_noncoef;
+
+        add(is_inter.as_flattened_mut(), o_is_inter.as_flattened());
+        add(comp_mode.as_flattened_mut(), o_comp_mode.as_flattened());
+        add(comp_ref.as_flattened_mut(), o_comp_ref.as_flattened());
+        add(
+            single_ref.as_flattened_mut().as_flattened_mut(),
+            o_single_ref.as_flattened().as_flattened(),
+        );
+        add(inter_mode.as_flattened_mut(), o_inter_mode.as_flattened());
+        add(y_mode.as_flattened_mut(), o_y_mode.as_flattened());
+        add(uv_mode.as_flattened_mut(), o_uv_mode.as_flattened());
+        add(partition.as_flattened_mut(), o_partition.as_flattened());
+        add(skip.as_flattened_mut(), o_skip.as_flattened());
+        add(
+            interp_filter.as_flattened_mut(),
+            o_interp_filter.as_flattened(),
+        );
+        add(
+            tx_size.as_flattened_mut().as_flattened_mut(),
+            o_tx_size.as_flattened().as_flattened(),
+        );
+        add(mv_joint, o_mv_joint);
+
+        for (comp, o_comp) in mv_comp.iter_mut().zip(o_mv_comp) {
+            let CountsMvComponent {
+                sign,
+                class,
+                class0_bit,
+                bits,
+                class0_fr,
+                fr,
+                class0_hp,
+                hp,
+            } = comp;
+            let CountsMvComponent {
+                sign: o_sign,
+                class: o_class,
+                class0_bit: o_class0_bit,
+                bits: o_bits,
+                class0_fr: o_class0_fr,
+                fr: o_fr,
+                class0_hp: o_class0_hp,
+                hp: o_hp,
+            } = o_comp;
+            add(sign, o_sign);
+            add(class, o_class);
+            add(class0_bit, o_class0_bit);
+            add(bits.as_flattened_mut(), o_bits.as_flattened());
+            add(class0_fr.as_flattened_mut(), o_class0_fr.as_flattened());
+            add(fr, o_fr);
+            add(class0_hp, o_class0_hp);
+            add(hp, o_hp);
+        }
     }
 }
 

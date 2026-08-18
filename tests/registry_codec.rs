@@ -517,3 +517,76 @@ fn registry_decoder_matches_batch_decode_on_the_corpus() {
     }
     assert!(swept >= 40, "corpus sweep covered {swept} fixtures");
 }
+
+/// Round-448 tile-parallel decode at the registry surface: a
+/// [`oxideav_vp9::Vp9Decoder`] granted a multi-thread budget through
+/// the framework `set_execution_context` hook decodes the staged
+/// multi-tile streams **frame-identically** to a default (serial)
+/// registry decoder — and the budget survives `reset( )` (it is stream
+/// configuration, not stream state). Docs-gated on the staged corpus.
+#[test]
+fn registry_decoder_execution_context_is_output_invariant() {
+    let root = std::path::Path::new("../../docs/video/vp9/fixtures");
+    if !root.is_dir() {
+        eprintln!("docs corpus not present; docs-gated");
+        return;
+    }
+    let params = vp9_params(0, 0, PixelFormat::Yuv420P);
+    for name in [
+        "tile-cols-2",
+        "tiles-2col-inter",
+        "tiles-4col-inter",
+        "tiles-2col-4row-inter",
+    ] {
+        let ivf_path = root.join(name).join("input.ivf");
+        if !ivf_path.is_file() {
+            eprintln!("{name}: not staged; skipping");
+            continue;
+        }
+        let ivf = std::fs::read(&ivf_path).expect("read input.ivf");
+        assert!(ivf.len() >= 32 && &ivf[..4] == b"DKIF", "{name}: IVF");
+        let mut packets: Vec<Packet> = Vec::new();
+        let mut at = 32usize;
+        while at + 12 <= ivf.len() {
+            let size =
+                u32::from_le_bytes([ivf[at], ivf[at + 1], ivf[at + 2], ivf[at + 3]]) as usize;
+            at += 12;
+            if at + size > ivf.len() {
+                break;
+            }
+            packets.push(Packet::new(
+                0,
+                TimeBase::MILLIS,
+                ivf[at..at + size].to_vec(),
+            ));
+            at += size;
+        }
+
+        let mut serial_dec = oxideav_vp9::make_decoder(&params).expect("serial decoder");
+        let serial = decode_all(serial_dec.as_mut(), &packets);
+
+        let mut par_dec = oxideav_vp9::Vp9Decoder::new();
+        par_dec.set_execution_context(&oxideav_core::ExecutionContext::with_threads(4));
+        let parallel = decode_all(&mut par_dec, &packets);
+        assert_eq!(parallel.len(), serial.len(), "{name}: frame count");
+        for (i, (p, s)) in parallel.iter().zip(&serial).enumerate() {
+            for (pi, (pp, sp)) in p.planes.iter().zip(&s.planes).enumerate() {
+                assert_eq!(
+                    pp.data, sp.data,
+                    "{name}: frame {i} plane {pi} differs under the thread budget"
+                );
+            }
+        }
+
+        // The budget survives reset( ): the re-decoded stream still
+        // matches the serial output.
+        par_dec.reset().expect("reset");
+        let after_reset = decode_all(&mut par_dec, &packets);
+        assert_eq!(after_reset.len(), serial.len(), "{name}: post-reset count");
+        for (i, (p, s)) in after_reset.iter().zip(&serial).enumerate() {
+            for (pp, sp) in p.planes.iter().zip(&s.planes) {
+                assert_eq!(pp.data, sp.data, "{name}: post-reset frame {i} differs");
+            }
+        }
+    }
+}

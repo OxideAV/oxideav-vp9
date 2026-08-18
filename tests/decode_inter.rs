@@ -1141,6 +1141,107 @@ fn full_corpus_sequences_byte_exact() {
     }
 }
 
+/// Round-448 tile-parallel decode parity: EVERY staged corpus fixture
+/// decodes **byte-identically** through
+/// [`oxideav_vp9::decode_vp9_sequence_with`] under a multi-thread
+/// budget as through the serial [`decode_vp9_sequence`] — the §6.4
+/// tile-column fan-out (live on the `tile-cols-2` / `tiles-2col-inter`
+/// / `tiles-4col-inter` / `tiles-2col-4row-inter` streams; a clamped
+/// no-op on the single-column rest) must never change a byte of
+/// output. Docs-gated on the staged corpus.
+#[test]
+fn full_corpus_tile_parallel_decode_matches_serial() {
+    let root = std::path::Path::new("../../docs/video/vp9/fixtures");
+    if !root.is_dir() {
+        eprintln!("docs corpus not present; docs-gated");
+        return;
+    }
+    let exec = oxideav_core::ExecutionContext::with_threads(4);
+    let mut checked = 0usize;
+    let mut entries: Vec<_> = std::fs::read_dir(root)
+        .expect("fixtures dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.join("input.ivf").is_file())
+        .collect();
+    entries.sort();
+    for base in entries {
+        let name = base.file_name().unwrap().to_string_lossy().into_owned();
+        let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");
+        let mut sub: Vec<Vec<u8>> = Vec::new();
+        for p in &ivf_chunks(&ivf) {
+            for f in split_superframe(p) {
+                sub.push(f.to_vec());
+            }
+        }
+        let refs: Vec<&[u8]> = sub.iter().map(|p| p.as_slice()).collect();
+        let serial =
+            decode_vp9_sequence(&refs).unwrap_or_else(|e| panic!("{name}: serial decode {e:?}"));
+        let parallel = oxideav_vp9::decode_vp9_sequence_with(&refs, &exec)
+            .unwrap_or_else(|e| panic!("{name}: tile-parallel decode {e:?}"));
+        assert_eq!(parallel.len(), serial.len(), "{name}: frame count");
+        for (i, (p, s)) in parallel.iter().zip(&serial).enumerate() {
+            assert_eq!(
+                p.to_planar_bytes(),
+                s.to_planar_bytes(),
+                "{name} frame {i}: tile-parallel decode differs from serial"
+            );
+        }
+        checked += 1;
+    }
+    assert!(
+        checked >= 40,
+        "expected the whole staged corpus, got {checked}"
+    );
+}
+
+/// Env-gated tile-parallel timing probe: point
+/// `OXIDEAV_VP9_TILE_BENCH_IVF` at any VP9 IVF file (a multi-tile
+/// stream to see real fan-out) and this test decodes it serially and
+/// under 2/4-thread budgets, printing wall times and asserting the
+/// outputs stay byte-identical. No-op unless the env var is set —
+/// timing never gates CI (run with `--release` and `--nocapture` for
+/// meaningful numbers).
+#[test]
+fn tile_parallel_bench_when_requested() {
+    let Some(path) = std::env::var_os("OXIDEAV_VP9_TILE_BENCH_IVF") else {
+        return;
+    };
+    let ivf = std::fs::read(&path).expect("bench IVF");
+    let mut sub: Vec<Vec<u8>> = Vec::new();
+    for p in &ivf_chunks(&ivf) {
+        for f in split_superframe(p) {
+            sub.push(f.to_vec());
+        }
+    }
+    let refs: Vec<&[u8]> = sub.iter().map(|p| p.as_slice()).collect();
+
+    let t0 = std::time::Instant::now();
+    let serial = decode_vp9_sequence(&refs).expect("serial decode");
+    let serial_time = t0.elapsed();
+    println!("serial: {} frames in {serial_time:?}", serial.len());
+
+    for threads in [2usize, 4] {
+        let exec = oxideav_core::ExecutionContext::with_threads(threads);
+        let t = std::time::Instant::now();
+        let par = oxideav_vp9::decode_vp9_sequence_with(&refs, &exec).expect("parallel decode");
+        let dt = t.elapsed();
+        println!(
+            "{threads} threads: {} frames in {dt:?} ({:.2}x)",
+            par.len(),
+            serial_time.as_secs_f64() / dt.as_secs_f64()
+        );
+        assert_eq!(par.len(), serial.len());
+        for (i, (p, s)) in par.iter().zip(&serial).enumerate() {
+            assert_eq!(
+                p.to_planar_bytes(),
+                s.to_planar_bytes(),
+                "frame {i}: tile-parallel decode differs from serial"
+            );
+        }
+    }
+}
+
 /// One `full_corpus_sequences_byte_exact` step: IVF demux → superframe
 /// split → sequence decode → planar packing, byte-exact vs the staged
 /// `expected.yuv`.

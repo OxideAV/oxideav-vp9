@@ -29,8 +29,8 @@ use std::collections::VecDeque;
 use oxideav_core::registry::{CodecInfo, Decoder, Encoder};
 use oxideav_core::{
     parse_options, CodecCapabilities, CodecId, CodecOptionsStruct, CodecParameters, CodecTag,
-    Error as CoreError, Frame, OptionField, OptionKind, OptionValue, Packet, PixelFormat,
-    Result as CoreResult, RuntimeContext, TimeBase, VideoFrame, VideoPlane,
+    Error as CoreError, ExecutionContext, Frame, OptionField, OptionKind, OptionValue, Packet,
+    PixelFormat, Result as CoreResult, RuntimeContext, TimeBase, VideoFrame, VideoPlane,
 };
 
 use crate::decode_frame::{Vp9DecodedFrame, Vp9SequenceDecoder};
@@ -156,6 +156,11 @@ pub struct Vp9Decoder {
     seq: Vp9SequenceDecoder,
     pending: VecDeque<Frame>,
     flushed: bool,
+    /// The caller-granted threading budget (framework contract: serial
+    /// until `set_execution_context` says otherwise); forwarded to the
+    /// sequence decoder's §6.4 tile-column fan-out and preserved across
+    /// [`Decoder::reset`].
+    exec: ExecutionContext,
 }
 
 impl Vp9Decoder {
@@ -166,6 +171,7 @@ impl Vp9Decoder {
             seq: Vp9SequenceDecoder::new(),
             pending: VecDeque::new(),
             flushed: false,
+            exec: ExecutionContext::serial(),
         }
     }
 }
@@ -179,6 +185,15 @@ impl Default for Vp9Decoder {
 impl Decoder for Vp9Decoder {
     fn codec_id(&self) -> &CodecId {
         &self.id
+    }
+
+    fn set_execution_context(&mut self, ctx: &ExecutionContext) {
+        // The single threading authority: multi-tile-column frames
+        // fan their §6.4 tile columns out over
+        // `ctx.effective_workers( tileCols )` workers (the §9.2.4
+        // multi-coder path), byte-identical to the serial walk.
+        self.exec = ctx.clone();
+        self.seq.set_execution_context(ctx);
     }
 
     fn send_packet(&mut self, packet: &Packet) -> CoreResult<()> {
@@ -216,8 +231,10 @@ impl Decoder for Vp9Decoder {
         // setup_past_independence( ) makes a keyframe self-contained,
         // so fresh cross-frame state (empty §8.10 buffers, default
         // probability banks) is exactly the decoder state a conforming
-        // stream expects there.
+        // stream expects there. The granted threading budget is stream
+        // configuration, not stream state — it survives the reset.
         self.seq = Vp9SequenceDecoder::new();
+        self.seq.set_execution_context(&self.exec);
         self.pending.clear();
         self.flushed = false;
         Ok(())

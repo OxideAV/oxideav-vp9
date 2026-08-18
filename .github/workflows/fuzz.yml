@@ -14,6 +14,10 @@ name: Fuzz
 #     the encoder DID emit must decode (byte-exact back to the input
 #     on the lossless targets), across fuzz-derived geometries,
 #     quantizers, formats (the full §7.2 profile matrix), and content.
+#   * decode_tile_parallel_diff — differential oracle over the
+#     round-448 tile-parallel path: every input must produce the
+#     identical outcome (frames byte-for-byte, or the same error)
+#     through the serial walk and the 4-thread tile-column fan-out.
 #
 # Seed corpus entries (corpus/*/seed-*) are derived from the crate's
 # synthetic test vectors and tracked in git; fuzz-grown corpus persists

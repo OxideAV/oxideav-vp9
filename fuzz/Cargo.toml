@@ -18,6 +18,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
 
 [dependencies.oxideav-vp9]
 path = ".."
@@ -67,6 +68,13 @@ bench = false
 [[bin]]
 name = "encode_lossy_matrix"
 path = "fuzz_targets/encode_lossy_matrix.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_tile_parallel_diff"
+path = "fuzz_targets/decode_tile_parallel_diff.rs"
 test = false
 doc = false
 bench = false

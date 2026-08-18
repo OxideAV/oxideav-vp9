@@ -10,8 +10,8 @@
 //! the encode is byte-deterministic, and bad arguments are rejected.
 
 use oxideav_vp9::{
-    decode_intra_frame, encode_vp9_lossy_422, encode_vp9_lossy_444, encode_vp9_lossy_hbd,
-    encode_vp9_lossy_hbd_422, Error,
+    decode_intra_frame, encode_vp9_lossy_422, encode_vp9_lossy_440, encode_vp9_lossy_444,
+    encode_vp9_lossy_hbd, encode_vp9_lossy_hbd_422, encode_vp9_lossy_hbd_440, Error,
 };
 
 /// Deterministic 8-bit planar content at the given chroma dims.
@@ -119,6 +119,32 @@ fn lossy_422_encodes_and_decodes() {
 }
 
 #[test]
+fn lossy_440_encodes_and_decodes() {
+    let (w, h) = (52usize, 36usize);
+    let (cw, ch) = (w, h.div_ceil(2));
+    let px = planar_u8(w, h, cw, ch);
+    let bytes = encode_vp9_lossy_440(&px, w as u32, h as u32, 100).expect("encode");
+    assert_eq!(
+        bytes,
+        encode_vp9_lossy_440(&px, w as u32, h as u32, 100).expect("encode 2"),
+        "byte-determinism"
+    );
+    let frame = decode_intra_frame(&bytes).expect("decode");
+    assert_eq!((frame.width, frame.height), (w as u32, h as u32));
+    assert!(!frame.subsampling_x && frame.subsampling_y, "4:4:0");
+    assert_eq!(frame.u.len(), cw * ch, "§8.10 chroma extent");
+    let src: Vec<u16> = px.iter().map(|&b| u16::from(b)).collect();
+    let dec: Vec<u16> = frame
+        .y
+        .iter()
+        .chain(&frame.u)
+        .chain(&frame.v)
+        .copied()
+        .collect();
+    assert!(mse_u16(&dec, &src) < 300.0, "q=100 distortion regime");
+}
+
+#[test]
 fn lossy_hbd_420_and_444_encode_and_decode() {
     for (bit_depth, subsample) in [(10u8, true), (12, true), (10, false), (12, false)] {
         let (w, h) = (44usize, 28usize);
@@ -164,6 +190,31 @@ fn lossy_hbd_422_encodes_and_decodes() {
         let frame = decode_intra_frame(&bytes).expect("decode");
         assert_eq!(frame.bit_depth, bit_depth);
         assert!(frame.subsampling_x && !frame.subsampling_y, "4:2:2");
+        assert_eq!(frame.u.len(), cw * ch);
+        let scale = f64::from(1u32 << (bit_depth - 8));
+        let dec: Vec<u16> = frame
+            .y
+            .iter()
+            .chain(&frame.u)
+            .chain(&frame.v)
+            .copied()
+            .collect();
+        let mse = mse_u16(&dec, &px);
+        assert!(mse < 2000.0 * scale * scale, "bd={bit_depth}: MSE {mse}");
+    }
+}
+
+#[test]
+fn lossy_hbd_440_encodes_and_decodes() {
+    for bit_depth in [10u8, 12] {
+        let (w, h) = (44usize, 28usize);
+        let (cw, ch) = (w, h.div_ceil(2));
+        let px = planar_u16(w, h, cw, ch, u32::from(bit_depth));
+        let bytes = encode_vp9_lossy_hbd_440(&px, w as u32, h as u32, bit_depth, 110)
+            .unwrap_or_else(|e| panic!("encode bd={bit_depth}: {e}"));
+        let frame = decode_intra_frame(&bytes).expect("decode");
+        assert_eq!(frame.bit_depth, bit_depth);
+        assert!(!frame.subsampling_x && frame.subsampling_y, "4:4:0");
         assert_eq!(frame.u.len(), cw * ch);
         let scale = f64::from(1u32 << (bit_depth - 8));
         let dec: Vec<u16> = frame
@@ -277,6 +328,17 @@ fn lossy_sequence_matrix_decodes_without_drift() {
             }),
         ),
         (
+            "seq-440-8bit",
+            8,
+            false,
+            true,
+            Box::new(move |frames| {
+                seq_u8(frames, &|refs| {
+                    oxideav_vp9::encode_vp9_lossy_sequence_440(refs, w as u32, h as u32, q)
+                })
+            }),
+        ),
+        (
             "seq-420-10bit",
             10,
             true,
@@ -306,6 +368,17 @@ fn lossy_sequence_matrix_decodes_without_drift() {
             Box::new(move |frames| {
                 let refs: Vec<&[u16]> = frames.iter().map(|f| f.as_slice()).collect();
                 oxideav_vp9::encode_vp9_lossy_sequence_hbd_422(&refs, w as u32, h as u32, 10, q)
+                    .expect("encode")
+            }),
+        ),
+        (
+            "seq-440-12bit",
+            12,
+            false,
+            true,
+            Box::new(move |frames| {
+                let refs: Vec<&[u16]> = frames.iter().map(|f| f.as_slice()).collect();
+                oxideav_vp9::encode_vp9_lossy_sequence_hbd_440(&refs, w as u32, h as u32, 12, q)
                     .expect("encode")
             }),
         ),
@@ -430,6 +503,11 @@ fn dump_matrix_streams_for_black_box_validation() {
                 .expect("422"),
         ),
         (
+            "lossy-440-8bit",
+            encode_vp9_lossy_440(&planar_u8(w, h, w, h.div_ceil(2)), w as u32, h as u32, q)
+                .expect("440"),
+        ),
+        (
             "lossy-420-10bit",
             encode_vp9_lossy_hbd(
                 &planar_u16(w, h, w.div_ceil(2), h.div_ceil(2), 10),
@@ -498,6 +576,17 @@ fn dump_matrix_streams_for_black_box_validation() {
                 q,
             )
             .expect("422-12"),
+        ),
+        (
+            "lossy-440-12bit",
+            encode_vp9_lossy_hbd_440(
+                &planar_u16(w, h, w, h.div_ceil(2), 12),
+                w as u32,
+                h as u32,
+                12,
+                q,
+            )
+            .expect("440-12"),
         ),
     ];
 
@@ -645,6 +734,26 @@ fn dump_matrix_streams_for_black_box_validation() {
                 oxideav_vp9::encode_vp9_lossy_sequence_rc(&refs8(&f420), w as u32, h as u32, 1200)
                     .expect("gop rc")
             }),
+            // Round-448 public 4:4:0 entries: the last §7.2.2 geometry
+            // without a dedicated public encoder (ssx = 0, ssy = 1 —
+            // the §8.5.2.1 row-only chroma MV rounding), at profile 1
+            // (8-bit) and the profile-3 12-bit corner.
+            ("gop-440-8bit", {
+                let f440 = gop_u8(false, true);
+                oxideav_vp9::encode_vp9_lossy_sequence_440(&refs8(&f440), w as u32, h as u32, q)
+                    .expect("gop 440")
+            }),
+            ("gop-440-12bit", {
+                let f440_12 = gop_u16(12, false, true);
+                oxideav_vp9::encode_vp9_lossy_sequence_hbd_440(
+                    &refs16(&f440_12),
+                    w as u32,
+                    h as u32,
+                    12,
+                    q,
+                )
+                .expect("gop 440-12")
+            }),
         ]
     };
     for (name, frames) in gop_cases {
@@ -685,6 +794,26 @@ fn lossy_matrix_public_rejections() {
     hot[0] = 1 << 12;
     assert_eq!(
         encode_vp9_lossy_hbd_422(&hot, 32, 32, 12, 100).unwrap_err(),
+        Error::Unsupported,
+        "sample exceeds the 12-bit range"
+    );
+    assert_eq!(
+        encode_vp9_lossy_440(&px8, 32, 32, 0).unwrap_err(),
+        Error::Unsupported,
+        "q == 0 is the lossless path"
+    );
+    assert_eq!(
+        encode_vp9_lossy_440(&px8[..10], 32, 32, 100).unwrap_err(),
+        Error::Unsupported,
+        "short buffer"
+    );
+    assert_eq!(
+        encode_vp9_lossy_hbd_440(&px16, 32, 32, 9, 100).unwrap_err(),
+        Error::Unsupported,
+        "bit_depth 9 is not a §7.2.2 depth"
+    );
+    assert_eq!(
+        encode_vp9_lossy_hbd_440(&hot, 32, 32, 12, 100).unwrap_err(),
         Error::Unsupported,
         "sample exceeds the 12-bit range"
     );

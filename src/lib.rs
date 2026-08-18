@@ -921,6 +921,45 @@ pub fn encode_vp9_lossy_hbd_422(
     )
 }
 
+/// Encode an 8-bit **4:4:0** planar frame (`Y` then `U` then `V`,
+/// chroma planes `width × ceil(h/2)`) into a **lossy** profile-1 VP9
+/// keyframe at quantizer index `base_q_idx` (`1..=255`).
+///
+/// 4:4:0 is the `subsampling_x = 0, subsampling_y = 1` §7.2.2 geometry
+/// — the vertical-only mirror of [`encode_vp9_lossy_422`] (profile 1
+/// codes both subsampling flags in its §6.2.2 `color_config( )`); the
+/// §8.5.2.1 chroma MV derivation rounds only the row component
+/// (`round_mv_comp_q2` on axis 0). Same decoder-mirror guarantee and
+/// error cases as [`encode_vp9_lossy_444`].
+pub fn encode_vp9_lossy_440(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+) -> Result<Vec<u8>, Error> {
+    pixel_encoder::encode_keyframe_lossy_u8(pixels, width, height, base_q_idx, false, true)
+}
+
+/// Encode a 10/12-bit **4:4:0** planar frame (native `u16` samples,
+/// chroma planes `width × ceil(h/2)`) into a **lossy** profile-3 VP9
+/// keyframe at quantizer index `base_q_idx` (`1..=255`).
+///
+/// The `subsampling_x = 0, subsampling_y = 1` high-bit-depth geometry
+/// [`encode_vp9_lossy_hbd`]'s two-way `subsample` flag cannot express
+/// (the vertical mirror of [`encode_vp9_lossy_hbd_422`]). Same
+/// guarantees and error cases as [`encode_vp9_lossy_hbd`].
+pub fn encode_vp9_lossy_hbd_440(
+    samples: &[u16],
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    base_q_idx: u8,
+) -> Result<Vec<u8>, Error> {
+    pixel_encoder::encode_keyframe_lossy_u16(
+        samples, width, height, bit_depth, base_q_idx, false, true,
+    )
+}
+
 /// Encode a **sequence** of 8-bit 4:2:0 planar frames into a lossy VP9
 /// stream at quantizer index `base_q_idx` (`1..=255`): a lossy keyframe
 /// followed by lossy inter (P-)frames with per-block `ZEROMV` / `NEWMV`
@@ -1041,6 +1080,19 @@ pub fn encode_vp9_lossy_sequence_422(
     pixel_encoder::encode_sequence_lossy_u8(frames, width, height, base_q_idx, true, false, true)
 }
 
+/// [`encode_vp9_lossy_sequence_444`] at **4:4:0** (chroma planes
+/// `width × ceil(h/2)`, the `subsampling_x = 0, subsampling_y = 1`
+/// profile-1 geometry — decode-side, the §8.5.2.1 chroma MV derivation
+/// rounds only the row component). Chain framing; same guarantees.
+pub fn encode_vp9_lossy_sequence_440(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+) -> Result<Vec<Vec<u8>>, Error> {
+    pixel_encoder::encode_sequence_lossy_u8(frames, width, height, base_q_idx, false, true, true)
+}
+
 /// Encode a **sequence** of 10/12-bit planar frames (native `u16`
 /// samples) into a lossy high-bit-depth VP9 stream at quantizer index
 /// `base_q_idx` (`1..=255`) — profile 2 when `subsample == true`
@@ -1080,6 +1132,22 @@ pub fn encode_vp9_lossy_sequence_hbd_422(
 ) -> Result<Vec<Vec<u8>>, Error> {
     pixel_encoder::encode_sequence_lossy_u16(
         frames, width, height, bit_depth, base_q_idx, true, false, true,
+    )
+}
+
+/// [`encode_vp9_lossy_sequence_hbd`] at **4:4:0** (profile 3, chroma
+/// planes `width × ceil(h/2)` — the vertical mirror of
+/// [`encode_vp9_lossy_sequence_hbd_422`]). Chain framing; same
+/// guarantees.
+pub fn encode_vp9_lossy_sequence_hbd_440(
+    frames: &[&[u16]],
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    base_q_idx: u8,
+) -> Result<Vec<Vec<u8>>, Error> {
+    pixel_encoder::encode_sequence_lossy_u16(
+        frames, width, height, bit_depth, base_q_idx, false, true, true,
     )
 }
 
@@ -3661,6 +3729,186 @@ mod encode_roundtrip_tests {
             ("lossless-chained-gop", build_lossless_chained_gop_stream()),
             ("lossy-hbd12-422-gop", build_lossy_hbd12_422_gop_stream()),
             ("lossy-rc-gop", build_lossy_rc_gop_stream()),
+        ] {
+            let path = std::path::Path::new("../../docs/video/vp9/fixtures")
+                .join(name)
+                .join("input.ivf");
+            if !path.is_file() {
+                eprintln!("{name}: not yet staged; docs-gated");
+                continue;
+            }
+            let staged = std::fs::read(&path).expect("staged input.ivf");
+            assert_eq!(
+                staged,
+                ivf_wrap_dims(&frames, 64, 48),
+                "{name}: staged fixture bytes != builder output"
+            );
+        }
+    }
+
+    // ----- round-448 fixtures: the 4:4:0 public-entry stream classes -----
+
+    /// Build the round-448 **4:4:0 GOP** (profile 1, 8-bit, 64x48,
+    /// `base_q_idx = 110`) through the new public
+    /// [`encode_vp9_lossy_sequence_440`] API — the corpus's first
+    /// **self-encoded** 4:4:0 stream (`ssx = 0, ssy = 1`: the §8.5.2.1
+    /// row-only chroma MV rounding, chroma planes `w × ceil(h/2)`),
+    /// chain-framed with the full lossy pipeline. The staged
+    /// `profile-1-yuv440-8bit-inter` covers this geometry as a
+    /// black-box encode; this one pins the *writer* side.
+    fn build_lossy_440_gop_stream() -> Vec<Vec<u8>> {
+        let inputs: Vec<Vec<u8>> = (0..4usize)
+            .map(|k| matrix_gop_frame_u8(64, 48, 64, 24, k))
+            .collect();
+        let refs: Vec<&[u8]> = inputs.iter().map(|f| f.as_slice()).collect();
+        encode_vp9_lossy_sequence_440(&refs, 64, 48, 110).expect("440 GOP encode")
+    }
+
+    /// Build the round-448 **12-bit 4:4:0 GOP** (profile 3, 64x48,
+    /// `base_q_idx = 110`) through the new public
+    /// [`encode_vp9_lossy_sequence_hbd_440`] API — the only §7.2
+    /// format-matrix corner with **no corpus fixture at all** (the
+    /// 8-bit 4:4:0 geometry has `profile-1-yuv440-8bit-inter`; the
+    /// high-bit-depth 4:4:0 rows have nothing): CAT6 tokens over the
+    /// row-only chroma MV rounding, chain-framed.
+    fn build_lossy_hbd12_440_gop_stream() -> Vec<Vec<u8>> {
+        let (w, h, cw, ch) = (64usize, 48usize, 64usize, 24usize);
+        let inputs: Vec<Vec<u16>> = (0..4usize)
+            .map(|k| {
+                let f = |x: usize, y: usize, s: usize| {
+                    (((x + 2 * k) * 61 + (y + k) * 113 + s * 29) % 4096) as u16
+                };
+                let mut px = Vec::with_capacity(w * h + 2 * cw * ch);
+                for y in 0..h {
+                    for x in 0..w {
+                        px.push(f(x, y, 0));
+                    }
+                }
+                for y in 0..ch {
+                    for x in 0..cw {
+                        px.push(f(x, y, 5));
+                    }
+                }
+                for y in 0..ch {
+                    for x in 0..cw {
+                        px.push(f(x, y, 11));
+                    }
+                }
+                px
+            })
+            .collect();
+        let refs: Vec<&[u16]> = inputs.iter().map(|f| f.as_slice()).collect();
+        encode_vp9_lossy_sequence_hbd_440(&refs, 64, 48, 12, 110).expect("hbd12-440 GOP encode")
+    }
+
+    /// The 4:4:0 GOP decodes end-to-end at profile 1 with the
+    /// `ssx = 0, ssy = 1` geometry on every frame; chain-framed;
+    /// byte-deterministic.
+    #[test]
+    fn lossy_440_gop_fixture_shape() {
+        let frames = build_lossy_440_gop_stream();
+        assert_eq!(frames.len(), 4);
+        let h0 = crate::header::parse_uncompressed_header(&frames[0]).expect("kf header");
+        assert_eq!(h0.profile, 1);
+        assert_eq!(h0.color_config.bit_depth, 8);
+        assert!(!h0.color_config.subsampling_x && h0.color_config.subsampling_y);
+        let ref_dims = vec![(64u32, 48u32); 8];
+        for (i, f) in frames.iter().enumerate().skip(1) {
+            let hdr = crate::header::parse_uncompressed_header_with_refs(
+                f,
+                Some(crate::header::RefFrameState {
+                    ref_dims: &ref_dims,
+                    color_config: h0.color_config,
+                }),
+            )
+            .expect("p header");
+            assert!(
+                hdr.show_frame && !hdr.error_resilient_mode,
+                "frame {i}: chain framing"
+            );
+        }
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        let decoded = decode_vp9_sequence(&refs).expect("decode");
+        assert_eq!(decoded.len(), 4);
+        for f in &decoded {
+            assert!(!f.subsampling_x && f.subsampling_y, "4:4:0 output");
+            assert_eq!(f.u.len(), 64 * 24, "§8.10 chroma extent");
+        }
+        assert_eq!(frames, build_lossy_440_gop_stream());
+    }
+
+    /// The 12-bit 4:4:0 GOP decodes end-to-end at profile 3 with the
+    /// `ssx = 0, ssy = 1` geometry on every frame; chain-framed;
+    /// byte-deterministic.
+    #[test]
+    fn lossy_hbd12_440_gop_fixture_shape() {
+        let frames = build_lossy_hbd12_440_gop_stream();
+        assert_eq!(frames.len(), 4);
+        let h0 = crate::header::parse_uncompressed_header(&frames[0]).expect("kf header");
+        assert_eq!(h0.profile, 3);
+        assert_eq!(h0.color_config.bit_depth, 12);
+        assert!(!h0.color_config.subsampling_x && h0.color_config.subsampling_y);
+        let ref_dims = vec![(64u32, 48u32); 8];
+        for (i, f) in frames.iter().enumerate().skip(1) {
+            let hdr = crate::header::parse_uncompressed_header_with_refs(
+                f,
+                Some(crate::header::RefFrameState {
+                    ref_dims: &ref_dims,
+                    color_config: h0.color_config,
+                }),
+            )
+            .expect("p header");
+            assert!(
+                hdr.show_frame && !hdr.error_resilient_mode,
+                "frame {i}: chain framing"
+            );
+        }
+        let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+        let decoded = decode_vp9_sequence(&refs).expect("decode");
+        assert_eq!(decoded.len(), 4);
+        for f in &decoded {
+            assert_eq!((f.bit_depth, f.u.len()), (12, 64 * 24));
+        }
+        assert_eq!(frames, build_lossy_hbd12_440_gop_stream());
+    }
+
+    /// Fixture-staging generator (round 448): stages the two 4:4:0
+    /// public-entry stream classes under `OXIDEAV_VP9_STAGE_DIR`.
+    /// Alongside each `input.ivf` it writes `crate-decode.yuv` — the
+    /// crate's own [`decode_vp9_sequence`] output in the corpus
+    /// `expected.yuv` packing — so the black-box verification step is
+    /// a byte compare between a reference decode of `input.ivf` and
+    /// this file.
+    #[test]
+    fn stage_round_448_fixtures_when_requested() {
+        let Some(dir) = std::env::var_os("OXIDEAV_VP9_STAGE_DIR") else {
+            return;
+        };
+        for (name, frames) in [
+            ("lossy-440-gop", build_lossy_440_gop_stream()),
+            ("lossy-hbd12-440-gop", build_lossy_hbd12_440_gop_stream()),
+        ] {
+            let ivf = ivf_wrap_dims(&frames, 64, 48);
+            let subdir = std::path::Path::new(&dir).join(name);
+            std::fs::create_dir_all(&subdir).expect("create stage dir");
+            std::fs::write(subdir.join("input.ivf"), &ivf).expect("write input.ivf");
+            let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+            let decoded = decode_vp9_sequence(&refs).expect("crate decode");
+            let mut yuv = Vec::new();
+            for f in &decoded {
+                yuv.extend_from_slice(&f.to_planar_bytes());
+            }
+            std::fs::write(subdir.join("crate-decode.yuv"), &yuv).expect("write crate-decode.yuv");
+        }
+    }
+
+    /// The staged round-448 fixtures are byte-identical to the
+    /// builders' output (docs-gated, per-fixture presence-gated).
+    #[test]
+    fn staged_round_448_fixtures_match_builders() {
+        for (name, frames) in [
+            ("lossy-440-gop", build_lossy_440_gop_stream()),
+            ("lossy-hbd12-440-gop", build_lossy_hbd12_440_gop_stream()),
         ] {
             let path = std::path::Path::new("../../docs/video/vp9/fixtures")
                 .join(name)

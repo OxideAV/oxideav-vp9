@@ -1120,6 +1120,25 @@ fn full_corpus_sequences_byte_exact() {
         }
         check_fixture_byte_exact(root, name);
     }
+
+    // Round-448 corpus extensions (self-encoded through the new public
+    // 4:4:0 entries; presence-gated until the staged bytes land in
+    // docs — builders + docs-gated identity tests live in the crate
+    // already):
+    //
+    // * lossy-440-gop — the corpus's first SELF-ENCODED 4:4:0 stream
+    //   (profile 1, ssx = 0 / ssy = 1: the §8.5.2.1 row-only chroma MV
+    //   rounding); the staged profile-1-yuv440-8bit-inter covers the
+    //   geometry as a black-box encode, this one pins the writer side.
+    // * lossy-hbd12-440-gop — profile 3, 12-bit, 4:4:0: the only §7.2
+    //   format-matrix corner that had NO corpus fixture at all.
+    for name in ["lossy-440-gop", "lossy-hbd12-440-gop"] {
+        if !root.join(name).is_dir() {
+            eprintln!("{name}: not yet staged; docs-gated");
+            continue;
+        }
+        check_fixture_byte_exact(root, name);
+    }
 }
 
 /// One `full_corpus_sequences_byte_exact` step: IVF demux → superframe
@@ -1885,6 +1904,54 @@ fn round_441_lf_deltas_fixture_flags_pin_update_then_persist() {
         persist_after,
         "a post-update frame must filter on the persisted values"
     );
+}
+
+/// Round-448 corpus extensions: the two self-encoded **4:4:0** fixtures'
+/// headers carry the flags that make them the corpus's writer-side
+/// 4:4:0 class — `subsampling_x = 0, subsampling_y = 1` at profile 1
+/// (8-bit) and profile 3 (12-bit, the previously fixture-less matrix
+/// corner) — on chain framing (shown non-error-resilient P-frames).
+/// Without this pin a regenerated stream could silently flip to a
+/// covered geometry and the byte-exact sweep would degrade. Presence-
+/// gated on the staged docs.
+#[test]
+fn round_448_yuv440_fixture_flags_pin_their_geometry() {
+    let root = std::path::Path::new("../../docs/video/vp9/fixtures");
+    for (name, profile, bit_depth) in [("lossy-440-gop", 1u8, 8u8), ("lossy-hbd12-440-gop", 3, 12)]
+    {
+        let base = root.join(name);
+        if !base.is_dir() {
+            eprintln!("{name}: not yet staged; docs-gated");
+            continue;
+        }
+        let ivf = std::fs::read(base.join("input.ivf")).expect("input.ivf");
+        let chunks = ivf_chunks(&ivf);
+        assert_eq!(chunks.len(), 4, "{name}: 4 coded packets");
+        let h0 = oxideav_vp9::parse_uncompressed_header(&chunks[0]).expect("kf header");
+        assert_eq!(h0.frame_type, oxideav_vp9::FrameType::KeyFrame, "{name}");
+        assert_eq!(h0.profile, profile, "{name}: profile");
+        assert_eq!(h0.color_config.bit_depth, bit_depth, "{name}: bit depth");
+        assert!(
+            !h0.color_config.subsampling_x && h0.color_config.subsampling_y,
+            "{name}: ssx = 0, ssy = 1 (4:4:0)"
+        );
+        let ref_dims = vec![(64u32, 48u32); 8];
+        for (i, p) in chunks.iter().enumerate().skip(1) {
+            let h = oxideav_vp9::parse_uncompressed_header_with_refs(
+                p,
+                Some(oxideav_vp9::RefFrameState {
+                    ref_dims: &ref_dims,
+                    color_config: h0.color_config,
+                }),
+            )
+            .expect("inter header");
+            assert_eq!(h.frame_type, oxideav_vp9::FrameType::NonKeyFrame, "{name}");
+            assert!(
+                h.show_frame && !h.error_resilient_mode,
+                "{name} frame {i}: chain framing"
+            );
+        }
+    }
 }
 
 /// §6.4.14 / §8.1 segment-map threading + §7.2.10 segmentation feature

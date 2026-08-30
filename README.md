@@ -508,8 +508,11 @@ prediction sees the decoder's exact state. Public entry points:
 ### Framework registry (round 445)
 
 `register( )` installs a real decode+encode registration under the
-`"vp9"` codec id (capabilities: lossy + lossless, the nine §7.2
-format-matrix pixel formats; wire-tag claims `VP90` / `VP09` /
+`"vp9"` codec id (capabilities: lossy + lossless, the **full twelve**
+§7.2.2 format-matrix pixel formats — 4:2:0 / 4:2:2 / 4:4:4 / 4:4:0 at
+8, 10 and 12 bits, the 4:4:0 trio via the framework's `Yuv440P` /
+`Yuv440P10Le` / `Yuv440P12Le` labels since core 0.1.35; wire-tag
+claims `VP90` / `VP09` /
 `V_VP9`; a typed `q` / `lossless` encoder-options schema), and
 [`make_decoder`] / [`make_encoder`] expose the direct-factory half of
 the dual-API convention:
@@ -517,8 +520,11 @@ the dual-API convention:
 * [`Vp9Encoder`] rides the **chained default GOP path** one frame per
   `send_frame` (the stateful push forms of the sequence engines):
   packet bytes are pinned **byte-identical** to the matching batch
-  entry at 8-bit 4:2:0 / 4:4:4, 10/12-bit, and under `lossless=true`
-  (8-bit 4:2:0), with keyframe packet flags and pts passthrough.
+  entry at 8-bit 4:2:0 / 4:4:4, 10/12-bit, 4:4:0 at every depth
+  (`Yuv440P*` input → [`encode_vp9_lossy_sequence_440`] /
+  [`encode_vp9_lossy_sequence_hbd_440`] bytes), and under
+  `lossless=true` (8-bit 4:2:0), with keyframe packet flags and pts
+  passthrough.
 * [`Vp9Decoder`] streams packets through [`Vp9SequenceDecoder`] — the
   incremental, stateful form of [`decode_vp9_sequence`] (which is now
   a thin loop over it): the §8.10 reference buffers + `FrameStore[ ]`,
@@ -527,10 +533,14 @@ the dual-API convention:
   §7.2.8 / §7.2.10 persistent header state all thread across packets,
   with the §B.2 Annex B split applied per packet — a whole-corpus
   packet-by-packet sweep decodes equal to the batch API (superframes,
-  hidden alt-refs, `show_existing_frame` included; the 4:4:0 stream
-  surfaces `Unsupported` at the frame-conversion boundary since the
-  framework has no 4:4:0 pixel-format label — the crate's direct
-  decode APIs carry the geometry). Since round 448 [`Vp9Decoder`]
+  hidden alt-refs, `show_existing_frame` and the three 4:4:0
+  fixtures included). Every §7.2.2 `(BitDepth, ssx, ssy)` triple maps
+  to a framework label through [`pixel_format_for_triple`] — 4:4:0
+  streams come back as `Yuv440P` / `Yuv440P10Le` / `Yuv440P12Le`
+  with full-width, half-height chroma planes (the label's own
+  `plane_dimensions( )` rule, §8.10 `ceil` on the row axis) — and
+  `Vp9Decoder::pixel_format( )` reports the label of the most
+  recently decoded frame. Since round 448 [`Vp9Decoder`]
   honors the framework `set_execution_context` hook: multi-tile
   streams decode tile-parallel under the granted budget,
   frame-identical to the serial decode, with the budget preserved

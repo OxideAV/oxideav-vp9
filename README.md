@@ -788,7 +788,7 @@ carries no forward update for it).
 
 ## Testing
 
-The crate carries 1290+ tests (lib unit tests plus integration suites
+The crate carries 1280+ tests (lib unit tests plus integration suites
 in `tests/`, including the keyframe **and inter** encoder writers, each
 round-tripped back through the in-crate decoder; `encode_keyframe`
 exercising the public `encode_vp9` → decode **byte-exact lossless**

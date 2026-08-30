@@ -1603,7 +1603,14 @@ pub(crate) fn encode_keyframe_lossy_tree_with_state(
     targets: &[Plane; 3],
     plan: &crate::frame_writer::KeyframeTreePlan,
 ) -> Result<(Vec<u8>, ReconState, crate::decode_block::Vp9FrameState), Error> {
-    if hdr.frame_type != FrameType::KeyFrame || hdr.quantization.lossless {
+    // §6.2 FrameIsIntra over a writable header: a key frame, or a
+    // hidden intra-only frame (the assembler enforces the same
+    // predicate; both classes code the identical intra body).
+    let frame_is_intra = match hdr.frame_type {
+        FrameType::KeyFrame => !hdr.intra_only,
+        FrameType::NonKeyFrame => hdr.intra_only && !hdr.show_frame,
+    };
+    if !frame_is_intra || hdr.quantization.lossless {
         return Err(Error::Unsupported);
     }
     if plan.leaves.values().any(|lp| lp.skip) {
@@ -1728,7 +1735,14 @@ pub(crate) fn encode_keyframe_lossy_tree_elect_skip_with_state(
     use std::cell::RefCell;
     use std::collections::HashMap;
 
-    if hdr.frame_type != FrameType::KeyFrame || hdr.quantization.lossless {
+    // §6.2 FrameIsIntra over a writable header: a key frame, or a
+    // hidden intra-only frame (the assembler enforces the same
+    // predicate; both classes code the identical intra body).
+    let frame_is_intra = match hdr.frame_type {
+        FrameType::KeyFrame => !hdr.intra_only,
+        FrameType::NonKeyFrame => hdr.intra_only && !hdr.show_frame,
+    };
+    if !frame_is_intra || hdr.quantization.lossless {
         return Err(Error::Unsupported);
     }
     if plan.leaves.values().any(|lp| lp.skip) {
@@ -6186,6 +6200,11 @@ pub(crate) struct GopStructure {
     pub tile_cols_log2: u8,
     /// §6.2.13 `tile_rows_log2` (`0..=2`).
     pub tile_rows_log2: u8,
+    /// Code each group's hidden alt-ref as a §6.2 **intra-only** frame
+    /// (`show_frame = 0`, `intra_only = 1`) instead of a P-frame — a
+    /// mid-GOP refresh point that cuts the prediction chain without a
+    /// keyframe's full reset of the display stream.
+    pub intra_only_altref: bool,
 }
 
 /// Lossy **structured GOP** encoder (round 452): the two-slot chain of
@@ -6443,6 +6462,108 @@ impl StructuredGopEncoder {
         Ok(bytes)
     }
 
+    /// Code one hidden §6.2 **intra-only** frame into `refresh_slot` —
+    /// the intra-only alt-ref of the pyramid. §6.2 codes the
+    /// `intra_only` flag only for `show_frame = 0` headers; the frame
+    /// runs the keyframe planner + tree encoder (mode_info( )
+    /// dispatches on `FrameIsIntra`, so key and hidden intra-only
+    /// frames code the identical §6.3/§6.4 intra body), refreshes only
+    /// its slot, and codes `reset_frame_context = 3` (all four §7.2
+    /// context banks back to the defaults the writer models).
+    ///
+    /// §7.2 `setup_past_independence( )` runs on the decode side for
+    /// every intra-only frame: the encoder mirrors it by restarting the
+    /// §7.2.8 delta baseline and the §7.2.10 feature table (the frame
+    /// codes `update_data = 1`), and clearing the §6.4.14 map before
+    /// the frame's own `update_map = 1` walk replaces it (§8.1 step 3).
+    fn code_intra_only_arf(
+        &mut self,
+        targets: &[Plane; 3],
+        refresh_slot: usize,
+    ) -> Result<Vec<u8>, Error> {
+        let (width, height, base_q_idx, fmt) = (self.width, self.height, self.base_q_idx, self.fmt);
+        let w = width as usize;
+        let h = height as usize;
+        let mi_cols = (width + 7) >> 3;
+        let mi_rows = (height + 7) >> 3;
+        let seg_mode = self.structure.segmentation;
+
+        let mut hdr = lossy_keyframe_header_fmt(width, height, base_q_idx, fmt);
+        hdr.frame_type = FrameType::NonKeyFrame;
+        hdr.intra_only = true;
+        hdr.show_frame = false;
+        hdr.error_resilient_mode = false;
+        hdr.reset_frame_context = 3;
+        hdr.refresh_frame_flags = 1u8 << refresh_slot;
+        hdr.tile_info.tile_cols_log2 = self.structure.tile_cols_log2;
+        hdr.tile_info.tile_rows_log2 = self.structure.tile_rows_log2;
+
+        let mut plan = plan_keyframe_tree(
+            targets,
+            mi_rows,
+            mi_cols,
+            fmt.ssx,
+            fmt.ssy,
+            u32::from(fmt.bit_depth),
+            base_q_idx,
+        );
+        if seg_mode.enabled() {
+            let counts = if seg_mode.adaptive_quant() {
+                assign_keyframe_aq_segments(
+                    &mut plan,
+                    targets,
+                    mi_cols,
+                    mi_rows,
+                    u32::from(fmt.bit_depth),
+                )
+            } else {
+                let mut c = SegSymbolCounts::default();
+                for _ in 0..plan.leaves.len() {
+                    c.count_tree(0);
+                }
+                c
+            };
+            hdr.segmentation = seg_params_for(
+                seg_mode,
+                false,
+                counts.tree_probs(),
+                [255; 3],
+                [0; AQ_SEGMENTS],
+            );
+        }
+        let encode = |hdr2: &Vp9FrameHeader| {
+            encode_keyframe_lossy_tree_elect_skip_with_state(hdr2, targets, &plan)
+        };
+        let (b0, recon0, state0) = encode(&hdr)?;
+        // §7.2 setup_past_independence( ) — encoder-side mirror.
+        self.lf_persist = LfDeltaState::default();
+        self.seg_persist = None;
+        let seg_map = state0.segment_ids.clone();
+        let (bytes, recon, final_hdr) = finish_frame_lossy(
+            &hdr,
+            b0,
+            recon0,
+            state0,
+            targets,
+            w,
+            h,
+            &mut self.lf_persist,
+            seg_mode.enabled().then_some(&mut self.seg_persist),
+            encode,
+        )?;
+        self.headers.push(final_hdr);
+        self.seg_maps.push(seg_mode.enabled().then_some(seg_map));
+        self.slots[refresh_slot] = Some(self.crop(&recon));
+        self.recons.push(Some(recon));
+        // Hidden frame: §7.2.6 (c) — no usable prev field for the next
+        // decoded frame (and (e) would zero it anyway: FrameIsIntra).
+        self.prev_field = None;
+        if seg_mode.enabled() {
+            self.prev_seg_map = Some(self.seg_maps.last().unwrap().clone().unwrap());
+        }
+        Ok(bytes)
+    }
+
     /// The §6.2 `show_existing_frame` packet displaying `slot`.
     fn show_existing_packet(&mut self, slot: usize) -> Result<Vec<u8>, Error> {
         let mut hdr = lossless_pframe_header_fmt(self.width, self.height, self.fmt);
@@ -6555,9 +6676,14 @@ impl StructuredGopEncoder {
                 i += 1;
                 continue;
             }
-            // 1. Hidden alt-ref: the group's last frame into the free slot.
+            // 1. Hidden alt-ref: the group's last frame into the free
+            // slot — a P-frame, or an intra-only refresh point.
             let alt_slot = self.alt_slot;
-            out.push(self.code_pframe(&rest[group_end], false, false, alt_slot)?);
+            if self.structure.intra_only_altref {
+                out.push(self.code_intra_only_arf(&rest[group_end], alt_slot)?);
+            } else {
+                out.push(self.code_pframe(&rest[group_end], false, false, alt_slot)?);
+            }
             // 2. The group's shown frames over [ LAST, GOLDEN, ALTREF ].
             for targets in &rest[i..group_end] {
                 let last_slot = self.last_slot;
@@ -7239,6 +7365,7 @@ mod tests {
             segmentation: SegMode::Off,
             tile_cols_log2: 0,
             tile_rows_log2: 0,
+            intra_only_altref: false,
         };
         let (packets, headers, decoded, _) =
             assert_structured_gop_mirror(&src, w, h, 100, structure);
@@ -7333,6 +7460,52 @@ mod tests {
         }
     }
 
+    /// Intra-only alt-ref emission (round 452): each group's hidden
+    /// frame is a §6.2 intra-only frame (NonKeyFrame + intra_only +
+    /// show_frame = 0, reset_frame_context = 3, single-slot refresh)
+    /// — the decoder-mirror holds across the §7.2
+    /// `setup_past_independence( )` the decoder runs on it (delta
+    /// baseline / feature table / PrevSegmentIds restart), with the
+    /// full segmentation emission stacked on.
+    #[test]
+    fn intra_only_altref_gop_decodes_to_encoder_reconstruction() {
+        let (w, h) = (64u32, 48u32);
+        let src: Vec<Vec<u8>> = (0..7)
+            .map(|k| half_static_frame(w as usize, h as usize, k))
+            .collect();
+        let structure = GopStructure {
+            altref_interval: 3,
+            segmentation: SegMode::Full,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
+            intra_only_altref: true,
+        };
+        let (packets, headers, decoded, _) =
+            assert_structured_gop_mirror(&src, w, h, 100, structure);
+        // kf, [IO-ARF, P, P, SE], [IO-ARF, P, P, SE] -> 9 packets.
+        assert_eq!(packets.len(), 9);
+        for i in [1usize, 5] {
+            let hd = &headers[i];
+            assert_eq!(hd.frame_type, FrameType::NonKeyFrame);
+            assert!(hd.intra_only && !hd.show_frame);
+            assert_eq!(hd.reset_frame_context, 3);
+            assert!(!hd.error_resilient_mode);
+            assert!(hd.segmentation.enabled && hd.segmentation.update_data);
+            assert!(!hd.segmentation.temporal_update);
+        }
+        assert_eq!(headers[1].refresh_frame_flags, 0x04);
+        assert_eq!(headers[5].refresh_frame_flags, 0x01);
+        // The frame after the intra-only ARF predicts its map from it
+        // (temporal update on) — §8.1 step 3 after setup_past_independence.
+        assert!(headers[2].segmentation.temporal_update);
+        // Re-parse the hidden intra-only header from the bytes: the
+        // §6.2 intra_only branch is what the packet carries.
+        let parsed = crate::header::parse_uncompressed_header(&packets[1]).expect("parse");
+        assert!(parsed.intra_only && !parsed.show_frame);
+        assert_eq!(parsed.profile, 0);
+        dump_ivf("intra-only-altref", &packets, w, h, &decoded);
+    }
+
     /// Tile encode (round 452): a 2-tile-column wide GOP and a
     /// 2-tile-row GOP (with segmentation) both decoder-mirror, the
     /// coded headers carry the §6.2.13 fields, and the multi-column
@@ -7353,6 +7526,7 @@ mod tests {
             segmentation: SegMode::Off,
             tile_cols_log2: 1,
             tile_rows_log2: 0,
+            intra_only_altref: false,
         };
         let (packets, headers, decoded, _) =
             assert_structured_gop_mirror(&src, w, h, 140, structure);
@@ -7387,6 +7561,7 @@ mod tests {
             segmentation: SegMode::Full,
             tile_cols_log2: 0,
             tile_rows_log2: 1,
+            intra_only_altref: false,
         };
         let (pk2, hs2, dec2, _) = assert_structured_gop_mirror(&src2, w2, h2, 120, rows);
         for hd in hs2.iter().filter(|hd| !hd.show_existing_frame) {
@@ -7444,6 +7619,7 @@ mod tests {
             segmentation: SegMode::Full,
             tile_cols_log2: 0,
             tile_rows_log2: 0,
+            intra_only_altref: false,
         };
         let (packets, headers, decoded, seg_maps) =
             assert_structured_gop_mirror(&src, w, h, 100, full);
@@ -7554,6 +7730,7 @@ mod tests {
                 segmentation: mode,
                 tile_cols_log2: 0,
                 tile_rows_log2: 0,
+                intra_only_altref: false,
             };
             let (pk, hs, dec, _) = assert_structured_gop_mirror(&src[..4], w, h, 120, st);
             assert!(hs

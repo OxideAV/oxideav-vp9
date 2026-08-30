@@ -1284,6 +1284,14 @@ pub struct Vp9GopConfig {
     pub tile_cols_log2: u8,
     /// §6.2.13 `tile_rows_log2` (`0..=2`).
     pub tile_rows_log2: u8,
+    /// Code each alt-ref group's hidden frame as a §6.2 **intra-only**
+    /// frame instead of a P-frame: a mid-GOP refresh point (the
+    /// prediction chain is cut without a keyframe in the display
+    /// stream; the decoder's §7.2 `setup_past_independence( )` runs on
+    /// it and the frame surfaces later through its
+    /// `show_existing_frame` packet). Requires `altref_interval >= 2`
+    /// to have any effect.
+    pub intra_only_altref: bool,
 }
 
 impl Vp9GopConfig {
@@ -1296,6 +1304,7 @@ impl Vp9GopConfig {
             segmentation: Vp9Segmentation::Off,
             tile_cols_log2: 0,
             tile_rows_log2: 0,
+            intra_only_altref: false,
         }
     }
 }
@@ -1342,6 +1351,7 @@ pub fn encode_vp9_lossy_sequence_with(
         },
         tile_cols_log2: cfg.tile_cols_log2,
         tile_rows_log2: cfg.tile_rows_log2,
+        intra_only_altref: cfg.intra_only_altref,
     };
     pixel_encoder::encode_sequence_lossy_structured_u8(
         frames,

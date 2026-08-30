@@ -218,6 +218,23 @@ fn gop_config_entry_contract() {
         );
     }
 
+    // Intra-only alt-refs: same packet structure, the hidden frames are
+    // §6.2 intra-only (profile-0 header, no reference), still exactly
+    // the input frame count of shown frames.
+    let mut io = Vp9GopConfig::new(110);
+    io.altref_interval = 3;
+    io.intra_only_altref = true;
+    let packets = encode_vp9_lossy_sequence_with(&refs(&src), w, h, &io).expect("intra-only cfg");
+    // 5 frames: kf + group [1,2,3] (ARF, P, P, SE) + the lone frame 4.
+    assert_eq!(packets.len(), 1 + 4 + 1);
+    let decoded = decode_vp9_sequence(&refs(&packets)).expect("decode");
+    assert_eq!(decoded.len(), 5);
+    // §6.2 bit layout of the hidden intra-only header: frame_marker 10,
+    // profile bits 00, show_existing 0, frame_type 1 (non-key),
+    // show_frame 0, error_resilient 0, intra_only 1 -> 1000_0100 1...
+    assert_eq!(packets[1][0], 0b1000_0100);
+    assert_eq!(packets[1][1] >> 7, 1);
+
     let mut bad = Vp9GopConfig::new(0);
     bad.segmentation = Vp9Segmentation::Full;
     assert_eq!(
@@ -384,7 +401,21 @@ fn build_r452_fixture_streams() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
         let yuv = yuv_of(&packets);
         out.push(("tiles-2col-encoded-gop", ivf_wrap(&packets, 512, 32), yuv));
     }
-    // 4. resized-encoded-gop — the first PIXEL-ACCURATE self-encoded
+    // 4. intra-only-emitted-gop — the first ENCODER-MINTED hidden
+    // intra-only frames (mid-GOP refresh points shown through
+    // show_existing_frame), with the full segmentation emission.
+    {
+        let src: Vec<Vec<u8>> = (0..7).map(|k| half_static_scene(64, 48, k)).collect();
+        let mut cfg = Vp9GopConfig::new(100);
+        cfg.altref_interval = 3;
+        cfg.segmentation = Vp9Segmentation::Full;
+        cfg.intra_only_altref = true;
+        let packets =
+            encode_vp9_lossy_sequence_with(&refs(&src), 64, 48, &cfg).expect("intra-only");
+        let yuv = yuv_of(&packets);
+        out.push(("intra-only-emitted-gop", ivf_wrap(&packets, 64, 48), yuv));
+    }
+    // 5. resized-encoded-gop — the first PIXEL-ACCURATE self-encoded
     // §8.5.2.3 stream (the r409 scaled-reference fixture is all-skip).
     {
         let sizes: [(u32, u32); 4] = [(128, 96), (64, 48), (96, 64), (128, 96)];
@@ -428,7 +459,7 @@ fn half_static_scene(w: usize, h: usize, k: usize) -> Vec<u8> {
 fn r452_fixture_builders_are_deterministic() {
     let a = build_r452_fixture_streams();
     let b = build_r452_fixture_streams();
-    assert_eq!(a.len(), 4);
+    assert_eq!(a.len(), 5);
     for ((n1, ivf1, yuv1), (n2, ivf2, yuv2)) in a.iter().zip(b.iter()) {
         assert_eq!(n1, n2);
         assert_eq!(ivf1, ivf2, "{n1} ivf not deterministic");

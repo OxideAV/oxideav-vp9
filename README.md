@@ -473,6 +473,12 @@ prediction sees the decoder's exact state. Public entry points:
     multi-tile-column streams the crate's own §9.2.4 **tile-parallel
     decoder** consumes (pinned byte-identical through
     [`decode_vp9_sequence_with`] at a 4-thread budget).
+  * **intra-only frames** (`intra_only_altref`) — each group's hidden
+    frame coded as a §6.2 intra-only frame (`show_frame = 0`,
+    `intra_only = 1`, `reset_frame_context = 3`): a mid-GOP refresh
+    point without a keyframe in the display stream, the encoder
+    mirroring the decoder's §7.2 `setup_past_independence( )` (delta
+    baseline, feature table and `PrevSegmentIds` restart).
 * [`encode_vp9_lossy_sequence_resized`] — **scaled-reference encode**
   (round 452): mid-stream §6.2.5 coded-size changes with the
   **§8.5.2.3 scaled sampler** on the write side (`xScale =
@@ -759,8 +765,9 @@ carries no forward update for it).
   validated byte-exact at both depths on keyframes and GOPs.
   **Round 452 lands the structured GOP axes** (alt-ref pyramid with
   hidden frames + `show_existing_frame`, all-four-feature §6.2.11
-  segmentation emission, encode-side tile columns/rows, pixel-accurate
-  scaled-reference encode — see the Encoder section), and its
+  segmentation emission, encode-side tile columns/rows, hidden
+  intra-only refresh frames, pixel-accurate scaled-reference encode —
+  see the Encoder section), and its
   segmentation decoder-mirror caught a real decode bug: §6.4.14
   `PrevSegmentIds` was wrongly invalidated by a *hidden* predecessor
   (the `show_frame` gate belongs to §7.2.6 (c) `UsePrevFrameMvs`
@@ -775,9 +782,7 @@ carries no forward update for it).
     frame codes forward-updates-only default probabilities, leaving
     entropy-rate on the table;
   * no two-pass rate control (the per-frame bisection of
-    `encode_vp9_lossy_sequence_rc` is one-pass), no hidden intra-only
-    refresh emission (the decoder handles intra-only frames; the
-    header writer can code them; no public entry mints them), and the
+    `encode_vp9_lossy_sequence_rc` is one-pass), and the
     interpolation filter is frame-level `EIGHTTAP` (no switchable
     per-block election).
 

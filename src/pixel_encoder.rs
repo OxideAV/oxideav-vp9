@@ -3811,6 +3811,44 @@ pub(crate) fn encode_pframe_lossy_tree_motion_with_state(
     sub8x8: bool,
     prev_frame_mvs: Option<&crate::frame_writer::PrevMotionField>,
 ) -> Result<(Vec<u8>, ReconState, crate::decode_block::Vp9FrameState), Error> {
+    encode_pframe_lossy_tree_motion_with_state_alt(
+        hdr,
+        targets,
+        reference,
+        golden,
+        None,
+        ref_w,
+        ref_h,
+        search_range,
+        subpel,
+        sub8x8,
+        prev_frame_mvs,
+    )
+}
+
+/// [`encode_pframe_lossy_tree_motion_with_state`] over a **three-slot
+/// reference set**: `altref`, when supplied, is a distinct §8.10 buffer
+/// resolved by `ref_frame_idx[ 2 ]` (the hidden alt-ref of the
+/// pyramid GOP), so the leaf sweep evaluates single-reference
+/// `ALTREF_FRAME` candidates (ZEROMV + searched NEWMV) alongside LAST /
+/// GOLDEN, and the `[ LAST, ALTREF ]` compound pair averages the true
+/// alt-ref planes. `None` aliases ALTREF onto the GOLDEN planes — the
+/// two-slot layout every earlier sequence entry codes — and is
+/// byte-identical to the historical output.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_pframe_lossy_tree_motion_with_state_alt(
+    hdr: &Vp9FrameHeader,
+    targets: &[Plane; 3],
+    reference: &[(&[i32], usize); 3],
+    golden: Option<&[(&[i32], usize); 3]>,
+    altref: Option<&[(&[i32], usize); 3]>,
+    ref_w: u32,
+    ref_h: u32,
+    search_range: i32,
+    subpel: bool,
+    sub8x8: bool,
+    prev_frame_mvs: Option<&crate::frame_writer::PrevMotionField>,
+) -> Result<(Vec<u8>, ReconState, crate::decode_block::Vp9FrameState), Error> {
     use crate::frame_writer::{InterFrameTreePlan, InterTreeLeaf, InterTreePlanner};
     use crate::inter_decode::FrameStateMvSource;
     use crate::mode_info::{LAST_FRAME, NEARESTMV, NEARMV, NEWMV, NONE_REF_FRAME, ZEROMV};
@@ -3873,8 +3911,11 @@ pub(crate) fn encode_pframe_lossy_tree_motion_with_state(
     // pair coded is [ LAST, ALTREF ], which is the §6.3.18
     // fixed/variable layout exactly when LAST and GOLDEN share a bias
     // that ALTREF does not.
+    // The ALTREF planes: the pyramid's distinct hidden alt-ref slot when
+    // supplied, else the GOLDEN alias of the two-slot layout.
+    let alt_planes: Option<&[(&[i32], usize); 3]> = altref.or(golden);
     let compound_ok =
-        golden.is_some() && sign_bias[1] == sign_bias[2] && sign_bias[3] != sign_bias[1];
+        alt_planes.is_some() && sign_bias[1] == sign_bias[2] && sign_bias[3] != sign_bias[1];
     let reference_mode = if compound_ok {
         crate::compressed::ReferenceMode::ReferenceModeSelect
     } else {
@@ -4033,14 +4074,41 @@ pub(crate) fn encode_pframe_lossy_tree_motion_with_state(
                         }
                     }
                 }
+                // A distinct ALTREF slot (the pyramid's hidden alt-ref)
+                // is a third single-reference candidate: ZEROMV plus the
+                // searched NEWMV, scored exactly like GOLDEN.
+                let mut a_new_mv: Option<[i32; 2]> = None;
+                if let Some(aplanes) = altref {
+                    let (a_zero, a_new) = eval_ref(crate::mode_info::ALTREF_FRAME, aplanes);
+                    if a_zero < best_score {
+                        best_score = a_zero;
+                        choice = (
+                            [crate::mode_info::ALTREF_FRAME, NONE_REF_FRAME],
+                            ZEROMV,
+                            [[0, 0], [0, 0]],
+                        );
+                    }
+                    if let Some((mv, sad)) = a_new {
+                        a_new_mv = Some(mv);
+                        if search_range > 0 && sad + NEWMV_SAD_MARGIN < best_score {
+                            best_score = sad + NEWMV_SAD_MARGIN;
+                            choice = (
+                                [crate::mode_info::ALTREF_FRAME, NONE_REF_FRAME],
+                                NEWMV,
+                                [mv, [0, 0]],
+                            );
+                        }
+                    }
+                }
                 // Compound (LAST + ALTREF) candidates — the §8.5.2
                 // Round2( p0 + p1, 1 ) average of both references
                 // (ALTREF resolves to the same slot as GOLDEN in the
-                // sequence layout). ZEROMV averages the co-located
-                // blocks; NEWMV pairs the per-reference winners, each
-                // re-snapped against its own list's §6.5.12 BestMv.
+                // two-slot sequence layout, to the hidden alt-ref in
+                // the pyramid). ZEROMV averages the co-located blocks;
+                // NEWMV pairs the per-reference winners, each re-snapped
+                // against its own list's §6.5.12 BestMv.
                 if compound_ok {
-                    let gplanes = golden.expect("compound requires golden planes");
+                    let gplanes = alt_planes.expect("compound requires altref planes");
                     let comp_pair = [LAST_FRAME, crate::mode_info::ALTREF_FRAME];
                     let comp_sad = |mvs: [[i32; 2]; 2]| -> u64 {
                         let mut sc = scratch3.borrow_mut();
@@ -4071,7 +4139,11 @@ pub(crate) fn encode_pframe_lossy_tree_motion_with_state(
                         choice = (comp_pair, ZEROMV, zero_pair);
                     }
                     let l_mv = l_new.map(|(mv, _)| mv).unwrap_or([0, 0]);
-                    let a_mv = g_new_mv.unwrap_or([0, 0]);
+                    let a_mv = if altref.is_some() {
+                        a_new_mv.unwrap_or([0, 0])
+                    } else {
+                        g_new_mv.unwrap_or([0, 0])
+                    };
                     if search_range > 0 && (l_mv != [0, 0] || a_mv != [0, 0]) {
                         // Re-snap the ALTREF-list vector against the
                         // ALTREF predictors (its parity gate may differ
@@ -4144,13 +4216,13 @@ pub(crate) fn encode_pframe_lossy_tree_motion_with_state(
                     choice.1 = NEARMV;
                 }
             }
-            let ref_planes: &[(&[i32], usize); 3] = if choice.0[0] == LAST_FRAME {
-                reference
-            } else {
-                golden.expect("GOLDEN elected only when present")
+            let ref_planes: &[(&[i32], usize); 3] = match choice.0[0] {
+                LAST_FRAME => reference,
+                crate::mode_info::GOLDEN_FRAME => golden.expect("GOLDEN elected only when present"),
+                _ => alt_planes.expect("ALTREF elected only when present"),
             };
             let second_planes: Option<&[(&[i32], usize); 3]> = if is_compound {
-                Some(golden.expect("compound requires golden planes"))
+                Some(alt_planes.expect("compound requires altref planes"))
             } else {
                 None
             };
@@ -4973,6 +5045,327 @@ impl LossyGopEncoder {
     }
 }
 
+/// One visible-extent reference buffer of the encoder-side §8.10
+/// `FrameStore`: the three planes cropped to the frame's visible
+/// dimensions (luma `w × h`, chroma per the format).
+type StoredRef = [Vec<i32>; 3];
+
+/// The visible-extent crop of a reconstruction (the §8.10 store).
+fn visible_crop_planes(recon: &ReconState, w: usize, h: usize, cw: usize, ch: usize) -> StoredRef {
+    let crop = |p: &Plane, vw: usize, vh: usize| -> Vec<i32> {
+        let mut out = Vec::with_capacity(vw * vh);
+        for y in 0..vh {
+            for x in 0..vw {
+                out.push(p.get(x, y));
+            }
+        }
+        out
+    };
+    [
+        crop(&recon.planes[0], w, h),
+        crop(&recon.planes[1], cw, ch),
+        crop(&recon.planes[2], cw, ch),
+    ]
+}
+
+fn stored_ref_view(r: &StoredRef, w: usize, cw: usize) -> [(&[i32], usize); 3] {
+    [
+        (r[0].as_slice(), w),
+        (r[1].as_slice(), cw),
+        (r[2].as_slice(), cw),
+    ]
+}
+
+/// Lossy **alt-ref pyramid** GOP encoder (round 452): a three-slot
+/// §8.10 reference set — `LAST` (the previous decoded frame), a
+/// long-term `GOLDEN` (the keyframe) and a **hidden alt-ref** — coded
+/// over groups of `interval` display frames:
+///
+/// 1. the group's *last* source frame is coded first as a hidden
+///    (`show_frame = 0`) P-frame into the free slot — the alt-ref;
+/// 2. the group's earlier frames are coded as shown P-frames with
+///    `ref_frame_idx = [ last, golden, alt ]` and
+///    `ref_frame_sign_bias = [ 0, 0, 1 ]` (the alt-ref genuinely lies in
+///    the future, so the §6.5 candidate sign flip is the semantically
+///    right one), each leaf electing among single `LAST` / `GOLDEN` /
+///    `ALTREF` and the `[ LAST, ALTREF ]` §6.3.18 compound pair;
+/// 3. a `show_existing_frame` packet (§6.2 one-byte header) displays
+///    the alt-ref at its display position — no re-coding — after
+///    which the alt-ref slot becomes `LAST` and the old `LAST` slot is
+///    the next group's free alt-ref slot.
+///
+/// §7.2.6 modeling: the frame decoded right after the hidden alt-ref
+/// sees `show_frame == 0` at the previous `compute_image_size( )`
+/// invocation, so `UsePrevFrameMvs = 0` there (the encoder asserts the
+/// absent prev field on a non-error-resilient header); every other
+/// shown P-frame threads the previous decoded frame's §6.4.4 motion
+/// field, and a `show_existing_frame` packet invokes neither
+/// `compute_image_size( )` nor the §6.1.2 `PrevMvs` save, so the
+/// frame after it still models the field of the last *decoded* frame.
+/// The §7.2.8 loop-filter delta baseline persists across every packet
+/// (hidden frames elect deltas too; `show_existing_frame` touches
+/// nothing).
+pub(crate) struct AltrefPyramidEncoder {
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+    fmt: LossyFormat,
+    interval: usize,
+    slots: [Option<StoredRef>; 3],
+    last_slot: usize,
+    golden_slot: usize,
+    alt_slot: usize,
+    prev_field: Option<crate::frame_writer::PrevMotionField>,
+    lf_persist: LfDeltaState,
+    /// Per coded packet: `Some( recon )` for decoded frames (keyframe,
+    /// shown P-frames, hidden alt-refs), `None` for
+    /// `show_existing_frame` packets. Tests pair the decoder's shown
+    /// output against these in display order.
+    pub recons: Vec<Option<ReconState>>,
+}
+
+impl AltrefPyramidEncoder {
+    /// `interval >= 2` display frames per group (the alt-ref is the
+    /// group's last frame); `1` degenerates to the plain chain.
+    pub fn new(
+        width: u32,
+        height: u32,
+        base_q_idx: u8,
+        fmt: LossyFormat,
+        interval: usize,
+    ) -> Result<Self, Error> {
+        validate_lossy_args(width, height, base_q_idx)?;
+        if interval == 0 {
+            return Err(Error::Unsupported);
+        }
+        Ok(Self {
+            width,
+            height,
+            base_q_idx,
+            fmt,
+            interval,
+            slots: [None, None, None],
+            last_slot: 0,
+            golden_slot: 1,
+            alt_slot: 2,
+            prev_field: None,
+            lf_persist: LfDeltaState::default(),
+            recons: Vec::new(),
+        })
+    }
+
+    fn crop(&self, recon: &ReconState) -> StoredRef {
+        let (cw, ch) = self.fmt.chroma_dims(self.width, self.height);
+        visible_crop_planes(recon, self.width as usize, self.height as usize, cw, ch)
+    }
+
+    /// Code one P-frame (shown or hidden) against the current slot
+    /// roles; `use_alt` admits the distinct alt-ref slot as the third
+    /// reference (false while the group's alt-ref is being built).
+    fn code_pframe(
+        &mut self,
+        targets: &[Plane; 3],
+        shown: bool,
+        use_alt: bool,
+        refresh_slot: usize,
+    ) -> Result<Vec<u8>, Error> {
+        use crate::frame_writer::PrevMotionField;
+        let (width, height, fmt) = (self.width, self.height, self.fmt);
+        let w = width as usize;
+        let h = height as usize;
+        let (cw, _ch) = fmt.chroma_dims(width, height);
+
+        let last = self.slots[self.last_slot]
+            .as_ref()
+            .expect("LAST slot filled");
+        let golden = self.slots[self.golden_slot]
+            .as_ref()
+            .expect("GOLDEN slot filled");
+        let last_v = stored_ref_view(last, w, cw);
+        let golden_v = stored_ref_view(golden, w, cw);
+        let alt_v = if use_alt {
+            self.slots[self.alt_slot]
+                .as_ref()
+                .map(|a| stored_ref_view(a, w, cw))
+        } else {
+            None
+        };
+
+        let mut hdr = lossless_pframe_header_fmt(width, height, fmt);
+        hdr.error_resilient_mode = false;
+        hdr.show_frame = shown;
+        let alt_idx = if use_alt {
+            self.alt_slot
+        } else {
+            self.golden_slot
+        };
+        hdr.ref_frame_idx = Some([self.last_slot as u8, self.golden_slot as u8, alt_idx as u8]);
+        hdr.ref_frame_sign_bias = [false, false, true];
+        hdr.refresh_frame_flags = 1u8 << refresh_slot;
+        hdr.quantization = QuantizationParams {
+            base_q_idx: self.base_q_idx,
+            delta_q_y_dc: 0,
+            delta_q_uv_dc: 0,
+            delta_q_uv_ac: 0,
+            lossless: false,
+        };
+        let prev_field = self.prev_field.as_ref();
+        let encode = |hdr2: &Vp9FrameHeader| {
+            encode_pframe_lossy_tree_motion_with_state_alt(
+                hdr2,
+                targets,
+                &last_v,
+                Some(&golden_v),
+                alt_v.as_ref(),
+                width,
+                height,
+                PFRAME_SEARCH_RANGE,
+                true,
+                true,
+                prev_field,
+            )
+        };
+        let (p0, recon0, state0) = encode(&hdr)?;
+        let next_field = PrevMotionField::from_state(&state0);
+        let (bytes, recon) = finish_frame_with_filter_deltas(
+            &hdr,
+            p0,
+            recon0,
+            state0,
+            targets,
+            w,
+            h,
+            &mut self.lf_persist,
+            encode,
+        )?;
+        self.slots[refresh_slot] = Some(self.crop(&recon));
+        self.recons.push(Some(recon));
+        // §7.2.6 (c): a hidden frame leaves the next decoded frame
+        // without a usable prev field.
+        self.prev_field = if shown { Some(next_field) } else { None };
+        Ok(bytes)
+    }
+
+    /// The §6.2 `show_existing_frame` packet displaying `slot`.
+    fn show_existing_packet(&mut self, slot: usize) -> Result<Vec<u8>, Error> {
+        let mut hdr = lossless_pframe_header_fmt(self.width, self.height, self.fmt);
+        hdr.show_existing_frame = true;
+        hdr.frame_to_show_map_idx = Some(slot as u8);
+        self.recons.push(None);
+        crate::header_writer::write_uncompressed_header(&hdr)
+    }
+
+    /// Encode the whole GOP: keyframe, then alt-ref groups. Returns the
+    /// packets in decode order (one `Vec<u8>` per §6.1 frame; hidden
+    /// alt-refs and `show_existing_frame` packets included).
+    pub fn encode(&mut self, frame_targets: &[[Plane; 3]]) -> Result<Vec<Vec<u8>>, Error> {
+        use crate::frame_writer::PrevMotionField;
+        let Some((kf_targets, rest)) = frame_targets.split_first() else {
+            return Err(Error::Unsupported);
+        };
+        let (width, height, base_q_idx, fmt) = (self.width, self.height, self.base_q_idx, self.fmt);
+        let w = width as usize;
+        let h = height as usize;
+
+        // Keyframe: the chain-model keyframe of the default sequence
+        // entry (planner tree, skip election, filter election),
+        // refreshing every slot.
+        let kf_hdr = lossy_keyframe_header_fmt(width, height, base_q_idx, fmt);
+        let kf_plan = plan_keyframe_tree(
+            kf_targets,
+            (height + 7) >> 3,
+            (width + 7) >> 3,
+            fmt.ssx,
+            fmt.ssy,
+            u32::from(fmt.bit_depth),
+            base_q_idx,
+        );
+        let encode_kf = |hdr2: &Vp9FrameHeader| {
+            encode_keyframe_lossy_tree_elect_skip_with_state(hdr2, kf_targets, &kf_plan)
+        };
+        let (kf0, kf_recon0, kf_state0) = encode_kf(&kf_hdr)?;
+        self.prev_field = Some(PrevMotionField::from_state(&kf_state0));
+        let (kf_bytes, kf_recon) = finish_frame_with_filter(
+            &kf_hdr, kf0, kf_recon0, kf_state0, kf_targets, w, h, encode_kf,
+        )?;
+        self.lf_persist = LfDeltaState::default();
+        let kf_crop = self.crop(&kf_recon);
+        self.slots = [Some(kf_crop.clone()), Some(kf_crop.clone()), Some(kf_crop)];
+        self.last_slot = 0;
+        self.golden_slot = 1;
+        self.alt_slot = 2;
+        self.recons.push(Some(kf_recon));
+
+        let mut out = Vec::with_capacity(frame_targets.len() + frame_targets.len() / self.interval);
+        out.push(kf_bytes);
+
+        let mut i = 0usize;
+        while i < rest.len() {
+            let group_end = (i + self.interval - 1).min(rest.len() - 1);
+            if group_end == i {
+                // A lone frame: plain shown P-frame over LAST / GOLDEN.
+                let last_slot = self.last_slot;
+                out.push(self.code_pframe(&rest[i], true, false, last_slot)?);
+                i += 1;
+                continue;
+            }
+            // 1. Hidden alt-ref: the group's last frame into the free slot.
+            let alt_slot = self.alt_slot;
+            out.push(self.code_pframe(&rest[group_end], false, false, alt_slot)?);
+            // 2. The group's shown frames over [ LAST, GOLDEN, ALTREF ].
+            for targets in &rest[i..group_end] {
+                let last_slot = self.last_slot;
+                out.push(self.code_pframe(targets, true, true, last_slot)?);
+            }
+            // 3. Display the alt-ref; it becomes LAST, the old LAST slot
+            // is freed for the next group's alt-ref.
+            out.push(self.show_existing_packet(alt_slot)?);
+            let old_last = self.last_slot;
+            self.last_slot = alt_slot;
+            self.alt_slot = old_last;
+            i = group_end + 1;
+        }
+        Ok(out)
+    }
+}
+
+/// [`encode_sequence_lossy_planes`] on the alt-ref pyramid GOP
+/// structure ([`AltrefPyramidEncoder`]).
+pub(crate) fn encode_sequence_lossy_pyramid_planes(
+    frame_targets: &[[Plane; 3]],
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+    fmt: LossyFormat,
+    interval: usize,
+) -> Result<Vec<Vec<u8>>, Error> {
+    AltrefPyramidEncoder::new(width, height, base_q_idx, fmt, interval)?.encode(frame_targets)
+}
+
+/// 8-bit planar-`u8` front end of [`encode_sequence_lossy_pyramid_planes`].
+pub(crate) fn encode_sequence_lossy_pyramid_u8(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+    fmt: LossyFormat,
+    interval: usize,
+) -> Result<Vec<Vec<u8>>, Error> {
+    if frames.is_empty() {
+        return Err(Error::Unsupported);
+    }
+    validate_lossy_args(width, height, base_q_idx)?;
+    let need = fmt.planar_len(width, height);
+    if frames.iter().any(|f| f.len() < need) {
+        return Err(Error::Unsupported);
+    }
+    let targets: Vec<[Plane; 3]> = frames
+        .iter()
+        .map(|f| padded_targets_from_u8(f, width, height, fmt))
+        .collect();
+    encode_sequence_lossy_pyramid_planes(&targets, width, height, base_q_idx, fmt, interval)
+}
+
 /// [`encode_sequence_lossy_420`] on **non-error-resilient chain
 /// framing** — the §7.2.6 `UsePrevFrameMvs == 1` model applied to the
 /// lossy GOP: every P-frame is shown and non-error-resilient, the
@@ -5443,6 +5836,120 @@ impl LosslessGopEncoder420 {
 mod tests {
     use super::*;
     use crate::decode_frame::decode_intra_frame;
+
+    /// Source frame `k` of a translating 4:2:0 scene: a diagonal ramp
+    /// plus a sharp textured patch moving 2 px/frame, so LAST /
+    /// GOLDEN / ALTREF and the compound pair all find distinct wins.
+    fn moving_scene_frame(w: usize, h: usize, k: usize) -> Vec<u8> {
+        let cw = w.div_ceil(2);
+        let ch = h.div_ceil(2);
+        let mut px = Vec::with_capacity(w * h + 2 * cw * ch);
+        for y in 0..h {
+            for x in 0..w {
+                let mut v = ((x + 2 * k) * 3 + y * 2) % 200 + 20;
+                let px_x = x as i64 - 2 * k as i64;
+                if (8..24).contains(&px_x) && (8..24).contains(&y) {
+                    v = (px_x as usize * 37 + y * 53) % 255;
+                }
+                px.push(v as u8);
+            }
+        }
+        for plane in 0..2usize {
+            for y in 0..ch {
+                for x in 0..cw {
+                    px.push(((x + k) * 5 + y * 3 + plane * 90) as u8);
+                }
+            }
+        }
+        px
+    }
+
+    /// Alt-ref pyramid GOP (round 452): the packets decode through the
+    /// crate's own sequence decoder to exactly `frames.len()` shown
+    /// frames, each equal sample-for-sample to the encoder's
+    /// reconstruction in display order — the hidden alt-ref's
+    /// reconstruction surfaces at its `show_existing_frame` position —
+    /// and the structure is exactly keyframe + per-group (hidden ARF,
+    /// interval-1 shown P-frames, one show-existing packet).
+    #[test]
+    fn altref_pyramid_gop_decodes_to_encoder_reconstruction() {
+        use crate::decode_frame::decode_vp9_sequence;
+        let (w, h) = (64u32, 48u32);
+        let n = 8usize;
+        let interval = 3usize;
+        let src: Vec<Vec<u8>> = (0..n)
+            .map(|k| moving_scene_frame(w as usize, h as usize, k))
+            .collect();
+        let fmt = LossyFormat::YUV420_8;
+        let targets: Vec<[Plane; 3]> = src
+            .iter()
+            .map(|f| padded_targets_from_u8(f, w, h, fmt))
+            .collect();
+        let mut enc = AltrefPyramidEncoder::new(w, h, 100, fmt, interval).expect("enc");
+        let packets = enc.encode(&targets).expect("encode");
+        // kf + groups: [1,2,3] -> ARF(3),P1,P2,SE ; [4,5,6] -> ARF,P,P,SE ; [7] -> P.
+        assert_eq!(packets.len(), 1 + 4 + 4 + 1);
+        assert_eq!(enc.recons.len(), packets.len());
+        // The show-existing packets are one-byte §6.2 headers.
+        assert_eq!(packets[4].len(), 1);
+        assert_eq!(packets[8].len(), 1);
+
+        let refs: Vec<&[u8]> = packets.iter().map(|p| p.as_slice()).collect();
+        let decoded = decode_vp9_sequence(&refs).expect("decode");
+        assert_eq!(decoded.len(), n);
+
+        // Display-order reconstruction list: keyframe, then per group
+        // the shown P-frames followed by the ARF recon.
+        let mut display: Vec<&ReconState> = Vec::new();
+        display.push(enc.recons[0].as_ref().unwrap());
+        for g in [1usize, 5] {
+            display.push(enc.recons[g + 1].as_ref().unwrap());
+            display.push(enc.recons[g + 2].as_ref().unwrap());
+            display.push(enc.recons[g].as_ref().unwrap());
+        }
+        display.push(enc.recons[9].as_ref().unwrap());
+        for (i, (d, r)) in decoded.iter().zip(display.iter()).enumerate() {
+            let vis = visible_crop_planes(r, w as usize, h as usize, 32, 24);
+            let dy: Vec<i32> = d.y.iter().map(|&v| i32::from(v)).collect();
+            let du: Vec<i32> = d.u.iter().map(|&v| i32::from(v)).collect();
+            let dv: Vec<i32> = d.v.iter().map(|&v| i32::from(v)).collect();
+            assert_eq!(dy, vis[0], "frame {i} luma != encoder recon");
+            assert_eq!(du, vis[1], "frame {i} U != encoder recon");
+            assert_eq!(dv, vis[2], "frame {i} V != encoder recon");
+        }
+        // Byte-determinism (fixture staging relies on it).
+        let again = AltrefPyramidEncoder::new(w, h, 100, fmt, interval)
+            .unwrap()
+            .encode(&targets)
+            .unwrap();
+        assert_eq!(packets, again);
+        if let Some(dir) = std::env::var_os("OXIDEAV_VP9_R452_DUMP") {
+            let mut ivf = Vec::new();
+            ivf.extend_from_slice(b"DKIF");
+            ivf.extend_from_slice(&0u16.to_le_bytes());
+            ivf.extend_from_slice(&32u16.to_le_bytes());
+            ivf.extend_from_slice(b"VP90");
+            ivf.extend_from_slice(&(w as u16).to_le_bytes());
+            ivf.extend_from_slice(&(h as u16).to_le_bytes());
+            ivf.extend_from_slice(&25u32.to_le_bytes());
+            ivf.extend_from_slice(&1u32.to_le_bytes());
+            ivf.extend_from_slice(&(packets.len() as u32).to_le_bytes());
+            ivf.extend_from_slice(&0u32.to_le_bytes());
+            for (i, f) in packets.iter().enumerate() {
+                ivf.extend_from_slice(&(f.len() as u32).to_le_bytes());
+                ivf.extend_from_slice(&(i as u64).to_le_bytes());
+                ivf.extend_from_slice(f);
+            }
+            let dir = std::path::Path::new(&dir);
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("altref.ivf"), ivf).unwrap();
+            let mut yuv = Vec::new();
+            for f in &decoded {
+                yuv.extend_from_slice(&f.to_planar_bytes());
+            }
+            std::fs::write(dir.join("altref-crate.yuv"), yuv).unwrap();
+        }
+    }
 
     /// Deterministic pseudo-random planar 4:2:0 frame.
     fn noise_frame(width: u32, height: u32, seed: u64) -> Vec<u8> {

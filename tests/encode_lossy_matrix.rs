@@ -743,6 +743,23 @@ fn dump_matrix_streams_for_black_box_validation() {
                 oxideav_vp9::encode_vp9_lossy_sequence_440(&refs8(&f440), w as u32, h as u32, q)
                     .expect("gop 440")
             }),
+            // Round-452 alt-ref pyramid: hidden ARFs + show_existing_frame
+            // packets + three-slot [LAST, GOLDEN, ALTREF] election. NOTE
+            // for the black-box compare: the hidden packets carry IVF
+            // timestamps, so the reference decoder must be run with
+            // timestamp passthrough (no frame-rate conformance) to emit
+            // exactly the shown frames.
+            ("gop-altref-pyramid", {
+                let f420 = gop_u8(true, true);
+                oxideav_vp9::encode_vp9_lossy_sequence_altref(
+                    &refs8(&f420),
+                    w as u32,
+                    h as u32,
+                    q,
+                    3,
+                )
+                .expect("gop altref")
+            }),
             ("gop-440-12bit", {
                 let f440_12 = gop_u16(12, false, true);
                 oxideav_vp9::encode_vp9_lossy_sequence_hbd_440(

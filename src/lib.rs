@@ -1190,6 +1190,60 @@ pub fn encode_vp9_lossy_sequence_rc(
     pixel_encoder::encode_sequence_lossy_rc_420(frames, width, height, target_bytes_per_frame)
 }
 
+/// Encode an 8-bit 4:2:0 sequence as a lossy **alt-ref pyramid** GOP
+/// (round 452): a keyframe, then groups of `altref_interval` display
+/// frames each coded as a **hidden alt-ref** (`show_frame = 0`, the
+/// group's last source frame, refreshed into a free §8.10 slot) followed
+/// by the group's earlier frames as shown P-frames over the three-slot
+/// reference set `ref_frame_idx = [ LAST, GOLDEN, ALTREF ]` with
+/// `ref_frame_sign_bias = [ 0, 0, 1 ]` — every leaf elects among single
+/// `LAST` / `GOLDEN` / `ALTREF` prediction and the `[ LAST, ALTREF ]`
+/// §6.3.18 compound pair (`reference_select`) — and closed by a
+/// `show_existing_frame` packet that displays the alt-ref at its
+/// display position without re-coding it. The alt-ref slot then
+/// becomes `LAST` and the freed slot hosts the next group's alt-ref;
+/// the keyframe stays parked as the long-term `GOLDEN`.
+///
+/// The returned packets are in **decode order** — one entry per §6.1
+/// frame, the hidden alt-refs and the one-byte `show_existing_frame`
+/// packets included — so `out.len() > frames.len()` whenever a group
+/// forms; [`decode_vp9_sequence`] returns exactly `frames.len()` shown
+/// frames in display order. Every shown frame equals the encoder's
+/// in-loop reconstruction bit-for-bit (the hidden alt-ref's
+/// reconstruction is what the `show_existing_frame` packet displays).
+///
+/// The §7.2.6 `UsePrevFrameMvs` model follows the spec's
+/// `compute_image_size( )` bookkeeping exactly: the frame decoded right
+/// after a hidden alt-ref sees `show_frame == 0` at the previous
+/// invocation and codes with the prev field absent; a
+/// `show_existing_frame` packet invokes neither `compute_image_size( )`
+/// nor the §6.1.2 `PrevMvs` save, so the following frame still models
+/// the last *decoded* frame's motion field.
+///
+/// `altref_interval == 1` degenerates to plain shown P-frames (no
+/// hidden frames; byte-identical GOP structure to a two-slot chain but
+/// NOT byte-identical to [`encode_vp9_lossy_sequence`], which threads
+/// its own slot layout). Returns [`Error::Unsupported`] for an empty
+/// sequence, `base_q_idx == 0`, `altref_interval == 0`, degenerate
+/// dimensions, or any too-short frame buffer.
+pub fn encode_vp9_lossy_sequence_altref(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+    altref_interval: u32,
+) -> Result<Vec<Vec<u8>>, Error> {
+    let fmt = pixel_encoder::LossyFormat::new(8, true, true)?;
+    pixel_encoder::encode_sequence_lossy_pyramid_u8(
+        frames,
+        width,
+        height,
+        base_q_idx,
+        fmt,
+        altref_interval as usize,
+    )
+}
+
 /// Encode a minimal VP9 **inter (P-frame) sequence** of `width × height`:
 /// a keyframe followed by `num_pframes` all-skip, single-reference-`LAST`,
 /// `ZEROMV` P-frames.

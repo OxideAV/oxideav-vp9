@@ -309,3 +309,166 @@ fn resized_sequence_contract() {
         Error::Unsupported
     );
 }
+
+// ----- round-452 fixture packages: builders + staging + identity -----
+
+/// Wrap coded packets in a minimal IVF container (the corpus layout).
+fn ivf_wrap(packets: &[Vec<u8>], w: u16, h: u16) -> Vec<u8> {
+    let mut ivf = Vec::new();
+    ivf.extend_from_slice(b"DKIF");
+    ivf.extend_from_slice(&0u16.to_le_bytes());
+    ivf.extend_from_slice(&32u16.to_le_bytes());
+    ivf.extend_from_slice(b"VP90");
+    ivf.extend_from_slice(&w.to_le_bytes());
+    ivf.extend_from_slice(&h.to_le_bytes());
+    ivf.extend_from_slice(&25u32.to_le_bytes());
+    ivf.extend_from_slice(&1u32.to_le_bytes());
+    ivf.extend_from_slice(&(packets.len() as u32).to_le_bytes());
+    ivf.extend_from_slice(&0u32.to_le_bytes());
+    for (i, f) in packets.iter().enumerate() {
+        ivf.extend_from_slice(&(f.len() as u32).to_le_bytes());
+        ivf.extend_from_slice(&(i as u64).to_le_bytes());
+        ivf.extend_from_slice(f);
+    }
+    ivf
+}
+
+/// The four round-452 fixture streams, built deterministically through
+/// the PUBLIC entries: `(name, ivf bytes, expected.yuv = the crate's
+/// own decode, locally verified byte-exact against the black-box
+/// reference decoder at build time — hidden packets carry IVF
+/// timestamps, so the reference decode runs with timestamp passthrough,
+/// and the resized stream additionally with output auto-scaling
+/// disabled)`.
+fn build_r452_fixture_streams() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
+    let yuv_of = |packets: &[Vec<u8>]| -> Vec<u8> {
+        let decoded = decode_vp9_sequence(&refs(packets)).expect("fixture decodes");
+        let mut yuv = Vec::new();
+        for f in &decoded {
+            yuv.extend_from_slice(&f.to_planar_bytes());
+        }
+        yuv
+    };
+    let mut out = Vec::new();
+
+    // 1. altref-pyramid-gop — the corpus's first ENCODER-MINTED hidden
+    // alt-ref + show_existing_frame stream (three-slot election).
+    {
+        let src: Vec<Vec<u8>> = (0..8).map(|k| scene_frame(64, 48, k)).collect();
+        let packets =
+            encode_vp9_lossy_sequence_altref(&refs(&src), 64, 48, 100, 3).expect("pyramid");
+        let yuv = yuv_of(&packets);
+        out.push(("altref-pyramid-gop", ivf_wrap(&packets, 64, 48), yuv));
+    }
+    // 2. seg-emitted-full-gop — all four SEG_LVL_* features emitted by
+    // the encoder (fitted tree/pred probs, temporal updates, persistent
+    // table) on the pyramid framing.
+    {
+        let src: Vec<Vec<u8>> = (0..6).map(|k| half_static_scene(64, 48, k)).collect();
+        let mut cfg = Vp9GopConfig::new(100);
+        cfg.altref_interval = 3;
+        cfg.segmentation = Vp9Segmentation::Full;
+        let packets = encode_vp9_lossy_sequence_with(&refs(&src), 64, 48, &cfg).expect("seg");
+        let yuv = yuv_of(&packets);
+        out.push(("seg-emitted-full-gop", ivf_wrap(&packets, 64, 48), yuv));
+    }
+    // 3. tiles-2col-encoded-gop — the first self-encoded
+    // multi-tile-column stream (the §9.2.4 tile-parallel decoder's
+    // consumer-side twin).
+    {
+        let src: Vec<Vec<u8>> = (0..3).map(|k| scene_frame(512, 32, k)).collect();
+        let mut cfg = Vp9GopConfig::new(140);
+        cfg.altref_interval = 2;
+        cfg.tile_cols_log2 = 1;
+        let packets = encode_vp9_lossy_sequence_with(&refs(&src), 512, 32, &cfg).expect("tiles");
+        let yuv = yuv_of(&packets);
+        out.push(("tiles-2col-encoded-gop", ivf_wrap(&packets, 512, 32), yuv));
+    }
+    // 4. resized-encoded-gop — the first PIXEL-ACCURATE self-encoded
+    // §8.5.2.3 stream (the r409 scaled-reference fixture is all-skip).
+    {
+        let sizes: [(u32, u32); 4] = [(128, 96), (64, 48), (96, 64), (128, 96)];
+        let src: Vec<Vec<u8>> = sizes
+            .iter()
+            .enumerate()
+            .map(|(k, &(w, h))| scene_frame(w as usize, h as usize, k))
+            .collect();
+        let packets = encode_vp9_lossy_sequence_resized(&refs(&src), &sizes, 110).expect("resized");
+        let yuv = yuv_of(&packets);
+        out.push(("resized-encoded-gop", ivf_wrap(&packets, 128, 96), yuv));
+    }
+    out
+}
+
+/// [`scene_frame`] with a genuinely static (luma AND chroma) left half
+/// — the static-skip segment's habitat (mirrors the unit-test scene).
+fn half_static_scene(w: usize, h: usize, k: usize) -> Vec<u8> {
+    let mut px = scene_frame(w, h, k);
+    for y in 0..h {
+        for x in 0..w / 2 {
+            px[y * w + x] = ((x >> 1) + (y >> 1) + 60) as u8;
+        }
+    }
+    let cw = w.div_ceil(2);
+    let ch = h.div_ceil(2);
+    for plane in 0..2usize {
+        let base = w * h + plane * cw * ch;
+        for y in 0..ch {
+            for x in 0..cw / 2 {
+                px[base + y * cw + x] = (x + y + 90 + plane * 40) as u8;
+            }
+        }
+    }
+    px
+}
+
+/// The builders are deterministic (staging relies on it) and every
+/// stream decodes through the in-crate decoder.
+#[test]
+fn r452_fixture_builders_are_deterministic() {
+    let a = build_r452_fixture_streams();
+    let b = build_r452_fixture_streams();
+    assert_eq!(a.len(), 4);
+    for ((n1, ivf1, yuv1), (n2, ivf2, yuv2)) in a.iter().zip(b.iter()) {
+        assert_eq!(n1, n2);
+        assert_eq!(ivf1, ivf2, "{n1} ivf not deterministic");
+        assert_eq!(yuv1, yuv2, "{n1} yuv not deterministic");
+        assert!(!yuv1.is_empty());
+    }
+}
+
+/// Fixture-staging generator (round 452): under `OXIDEAV_VP9_STAGE_DIR`
+/// emits each package as `<name>/input.ivf` + `<name>/expected.yuv`
+/// (the crate's own decode — locally verified byte-exact against the
+/// black-box reference decoder). No-op unless the env var is set.
+#[test]
+fn stage_round_452_fixtures_when_requested() {
+    let Some(dir) = std::env::var_os("OXIDEAV_VP9_STAGE_DIR") else {
+        return;
+    };
+    for (name, ivf, yuv) in build_r452_fixture_streams() {
+        let sub = std::path::Path::new(&dir).join(name);
+        std::fs::create_dir_all(&sub).expect("create stage dir");
+        std::fs::write(sub.join("input.ivf"), &ivf).expect("write input.ivf");
+        std::fs::write(sub.join("expected.yuv"), &yuv).expect("write expected.yuv");
+    }
+}
+
+/// Docs-gated identity: a staged round-452 package must be
+/// byte-identical to the builder's output (the fixture IS this crate's
+/// writer output). No-op while the corpus lacks the package.
+#[test]
+fn staged_r452_fixtures_match_builders() {
+    let root = std::path::Path::new("../../docs/video/vp9/fixtures");
+    for (name, ivf, yuv) in build_r452_fixture_streams() {
+        let sub = root.join(name);
+        if !sub.join("input.ivf").is_file() {
+            eprintln!("{name}: not staged yet; docs-gated");
+            continue;
+        }
+        let staged = std::fs::read(sub.join("input.ivf")).expect("staged ivf");
+        assert_eq!(staged, ivf, "{name}: staged bytes != builder output");
+        let expected = std::fs::read(sub.join("expected.yuv")).expect("staged yuv");
+        assert_eq!(expected, yuv, "{name}: staged expected.yuv != crate decode");
+    }
+}

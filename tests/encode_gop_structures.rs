@@ -224,3 +224,41 @@ fn gop_config_entry_contract() {
         Error::Unsupported
     );
 }
+
+/// Tile axes on [`Vp9GopConfig`]: a 2-tile-column config on a
+/// wide-enough frame yields a decodable multi-tile GOP; configs outside
+/// the §6.2.13 / §6.2.14 writable range are rejected.
+#[test]
+fn gop_config_tiles_contract() {
+    // 2 columns need sb64_cols >= 8 (512 px).
+    let (w, h) = (512u32, 32u32);
+    let src: Vec<Vec<u8>> = (0..2)
+        .map(|k| scene_frame(w as usize, h as usize, k))
+        .collect();
+    let mut cfg = Vp9GopConfig::new(160);
+    cfg.tile_cols_log2 = 1;
+    cfg.tile_rows_log2 = 0;
+    let packets = encode_vp9_lossy_sequence_with(&refs(&src), w, h, &cfg).expect("tiled encode");
+    let decoded = decode_vp9_sequence(&refs(&packets)).expect("decode");
+    assert_eq!(decoded.len(), 2);
+    for (k, f) in decoded.iter().enumerate() {
+        let p = psnr_luma(&f.y, &src[k], (w * h) as usize);
+        assert!(p > 26.0, "frame {k} luma PSNR {p:.2} dB");
+    }
+
+    // A 64-px-wide frame cannot code 2 tile columns (max_log2 = 0).
+    let narrow: Vec<Vec<u8>> = (0..2).map(|k| scene_frame(64, 48, k)).collect();
+    let mut bad = Vp9GopConfig::new(160);
+    bad.tile_cols_log2 = 1;
+    assert_eq!(
+        encode_vp9_lossy_sequence_with(&refs(&narrow), 64, 48, &bad).unwrap_err(),
+        Error::Unsupported
+    );
+    // tile_rows_log2 > 2 is uncodeable (§6.2.13).
+    let mut bad2 = Vp9GopConfig::new(160);
+    bad2.tile_rows_log2 = 3;
+    assert_eq!(
+        encode_vp9_lossy_sequence_with(&refs(&narrow), 64, 48, &bad2).unwrap_err(),
+        Error::Unsupported
+    );
+}

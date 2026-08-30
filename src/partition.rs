@@ -946,6 +946,21 @@ pub(crate) fn get_tile_offset(tile_num: u32, mis: u32, tile_sz_log2: u32) -> u32
     offset.min(mis)
 }
 
+/// The `[ MiColStart, MiColEnd )` extents of the tile column containing
+/// MI column `mi_c` — the §6.4 `get_tile_offset( )` bracket the
+/// encoder-side availability / candidate-window derivations need when
+/// coding a multi-tile-column frame.
+pub(crate) fn tile_col_bounds(mi_cols: u32, tile_cols_log2: u32, mi_c: u32) -> (u32, u32) {
+    for t in 0..(1u32 << tile_cols_log2) {
+        let s = get_tile_offset(t, mi_cols, tile_cols_log2);
+        let e = get_tile_offset(t + 1, mi_cols, tile_cols_log2);
+        if mi_c >= s && mi_c < e {
+            return (s, e);
+        }
+    }
+    (0, mi_cols)
+}
+
 /// `decode_tile( )` per spec §6.4.2 (`vp9-spec.txt` lines 2343-2349).
 ///
 /// ```text

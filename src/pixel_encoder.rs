@@ -233,6 +233,7 @@ impl ReconState {
         start_x: u32,
         start_y: u32,
         mode: PredMode,
+        tile_mi_col_start: u32,
     ) {
         let sub_x = plane > 0 && self.subsampling_x;
         let sub_y = plane > 0 && self.subsampling_y;
@@ -251,7 +252,11 @@ impl ReconState {
             &mut self.planes[plane],
             start_x as usize,
             start_y as usize,
-            mi_c > 0 || x > 0,
+            // §6.4.4 AvailL = MiCol > MiColStart: a tile's left edge
+            // severs the left neighbour exactly as the decoder's
+            // per-tile walk does (AvailU stays frame-level — the above
+            // context carries across tile rows).
+            mi_c > tile_mi_col_start || x > 0,
             mi_r > 0 || y > 0,
             x + step < num4x4w,
             tx_sz,
@@ -313,7 +318,7 @@ pub(crate) fn encode_keyframe_lossless(
     let mut coeffs: Box<FrameCoefSource<'_>> = Box::new(
         move |mi_r: u32, mi_c: u32, plane: usize, sx: u32, sy: u32, _b: usize| -> Vec<i64> {
             // 1. Predict, exactly as the decoder will.
-            recon.predict_block(mi_r, mi_c, BLOCK_8X8, plane, 0, sx, sy, PredMode::DcPred);
+            recon.predict_block(mi_r, mi_c, BLOCK_8X8, plane, 0, sx, sy, PredMode::DcPred, 0);
 
             // 2. Residual = target - prediction over the 4x4 block.
             let mut block = vec![0i64; 16];
@@ -457,7 +462,17 @@ pub(crate) fn encode_keyframe_lossless_elect_skip(
         let recon_ref = &mut recon;
         let mut coeffs: Box<FrameCoefSource<'_>> = Box::new(
             |mi_r: u32, mi_c: u32, plane: usize, sx: u32, sy: u32, _b: usize| -> Vec<i64> {
-                recon_ref.predict_block(mi_r, mi_c, BLOCK_8X8, plane, 0, sx, sy, PredMode::DcPred);
+                recon_ref.predict_block(
+                    mi_r,
+                    mi_c,
+                    BLOCK_8X8,
+                    plane,
+                    0,
+                    sx,
+                    sy,
+                    PredMode::DcPred,
+                    0,
+                );
                 let mut block = vec![0i64; 16];
                 for i in 0..4usize {
                     for j in 0..4usize {
@@ -854,7 +869,7 @@ pub(crate) fn encode_keyframe_lossy(
                     crate::reconstruct::tx_type_for_intra(mode)
                 };
 
-                recon_ref.predict_block(mi_r, mi_c, BLOCK_8X8, plane, 0, sx, sy, mode);
+                recon_ref.predict_block(mi_r, mi_c, BLOCK_8X8, plane, 0, sx, sy, mode, 0);
 
                 let mut block = vec![0i64; 16];
                 for i in 0..4usize {
@@ -1604,6 +1619,7 @@ pub(crate) fn encode_keyframe_lossy_tree_with_state(
     let seg = hdr.segmentation;
     let quant = hdr.quantization;
     let bd8 = hdr.color_config.bit_depth;
+    let kf_tile_cols_log2 = u32::from(hdr.tile_info.tile_cols_log2);
 
     let (bytes, state) = {
         let recon_ref = &mut recon;
@@ -1629,7 +1645,17 @@ pub(crate) fn encode_keyframe_lossy_tree_with_state(
                     crate::reconstruct::tx_type_for_intra(mode)
                 };
 
-                recon_ref.predict_block(mi_r, mi_c, lp.mi_size, plane, tx_sz, sx, sy, mode);
+                recon_ref.predict_block(
+                    mi_r,
+                    mi_c,
+                    lp.mi_size,
+                    plane,
+                    tx_sz,
+                    sx,
+                    sy,
+                    mode,
+                    crate::partition::tile_col_bounds(mi_cols, kf_tile_cols_log2, mi_c).0,
+                );
 
                 let n0 = 4usize << tx_sz;
                 let mut block = vec![0i64; n0 * n0];
@@ -1718,6 +1744,7 @@ pub(crate) fn encode_keyframe_lossy_tree_elect_skip_with_state(
     let seg = hdr.segmentation;
     let quant = hdr.quantization;
     let bd8 = hdr.color_config.bit_depth;
+    let kf_tile_cols_log2 = u32::from(hdr.tile_info.tile_cols_log2);
 
     // Pass 1 — the identical decoder-mirror encode, caching every
     // block's tokens and folding each leaf's "all tokens zero" flag.
@@ -1745,7 +1772,17 @@ pub(crate) fn encode_keyframe_lossy_tree_elect_skip_with_state(
                     crate::reconstruct::tx_type_for_intra(mode)
                 };
 
-                recon_ref.predict_block(mi_r, mi_c, lp.mi_size, plane, tx_sz, sx, sy, mode);
+                recon_ref.predict_block(
+                    mi_r,
+                    mi_c,
+                    lp.mi_size,
+                    plane,
+                    tx_sz,
+                    sx,
+                    sy,
+                    mode,
+                    crate::partition::tile_col_bounds(mi_cols, kf_tile_cols_log2, mi_c).0,
+                );
 
                 let n0 = 4usize << tx_sz;
                 let mut block = vec![0i64; n0 * n0];
@@ -1968,6 +2005,37 @@ fn predict_inter_leaf2(
     ssy: bool,
     bit_depth: u32,
 ) {
+    predict_inter_leaf2_scaled(
+        pred, reference, second, vis_w, vis_h, vis_w, vis_h, r, c, mi_size, mv, mi_cols, mi_rows,
+        ssx, ssy, bit_depth,
+    )
+}
+
+/// [`predict_inter_leaf2`] over a reference whose §8.10 stored
+/// dimensions differ from the current frame's: `ref_w × ref_h` is the
+/// reference's luma extent, `cur_w × cur_h` the coded frame's, and the
+/// §8.5.2.3 motion-vector scaling process resolves every sample read
+/// (`xScale = (RefFrameWidth << 14) / FrameWidth`). Equal dimensions
+/// reduce to the unscaled path bit-for-bit.
+#[allow(clippy::too_many_arguments)]
+fn predict_inter_leaf2_scaled(
+    pred: &mut [Plane; 3],
+    reference: &[(&[i32], usize); 3],
+    second: Option<&[(&[i32], usize); 3]>,
+    ref_w: u32,
+    ref_h: u32,
+    cur_w: u32,
+    cur_h: u32,
+    r: u32,
+    c: u32,
+    mi_size: u8,
+    mv: [[i32; 2]; 2],
+    mi_cols: u32,
+    mi_rows: u32,
+    ssx: bool,
+    ssy: bool,
+    bit_depth: u32,
+) {
     use crate::partition::{NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP};
     let num8x8w = u32::from(NUM_8X8_BLOCKS_WIDE_LOOKUP[mi_size as usize]);
     let num8x8h = u32::from(NUM_8X8_BLOCKS_HIGH_LOOKUP[mi_size as usize]);
@@ -1986,16 +2054,16 @@ fn predict_inter_leaf2(
                 Some(RefPlane {
                     samples,
                     stride,
-                    ref_frame_width: vis_w as i32,
-                    ref_frame_height: vis_h as i32,
+                    ref_frame_width: ref_w as i32,
+                    ref_frame_height: ref_h as i32,
                 }),
                 second.map(|sp| {
                     let (s2, stride2) = sp[plane];
                     RefPlane {
                         samples: s2,
                         stride: stride2,
-                        ref_frame_width: vis_w as i32,
-                        ref_frame_height: vis_h as i32,
+                        ref_frame_width: ref_w as i32,
+                        ref_frame_height: ref_h as i32,
                     }
                 }),
             ],
@@ -2008,10 +2076,10 @@ fn predict_inter_leaf2(
             mi_size,
         };
         let geom = ScaleGeom {
-            ref_frame_width: vis_w as i32,
-            ref_frame_height: vis_h as i32,
-            frame_width: vis_w as i32,
-            frame_height: vis_h as i32,
+            ref_frame_width: ref_w as i32,
+            ref_frame_height: ref_h as i32,
+            frame_width: cur_w as i32,
+            frame_height: cur_h as i32,
             subsampling_x: ssx,
             subsampling_y: ssy,
         };
@@ -3527,6 +3595,7 @@ fn plan_sub8x8_leaf(
     ref_h: u32,
     r: u32,
     c: u32,
+    tile_bounds: (u32, u32),
     subsize: u8,
     mi_cols: u32,
     mi_rows: u32,
@@ -3565,8 +3634,8 @@ fn plan_sub8x8_leaf(
         mi_rows: mi_rows as i32,
         mi_cols: mi_cols as i32,
         mi_size: subsize as usize,
-        mi_col_start: 0,
-        mi_col_end: mi_cols as i32,
+        mi_col_start: tile_bounds.0 as i32,
+        mi_col_end: tile_bounds.1 as i32,
     };
     let src = FrameStateMvSource::new(state, prev_src);
     let mv_refs = geom.find_mv_refs(&src, LAST_FRAME, -1, sign_bias, prev_src.is_some());
@@ -3887,6 +3956,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion_opts(
     let ssx = hdr.color_config.subsampling_x;
     let ssy = hdr.color_config.subsampling_y;
     let bit_depth = u32::from(hdr.color_config.bit_depth);
+    let tile_cols_log2 = u32::from(hdr.tile_info.tile_cols_log2);
     // §7.2 setup_past_independence( ): error-resilient frames have
     // all-zero *effective* sign biases (see assemble_inter_frame_tree).
     let sign_bias = if hdr.error_resilient_mode {
@@ -3967,6 +4037,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion_opts(
                     ref_h,
                     r,
                     c,
+                    crate::partition::tile_col_bounds(mi_cols, tile_cols_log2, c),
                     subsize,
                     mi_cols,
                     mi_rows,
@@ -3984,6 +4055,10 @@ pub(crate) fn encode_pframe_lossy_tree_motion_opts(
             }
             let max_tx = MAX_TXSIZE_LOOKUP[subsize as usize];
             let num8x8 = u32::from(crate::partition::NUM_8X8_BLOCKS_WIDE_LOOKUP[subsize as usize]);
+            // §6.4.4 / §6.5: the candidate scans clamp their column
+            // window to the leaf's tile (identity on single-tile
+            // frames).
+            let (tile_cs, tile_ce) = crate::partition::tile_col_bounds(mi_cols, tile_cols_log2, c);
 
             // §6.2.11 segmentation election: the leaf's activity class
             // (the SEG_LVL_ALT_Q / SEG_LVL_ALT_L segments) — sub-8x8
@@ -4026,8 +4101,8 @@ pub(crate) fn encode_pframe_lossy_tree_motion_opts(
                         mi_rows: mi_rows as i32,
                         mi_cols: mi_cols as i32,
                         mi_size: subsize as usize,
-                        mi_col_start: 0,
-                        mi_col_end: mi_cols as i32,
+                        mi_col_start: tile_cs as i32,
+                        mi_col_end: tile_ce as i32,
                     };
                     let src = FrameStateMvSource::new(state, prev_src);
                     let mv_refs = geom.find_mv_refs(&src, ref_frame, -1, &sign_bias, use_prev);
@@ -4270,8 +4345,8 @@ pub(crate) fn encode_pframe_lossy_tree_motion_opts(
                             mi_rows: mi_rows as i32,
                             mi_cols: mi_cols as i32,
                             mi_size: subsize as usize,
-                            mi_col_start: 0,
-                            mi_col_end: mi_cols as i32,
+                            mi_col_start: tile_cs as i32,
+                            mi_col_end: tile_ce as i32,
                         };
                         let src = FrameStateMvSource::new(state, prev_src);
                         let mv_refs = geom.find_mv_refs(
@@ -4312,8 +4387,8 @@ pub(crate) fn encode_pframe_lossy_tree_motion_opts(
                     mi_rows: mi_rows as i32,
                     mi_cols: mi_cols as i32,
                     mi_size: subsize as usize,
-                    mi_col_start: 0,
-                    mi_col_end: mi_cols as i32,
+                    mi_col_start: tile_cs as i32,
+                    mi_col_end: tile_ce as i32,
                 };
                 let src = FrameStateMvSource::new(state, prev_src);
                 let lists = 1 + usize::from(is_compound);
@@ -4513,6 +4588,461 @@ pub(crate) fn encode_pframe_lossy_tree_motion_opts(
     drop(planner);
     drop(coeffs);
     Ok((bytes, work.into_inner(), state))
+}
+
+/// Encode one lossy P-frame against a **differently-sized** reference —
+/// the §8.5.2.3 scaled-motion-compensation encode (round 452). The
+/// reference is the previous frame's §8.10 store at `ref_w × ref_h`;
+/// the coded frame is `hdr.frame_width × hdr.frame_height`. Every
+/// prediction — the candidate sweep and the final decoder-mirror —
+/// runs the identical §8.5.2.3 sampler the decoder does, so the
+/// reconstruction stays exact.
+///
+/// The partition tree is planned against a **virtual reference**: the
+/// whole-frame ZEROMV scaled prediction at the current size (only the
+/// tree shape is taken from that plan — every leaf's motion is
+/// re-elected below with the true scaled predictor). Per leaf the
+/// election is ZEROMV vs. a log-diamond NEWMV descent (eighth-pel
+/// steps 64..1, each candidate scored by the real §8.5.2.3 prediction
+/// SAD, the winner parity-snapped against the §6.5.12 `BestMv` and
+/// §6.4.16-mapped to NEARESTMV / NEARMV when it equals a predictor),
+/// then the per-leaf transform-size + skip elections of the ordinary
+/// inter path. Single reference (`ref_frame_idx = [ s, s, s ]`), no
+/// prev-frame motion field (§7.2.6 (b) fails across a size change).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_pframe_lossy_scaled(
+    hdr: &Vp9FrameHeader,
+    targets: &[Plane; 3],
+    reference: &[(&[i32], usize); 3],
+    ref_w: u32,
+    ref_h: u32,
+) -> Result<(Vec<u8>, ReconState, crate::decode_block::Vp9FrameState), Error> {
+    use crate::frame_writer::{InterFrameTreePlan, InterTreeLeaf, InterTreePlanner};
+    use crate::inter_decode::FrameStateMvSource;
+    use crate::mode_info::{LAST_FRAME, NEARESTMV, NEARMV, NEWMV, NONE_REF_FRAME, ZEROMV};
+    use crate::mv::use_mv_hp;
+    use crate::mv_ref::MvRefGeometry;
+    use crate::residual::MAX_TXSIZE_LOOKUP;
+    use std::cell::RefCell;
+
+    if hdr.frame_type != FrameType::NonKeyFrame || hdr.quantization.lossless {
+        return Err(Error::Unsupported);
+    }
+    // §5 / §8.5.2.3 reference-scaling bounds: at most 2x downscale and
+    // 16x upscale on each axis.
+    let cur_w = hdr.frame_width;
+    let cur_h = hdr.frame_height;
+    if 2 * cur_w < ref_w || 2 * cur_h < ref_h || cur_w > 16 * ref_w || cur_h > 16 * ref_h {
+        return Err(Error::Unsupported);
+    }
+    let mi_cols = (cur_w + 7) >> 3;
+    let mi_rows = (cur_h + 7) >> 3;
+    let ssx = hdr.color_config.subsampling_x;
+    let ssy = hdr.color_config.subsampling_y;
+    let bit_depth = u32::from(hdr.color_config.bit_depth);
+    let sign_bias = [false; 4];
+    let seg = hdr.segmentation;
+    let quant = hdr.quantization;
+
+    // Virtual reference: the ZEROMV scaled prediction of the whole
+    // frame at the current size — the partition planner's stand-in.
+    let mut virtual_ref = ReconState::new(mi_cols, mi_rows, ssx, ssy, bit_depth);
+    {
+        let mut r = 0u32;
+        while r < mi_rows {
+            let mut c = 0u32;
+            while c < mi_cols {
+                predict_inter_leaf2_scaled(
+                    &mut virtual_ref.planes,
+                    reference,
+                    None,
+                    ref_w,
+                    ref_h,
+                    cur_w,
+                    cur_h,
+                    r,
+                    c,
+                    crate::residual::BLOCK_64X64,
+                    [[0, 0], [0, 0]],
+                    mi_cols,
+                    mi_rows,
+                    ssx,
+                    ssy,
+                    bit_depth,
+                );
+                c += 8;
+            }
+            r += 8;
+        }
+    }
+    let (cw, chh) = (
+        (cur_w as usize).div_ceil(1 << usize::from(ssx)),
+        (cur_h as usize).div_ceil(1 << usize::from(ssy)),
+    );
+    let vref_crop = visible_crop_planes(&virtual_ref, cur_w as usize, cur_h as usize, cw, chh);
+    let vref_views = stored_ref_view(&vref_crop, cur_w as usize, cw);
+    let (partitions, _hints, _sub_hints) = plan_inter_partitions(
+        targets,
+        &vref_views,
+        cur_w,
+        cur_h,
+        mi_cols,
+        mi_rows,
+        PFRAME_SEARCH_RANGE,
+        false,
+    );
+
+    let work = RefCell::new(ReconState::new(mi_cols, mi_rows, ssx, ssy, bit_depth));
+    let token_cache: RefCell<std::collections::HashMap<(usize, u32, u32), Vec<i64>>> =
+        RefCell::new(std::collections::HashMap::new());
+    let scratch3 = RefCell::new(ReconState::new(mi_cols, mi_rows, ssx, ssy, bit_depth).planes);
+
+    let tx_mode = crate::compressed::TxMode::TxModeSelect;
+    const NEWMV_SAD_MARGIN: u64 = 64;
+
+    let mut planner: Box<InterTreePlanner<'_>> =
+        Box::new(|r: u32, c: u32, subsize: u8, state| -> InterTreeLeaf {
+            debug_assert!(subsize >= crate::residual::BLOCK_8X8);
+            let max_tx = MAX_TXSIZE_LOOKUP[subsize as usize];
+
+            // Score one MV by the true §8.5.2.3 prediction's luma SAD.
+            let leaf_sad = |mv: [i32; 2]| -> u64 {
+                let mut sc = scratch3.borrow_mut();
+                predict_inter_leaf2_scaled(
+                    &mut sc,
+                    reference,
+                    None,
+                    ref_w,
+                    ref_h,
+                    cur_w,
+                    cur_h,
+                    r,
+                    c,
+                    subsize,
+                    [mv, [0, 0]],
+                    mi_cols,
+                    mi_rows,
+                    ssx,
+                    ssy,
+                    bit_depth,
+                );
+                leaf_luma_sad(targets, &sc, r, c, subsize, mi_cols, mi_rows)
+            };
+
+            let zero_sad = leaf_sad([0, 0]);
+            // Log-diamond descent in eighth-pel units.
+            let mut best_mv = [0i32, 0i32];
+            let mut best_sad = zero_sad;
+            for step in [64i32, 32, 16, 8, 4, 2, 1] {
+                loop {
+                    let mut improved = false;
+                    for (dy, dx) in [
+                        (-step, 0),
+                        (step, 0),
+                        (0, -step),
+                        (0, step),
+                        (-step, -step),
+                        (-step, step),
+                        (step, -step),
+                        (step, step),
+                    ] {
+                        let cand = [best_mv[0] + dy, best_mv[1] + dx];
+                        if cand[0].abs() > 1024 || cand[1].abs() > 1024 {
+                            continue;
+                        }
+                        let sad = leaf_sad(cand);
+                        if sad < best_sad {
+                            best_sad = sad;
+                            best_mv = cand;
+                            improved = true;
+                        }
+                    }
+                    if !improved {
+                        break;
+                    }
+                }
+            }
+
+            let mut choice: ([i32; 2], u8, [[i32; 2]; 2]) =
+                ([LAST_FRAME, NONE_REF_FRAME], ZEROMV, [[0, 0], [0, 0]]);
+            if best_mv != [0, 0] && best_sad + NEWMV_SAD_MARGIN < zero_sad {
+                // Parity-snap against the §6.5.12 BestMv, then the
+                // §6.4.16 predictor-referencing mode mapping.
+                let geom = MvRefGeometry {
+                    mi_row: r as i32,
+                    mi_col: c as i32,
+                    mi_rows: mi_rows as i32,
+                    mi_cols: mi_cols as i32,
+                    mi_size: subsize as usize,
+                    mi_col_start: 0,
+                    mi_col_end: mi_cols as i32,
+                };
+                let src = FrameStateMvSource::new(state, None);
+                let mv_refs = geom.find_mv_refs(&src, LAST_FRAME, -1, &sign_bias, false);
+                let best_refs =
+                    geom.find_best_ref_mvs(mv_refs.ref_list_mv, hdr.allow_high_precision_mv);
+                let use_hp = hdr.allow_high_precision_mv && use_mv_hp(best_refs[0]);
+                let mut mv = best_mv;
+                for (comp, m) in mv.iter_mut().enumerate() {
+                    let d = *m - best_refs[0][comp];
+                    if d != 0 && !use_hp && (d & 1) != 0 {
+                        *m -= 1;
+                    }
+                }
+                let mode = if mv == best_refs[0] {
+                    NEARESTMV
+                } else if mv == best_refs[1] {
+                    NEARMV
+                } else {
+                    NEWMV
+                };
+                choice = ([LAST_FRAME, NONE_REF_FRAME], mode, [mv, [0, 0]]);
+            }
+
+            let mut work = work.borrow_mut();
+            predict_inter_leaf2_scaled(
+                &mut work.planes,
+                reference,
+                None,
+                ref_w,
+                ref_h,
+                cur_w,
+                cur_h,
+                r,
+                c,
+                subsize,
+                choice.2,
+                mi_cols,
+                mi_rows,
+                ssx,
+                ssy,
+                bit_depth,
+            );
+            let (tx, blocks, all_zero) = select_inter_leaf_tx(
+                targets,
+                &work.planes,
+                r,
+                c,
+                subsize,
+                mi_cols,
+                mi_rows,
+                ssx,
+                ssy,
+                bit_depth,
+                &seg,
+                &quant,
+                0,
+            );
+            let mut skip = all_zero;
+            let bd8 = hdr.color_config.bit_depth;
+            if !skip {
+                let sse_skip = leaf_sse(
+                    targets,
+                    &work.planes,
+                    r,
+                    c,
+                    subsize,
+                    mi_cols,
+                    mi_rows,
+                    ssx,
+                    ssy,
+                );
+                {
+                    let mut cache = token_cache.borrow_mut();
+                    for (plane, sx, sy, tx_sz, block) in blocks {
+                        let dc_q = get_dc_quant(plane, &seg, &quant, 0, bd8);
+                        let ac_q = get_ac_quant(plane, &seg, &quant, 0, bd8);
+                        reconstruct_block(
+                            &mut work.planes[plane],
+                            sx as usize,
+                            sy as usize,
+                            tx_sz,
+                            &block,
+                            dc_q,
+                            ac_q,
+                            DCT_DCT,
+                            false,
+                            bit_depth,
+                        );
+                        cache.insert((plane, sx, sy), block);
+                    }
+                }
+                let sse_coded = leaf_sse(
+                    targets,
+                    &work.planes,
+                    r,
+                    c,
+                    subsize,
+                    mi_cols,
+                    mi_rows,
+                    ssx,
+                    ssy,
+                );
+                if sse_coded >= sse_skip {
+                    token_cache.borrow_mut().retain(|&(p, sx, sy), _| {
+                        !leaf_contains(r, c, subsize, ssx, ssy, p, sx, sy)
+                    });
+                    predict_inter_leaf2_scaled(
+                        &mut work.planes,
+                        reference,
+                        None,
+                        ref_w,
+                        ref_h,
+                        cur_w,
+                        cur_h,
+                        r,
+                        c,
+                        subsize,
+                        choice.2,
+                        mi_cols,
+                        mi_rows,
+                        ssx,
+                        ssy,
+                        bit_depth,
+                    );
+                    skip = true;
+                }
+            }
+            InterTreeLeaf {
+                mi_size: subsize,
+                tx_size: if skip { max_tx } else { tx },
+                y_mode: choice.1,
+                interp_filter: 0,
+                ref_frame: choice.0,
+                mv: choice.2,
+                skip,
+                segment_id: 0,
+                sub: None,
+            }
+        });
+
+    let mut coeffs: Box<FrameCoefSource<'_>> = Box::new(
+        |_mi_r: u32, _mi_c: u32, plane: usize, sx: u32, sy: u32, _b: usize| -> Vec<i64> {
+            token_cache
+                .borrow_mut()
+                .remove(&(plane, sx, sy))
+                .expect("planner pre-computed this block's tokens")
+        },
+    );
+
+    let plan = InterFrameTreePlan {
+        tx_mode,
+        reference_mode: crate::compressed::ReferenceMode::SingleReference,
+        partitions,
+        prev_segment_ids: None,
+        // §7.2.6 (b): the size changed, so UsePrevFrameMvs derives 0 on
+        // a non-error-resilient header with no supplied field.
+        prev_frame_mvs_absent: true,
+        prev_frame_mvs: None,
+    };
+    let (bytes, state) = crate::frame_writer::assemble_inter_frame_tree_with_state(
+        hdr,
+        &plan,
+        &mut *planner,
+        &mut *coeffs,
+    )?;
+    drop(planner);
+    drop(coeffs);
+    Ok((bytes, work.into_inner(), state))
+}
+
+/// Encode a lossy 8-bit 4:2:0 sequence whose frames change coded size
+/// mid-stream: a keyframe at `sizes[ 0 ]`, then one P-frame per later
+/// frame at its own §6.2.5 explicit size, referencing the previous
+/// frame's §8.10 store through the §8.5.2.3 scaled sampler whenever the
+/// sizes differ (the unscaled leaf path when they match — both through
+/// [`encode_pframe_lossy_scaled`]'s identity reduction). Every frame is
+/// shown; single reference slot 0.
+pub(crate) fn encode_sequence_lossy_resized_u8(
+    frames: &[&[u8]],
+    sizes: &[(u32, u32)],
+    base_q_idx: u8,
+) -> Result<Vec<Vec<u8>>, Error> {
+    let fmt = LossyFormat::YUV420_8;
+    if frames.is_empty() || frames.len() != sizes.len() {
+        return Err(Error::Unsupported);
+    }
+    for (f, &(w, h)) in frames.iter().zip(sizes) {
+        validate_lossy_args(w, h, base_q_idx)?;
+        if f.len() < fmt.planar_len(w, h) {
+            return Err(Error::Unsupported);
+        }
+    }
+    let (kw, kh) = sizes[0];
+    let kf_targets = padded_targets_from_u8(frames[0], kw, kh, fmt);
+    let kf_hdr = lossy_keyframe_header_fmt(kw, kh, base_q_idx, fmt);
+    let kf_plan = plan_keyframe_tree(
+        &kf_targets,
+        (kh + 7) >> 3,
+        (kw + 7) >> 3,
+        fmt.ssx,
+        fmt.ssy,
+        u32::from(fmt.bit_depth),
+        base_q_idx,
+    );
+    let encode_kf = |hdr2: &Vp9FrameHeader| {
+        encode_keyframe_lossy_tree_elect_skip_with_state(hdr2, &kf_targets, &kf_plan)
+    };
+    let (kf0, kf_recon0, kf_state0) = encode_kf(&kf_hdr)?;
+    let mut lf_persist = LfDeltaState::default();
+    let (kf_bytes, kf_recon, _) = finish_frame_lossy(
+        &kf_hdr,
+        kf0,
+        kf_recon0,
+        kf_state0,
+        &kf_targets,
+        kw as usize,
+        kh as usize,
+        &mut lf_persist,
+        None,
+        encode_kf,
+    )?;
+    let mut out = Vec::with_capacity(frames.len());
+    out.push(kf_bytes);
+
+    let mut prev_recon = kf_recon;
+    let (mut pw, mut ph) = (kw, kh);
+    for (f, &(w, h)) in frames.iter().zip(sizes).skip(1) {
+        // §5 scaling bounds between consecutive coded sizes.
+        if 2 * w < pw || 2 * h < ph || w > 16 * pw || h > 16 * ph {
+            return Err(Error::Unsupported);
+        }
+        let targets = padded_targets_from_u8(f, w, h, fmt);
+        let (pcw, pch) = fmt.chroma_dims(pw, ph);
+        let prev_crop = visible_crop_planes(&prev_recon, pw as usize, ph as usize, pcw, pch);
+        let prev_views = stored_ref_view(&prev_crop, pw as usize, pcw);
+
+        let mut hdr = lossless_pframe_header_fmt(w, h, fmt);
+        hdr.error_resilient_mode = false;
+        hdr.refresh_frame_flags = 0x01;
+        hdr.ref_frame_idx = Some([0, 0, 0]);
+        hdr.quantization = QuantizationParams {
+            base_q_idx,
+            delta_q_y_dc: 0,
+            delta_q_uv_dc: 0,
+            delta_q_uv_ac: 0,
+            lossless: false,
+        };
+        let encode =
+            |hdr2: &Vp9FrameHeader| encode_pframe_lossy_scaled(hdr2, &targets, &prev_views, pw, ph);
+        let (p0, recon0, state0) = encode(&hdr)?;
+        let (bytes, recon, _) = finish_frame_lossy(
+            &hdr,
+            p0,
+            recon0,
+            state0,
+            &targets,
+            w as usize,
+            h as usize,
+            &mut lf_persist,
+            None,
+            encode,
+        )?;
+        out.push(bytes);
+        prev_recon = recon;
+        (pw, ph) = (w, h);
+    }
+    Ok(out)
 }
 
 /// Close out one lossy frame with the §8.8 encode-side loop filter:
@@ -5651,6 +6181,11 @@ pub(crate) struct GopStructure {
     pub altref_interval: usize,
     /// §6.2.11 feature emission.
     pub segmentation: SegMode,
+    /// §6.2.13 `tile_cols_log2` on every decoded frame (validated
+    /// against the §6.2.14 min/max derivation at write time).
+    pub tile_cols_log2: u8,
+    /// §6.2.13 `tile_rows_log2` (`0..=2`).
+    pub tile_rows_log2: u8,
 }
 
 /// Lossy **structured GOP** encoder (round 452): the two-slot chain of
@@ -5802,6 +6337,8 @@ impl StructuredGopEncoder {
         };
 
         let mut hdr = lossless_pframe_header_fmt(width, height, fmt);
+        hdr.tile_info.tile_cols_log2 = self.structure.tile_cols_log2;
+        hdr.tile_info.tile_rows_log2 = self.structure.tile_rows_log2;
         hdr.error_resilient_mode = false;
         hdr.show_frame = shown;
         let alt_idx = if use_alt {
@@ -5937,6 +6474,8 @@ impl StructuredGopEncoder {
         // entry (planner tree, skip election, filter election),
         // refreshing every slot, plus the activity-class segment map.
         let mut kf_hdr = lossy_keyframe_header_fmt(width, height, base_q_idx, fmt);
+        kf_hdr.tile_info.tile_cols_log2 = self.structure.tile_cols_log2;
+        kf_hdr.tile_info.tile_rows_log2 = self.structure.tile_rows_log2;
         let mut kf_plan = plan_keyframe_tree(
             kf_targets,
             mi_rows,
@@ -6698,6 +7237,8 @@ mod tests {
         let structure = GopStructure {
             altref_interval: 3,
             segmentation: SegMode::Off,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
         };
         let (packets, headers, decoded, _) =
             assert_structured_gop_mirror(&src, w, h, 100, structure);
@@ -6713,6 +7254,68 @@ mod tests {
         assert_eq!(headers[6].ref_frame_idx, Some([2, 1, 0]));
         assert!(headers.iter().all(|h| !h.segmentation.enabled));
         dump_ivf("altref", &packets, w, h, &decoded);
+    }
+
+    /// Tile encode (round 452): a 2-tile-column wide GOP and a
+    /// 2-tile-row GOP (with segmentation) both decoder-mirror, the
+    /// coded headers carry the §6.2.13 fields, and the multi-column
+    /// stream decodes byte-identically through the §9.2.4
+    /// tile-parallel path at a 4-thread budget — the encoder now mints
+    /// the streams the r448 parallel decoder consumes.
+    #[test]
+    fn tiled_gop_decodes_to_encoder_reconstruction() {
+        use oxideav_core::ExecutionContext;
+        // 2 tile columns need sb64_cols >= 8 (§6.2.14 MIN_TILE_WIDTH_B64
+        // = 4): 512 px wide, kept short to bound the motion search.
+        let (w, h) = (512u32, 32u32);
+        let src: Vec<Vec<u8>> = (0..3)
+            .map(|k| moving_scene_frame(w as usize, h as usize, k))
+            .collect();
+        let structure = GopStructure {
+            altref_interval: 2,
+            segmentation: SegMode::Off,
+            tile_cols_log2: 1,
+            tile_rows_log2: 0,
+        };
+        let (packets, headers, decoded, _) =
+            assert_structured_gop_mirror(&src, w, h, 140, structure);
+        for hd in headers.iter().filter(|hd| !hd.show_existing_frame) {
+            assert_eq!(hd.tile_info.tile_cols_log2, 1);
+            assert_eq!(hd.tile_info.tile_rows_log2, 0);
+        }
+        // §9.2.4 parity: the tile-parallel fan-out reproduces the
+        // serial decode byte-for-byte on the self-encoded stream.
+        let refs: Vec<&[u8]> = packets.iter().map(|p| p.as_slice()).collect();
+        let par = crate::decode_frame::decode_vp9_sequence_with(
+            &refs,
+            &ExecutionContext::with_threads(4),
+        )
+        .expect("tile-parallel decode");
+        assert_eq!(par.len(), decoded.len());
+        for (a, b) in par.iter().zip(decoded.iter()) {
+            assert_eq!(a.y, b.y);
+            assert_eq!(a.u, b.u);
+            assert_eq!(a.v, b.v);
+        }
+        dump_ivf("tiles-2col", &packets, w, h, &decoded);
+
+        // Tile ROWS (per-tile-row left-context resets on the writer
+        // side), stacked with the full segmentation emission.
+        let (w2, h2) = (64u32, 160u32);
+        let src2: Vec<Vec<u8>> = (0..4)
+            .map(|k| half_static_frame(w2 as usize, h2 as usize, k))
+            .collect();
+        let rows = GopStructure {
+            altref_interval: 2,
+            segmentation: SegMode::Full,
+            tile_cols_log2: 0,
+            tile_rows_log2: 1,
+        };
+        let (pk2, hs2, dec2, _) = assert_structured_gop_mirror(&src2, w2, h2, 120, rows);
+        for hd in hs2.iter().filter(|hd| !hd.show_existing_frame) {
+            assert_eq!(hd.tile_info.tile_rows_log2, 1);
+        }
+        dump_ivf("tiles-2row-seg", &pk2, w2, h2, &dec2);
     }
 
     /// Source frame `k` of a half-static scene: the left half is a
@@ -6762,6 +7365,8 @@ mod tests {
         let full = GopStructure {
             altref_interval: 3,
             segmentation: SegMode::Full,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
         };
         let (packets, headers, decoded, seg_maps) =
             assert_structured_gop_mirror(&src, w, h, 100, full);
@@ -6870,6 +7475,8 @@ mod tests {
             let st = GopStructure {
                 altref_interval: 2,
                 segmentation: mode,
+                tile_cols_log2: 0,
+                tile_rows_log2: 0,
             };
             let (pk, hs, dec, _) = assert_structured_gop_mirror(&src[..4], w, h, 120, st);
             assert!(hs

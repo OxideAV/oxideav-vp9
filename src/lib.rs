@@ -1276,6 +1276,14 @@ pub struct Vp9GopConfig {
     pub altref_interval: u32,
     /// §6.2.11 feature emission.
     pub segmentation: Vp9Segmentation,
+    /// §6.2.13 `tile_cols_log2`: the frame is coded as `1 <<
+    /// tile_cols_log2` independently decodable tile columns (validated
+    /// against the §6.2.14 min/max derivation — two columns need a
+    /// frame at least 8 SB64s ≈ 512 px wide), feeding the decoder's
+    /// §9.2.4 tile-parallel path.
+    pub tile_cols_log2: u8,
+    /// §6.2.13 `tile_rows_log2` (`0..=2`).
+    pub tile_rows_log2: u8,
 }
 
 impl Vp9GopConfig {
@@ -1286,6 +1294,8 @@ impl Vp9GopConfig {
             base_q_idx,
             altref_interval: 1,
             segmentation: Vp9Segmentation::Off,
+            tile_cols_log2: 0,
+            tile_rows_log2: 0,
         }
     }
 }
@@ -1330,6 +1340,8 @@ pub fn encode_vp9_lossy_sequence_with(
             Vp9Segmentation::StaticSkip => pixel_encoder::SegMode::StaticSkip,
             Vp9Segmentation::Full => pixel_encoder::SegMode::Full,
         },
+        tile_cols_log2: cfg.tile_cols_log2,
+        tile_rows_log2: cfg.tile_rows_log2,
     };
     pixel_encoder::encode_sequence_lossy_structured_u8(
         frames,

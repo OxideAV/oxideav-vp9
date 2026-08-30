@@ -503,3 +503,36 @@ fn staged_r452_fixtures_match_builders() {
         assert_eq!(expected, yuv, "{name}: staged expected.yuv != crate decode");
     }
 }
+
+/// Regression for the `encode_gop_structures` fuzz crash
+/// (73f3c7e7…): fuzz bytes `fc fc fc 3a 0a f6 fc 26` derive a 33x20
+/// frame on the resized arm, whose half-size twin the harness took as
+/// `floor(33 / 2) = 16` — a 2x-PLUS downscale the §5 scaling bounds
+/// forbid, so the encoder's `Unsupported` was the correct answer and
+/// the harness input was invalid. Pins both halves: the floor twin
+/// rejects, the `ceil` twin (the corrected derivation) encodes and
+/// decodes at its declared sizes in both directions.
+#[test]
+fn resized_odd_geometry_half_twin_regression() {
+    let (w, h) = (33u32, 20u32);
+    let f0 = scene_frame(33, 20, 0);
+    let floor_twin = scene_frame(16, 10, 1);
+    assert_eq!(
+        encode_vp9_lossy_sequence_resized(&[&f0, &floor_twin], &[(w, h), (16, 10)], 253)
+            .unwrap_err(),
+        Error::Unsupported,
+        "2 * 16 < 33 is outside the §5 2x downscale bound"
+    );
+    let sizes = [(33u32, 20u32), (17, 10), (33, 20), (17, 10)];
+    let src: Vec<Vec<u8>> = sizes
+        .iter()
+        .enumerate()
+        .map(|(k, &(fw, fh))| scene_frame(fw as usize, fh as usize, k))
+        .collect();
+    let packets = encode_vp9_lossy_sequence_resized(&refs(&src), &sizes, 253).expect("ceil twin");
+    let decoded = decode_vp9_sequence(&refs(&packets)).expect("decode");
+    assert_eq!(decoded.len(), 4);
+    for (d, &(fw, fh)) in decoded.iter().zip(&sizes) {
+        assert_eq!((d.width, d.height), (fw, fh));
+    }
+}

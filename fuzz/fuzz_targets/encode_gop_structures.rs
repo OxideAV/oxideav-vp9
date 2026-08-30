@@ -55,9 +55,13 @@ fuzz_target!(|data: &[u8]| {
     };
 
     if sel & 0x80 != 0 {
-        // Resized arm: alternate between (w, h) and a half/identical
-        // twin within the §5 bounds.
-        let (w2, h2) = ((w / 2).max(4), (h / 2).max(4));
+        // Resized arm: alternate between (w, h) and its half-size twin.
+        // §5 bounds consecutive coded sizes to a 2x downscale, so the
+        // twin is ceil(w / 2): floor(w / 2) on an odd w is a 2x-PLUS
+        // downscale the encoder correctly rejects (CI crash
+        // 73f3c7e7: w = 33 -> 16). The derivation MUST stay inside
+        // the contract so `expect` only fires on a real defect.
+        let (w2, h2) = (w.div_ceil(2), h.div_ceil(2));
         let sizes: Vec<(u32, u32)> = (0..n_frames)
             .map(|k| if k % 2 == 0 { (w, h) } else { (w2, h2) })
             .collect();

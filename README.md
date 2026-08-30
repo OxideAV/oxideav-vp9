@@ -40,7 +40,16 @@ threading the *filtered* reconstructions per the §8.10 post-filter
 store) whose output equals the
 encoder's in-loop reconstruction bit-for-bit, and
 `encode_vp9_lossy_sequence_rc` adds per-frame byte-budget rate control
-(see the "Encoder" section). **Round 441 drives the lossy pipeline
+(see the "Encoder" section). **Round 452 adds the structured GOP
+axes**: an alt-ref pyramid (hidden alt-refs + `show_existing_frame` +
+a true three-slot `[ LAST, GOLDEN, ALTREF ]` election), §6.2.11
+segmentation emission (all four `SEG_LVL_*` features with per-frame
+fitted tree/pred probabilities and the §7.2.10 persistent feature
+table), encode-side tile columns + tile rows (feeding the crate's own
+§9.2.4 tile-parallel decoder), and pixel-accurate §8.5.2.3
+scaled-reference encoding across mid-stream coded-size changes — all
+under one `#[non_exhaustive]` [`Vp9GopConfig`] entry
+([`encode_vp9_lossy_sequence_with`]). **Round 441 drives the lossy pipeline
 across the full §7.2 format matrix** — `encode_vp9_lossy_444` /
 `encode_vp9_lossy_422` / `encode_vp9_lossy_hbd` /
 `encode_vp9_lossy_hbd_422` keyframes plus the matching
@@ -419,6 +428,61 @@ prediction sees the decoder's exact state. Public entry points:
   [`encode_vp9_lossy_sequence_hbd_422`] (round 441) run this whole
   chain-framed pipeline at every §7.2 format, each GOP black-box
   validated byte-exact.
+* [`encode_vp9_lossy_sequence_with`] — the **structured GOP encoder**
+  (round 452), configured by [`Vp9GopConfig`]
+  (`#[non_exhaustive]`; construct via `Vp9GopConfig::new( base_q_idx )`
+  and set fields):
+  * **alt-ref pyramid** (`altref_interval`, also exposed as
+    [`encode_vp9_lossy_sequence_altref`]) — each group's last source
+    frame is coded first as a **hidden** (`show_frame = 0`) P-frame
+    into a free §8.10 slot; the group's earlier frames are shown
+    P-frames over `ref_frame_idx = [ last, golden, alt ]` with
+    `ref_frame_sign_bias = [ 0, 0, 1 ]` (a genuinely *future* alt-ref,
+    so the §6.5 candidate sign flip is semantically right), every leaf
+    electing among single `LAST` / `GOLDEN` / `ALTREF` and the
+    `[ LAST, ALTREF ]` §6.3.18 compound pair over the true alt-ref
+    planes; a one-byte §6.2 `show_existing_frame` packet displays the
+    alt-ref at its display position, after which the alt-ref slot
+    becomes `LAST` and the freed slot hosts the next group's alt-ref
+    (the keyframe stays the long-term `GOLDEN`). §7.2.6 is modeled to
+    the letter: the frame after a hidden alt-ref codes with the prev
+    field absent, and a `show_existing_frame` packet invokes neither
+    `compute_image_size( )` nor the §6.1.2 `PrevMvs` save.
+  * **§6.2.11 segmentation emission** (`segmentation`:
+    [`Vp9Segmentation`]) — `AdaptiveQuant` codes four activity-class
+    segments (per-leaf luma mean-absolute-deviation buckets) carrying
+    `SEG_LVL_ALT_Q` deltas `[-16, -6, +4, +12]` around `base_q_idx`
+    plus a per-frame per-segment `SEG_LVL_ALT_L` election swept by
+    full-§8.8-filter SSE; `StaticSkip` sends leaves whose co-located
+    `LAST` prediction's quantized residual is all zero to a
+    `SEG_LVL_SKIP` + `SEG_LVL_REF_FRAME = LAST_FRAME` segment (no
+    skip / is_inter / ref_frame / inter_mode syntax, no residual —
+    honoring the §6.4.16 `MiSize >= BLOCK_8X8` bound); `Full` is both.
+    Every decoded frame codes `update_map = 1` with **per-frame
+    fitted** `segmentation_tree_probs` (a probe encode counts the §9.3
+    `segment_tree` decisions), `temporal_update = 1` whenever a
+    §6.4.14 `PrevSegmentIds` predictor exists, and the §7.2.10
+    persistent feature table (`update_data` only when the elected
+    table moved). Per-segment *lossless* does not exist in VP9 —
+    §6.2.9 derives `Lossless` from the frame's `base_q_idx` alone.
+  * **tile columns + tile rows** (`tile_cols_log2` /
+    `tile_rows_log2`, validated against the §6.2.14 min/max
+    derivation) — the intra predictor derives §6.4.4 `AvailL = MiCol >
+    MiColStart` at tile edges and every §6.5 candidate scan clamps its
+    column window to the leaf's tile, so the encoder mints the
+    multi-tile-column streams the crate's own §9.2.4 **tile-parallel
+    decoder** consumes (pinned byte-identical through
+    [`decode_vp9_sequence_with`] at a 4-thread budget).
+* [`encode_vp9_lossy_sequence_resized`] — **scaled-reference encode**
+  (round 452): mid-stream §6.2.5 coded-size changes with the
+  **§8.5.2.3 scaled sampler** on the write side (`xScale =
+  (RefFrameWidth << 14) / FrameWidth`), each leaf electing ZEROMV vs. a
+  log-diamond NEWMV descent where every candidate is scored by the
+  decoder's own scaled prediction — pixel-accurate residual coding
+  across 2x-downscale / fractional-upscale transitions (the r409
+  `scaled-reference` fixture was all-skip ZEROMV; this entry codes real
+  content), §5 ratio bounds enforced, §7.2.6 (b) modeled
+  (`UsePrevFrameMvs = 0` across a resize).
 * [`encode_vp9_lossy_sequence_rc`] — **rate control**: every frame is
   coded at the lowest `base_q_idx` whose size fits a caller-chosen
   per-frame byte budget, via an exact per-frame binary search over the
@@ -610,13 +674,15 @@ carries no forward update for it).
 
 ### Not yet supported
 
-* ~~Scaled-reference inter prediction~~ — **corpus-validated as of
-  round 409**: the `scaled-reference` fixture (self-encoded per the
-  #249-part-2 tooling-gap workaround — no black-box encoder CLI mints
-  mid-stream coded-size changes) decodes byte-exact against a black-box
-  reference decode, covering the 2x conformance extreme, a 1/2x
-  upscale, the fractional 4/3 ratio, and a scaled `NEWMV`; two
-  closed-form §8.5.2.3 phase-0 identities are pinned in-crate.
+* ~~Scaled-reference inter prediction~~ — decode **corpus-validated
+  since round 409** (the `scaled-reference` fixture covers the 2x
+  conformance extreme, a 1/2x upscale, the fractional 4/3 ratio, and a
+  scaled `NEWMV`; two closed-form §8.5.2.3 phase-0 identities are
+  pinned in-crate), and — **round 452** — the ENCODE side too:
+  [`encode_vp9_lossy_sequence_resized`] mints pixel-accurate
+  mid-stream coded-size changes through the same §8.5.2.3 sampler
+  (the r409 fixture had to be all-skip ZEROMV for lack of encoder
+  tooling; that gap is closed by the crate's own encoder).
 * ~~Tile **rows** (`tile_rows_log2 >= 1`)~~ — **corpus-validated as of
   round 434**: the staged `tiles-2col-4row-inter` fixture (docs ask
   #270) decodes byte-exact with no code change. The long-standing
@@ -691,15 +757,33 @@ carries no forward update for it).
   [`encode_vp9_lossy_sequence_hbd_440`] chain-framed GOPs; `ssx = 0,
   ssy = 1`, profile 1 at 8-bit / profile 3 at 10/12-bit), black-box
   validated byte-exact at both depths on keyframes and GOPs.
-  The inter *writers* carry compound references and
-  **every** `MiSize` — the round-415 sub-8x8 per-(idy, idx) MV walk
-  included, driven by `encode_pframe_lossless_layout` over arbitrary
-  §6.4.3 layouts; the partition search simply does not *elect*
-  compound or sub-8x8 shapes yet.
+  **Round 452 lands the structured GOP axes** (alt-ref pyramid with
+  hidden frames + `show_existing_frame`, all-four-feature §6.2.11
+  segmentation emission, encode-side tile columns/rows, pixel-accurate
+  scaled-reference encode — see the Encoder section), and its
+  segmentation decoder-mirror caught a real decode bug: §6.4.14
+  `PrevSegmentIds` was wrongly invalidated by a *hidden* predecessor
+  (the `show_frame` gate belongs to §7.2.6 (c) `UsePrevFrameMvs`
+  only; §8.1 step 3 has no such condition) — fixed and black-box
+  validated. Remaining encoder gaps, honestly:
+  * the structured-GOP / resized entries are public at 8-bit 4:2:0
+    (the internal pipeline is format-generic; HBD / 4:4:4 / 4:2:2 /
+    4:4:0 public wrappers for them are a thin follow-up — the classic
+    chain entries already cover the full §7.2 matrix);
+  * writer-side §8.4 backward adaptation (`refresh_frame_context = 1`
+    with `frame_parallel_decoding_mode = 0`) is not modeled — every
+    frame codes forward-updates-only default probabilities, leaving
+    entropy-rate on the table;
+  * no two-pass rate control (the per-frame bisection of
+    `encode_vp9_lossy_sequence_rc` is one-pass), no hidden intra-only
+    refresh emission (the decoder handles intra-only frames; the
+    header writer can code them; no public entry mints them), and the
+    interpolation filter is frame-level `EIGHTTAP` (no switchable
+    per-block election).
 
 ## Testing
 
-The crate carries 1270+ tests (lib unit tests plus integration suites
+The crate carries 1290+ tests (lib unit tests plus integration suites
 in `tests/`, including the keyframe **and inter** encoder writers, each
 round-tripped back through the in-crate decoder; `encode_keyframe`
 exercising the public `encode_vp9` → decode **byte-exact lossless**
@@ -707,7 +791,13 @@ round-trip across a geometry sweep; the lossless / lossy sequence
 encoders reconstructed through `decode_vp9_sequence` with chain-level
 decoder-mirror pins; the `registry_codec` suite pinning the framework
 Encoder byte-identical to the batch entries and the framework Decoder
-equal to the batch decode across the whole staged corpus; and the
+equal to the batch decode across the whole staged corpus; the
+round-452 `encode_gop_structures` suite (alt-ref pyramid packet
+structure + slot rotation, `Vp9GopConfig` contract, segmentation and
+tile and resized-sequence contracts/rejections) with the deep
+decoder-mirrors — every shown frame equal to the encoder's
+reconstruction sample-for-sample, hidden alt-refs surfacing at their
+`show_existing_frame` position — in the crate's unit tests; and the
 motion-search / mode-selection rate assertions). Tests construct their inputs bit-by-bit; §9.2 golden buffers
 are hand-derived by stepping the decoder, not borrowed from any
 third-party VP9 implementation. Several precision-critical primitives

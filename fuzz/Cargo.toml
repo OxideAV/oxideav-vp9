@@ -79,5 +79,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "encode_gop_structures"
+path = "fuzz_targets/encode_gop_structures.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

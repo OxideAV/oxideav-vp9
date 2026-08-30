@@ -18,6 +18,12 @@ name: Fuzz
 #     round-448 tile-parallel path: every input must produce the
 #     identical outcome (frames byte-for-byte, or the same error)
 #     through the serial walk and the 4-thread tile-column fan-out.
+#   * encode_gop_structures — oracle-carrying round-trip over the
+#     round-452 structured-GOP write paths: fuzz-derived Vp9GopConfig
+#     axes (alt-ref pyramid interval, §6.2.11 segmentation mode, tile
+#     rows) plus the §8.5.2.3 resized-sequence arm; the emitted
+#     packets must decode to exactly the source frame count of shown
+#     frames at the declared sizes.
 #
 # Seed corpus entries (corpus/*/seed-*) are derived from the crate's
 # synthetic test vectors and tracked in git; fuzz-grown corpus persists

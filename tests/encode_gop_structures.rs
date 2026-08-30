@@ -11,7 +11,8 @@
 
 use oxideav_vp9::{
     decode_vp9_sequence, encode_vp9_lossy_sequence, encode_vp9_lossy_sequence_altref,
-    encode_vp9_lossy_sequence_with, Error, Vp9GopConfig, Vp9Segmentation,
+    encode_vp9_lossy_sequence_resized, encode_vp9_lossy_sequence_with, Error, Vp9GopConfig,
+    Vp9Segmentation,
 };
 
 /// Source frame `k` of a translating 4:2:0 scene (a ramp plus a sharp
@@ -259,6 +260,52 @@ fn gop_config_tiles_contract() {
     bad2.tile_rows_log2 = 3;
     assert_eq!(
         encode_vp9_lossy_sequence_with(&refs(&narrow), 64, 48, &bad2).unwrap_err(),
+        Error::Unsupported
+    );
+}
+
+/// The resized-sequence entry: mid-stream coded-size changes decode at
+/// their declared sizes; out-of-§5-ratio and malformed inputs reject.
+#[test]
+fn resized_sequence_contract() {
+    let sizes: [(u32, u32); 3] = [(96, 64), (48, 32), (96, 64)];
+    let src: Vec<Vec<u8>> = sizes
+        .iter()
+        .enumerate()
+        .map(|(k, &(w, h))| scene_frame(w as usize, h as usize, k))
+        .collect();
+    let packets =
+        encode_vp9_lossy_sequence_resized(&refs(&src), &sizes, 120).expect("resized encode");
+    let decoded = decode_vp9_sequence(&refs(&packets)).expect("decode");
+    assert_eq!(decoded.len(), 3);
+    for (k, (f, &(w, h))) in decoded.iter().zip(sizes.iter()).enumerate() {
+        assert_eq!((f.width, f.height), (w, h), "frame {k}");
+    }
+    assert_eq!(
+        packets,
+        encode_vp9_lossy_sequence_resized(&refs(&src), &sizes, 120).unwrap()
+    );
+
+    // > 2x downscale between consecutive frames is outside the §5
+    // scaling bounds.
+    let big = scene_frame(128, 128, 0);
+    let tiny = scene_frame(32, 32, 1);
+    assert_eq!(
+        encode_vp9_lossy_sequence_resized(&[&big, &tiny], &[(128, 128), (32, 32)], 120)
+            .unwrap_err(),
+        Error::Unsupported
+    );
+    // Mismatched lengths / empty input / lossless qindex reject.
+    assert_eq!(
+        encode_vp9_lossy_sequence_resized(&[&big], &[(128, 128), (64, 64)], 120).unwrap_err(),
+        Error::Unsupported
+    );
+    assert_eq!(
+        encode_vp9_lossy_sequence_resized(&[], &[], 120).unwrap_err(),
+        Error::Unsupported
+    );
+    assert_eq!(
+        encode_vp9_lossy_sequence_resized(&[&big], &[(128, 128)], 0).unwrap_err(),
         Error::Unsupported
     );
 }

@@ -1353,6 +1353,32 @@ pub fn encode_vp9_lossy_sequence_with(
     )
 }
 
+/// Encode an 8-bit 4:2:0 sequence whose frames **change coded size
+/// mid-stream** (round 452): a keyframe at `sizes[ 0 ]`, then one shown
+/// P-frame per later frame at its own §6.2.5 explicit size, predicted
+/// from the previous frame's §8.10 store through the **§8.5.2.3 scaled
+/// motion compensation** whenever consecutive sizes differ (`xScale =
+/// (RefFrameWidth << 14) / FrameWidth`; equal sizes reduce to the
+/// unscaled sampler bit-for-bit). Each `frames[ i ]` is a planar
+/// 4:2:0 buffer at `sizes[ i ]`.
+///
+/// Per leaf the encoder elects ZEROMV vs. a log-diamond NEWMV descent,
+/// every candidate scored by the decoder's own §8.5.2.3 prediction, so
+/// the reconstruction mirror is exact across the size change; §7.2.6
+/// derives `UsePrevFrameMvs = 0` across a resize (condition (b)) and
+/// the encoder models exactly that. The §5 scaling bounds apply
+/// between consecutive sizes: at most 2x downscale and 16x upscale per
+/// axis — outside them (or for an empty sequence, mismatched
+/// `frames` / `sizes` lengths, `base_q_idx == 0`, degenerate
+/// dimensions, or a short buffer) returns [`Error::Unsupported`].
+pub fn encode_vp9_lossy_sequence_resized(
+    frames: &[&[u8]],
+    sizes: &[(u32, u32)],
+    base_q_idx: u8,
+) -> Result<Vec<Vec<u8>>, Error> {
+    pixel_encoder::encode_sequence_lossy_resized_u8(frames, sizes, base_q_idx)
+}
+
 /// Encode a minimal VP9 **inter (P-frame) sequence** of `width × height`:
 /// a keyframe followed by `num_pframes` all-skip, single-reference-`LAST`,
 /// `ZEROMV` P-frames.

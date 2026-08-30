@@ -132,7 +132,21 @@ fn register_installs_decoder_and_encoder() {
     assert_eq!(impls.len(), 1);
     let caps: &CodecCapabilities = &impls[0].caps;
     assert!(caps.decode && caps.encode && caps.lossy && caps.lossless);
-    assert_eq!(caps.accepted_pixel_formats.len(), 9, "the §7.2 matrix");
+    assert_eq!(
+        caps.accepted_pixel_formats.len(),
+        12,
+        "the full §7.2.2 matrix: 4 geometries x 3 depths"
+    );
+    for fmt in [
+        PixelFormat::Yuv440P,
+        PixelFormat::Yuv440P10Le,
+        PixelFormat::Yuv440P12Le,
+    ] {
+        assert!(
+            caps.accepted_pixel_formats.contains(&fmt),
+            "{fmt:?} is a registered VP9 format"
+        );
+    }
 
     // The encoder options schema is discoverable through the registry.
     let schema = ctx
@@ -420,8 +434,10 @@ fn registry_decoder_reset_starts_a_fresh_stream() {
 /// `decode_vp9_sequence` outputs — IVF chunks (superframes included)
 /// map to packets, so the §B.2 in-decoder split and the §8.9
 /// `show_existing_frame` path are corpus-validated at the registry
-/// surface. Fixtures whose §7.2.2 triple has no framework pixel-format
-/// label (4:4:0) are asserted to fail with `Unsupported` instead.
+/// surface. Every §7.2.2 triple in the corpus — the 4:4:0 fixtures
+/// included — decodes with the framework label the decoder reports
+/// matching the stream's `(BitDepth, ssx, ssy)` triple, and every
+/// plane's extent equal to that label's own `plane_dimensions( )`.
 #[test]
 fn registry_decoder_matches_batch_decode_on_the_corpus() {
     let root = std::path::Path::new("../../docs/video/vp9/fixtures");
@@ -430,6 +446,7 @@ fn registry_decoder_matches_batch_decode_on_the_corpus() {
         return;
     }
     let mut swept = 0usize;
+    let mut saw_440 = 0usize;
     for entry in std::fs::read_dir(root).expect("read fixtures dir") {
         let dir = entry.expect("dir entry").path();
         let ivf_path = dir.join("input.ivf");
@@ -465,48 +482,57 @@ fn registry_decoder_matches_batch_decode_on_the_corpus() {
         }
         let expected = oxideav_vp9::decode_vp9_sequence(&split).expect("batch decode");
 
-        let params = vp9_params(0, 0, PixelFormat::Yuv420P);
-        let mut dec = oxideav_vp9::make_decoder(&params).expect("decoder");
-        let is_440 = expected
-            .first()
-            .map(|f| !f.subsampling_x && f.subsampling_y)
-            .unwrap_or(false);
-        if is_440 {
-            let err = chunks.iter().find_map(|c| {
-                dec.send_packet(&Packet::new(0, TimeBase::MILLIS, c.to_vec()))
-                    .err()
-            });
-            assert!(
-                matches!(err, Some(CoreError::Unsupported(_))),
-                "{name}: 4:4:0 must surface Unsupported"
-            );
-            continue;
-        }
+        let mut dec = oxideav_vp9::Vp9Decoder::new();
         let packets: Vec<Packet> = chunks
             .iter()
             .map(|c| Packet::new(0, TimeBase::MILLIS, c.to_vec()))
             .collect();
-        let decoded = decode_all(dec.as_mut(), &packets);
+        let decoded = decode_all(&mut dec, &packets);
         assert_eq!(decoded.len(), expected.len(), "{name}: shown-frame count");
+        let last = expected.last().expect("at least one shown frame");
+        let label = oxideav_vp9::pixel_format_for_triple(
+            last.bit_depth,
+            last.subsampling_x,
+            last.subsampling_y,
+        )
+        .expect("every §7.2.2 triple has a framework label");
+        assert_eq!(dec.pixel_format(), Some(label), "{name}: decoder label");
+        if !last.subsampling_x && last.subsampling_y {
+            assert!(
+                matches!(
+                    label,
+                    PixelFormat::Yuv440P | PixelFormat::Yuv440P10Le | PixelFormat::Yuv440P12Le
+                ),
+                "{name}: 4:4:0 streams carry the Yuv440P family, got {label:?}"
+            );
+            saw_440 += 1;
+        }
         for (i, (v, b)) in decoded.iter().zip(&expected).enumerate() {
-            let (cw, _) = if b.subsampling_x {
-                ((b.width as usize).div_ceil(2), 0)
-            } else {
-                (b.width as usize, 0)
-            };
-            let dims = [
-                (b.y.as_slice(), b.width as usize),
-                (b.u.as_slice(), cw),
-                (b.v.as_slice(), cw),
-            ];
-            for (pi, (plane, (samples, pw))) in v.planes.iter().zip(dims).enumerate() {
+            let fmt =
+                oxideav_vp9::pixel_format_for_triple(b.bit_depth, b.subsampling_x, b.subsampling_y)
+                    .expect("label");
+            let bps = if b.bit_depth == 8 { 1 } else { 2 };
+            let planes_expected = [b.y.as_slice(), b.u.as_slice(), b.v.as_slice()];
+            assert_eq!(v.image_planes().len(), 3, "{name} frame {i}: plane count");
+            for (pi, (plane, samples)) in v.planes.iter().zip(planes_expected).enumerate() {
+                let (pw, ph) = fmt
+                    .plane_dimensions(pi, b.width, b.height)
+                    .expect("plane dims");
                 let expected_bytes: Vec<u8> = if b.bit_depth == 8 {
                     samples.iter().map(|&s| s as u8).collect()
                 } else {
                     samples.iter().flat_map(|s| s.to_le_bytes()).collect()
                 };
-                let width_bytes = pw * if b.bit_depth == 8 { 1 } else { 2 };
-                assert_eq!(plane.stride, width_bytes, "{name} frame {i} plane {pi}");
+                assert_eq!(
+                    plane.stride,
+                    pw as usize * bps,
+                    "{name} frame {i} plane {pi}: stride is the label's plane width"
+                );
+                assert_eq!(
+                    plane.data.len(),
+                    (pw * ph) as usize * bps,
+                    "{name} frame {i} plane {pi}: extent is the label's plane geometry"
+                );
                 assert_eq!(
                     plane.data, expected_bytes,
                     "{name}: frame {i} plane {pi} samples"
@@ -516,6 +542,115 @@ fn registry_decoder_matches_batch_decode_on_the_corpus() {
         swept += 1;
     }
     assert!(swept >= 40, "corpus sweep covered {swept} fixtures");
+    assert!(
+        saw_440 >= 1,
+        "the staged corpus carries at least one 4:4:0 stream (profile-1-yuv440-8bit-inter)"
+    );
+}
+
+/// 4:4:0 at every §7.2.2 depth through the registry pair: the Encoder
+/// accepts `Yuv440P` / `Yuv440P10Le` / `Yuv440P12Le` input (profile 1
+/// at 8-bit, profile 3 at 10/12-bit) with packet bytes identical to
+/// the public `encode_vp9_lossy_sequence_440` /
+/// `encode_vp9_lossy_sequence_hbd_440` entries, and the Decoder hands
+/// the frames back labelled with the same format, chroma planes at
+/// the framework's full-width / half-height 4:4:0 geometry (odd
+/// height: `ceil( h / 2 )` rows), sample-exact against
+/// `decode_vp9_sequence`.
+#[test]
+fn registry_pair_carries_440_at_every_depth() {
+    let (w, h) = (24usize, 19usize);
+    let cases = [
+        (PixelFormat::Yuv440P, 8u8),
+        (PixelFormat::Yuv440P10Le, 10u8),
+        (PixelFormat::Yuv440P12Le, 12u8),
+    ];
+    for (fmt, depth) in cases {
+        assert_eq!(fmt.chroma_subsampling(), Some((0, 1)), "{fmt:?} is 4:4:0");
+        let (cw, ch) = fmt
+            .plane_dimensions(1, w as u32, h as u32)
+            .map(|(a, b)| (a as usize, b as usize))
+            .expect("chroma dims");
+        assert_eq!((cw, ch), (w, h.div_ceil(2)), "{fmt:?} chroma geometry");
+        assert_eq!(
+            oxideav_vp9::pixel_format_for_triple(depth, false, true),
+            Some(fmt)
+        );
+
+        let inputs8: Vec<Vec<u8>> = (0..3).map(|k| planar_frame_u8(w, h, cw, ch, k)).collect();
+        let (expected, frames): (Vec<Vec<u8>>, Vec<Frame>) = if depth == 8 {
+            let refs: Vec<&[u8]> = inputs8.iter().map(|f| f.as_slice()).collect();
+            let expected =
+                oxideav_vp9::encode_vp9_lossy_sequence_440(&refs, 24, 19, 120).expect("440 batch");
+            let frames = inputs8
+                .iter()
+                .enumerate()
+                .map(|(i, f)| video_frame(f, [(w, h), (cw, ch), (cw, ch)], 1, i as i64))
+                .collect();
+            (expected, frames)
+        } else {
+            let inputs: Vec<Vec<u16>> = inputs8
+                .iter()
+                .map(|f| f.iter().map(|&b| u16::from(b) << (depth - 8)).collect())
+                .collect();
+            let refs: Vec<&[u16]> = inputs.iter().map(|f| f.as_slice()).collect();
+            let expected =
+                oxideav_vp9::encode_vp9_lossy_sequence_hbd_440(&refs, 24, 19, depth, 120)
+                    .expect("hbd 440 batch");
+            let frames = inputs
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    let bytes: Vec<u8> = f.iter().flat_map(|s| s.to_le_bytes()).collect();
+                    video_frame(&bytes, [(w, h), (cw, ch), (cw, ch)], 2, i as i64)
+                })
+                .collect();
+            (expected, frames)
+        };
+
+        let mut params = vp9_params(24, 19, fmt);
+        params.options.insert("q", "120");
+        let mut enc = oxideav_vp9::make_encoder(&params).expect("440 encoder");
+        assert_eq!(enc.output_params().pixel_format, Some(fmt));
+        let packets = encode_all(enc.as_mut(), &frames);
+        assert_eq!(packets.len(), expected.len(), "{fmt:?}: packet count");
+        for (i, (p, e)) in packets.iter().zip(&expected).enumerate() {
+            assert_eq!(&p.data, e, "{fmt:?}: packet {i} bytes");
+        }
+
+        // Header pins: the stream actually signals ssx = 0, ssy = 1.
+        let hdr = oxideav_vp9::parse_uncompressed_header(&packets[0].data).expect("header");
+        assert!(
+            !hdr.color_config.subsampling_x && hdr.color_config.subsampling_y,
+            "{fmt:?}: 4:4:0 header"
+        );
+        assert_eq!(hdr.color_config.bit_depth, depth);
+
+        let split: Vec<&[u8]> = packets.iter().map(|p| p.data.as_slice()).collect();
+        let batch = oxideav_vp9::decode_vp9_sequence(&split).expect("batch decode");
+        let mut dec = oxideav_vp9::Vp9Decoder::new();
+        let decoded = decode_all(&mut dec, &packets);
+        assert_eq!(dec.pixel_format(), Some(fmt), "{fmt:?}: decoder label");
+        assert_eq!(decoded.len(), batch.len());
+        let bps = if depth == 8 { 1 } else { 2 };
+        for (i, (v, b)) in decoded.iter().zip(&batch).enumerate() {
+            assert!(!b.subsampling_x && b.subsampling_y);
+            assert_eq!(v.planes[0].stride, w * bps);
+            assert_eq!(v.planes[1].stride, cw * bps);
+            assert_eq!(v.planes[1].data.len(), cw * ch * bps, "{fmt:?} frame {i} U");
+            assert_eq!(v.planes[2].data.len(), cw * ch * bps, "{fmt:?} frame {i} V");
+            let pack = |s: &[u16]| -> Vec<u8> {
+                if depth == 8 {
+                    s.iter().map(|&x| x as u8).collect()
+                } else {
+                    s.iter().flat_map(|x| x.to_le_bytes()).collect()
+                }
+            };
+            assert_eq!(v.planes[0].data, pack(&b.y), "{fmt:?} frame {i} Y");
+            assert_eq!(v.planes[1].data, pack(&b.u), "{fmt:?} frame {i} U");
+            assert_eq!(v.planes[2].data, pack(&b.v), "{fmt:?} frame {i} V");
+        }
+    }
 }
 
 /// Round-448 tile-parallel decode at the registry surface: a

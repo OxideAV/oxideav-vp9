@@ -554,7 +554,9 @@ mod wide_filter;
 
 // Stable entry points: single-frame + multi-frame decode and the
 // decoded-frame type in their visible signatures.
-pub use codec::{make_decoder, make_encoder, Vp9Decoder, Vp9Encoder, Vp9EncoderOptions};
+pub use codec::{
+    make_decoder, make_encoder, pixel_format_for_triple, Vp9Decoder, Vp9Encoder, Vp9EncoderOptions,
+};
 
 pub use decode_frame::{
     decode_intra_frame, decode_vp9_sequence, decode_vp9_sequence_with, Vp9DecodedFrame,

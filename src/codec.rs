@@ -70,14 +70,21 @@ fn format_triple(fmt: PixelFormat) -> Option<(u8, bool, bool)> {
         PixelFormat::Yuv420P12Le => (12, true, true),
         PixelFormat::Yuv422P12Le => (12, true, false),
         PixelFormat::Yuv444P12Le => (12, false, false),
+        PixelFormat::Yuv440P => (8, false, true),
+        PixelFormat::Yuv440P10Le => (10, false, true),
+        PixelFormat::Yuv440P12Le => (12, false, true),
         _ => return None,
     })
 }
 
-/// The framework pixel format for a §7.2.2 triple, if one exists
-/// (4:4:0 — `ssx = 0, ssy = 1` — has no framework label; streams using
-/// it still decode through [`crate::decode_vp9_sequence`] directly).
-fn triple_format(bit_depth: u8, ssx: bool, ssy: bool) -> Option<PixelFormat> {
+/// The framework pixel format for a §7.2.2 triple. Every one of the
+/// twelve `(BitDepth, subsampling_x, subsampling_y)` combinations the
+/// §6.2.2 `color_config( )` syntax can signal has a label — the 4:4:0
+/// geometry (`ssx = 0, ssy = 1`) maps onto the framework's `Yuv440P`
+/// family (full-width, half-height chroma). `None` only for a
+/// bit-depth outside the §7.2.2 set, which the header parser already
+/// rejects.
+pub fn pixel_format_for_triple(bit_depth: u8, ssx: bool, ssy: bool) -> Option<PixelFormat> {
     Some(match (bit_depth, ssx, ssy) {
         (8, true, true) => PixelFormat::Yuv420P,
         (8, true, false) => PixelFormat::Yuv422P,
@@ -88,6 +95,9 @@ fn triple_format(bit_depth: u8, ssx: bool, ssy: bool) -> Option<PixelFormat> {
         (12, true, true) => PixelFormat::Yuv420P12Le,
         (12, true, false) => PixelFormat::Yuv422P12Le,
         (12, false, false) => PixelFormat::Yuv444P12Le,
+        (8, false, true) => PixelFormat::Yuv440P,
+        (10, false, true) => PixelFormat::Yuv440P10Le,
+        (12, false, true) => PixelFormat::Yuv440P12Le,
         _ => return None,
     })
 }
@@ -121,23 +131,36 @@ fn pack_plane(samples: &[u16], width: usize, bit_depth: u8) -> VideoPlane {
 }
 
 /// Convert one decoded frame into a framework [`Frame`], carrying the
-/// packet's presentation timestamp through.
-fn decoded_to_frame(f: &Vp9DecodedFrame, pts: Option<i64>) -> CoreResult<Frame> {
-    let Some(_) = triple_format(f.bit_depth, f.subsampling_x, f.subsampling_y) else {
-        return Err(CoreError::unsupported(
-            "vp9: no framework pixel-format label for this stream's §7.2.2 \
-             format triple (4:4:0); use the crate's direct decode API",
-        ));
+/// packet's presentation timestamp through, and report the frame's
+/// framework pixel format. The plane geometry is the framework's own
+/// `PixelFormat::plane_dimensions` rule for that label (§8.10 `ceil`
+/// on each subsampled axis — for 4:4:0, full-width, half-height
+/// chroma).
+fn decoded_to_frame(f: &Vp9DecodedFrame, pts: Option<i64>) -> CoreResult<(PixelFormat, Frame)> {
+    let Some(fmt) = pixel_format_for_triple(f.bit_depth, f.subsampling_x, f.subsampling_y) else {
+        return Err(CoreError::unsupported(format!(
+            "vp9: no framework pixel-format label for bit depth {} (§7.2.2 allows 8/10/12)",
+            f.bit_depth
+        )));
     };
-    let (cw, _ch) = chroma_dims(f.width, f.height, f.subsampling_x, f.subsampling_y);
-    Ok(Frame::Video(VideoFrame {
-        pts,
-        planes: vec![
-            pack_plane(&f.y, f.width as usize, f.bit_depth),
-            pack_plane(&f.u, cw, f.bit_depth),
-            pack_plane(&f.v, cw, f.bit_depth),
-        ],
-    }))
+    let (cw, ch) = chroma_dims(f.width, f.height, f.subsampling_x, f.subsampling_y);
+    debug_assert_eq!(
+        fmt.plane_dimensions(1, f.width, f.height),
+        Some((cw as u32, ch as u32)),
+        "framework chroma geometry must agree with §8.10"
+    );
+    debug_assert_eq!(f.u.len(), cw * ch);
+    Ok((
+        fmt,
+        Frame::Video(VideoFrame {
+            pts,
+            planes: vec![
+                pack_plane(&f.y, f.width as usize, f.bit_depth),
+                pack_plane(&f.u, cw, f.bit_depth),
+                pack_plane(&f.v, cw, f.bit_depth),
+            ],
+        }),
+    ))
 }
 
 // ───────────────────────── decoder ─────────────────────────
@@ -156,6 +179,10 @@ pub struct Vp9Decoder {
     seq: Vp9SequenceDecoder,
     pending: VecDeque<Frame>,
     flushed: bool,
+    /// The framework label of the most recently decoded frame's §7.2.2
+    /// format triple (`None` before the first decoded frame or after
+    /// [`Decoder::reset`]).
+    format: Option<PixelFormat>,
     /// The caller-granted threading budget (framework contract: serial
     /// until `set_execution_context` says otherwise); forwarded to the
     /// sequence decoder's §6.4 tile-column fan-out and preserved across
@@ -171,8 +198,19 @@ impl Vp9Decoder {
             seq: Vp9SequenceDecoder::new(),
             pending: VecDeque::new(),
             flushed: false,
+            format: None,
             exec: ExecutionContext::serial(),
         }
+    }
+
+    /// The framework pixel format the decoded stream is labelled with —
+    /// the §7.2.2 `(BitDepth, subsampling_x, subsampling_y)` triple of
+    /// the most recently decoded frame mapped onto the framework's
+    /// planar YUV families (4:2:0 / 4:2:2 / 4:4:4 / 4:4:0 at 8, 10 and
+    /// 12 bits). `None` until a frame has been decoded, and again after
+    /// [`Decoder::reset`].
+    pub fn pixel_format(&self) -> Option<PixelFormat> {
+        self.format
     }
 }
 
@@ -203,8 +241,9 @@ impl Decoder for Vp9Decoder {
         let frames = split_superframe(&packet.data);
         for payload in frames {
             if let Some(decoded) = self.seq.push_frame(payload).map_err(map_err)? {
-                self.pending
-                    .push_back(decoded_to_frame(&decoded, packet.pts)?);
+                let (fmt, frame) = decoded_to_frame(&decoded, packet.pts)?;
+                self.format = Some(fmt);
+                self.pending.push_back(frame);
             }
         }
         Ok(())
@@ -237,6 +276,7 @@ impl Decoder for Vp9Decoder {
         self.seq.set_execution_context(&self.exec);
         self.pending.clear();
         self.flushed = false;
+        self.format = None;
         Ok(())
     }
 }
@@ -529,6 +569,9 @@ pub fn register(ctx: &mut RuntimeContext) {
                         PixelFormat::Yuv420P12Le,
                         PixelFormat::Yuv422P12Le,
                         PixelFormat::Yuv444P12Le,
+                        PixelFormat::Yuv440P,
+                        PixelFormat::Yuv440P10Le,
+                        PixelFormat::Yuv440P12Le,
                     ]),
             )
             .decoder(make_decoder)

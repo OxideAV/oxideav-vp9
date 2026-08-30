@@ -760,6 +760,19 @@ fn dump_matrix_streams_for_black_box_validation() {
                 )
                 .expect("gop altref")
             }),
+            // Round-452 segmentation emission: all four SEG_LVL_*
+            // features (activity-class ALT_Q + elected ALT_L, the
+            // static SKIP + REF_FRAME segment) on the alt-ref pyramid.
+            // Black-box compare needs timestamp passthrough (hidden
+            // packets).
+            ("gop-seg-full", {
+                let f420 = gop_u8(true, true);
+                let mut cfg = oxideav_vp9::Vp9GopConfig::new(q);
+                cfg.altref_interval = 2;
+                cfg.segmentation = oxideav_vp9::Vp9Segmentation::Full;
+                oxideav_vp9::encode_vp9_lossy_sequence_with(&refs8(&f420), w as u32, h as u32, &cfg)
+                    .expect("gop seg-full")
+            }),
             ("gop-440-12bit", {
                 let f440_12 = gop_u16(12, false, true);
                 oxideav_vp9::encode_vp9_lossy_sequence_hbd_440(

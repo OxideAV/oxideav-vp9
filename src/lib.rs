@@ -1233,14 +1233,111 @@ pub fn encode_vp9_lossy_sequence_altref(
     base_q_idx: u8,
     altref_interval: u32,
 ) -> Result<Vec<Vec<u8>>, Error> {
+    let mut cfg = Vp9GopConfig::new(base_q_idx);
+    cfg.altref_interval = altref_interval;
+    encode_vp9_lossy_sequence_with(frames, width, height, &cfg)
+}
+
+/// §6.2.11 segmentation feature emission selectable through
+/// [`Vp9GopConfig::segmentation`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Vp9Segmentation {
+    /// Single-segment frames (`segmentation_enabled = 0`).
+    #[default]
+    Off,
+    /// **Adaptive quantization**: four activity-class segments (luma
+    /// mean-absolute-deviation buckets per leaf) carrying
+    /// `SEG_LVL_ALT_Q` deltas `[-16, -6, +4, +12]` around `base_q_idx`
+    /// (flat content quantizes finer, busy content coarser) plus a
+    /// per-frame elected `SEG_LVL_ALT_L` per class.
+    AdaptiveQuant,
+    /// **Static-content skip**: leaves whose co-located `LAST`
+    /// prediction already matches the source code on a segment carrying
+    /// `SEG_LVL_SKIP` + `SEG_LVL_REF_FRAME = LAST_FRAME`, so §6.4.8 /
+    /// §6.4.13 / §6.4.16 / §6.4.17 read no skip / is_inter / ref_frame /
+    /// inter_mode syntax and no residual for them.
+    StaticSkip,
+    /// Both of the above (all four `SEG_LVL_*` features).
+    Full,
+}
+
+/// GOP-structure configuration of [`encode_vp9_lossy_sequence_with`]
+/// (round 452). Construct with [`Vp9GopConfig::new`] and set the public
+/// fields; the struct is `#[non_exhaustive]` so later rounds can add
+/// axes without a breaking change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Vp9GopConfig {
+    /// §7.2.9 `base_q_idx` for every frame (`1..=255`).
+    pub base_q_idx: u8,
+    /// Display frames per alt-ref group (`1` = no hidden alt-refs; see
+    /// [`encode_vp9_lossy_sequence_altref`]). `0` is rejected.
+    pub altref_interval: u32,
+    /// §6.2.11 feature emission.
+    pub segmentation: Vp9Segmentation,
+}
+
+impl Vp9GopConfig {
+    /// A plain two-slot-equivalent chain at `base_q_idx`: no alt-refs,
+    /// no segmentation.
+    pub fn new(base_q_idx: u8) -> Self {
+        Self {
+            base_q_idx,
+            altref_interval: 1,
+            segmentation: Vp9Segmentation::Off,
+        }
+    }
+}
+
+/// Encode an 8-bit 4:2:0 sequence as a lossy GOP under a
+/// [`Vp9GopConfig`]: the alt-ref pyramid of
+/// [`encode_vp9_lossy_sequence_altref`] and the §6.2.11 segmentation
+/// features of [`Vp9Segmentation`], on the same three-slot,
+/// chain-framed, filter-elected pipeline.
+///
+/// With segmentation on, every decoded frame codes
+/// `segmentation_update_map = 1` with per-frame fitted
+/// `segmentation_tree_probs`, `segmentation_temporal_update = 1` on
+/// every frame that has a §6.4.14 `PrevSegmentIds` predictor (the
+/// keyframe's §7.2 `setup_past_independence( )` clears it; a
+/// `show_existing_frame` packet leaves it untouched per §8.1 step 3),
+/// and `segmentation_update_data = 1` with the delta-mode feature table.
+/// Note that §6.2.9 derives `Lossless` from the frame's `base_q_idx`
+/// alone, so a per-segment lossless mode does not exist in VP9 — a
+/// `SEG_LVL_ALT_Q` segment reaching `qindex 0` still dequantizes
+/// through §8.6.2 at `dc_q( 0 )` / `ac_q( 0 )`.
+///
+/// Packets are returned in decode order (see
+/// [`encode_vp9_lossy_sequence_altref`] for the hidden-frame /
+/// `show_existing_frame` packet layout); every shown frame equals the
+/// encoder's in-loop reconstruction bit-for-bit. Returns
+/// [`Error::Unsupported`] for an empty sequence, `base_q_idx == 0`,
+/// `altref_interval == 0`, degenerate dimensions, or any too-short
+/// frame buffer.
+pub fn encode_vp9_lossy_sequence_with(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    cfg: &Vp9GopConfig,
+) -> Result<Vec<Vec<u8>>, Error> {
     let fmt = pixel_encoder::LossyFormat::new(8, true, true)?;
-    pixel_encoder::encode_sequence_lossy_pyramid_u8(
+    let structure = pixel_encoder::GopStructure {
+        altref_interval: cfg.altref_interval as usize,
+        segmentation: match cfg.segmentation {
+            Vp9Segmentation::Off => pixel_encoder::SegMode::Off,
+            Vp9Segmentation::AdaptiveQuant => pixel_encoder::SegMode::AdaptiveQuant,
+            Vp9Segmentation::StaticSkip => pixel_encoder::SegMode::StaticSkip,
+            Vp9Segmentation::Full => pixel_encoder::SegMode::Full,
+        },
+    };
+    pixel_encoder::encode_sequence_lossy_structured_u8(
         frames,
         width,
         height,
-        base_q_idx,
+        cfg.base_q_idx,
         fmt,
-        altref_interval as usize,
+        structure,
     )
 }
 

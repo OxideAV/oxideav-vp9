@@ -3015,9 +3015,7 @@ pub(crate) fn inter_block_mode_info<S: crate::mv_ref::MvCandidateSource>(
         )?;
         let ref_count = 1 + usize::from(is_compound);
         for (ref_list, mv_ref) in mv.iter().enumerate().take(ref_count) {
-            for slot in &mut block_mvs[ref_list] {
-                *slot = *mv_ref;
-            }
+            block_mvs[ref_list].fill(*mv_ref);
         }
     }
 

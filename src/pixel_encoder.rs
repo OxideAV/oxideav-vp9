@@ -1641,8 +1641,8 @@ pub(crate) fn encode_keyframe_lossy_tree_with_state(
                     }
                 }
 
-                let dc_q = get_dc_quant(plane, &seg, &quant, 0, bd8);
-                let ac_q = get_ac_quant(plane, &seg, &quant, 0, bd8);
+                let dc_q = get_dc_quant(plane, &seg, &quant, usize::from(lp.segment_id), bd8);
+                let ac_q = get_ac_quant(plane, &seg, &quant, usize::from(lp.segment_id), bd8);
                 crate::fwd_transform::forward_transform_2d(&mut block, tx_sz + 2, tx_type);
                 crate::fwd_transform::quantize_block_tx(&mut block, dc_q, ac_q, tx_sz, bit_depth);
 
@@ -1757,8 +1757,8 @@ pub(crate) fn encode_keyframe_lossy_tree_elect_skip_with_state(
                     }
                 }
 
-                let dc_q = get_dc_quant(plane, &seg, &quant, 0, bd8);
-                let ac_q = get_ac_quant(plane, &seg, &quant, 0, bd8);
+                let dc_q = get_dc_quant(plane, &seg, &quant, usize::from(lp.segment_id), bd8);
+                let ac_q = get_ac_quant(plane, &seg, &quant, usize::from(lp.segment_id), bd8);
                 crate::fwd_transform::forward_transform_2d(&mut block, tx_sz + 2, tx_type);
                 crate::fwd_transform::quantize_block_tx(&mut block, dc_q, ac_q, tx_sz, bit_depth);
 
@@ -3334,6 +3334,7 @@ fn select_inter_leaf_tx(
     bit_depth: u32,
     seg: &SegmentationParams,
     quant: &QuantizationParams,
+    segment_id: usize,
 ) -> (u32, Vec<LeafTokenBlock>, bool) {
     use crate::partition::NUM_8X8_BLOCKS_WIDE_LOOKUP;
     use crate::residual::MAX_TXSIZE_LOOKUP;
@@ -3367,8 +3368,8 @@ fn select_inter_leaf_tx(
             let n0 = 4u32 << tx_sz;
             let region_w = (num8x8 * 8) >> u32::from(sub_x);
             let region_h = (num8x8 * 8) >> u32::from(sub_y);
-            let dc_q = get_dc_quant(plane, seg, quant, 0, bd8);
-            let ac_q = get_ac_quant(plane, seg, quant, 0, bd8);
+            let dc_q = get_dc_quant(plane, seg, quant, segment_id, bd8);
+            let ac_q = get_ac_quant(plane, seg, quant, segment_id, bd8);
             let mut sy = base_y;
             while sy < base_y + region_h {
                 let mut sx = base_x;
@@ -3626,6 +3627,7 @@ fn plan_sub8x8_leaf(
         bit_depth,
         seg,
         quant,
+        0,
     );
     debug_assert_eq!(tx, 0, "sub-8x8 leaves are TX_4X4 only");
     let mut skip = all_zero;
@@ -3811,45 +3813,65 @@ pub(crate) fn encode_pframe_lossy_tree_motion_with_state(
     sub8x8: bool,
     prev_frame_mvs: Option<&crate::frame_writer::PrevMotionField>,
 ) -> Result<(Vec<u8>, ReconState, crate::decode_block::Vp9FrameState), Error> {
-    encode_pframe_lossy_tree_motion_with_state_alt(
+    encode_pframe_lossy_tree_motion_opts(
         hdr,
         targets,
         reference,
         golden,
-        None,
         ref_w,
         ref_h,
         search_range,
         subpel,
         sub8x8,
-        prev_frame_mvs,
+        &InterEncodeOpts {
+            prev_frame_mvs,
+            ..InterEncodeOpts::default()
+        },
     )
 }
 
-/// [`encode_pframe_lossy_tree_motion_with_state`] over a **three-slot
-/// reference set**: `altref`, when supplied, is a distinct §8.10 buffer
-/// resolved by `ref_frame_idx[ 2 ]` (the hidden alt-ref of the
-/// pyramid GOP), so the leaf sweep evaluates single-reference
-/// `ALTREF_FRAME` candidates (ZEROMV + searched NEWMV) alongside LAST /
-/// GOLDEN, and the `[ LAST, ALTREF ]` compound pair averages the true
-/// alt-ref planes. `None` aliases ALTREF onto the GOLDEN planes — the
-/// two-slot layout every earlier sequence entry codes — and is
-/// byte-identical to the historical output.
+/// Round-452 options of the inter tree encoder (the structured-GOP
+/// features layered over the two-slot chain; every `None` / `Off`
+/// keeps the historical output byte-identical).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct InterEncodeOpts<'a> {
+    /// A distinct §8.10 buffer resolved by `ref_frame_idx[ 2 ]` (the
+    /// hidden alt-ref of the pyramid GOP): the leaf sweep then
+    /// evaluates single-reference `ALTREF_FRAME` candidates (ZEROMV +
+    /// searched NEWMV) alongside LAST / GOLDEN, and the `[ LAST,
+    /// ALTREF ]` compound pair averages the true alt-ref planes.
+    /// `None` aliases ALTREF onto the GOLDEN planes — the two-slot
+    /// layout every earlier sequence entry codes.
+    pub altref: Option<&'a [(&'a [i32], usize); 3]>,
+    /// The §7.2.6 prev-motion-field model (see
+    /// [`encode_pframe_lossy_tree_motion_with_state`]).
+    pub prev_frame_mvs: Option<&'a crate::frame_writer::PrevMotionField>,
+    /// The §6.2.11 segmentation election ([`SegElection`]): per-leaf
+    /// segment ids and the symbol counts the header probabilities are
+    /// fitted from. `None` codes single-segment frames.
+    pub seg: Option<&'a SegElection<'a>>,
+}
+
+/// [`encode_pframe_lossy_tree_motion_with_state`] under
+/// [`InterEncodeOpts`]: the three-slot reference set and the
+/// segmentation election of the structured GOP encoder.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_pframe_lossy_tree_motion_with_state_alt(
+pub(crate) fn encode_pframe_lossy_tree_motion_opts(
     hdr: &Vp9FrameHeader,
     targets: &[Plane; 3],
     reference: &[(&[i32], usize); 3],
     golden: Option<&[(&[i32], usize); 3]>,
-    altref: Option<&[(&[i32], usize); 3]>,
     ref_w: u32,
     ref_h: u32,
     search_range: i32,
     subpel: bool,
     sub8x8: bool,
-    prev_frame_mvs: Option<&crate::frame_writer::PrevMotionField>,
+    opts: &InterEncodeOpts<'_>,
 ) -> Result<(Vec<u8>, ReconState, crate::decode_block::Vp9FrameState), Error> {
     use crate::frame_writer::{InterFrameTreePlan, InterTreeLeaf, InterTreePlanner};
+    let altref = opts.altref;
+    let prev_frame_mvs = opts.prev_frame_mvs;
+    let seg_election = opts.seg;
     use crate::inter_decode::FrameStateMvSource;
     use crate::mode_info::{LAST_FRAME, NEARESTMV, NEARMV, NEWMV, NONE_REF_FRAME, ZEROMV};
     use crate::mv::use_mv_hp;
@@ -3933,6 +3955,9 @@ pub(crate) fn encode_pframe_lossy_tree_motion_with_state_alt(
                 let hint = *sub_hints
                     .get(&(r, c))
                     .expect("sub-8x8 leaf without an elected hint");
+                if let Some(se) = seg_election {
+                    se.record(r, c, subsize, 0, mi_cols, mi_rows);
+                }
                 return plan_sub8x8_leaf(
                     &hint,
                     hdr.allow_high_precision_mv,
@@ -3959,6 +3984,17 @@ pub(crate) fn encode_pframe_lossy_tree_motion_with_state_alt(
             }
             let max_tx = MAX_TXSIZE_LOOKUP[subsize as usize];
             let num8x8 = u32::from(crate::partition::NUM_8X8_BLOCKS_WIDE_LOOKUP[subsize as usize]);
+
+            // §6.2.11 segmentation election: the leaf's activity class
+            // (the SEG_LVL_ALT_Q / SEG_LVL_ALT_L segments) — sub-8x8
+            // leaves above stay in segment 0.
+            let mut leaf_seg: u8 = match seg_election {
+                Some(se) if se.mode.adaptive_quant() => {
+                    aq_segment_for_leaf(targets, r, c, subsize, mi_cols, mi_rows, bit_depth)
+                }
+                _ => 0,
+            };
+            let static_skip_ok = seg_election.is_some_and(|se| se.mode.static_skip());
 
             // Evaluate one reference frame: leaf-level ZEROMV error plus
             // (when profitable) a snapped / sub-pel-refined NEWMV
@@ -4044,6 +4080,86 @@ pub(crate) fn encode_pframe_lossy_tree_motion_with_state_alt(
                 ([LAST_FRAME, NONE_REF_FRAME], ZEROMV, [[0, 0], [0, 0]]);
             {
                 let (l_zero, l_new) = eval_ref(LAST_FRAME, reference);
+                // Static-content segment: a leaf whose co-located LAST
+                // prediction's quantized residual is all zero codes on
+                // the SEG_LVL_SKIP + SEG_LVL_REF_FRAME segment — the
+                // ordinary path would elect skip = 1 ZEROMV LAST for it
+                // anyway (all-zero tokens), and the segment variant is
+                // strictly cheaper: §6.4.8 / §6.4.13 / §6.4.16 / §6.4.17
+                // then read no skip / is_inter / ref_frame / inter_mode
+                // syntax and §6.4.21 no residual; the block IS the
+                // ZEROMV LAST prediction. (§6.4.16 requires MiSize >=
+                // BLOCK_8X8 on that segment — sub-8x8 leaves returned
+                // above.)
+                let static_elected = static_skip_ok && {
+                    let mut sc = scratch3.borrow_mut();
+                    predict_inter_leaf2(
+                        &mut sc,
+                        reference,
+                        None,
+                        ref_w,
+                        ref_h,
+                        r,
+                        c,
+                        subsize,
+                        [[0, 0], [0, 0]],
+                        mi_cols,
+                        mi_rows,
+                        ssx,
+                        ssy,
+                        bit_depth,
+                    );
+                    let (_tx, _blocks, all_zero) = select_inter_leaf_tx(
+                        targets,
+                        &sc,
+                        r,
+                        c,
+                        subsize,
+                        mi_cols,
+                        mi_rows,
+                        ssx,
+                        ssy,
+                        bit_depth,
+                        &seg,
+                        &quant,
+                        STATIC_SKIP_SEGMENT,
+                    );
+                    all_zero
+                };
+                if static_elected {
+                    let mut work = work.borrow_mut();
+                    predict_inter_leaf2(
+                        &mut work.planes,
+                        reference,
+                        None,
+                        ref_w,
+                        ref_h,
+                        r,
+                        c,
+                        subsize,
+                        [[0, 0], [0, 0]],
+                        mi_cols,
+                        mi_rows,
+                        ssx,
+                        ssy,
+                        bit_depth,
+                    );
+                    let seg_id = STATIC_SKIP_SEGMENT as u8;
+                    if let Some(se) = seg_election {
+                        se.record(r, c, subsize, seg_id, mi_cols, mi_rows);
+                    }
+                    return InterTreeLeaf {
+                        mi_size: subsize,
+                        tx_size: max_tx,
+                        y_mode: ZEROMV,
+                        interp_filter: 0,
+                        ref_frame: [LAST_FRAME, NONE_REF_FRAME],
+                        mv: [[0, 0], [0, 0]],
+                        skip: true,
+                        segment_id: seg_id,
+                        sub: None,
+                    };
+                }
                 let mut best_score = l_zero;
                 if let Some((mv, sad)) = l_new {
                     if search_range > 0 && sad + NEWMV_SAD_MARGIN < best_score {
@@ -4260,6 +4376,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion_with_state_alt(
                 bit_depth,
                 &seg,
                 &quant,
+                usize::from(leaf_seg),
             );
             let mut skip = all_zero;
             let bd8 = hdr.color_config.bit_depth;
@@ -4280,8 +4397,8 @@ pub(crate) fn encode_pframe_lossy_tree_motion_with_state_alt(
                 {
                     let mut cache = token_cache.borrow_mut();
                     for (plane, sx, sy, tx_sz, block) in blocks {
-                        let dc_q = get_dc_quant(plane, &seg, &quant, 0, bd8);
-                        let ac_q = get_ac_quant(plane, &seg, &quant, 0, bd8);
+                        let dc_q = get_dc_quant(plane, &seg, &quant, usize::from(leaf_seg), bd8);
+                        let ac_q = get_ac_quant(plane, &seg, &quant, usize::from(leaf_seg), bd8);
                         reconstruct_block(
                             &mut work.planes[plane],
                             sx as usize,
@@ -4346,6 +4463,11 @@ pub(crate) fn encode_pframe_lossy_tree_motion_with_state_alt(
             // planes already hold it. §6.4.10: a skip block never codes
             // tx bits, so it carries the inferred size (== max_tx under
             // TX_MODE_SELECT).
+            if let Some(se) = seg_election {
+                se.record(r, c, subsize, leaf_seg, mi_cols, mi_rows);
+            } else {
+                leaf_seg = 0;
+            }
             InterTreeLeaf {
                 mi_size: subsize,
                 tx_size: if skip { max_tx } else { tx },
@@ -4354,7 +4476,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion_with_state_alt(
                 ref_frame: choice.0,
                 mv: choice.2,
                 skip,
-                segment_id: 0,
+                segment_id: leaf_seg,
                 sub: None,
             }
         });
@@ -4375,7 +4497,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion_with_state_alt(
         tx_mode,
         reference_mode,
         partitions,
-        prev_segment_ids: None,
+        prev_segment_ids: seg_election.and_then(|se| se.prev_map.map(<[u8]>::to_vec)),
         // Without a supplied prev field, a non-ER header is this
         // encoder's assertion that §7.2.6 derives 0 (hidden / intra /
         // resized predecessor); with one, the writer models the scan.
@@ -5045,6 +5167,451 @@ impl LossyGopEncoder {
     }
 }
 
+// ----- §6.2.11 segmentation election (round 452) -----
+
+/// Number of activity-class segments (`SEG_LVL_ALT_Q` / `SEG_LVL_ALT_L`
+/// carriers): segment ids `0..AQ_SEGMENTS`.
+pub(crate) const AQ_SEGMENTS: usize = 4;
+/// The static-content segment (`SEG_LVL_SKIP` + `SEG_LVL_REF_FRAME =
+/// LAST_FRAME`).
+pub(crate) const STATIC_SKIP_SEGMENT: usize = 4;
+/// Per activity class, the `SEG_LVL_ALT_Q` delta (§8.6.1 `get_qindex( )`
+/// with `segmentation_abs_or_delta_update = 0`): flat content quantizes
+/// finer, busy content coarser, around the frame `base_q_idx`.
+pub(crate) const AQ_DELTA_Q: [i16; AQ_SEGMENTS] = [-16, -6, 4, 12];
+/// Luma mean-absolute-deviation thresholds (per sample, in 8-bit units)
+/// separating the four activity classes.
+const AQ_MAD_THRESHOLDS: [u32; AQ_SEGMENTS - 1] = [2, 6, 14];
+/// `SEG_LVL_ALT_L` candidates swept per activity segment (delta mode,
+/// §8.8.1 `Clip3( 0, 63, level + data )`).
+const SEG_ALT_L_CANDIDATES: [i8; 6] = [-12, -6, -3, 3, 6, 12];
+
+/// Which §6.2.11 features the structured GOP encoder emits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SegMode {
+    /// Single-segment frames (`segmentation_enabled = 0`).
+    Off,
+    /// Activity-class segments carrying `SEG_LVL_ALT_Q` (+ the elected
+    /// `SEG_LVL_ALT_L`).
+    AdaptiveQuant,
+    /// The static-content `SEG_LVL_SKIP` + `SEG_LVL_REF_FRAME` segment
+    /// only (activity segments all map to segment 0).
+    StaticSkip,
+    /// Both.
+    Full,
+}
+
+impl SegMode {
+    pub(crate) fn enabled(self) -> bool {
+        self != SegMode::Off
+    }
+    pub(crate) fn adaptive_quant(self) -> bool {
+        matches!(self, SegMode::AdaptiveQuant | SegMode::Full)
+    }
+    pub(crate) fn static_skip(self) -> bool {
+        matches!(self, SegMode::StaticSkip | SegMode::Full)
+    }
+}
+
+/// Symbol counts of one frame's coded segment ids: the seven §9.3
+/// `segment_tree` node decisions (`[node][bit]`) and the §6.4.12
+/// `seg_id_predicted` flag (`[bit]`) — the inputs the
+/// `segmentation_tree_probs` / `segmentation_pred_prob` fit reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SegSymbolCounts {
+    pub tree: [[u32; 2]; 7],
+    pub pred: [u32; 2],
+}
+
+impl SegSymbolCounts {
+    /// Count one tree-coded `segment_id` along its §9.3 `segment_tree`
+    /// path: node 0 on `id >> 2`, node `1 + (id >> 2)` on `(id >> 1) &
+    /// 1`, node `3 + (id >> 1)` on `id & 1`.
+    fn count_tree(&mut self, id: u8) {
+        let id = usize::from(id & 7);
+        self.tree[0][id >> 2] += 1;
+        self.tree[1 + (id >> 2)][(id >> 1) & 1] += 1;
+        self.tree[3 + (id >> 1)][id & 1] += 1;
+    }
+
+    /// Fitted `segmentation_tree_probs`: per node, the probability of
+    /// the 0 branch (a node never visited codes the 1-bit `read_prob( )`
+    /// escape, 255).
+    pub(crate) fn tree_probs(&self) -> [u8; 7] {
+        let mut out = [255u8; 7];
+        for (node, c) in self.tree.iter().enumerate() {
+            out[node] = fit_prob(c[0], c[1]);
+        }
+        out
+    }
+
+    /// Fitted `segmentation_pred_prob` — one probability across the
+    /// three §9.3.2 contexts (the per-context split is a rate detail
+    /// the writer's contexts already key on).
+    pub(crate) fn pred_probs(&self) -> [u8; 3] {
+        [fit_prob(self.pred[0], self.pred[1]); 3]
+    }
+}
+
+/// The §7.2.10 persistent segmentation feature table as the decoder
+/// folds it: a frame coding `segmentation_update_data = 0` keeps the
+/// previous table, so the encoder codes the table only when it changed
+/// (`None` until the keyframe installs the first one; §7.2
+/// `setup_past_independence( )` clears it on key / intra-only /
+/// error-resilient frames).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SegTablePersist {
+    pub feature_enabled: [[bool; crate::header::SEG_LVL_MAX]; crate::header::MAX_SEGMENTS],
+    pub feature_data: [[i16; crate::header::SEG_LVL_MAX]; crate::header::MAX_SEGMENTS],
+}
+
+impl SegTablePersist {
+    fn of(seg: &SegmentationParams) -> Self {
+        Self {
+            feature_enabled: seg.feature_enabled,
+            feature_data: seg.feature_data,
+        }
+    }
+
+    /// The persisted `SEG_LVL_ALT_L` deltas of the activity segments.
+    fn alt_l(&self) -> [i8; AQ_SEGMENTS] {
+        let mut out = [0i8; AQ_SEGMENTS];
+        for (i, slot) in out.iter_mut().enumerate() {
+            if self.feature_enabled[i][crate::loop_filter::SEG_LVL_ALT_L] {
+                *slot = self.feature_data[i][crate::loop_filter::SEG_LVL_ALT_L] as i8;
+            }
+        }
+        out
+    }
+}
+
+/// `read_prob( )`-codeable probability of the 0 branch from counts:
+/// 255 (the 1-bit escape) when the node was never coded, else the
+/// rounded ratio clipped to `1..=255`.
+fn fit_prob(c0: u32, c1: u32) -> u8 {
+    let n = c0 + c1;
+    if n == 0 {
+        return 255;
+    }
+    let p = (u64::from(c0) * 256 + u64::from(n) / 2) / u64::from(n);
+    p.clamp(1, 255) as u8
+}
+
+/// The per-frame segmentation election handed to the inter tree
+/// encoder: the feature mode, the §6.4.14 `PrevSegmentIds` predictor
+/// (when the frame codes `segmentation_temporal_update = 1`), and the
+/// symbol counts the planner accumulates in coding order.
+pub(crate) struct SegElection<'a> {
+    pub mode: SegMode,
+    pub prev_map: Option<&'a [u8]>,
+    pub counts: std::cell::RefCell<SegSymbolCounts>,
+}
+
+impl SegElection<'_> {
+    /// Record one leaf's coded segment id at `(r, c)` × `mi_size`: under
+    /// temporal prediction the §6.4.14 predictor (the minimum
+    /// `PrevSegmentIds` over the on-screen block) decides whether the
+    /// leaf codes the one-bit `seg_id_predicted` alone or the tree.
+    pub(crate) fn record(&self, r: u32, c: u32, mi_size: u8, id: u8, mi_cols: u32, mi_rows: u32) {
+        let mut counts = self.counts.borrow_mut();
+        if let Some(prev) = self.prev_map {
+            let predicted = predicted_segment_id(prev, r, c, mi_size, mi_cols, mi_rows);
+            let hit = predicted == id;
+            counts.pred[usize::from(hit)] += 1;
+            if hit {
+                return;
+            }
+        }
+        counts.count_tree(id);
+    }
+}
+
+/// §6.4.14 `get_segment_id( )`: the minimum of `PrevSegmentIds` over the
+/// on-screen MIs the block covers.
+pub(crate) fn predicted_segment_id(
+    prev: &[u8],
+    r: u32,
+    c: u32,
+    mi_size: u8,
+    mi_cols: u32,
+    mi_rows: u32,
+) -> u8 {
+    use crate::partition::{NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP};
+    let bw = u32::from(NUM_8X8_BLOCKS_WIDE_LOOKUP[mi_size as usize]);
+    let bh = u32::from(NUM_8X8_BLOCKS_HIGH_LOOKUP[mi_size as usize]);
+    let xmis = (mi_cols - c).min(bw);
+    let ymis = (mi_rows - r).min(bh);
+    let mut seg = 7u8;
+    for y in 0..ymis {
+        for x in 0..xmis {
+            seg = seg.min(prev[((r + y) * mi_cols + c + x) as usize]);
+        }
+    }
+    seg
+}
+
+/// The activity class of a leaf: the luma mean absolute deviation over
+/// the leaf's on-screen samples (scaled to 8-bit units), bucketed by
+/// [`AQ_MAD_THRESHOLDS`].
+pub(crate) fn aq_segment_for_leaf(
+    targets: &[Plane; 3],
+    r: u32,
+    c: u32,
+    mi_size: u8,
+    mi_cols: u32,
+    mi_rows: u32,
+    bit_depth: u32,
+) -> u8 {
+    use crate::partition::{NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP};
+    let bw =
+        u32::from(NUM_8X8_BLOCKS_WIDE_LOOKUP[mi_size.max(crate::residual::BLOCK_8X8) as usize]);
+    let bh =
+        u32::from(NUM_8X8_BLOCKS_HIGH_LOOKUP[mi_size.max(crate::residual::BLOCK_8X8) as usize]);
+    let x0 = (c * 8) as usize;
+    let y0 = (r * 8) as usize;
+    let x1 = ((c + bw).min(mi_cols) * 8) as usize;
+    let y1 = ((r + bh).min(mi_rows) * 8) as usize;
+    let n = ((x1 - x0) * (y1 - y0)) as i64;
+    let mut sum = 0i64;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            sum += i64::from(targets[0].get(x, y));
+        }
+    }
+    let mean = (sum + n / 2) / n;
+    let mut mad = 0i64;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            mad += (i64::from(targets[0].get(x, y)) - mean).abs();
+        }
+    }
+    // Per-sample MAD in 8-bit units: the targets are at the frame's
+    // bit depth, so the class thresholds scale by the depth's range.
+    let max_sample = (1i64 << bit_depth) - 1;
+    let per_sample_8bit = (mad * 255) / (n * max_sample);
+    let mut seg = 0u8;
+    for &t in &AQ_MAD_THRESHOLDS {
+        if per_sample_8bit >= i64::from(t) {
+            seg += 1;
+        }
+    }
+    seg
+}
+
+/// The §6.2.11 `segmentation_params( )` of one frame under `mode`:
+/// `update_map = 1` (tree probs fitted per frame; `temporal_update`
+/// when a predictor map exists), `update_data = 1` with the delta-mode
+/// feature table — `SEG_LVL_ALT_Q` per activity class, the elected
+/// `SEG_LVL_ALT_L` per class, and the static segment's `SEG_LVL_SKIP` +
+/// `SEG_LVL_REF_FRAME = LAST_FRAME`.
+pub(crate) fn seg_params_for(
+    mode: SegMode,
+    temporal: bool,
+    tree_probs: [u8; 7],
+    pred_prob: [u8; 3],
+    alt_l: [i8; AQ_SEGMENTS],
+) -> SegmentationParams {
+    use crate::dequant::SEG_LVL_ALT_Q;
+    use crate::loop_filter::SEG_LVL_ALT_L;
+    use crate::mode_info::{SEG_LVL_REF_FRAME, SEG_LVL_SKIP};
+    let mut seg = SegmentationParams::default_disabled();
+    if !mode.enabled() {
+        return seg;
+    }
+    seg.enabled = true;
+    seg.update_map = true;
+    seg.tree_probs = Some(tree_probs);
+    seg.temporal_update = temporal;
+    seg.pred_prob = Some(if temporal { pred_prob } else { [255; 3] });
+    seg.update_data = true;
+    seg.abs_or_delta_update = false;
+    if mode.adaptive_quant() {
+        for (i, &dq) in AQ_DELTA_Q.iter().enumerate() {
+            seg.feature_enabled[i][SEG_LVL_ALT_Q] = true;
+            seg.feature_data[i][SEG_LVL_ALT_Q] = dq;
+        }
+    }
+    for (i, &dl) in alt_l.iter().enumerate() {
+        if dl != 0 {
+            seg.feature_enabled[i][SEG_LVL_ALT_L] = true;
+            seg.feature_data[i][SEG_LVL_ALT_L] = i16::from(dl);
+        }
+    }
+    if mode.static_skip() {
+        seg.feature_enabled[STATIC_SKIP_SEGMENT][SEG_LVL_SKIP] = true;
+        seg.feature_enabled[STATIC_SKIP_SEGMENT][SEG_LVL_REF_FRAME] = true;
+        seg.feature_data[STATIC_SKIP_SEGMENT][SEG_LVL_REF_FRAME] =
+            crate::mode_info::LAST_FRAME as i16;
+    }
+    seg
+}
+
+/// Assign the keyframe plan's leaves their activity-class segments.
+pub(crate) fn assign_keyframe_aq_segments(
+    plan: &mut crate::frame_writer::KeyframeTreePlan,
+    targets: &[Plane; 3],
+    mi_cols: u32,
+    mi_rows: u32,
+    bit_depth: u32,
+) -> SegSymbolCounts {
+    let mut counts = SegSymbolCounts::default();
+    // Deterministic order (the counts are order-independent; the
+    // iteration order only matters for reproducibility of any tie
+    // handling downstream).
+    let mut keys: Vec<(u32, u32)> = plan.leaves.keys().copied().collect();
+    keys.sort_unstable();
+    for key in keys {
+        let lp = plan.leaves.get_mut(&key).expect("key from the map");
+        lp.segment_id = aq_segment_for_leaf(
+            targets, key.0, key.1, lp.mi_size, mi_cols, mi_rows, bit_depth,
+        );
+        counts.count_tree(lp.segment_id);
+    }
+    counts
+}
+
+/// Close out one lossy frame of the structured GOP encoder:
+/// `(level, sharpness)` election at the persistent delta baseline, the
+/// §6.2.8 delta election (coded slot updates only where a slot moved),
+/// then — when `seg_alt_l` — a per-activity-segment `SEG_LVL_ALT_L`
+/// sweep over [`SEG_ALT_L_CANDIDATES`] (each moved segment costs the
+/// §6.2.11 feature bits, so only a strict SSE win moves one), the
+/// final assembly under the elected header, and the §8.8 filter on the
+/// reconstruction exactly as the decoder runs it. `persist` is folded
+/// exactly as the decoder's §7.2.8 state will be.
+#[allow(clippy::too_many_arguments)]
+fn finish_frame_lossy(
+    hdr: &Vp9FrameHeader,
+    bytes0: Vec<u8>,
+    recon0: ReconState,
+    state0: crate::decode_block::Vp9FrameState,
+    targets: &[Plane; 3],
+    vis_w: usize,
+    vis_h: usize,
+    persist: &mut LfDeltaState,
+    seg_persist: Option<&mut Option<SegTablePersist>>,
+    re_encode: impl FnOnce(
+        &Vp9FrameHeader,
+    )
+        -> Result<(Vec<u8>, ReconState, crate::decode_block::Vp9FrameState), Error>,
+) -> Result<(Vec<u8>, ReconState, Vp9FrameHeader), Error> {
+    use crate::recon_filter::{
+        elect_filter_params_at, elect_lf_deltas, filter_reconstruction_with_deltas, filtered_sse,
+    };
+
+    let (level, sharpness) = elect_filter_params_at(
+        &recon0,
+        &state0,
+        hdr,
+        targets,
+        vis_w,
+        vis_h,
+        persist.ref_deltas,
+        persist.mode_deltas,
+    );
+    if level == 0 {
+        // The frame's coded table (update_data as planned by the
+        // caller) is what the decoder persists.
+        if let Some(sp) = seg_persist {
+            if hdr.segmentation.enabled {
+                *sp = Some(SegTablePersist::of(&hdr.segmentation));
+            }
+        }
+        return Ok((bytes0, recon0, *hdr));
+    }
+    let mut hdr2 = *hdr;
+    hdr2.loop_filter.level = level;
+    hdr2.loop_filter.sharpness = sharpness;
+
+    let (ref_deltas, mode_deltas) = elect_lf_deltas(
+        &recon0,
+        &state0,
+        &hdr2,
+        targets,
+        vis_w,
+        vis_h,
+        persist.ref_deltas,
+        persist.mode_deltas,
+    );
+    let mut any_update = false;
+    for (i, slot) in hdr2.loop_filter.ref_deltas.iter_mut().enumerate() {
+        if ref_deltas[i] != persist.ref_deltas[i] {
+            *slot = Some(ref_deltas[i]);
+            any_update = true;
+        }
+    }
+    for (i, slot) in hdr2.loop_filter.mode_deltas.iter_mut().enumerate() {
+        if mode_deltas[i] != persist.mode_deltas[i] {
+            *slot = Some(mode_deltas[i]);
+            any_update = true;
+        }
+    }
+    hdr2.loop_filter.delta_enabled = true;
+    hdr2.loop_filter.delta_update = any_update;
+
+    let seg_alt_l = seg_persist.is_some() && hdr2.segmentation.enabled;
+    if seg_alt_l {
+        // Coordinate sweep, one activity segment at a time, each
+        // candidate scored by the full §8.8 filter under the candidate
+        // feature table.
+        let mut best = filtered_sse(
+            &recon0,
+            &state0,
+            &hdr2,
+            targets,
+            vis_w,
+            vis_h,
+            ref_deltas,
+            mode_deltas,
+        );
+        for seg_idx in 0..AQ_SEGMENTS {
+            let mut winner: Option<i8> = None;
+            for &cand in &SEG_ALT_L_CANDIDATES {
+                let mut probe = hdr2;
+                probe.segmentation.feature_enabled[seg_idx][crate::loop_filter::SEG_LVL_ALT_L] =
+                    true;
+                probe.segmentation.feature_data[seg_idx][crate::loop_filter::SEG_LVL_ALT_L] =
+                    i16::from(cand);
+                let sse = filtered_sse(
+                    &recon0,
+                    &state0,
+                    &probe,
+                    targets,
+                    vis_w,
+                    vis_h,
+                    ref_deltas,
+                    mode_deltas,
+                );
+                if sse < best {
+                    best = sse;
+                    winner = Some(cand);
+                }
+            }
+            if let Some(cand) = winner {
+                hdr2.segmentation.feature_enabled[seg_idx][crate::loop_filter::SEG_LVL_ALT_L] =
+                    true;
+                hdr2.segmentation.feature_data[seg_idx][crate::loop_filter::SEG_LVL_ALT_L] =
+                    i16::from(cand);
+            }
+        }
+    }
+    if let Some(sp) = seg_persist {
+        if hdr2.segmentation.enabled {
+            // §7.2.10: code the table only when it moved off the
+            // decoder's persisted copy.
+            let table = SegTablePersist::of(&hdr2.segmentation);
+            hdr2.segmentation.update_data = *sp != Some(table);
+            *sp = Some(table);
+        }
+    }
+
+    let (bytes, mut recon, state) = re_encode(&hdr2)?;
+    filter_reconstruction_with_deltas(&mut recon, &state, &hdr2, ref_deltas, mode_deltas);
+    persist.ref_deltas = ref_deltas;
+    persist.mode_deltas = mode_deltas;
+    Ok((bytes, recon, hdr2))
+}
+
 /// One visible-extent reference buffer of the encoder-side §8.10
 /// `FrameStore`: the three planes cropped to the frame's visible
 /// dimensions (luma `w × h`, chroma per the format).
@@ -5076,10 +5643,24 @@ fn stored_ref_view(r: &StoredRef, w: usize, cw: usize) -> [(&[i32], usize); 3] {
     ]
 }
 
-/// Lossy **alt-ref pyramid** GOP encoder (round 452): a three-slot
-/// §8.10 reference set — `LAST` (the previous decoded frame), a
-/// long-term `GOLDEN` (the keyframe) and a **hidden alt-ref** — coded
-/// over groups of `interval` display frames:
+/// Configuration of the structured GOP encoder (the crate-internal
+/// twin of the public `Vp9GopConfig`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GopStructure {
+    /// Display frames per alt-ref group (`1` = no hidden alt-refs).
+    pub altref_interval: usize,
+    /// §6.2.11 feature emission.
+    pub segmentation: SegMode,
+}
+
+/// Lossy **structured GOP** encoder (round 452): the two-slot chain of
+/// [`LossyGopEncoder`] generalised over a three-slot §8.10 reference
+/// set with an **alt-ref pyramid**, and over the §6.2.11 segmentation
+/// features.
+///
+/// **Alt-ref pyramid.** `LAST` (the previous decoded frame), a
+/// long-term `GOLDEN` (the keyframe) and a **hidden alt-ref**, coded
+/// over groups of `altref_interval` display frames:
 ///
 /// 1. the group's *last* source frame is coded first as a hidden
 ///    (`show_frame = 0`) P-frame into the free slot — the alt-ref;
@@ -5105,37 +5686,61 @@ fn stored_ref_view(r: &StoredRef, w: usize, cw: usize) -> [(&[i32], usize); 3] {
 /// The §7.2.8 loop-filter delta baseline persists across every packet
 /// (hidden frames elect deltas too; `show_existing_frame` touches
 /// nothing).
-pub(crate) struct AltrefPyramidEncoder {
+///
+/// **Segmentation** ([`SegMode`]). Every decoded frame codes
+/// `segmentation_update_map = 1` with per-frame fitted
+/// `segmentation_tree_probs` (a probe encode collects the coded-id
+/// counts, the final encode carries the fit), `temporal_update = 1`
+/// on every frame that has a §6.4.14 `PrevSegmentIds` predictor (the
+/// last decoded map-bearing frame's `SegmentIds`; the keyframe's
+/// §7.2 `setup_past_independence( )` clears it, `show_existing_frame`
+/// leaves it untouched — §8.1 step 3), and `update_data = 1` with the
+/// delta-mode feature table: `SEG_LVL_ALT_Q` per activity class,
+/// the per-frame elected `SEG_LVL_ALT_L` per class, and the static
+/// segment's `SEG_LVL_SKIP` + `SEG_LVL_REF_FRAME = LAST_FRAME`.
+pub(crate) struct StructuredGopEncoder {
     width: u32,
     height: u32,
     base_q_idx: u8,
     fmt: LossyFormat,
-    interval: usize,
+    structure: GopStructure,
     slots: [Option<StoredRef>; 3],
     last_slot: usize,
     golden_slot: usize,
     alt_slot: usize,
     prev_field: Option<crate::frame_writer::PrevMotionField>,
+    /// §6.4.14 `PrevSegmentIds` (the last decoded `update_map = 1`
+    /// frame's map).
+    prev_seg_map: Option<Vec<u8>>,
+    /// §7.2.10 persisted feature table (see [`SegTablePersist`]).
+    seg_persist: Option<SegTablePersist>,
     lf_persist: LfDeltaState,
+    /// Per coded packet: the frame's coded §6.4.4 `SegmentIds` map
+    /// (`None` for `show_existing_frame` packets) — tests pin the
+    /// election.
+    pub seg_maps: Vec<Option<Vec<u8>>>,
     /// Per coded packet: `Some( recon )` for decoded frames (keyframe,
     /// shown P-frames, hidden alt-refs), `None` for
     /// `show_existing_frame` packets. Tests pair the decoder's shown
     /// output against these in display order.
     pub recons: Vec<Option<ReconState>>,
+    /// Per coded packet: the final encoder-side header (tests pin the
+    /// structure: `show_frame`, `refresh_frame_flags`, the elected
+    /// segmentation table — an `update_data = 0` frame's table is the
+    /// persisted one the decoder holds).
+    pub headers: Vec<Vp9FrameHeader>,
 }
 
-impl AltrefPyramidEncoder {
-    /// `interval >= 2` display frames per group (the alt-ref is the
-    /// group's last frame); `1` degenerates to the plain chain.
+impl StructuredGopEncoder {
     pub fn new(
         width: u32,
         height: u32,
         base_q_idx: u8,
         fmt: LossyFormat,
-        interval: usize,
+        structure: GopStructure,
     ) -> Result<Self, Error> {
         validate_lossy_args(width, height, base_q_idx)?;
-        if interval == 0 {
+        if structure.altref_interval == 0 {
             return Err(Error::Unsupported);
         }
         Ok(Self {
@@ -5143,14 +5748,18 @@ impl AltrefPyramidEncoder {
             height,
             base_q_idx,
             fmt,
-            interval,
+            structure,
             slots: [None, None, None],
             last_slot: 0,
             golden_slot: 1,
             alt_slot: 2,
             prev_field: None,
+            prev_seg_map: None,
+            seg_persist: None,
             lf_persist: LfDeltaState::default(),
             recons: Vec::new(),
+            headers: Vec::new(),
+            seg_maps: Vec::new(),
         })
     }
 
@@ -5174,6 +5783,7 @@ impl AltrefPyramidEncoder {
         let w = width as usize;
         let h = height as usize;
         let (cw, _ch) = fmt.chroma_dims(width, height);
+        let seg_mode = self.structure.segmentation;
 
         let last = self.slots[self.last_slot]
             .as_ref()
@@ -5210,24 +5820,65 @@ impl AltrefPyramidEncoder {
             lossless: false,
         };
         let prev_field = self.prev_field.as_ref();
+        let prev_map = self.prev_seg_map.as_deref();
+        let temporal = seg_mode.enabled() && prev_map.is_some();
+        // Probe probabilities: the segment election never depends on
+        // them, so the probe encode's leaves are the final leaves. The
+        // feature table starts from the decoder's persisted copy (the
+        // previous frame's elected SEG_LVL_ALT_L included) and is coded
+        // only when it moves.
+        let persisted_alt_l = self
+            .seg_persist
+            .map(|p| p.alt_l())
+            .unwrap_or([0; AQ_SEGMENTS]);
+        hdr.segmentation = seg_params_for(seg_mode, temporal, [128; 7], [128; 3], persisted_alt_l);
+        hdr.segmentation.update_data =
+            self.seg_persist != Some(SegTablePersist::of(&hdr.segmentation));
+
+        let seg_election = SegElection {
+            mode: seg_mode,
+            prev_map: if temporal { prev_map } else { None },
+            counts: std::cell::RefCell::new(SegSymbolCounts::default()),
+        };
         let encode = |hdr2: &Vp9FrameHeader| {
-            encode_pframe_lossy_tree_motion_with_state_alt(
+            // Every encode of this frame re-collects the counts from
+            // scratch (byte-determinism: the fit only reads the probe's).
+            *seg_election.counts.borrow_mut() = SegSymbolCounts::default();
+            encode_pframe_lossy_tree_motion_opts(
                 hdr2,
                 targets,
                 &last_v,
                 Some(&golden_v),
-                alt_v.as_ref(),
                 width,
                 height,
                 PFRAME_SEARCH_RANGE,
                 true,
                 true,
-                prev_field,
+                &InterEncodeOpts {
+                    altref: alt_v.as_ref(),
+                    prev_frame_mvs: prev_field,
+                    seg: seg_mode.enabled().then_some(&seg_election),
+                },
             )
         };
+        if seg_mode.enabled() {
+            // Probe encode → fitted §6.2.11 probabilities.
+            encode(&hdr)?;
+            let counts = *seg_election.counts.borrow();
+            let update_data = hdr.segmentation.update_data;
+            hdr.segmentation = seg_params_for(
+                seg_mode,
+                temporal,
+                counts.tree_probs(),
+                counts.pred_probs(),
+                persisted_alt_l,
+            );
+            hdr.segmentation.update_data = update_data;
+        }
         let (p0, recon0, state0) = encode(&hdr)?;
         let next_field = PrevMotionField::from_state(&state0);
-        let (bytes, recon) = finish_frame_with_filter_deltas(
+        let next_seg_map = state0.segment_ids.clone();
+        let (bytes, recon, final_hdr) = finish_frame_lossy(
             &hdr,
             p0,
             recon0,
@@ -5236,13 +5887,22 @@ impl AltrefPyramidEncoder {
             w,
             h,
             &mut self.lf_persist,
+            seg_mode.enabled().then_some(&mut self.seg_persist),
             encode,
         )?;
+        self.headers.push(final_hdr);
+        self.seg_maps
+            .push(seg_mode.enabled().then_some(next_seg_map.clone()));
         self.slots[refresh_slot] = Some(self.crop(&recon));
         self.recons.push(Some(recon));
         // §7.2.6 (c): a hidden frame leaves the next decoded frame
         // without a usable prev field.
         self.prev_field = if shown { Some(next_field) } else { None };
+        if seg_mode.enabled() {
+            // §8.1 step 3: a decoded update_map = 1 frame's SegmentIds
+            // become PrevSegmentIds.
+            self.prev_seg_map = Some(next_seg_map);
+        }
         Ok(bytes)
     }
 
@@ -5252,6 +5912,8 @@ impl AltrefPyramidEncoder {
         hdr.show_existing_frame = true;
         hdr.frame_to_show_map_idx = Some(slot as u8);
         self.recons.push(None);
+        self.headers.push(hdr);
+        self.seg_maps.push(None);
         crate::header_writer::write_uncompressed_header(&hdr)
     }
 
@@ -5266,29 +5928,74 @@ impl AltrefPyramidEncoder {
         let (width, height, base_q_idx, fmt) = (self.width, self.height, self.base_q_idx, self.fmt);
         let w = width as usize;
         let h = height as usize;
+        let mi_cols = (width + 7) >> 3;
+        let mi_rows = (height + 7) >> 3;
+        let seg_mode = self.structure.segmentation;
+        let interval = self.structure.altref_interval;
 
         // Keyframe: the chain-model keyframe of the default sequence
         // entry (planner tree, skip election, filter election),
-        // refreshing every slot.
-        let kf_hdr = lossy_keyframe_header_fmt(width, height, base_q_idx, fmt);
-        let kf_plan = plan_keyframe_tree(
+        // refreshing every slot, plus the activity-class segment map.
+        let mut kf_hdr = lossy_keyframe_header_fmt(width, height, base_q_idx, fmt);
+        let mut kf_plan = plan_keyframe_tree(
             kf_targets,
-            (height + 7) >> 3,
-            (width + 7) >> 3,
+            mi_rows,
+            mi_cols,
             fmt.ssx,
             fmt.ssy,
             u32::from(fmt.bit_depth),
             base_q_idx,
         );
+        if seg_mode.enabled() {
+            let counts = if seg_mode.adaptive_quant() {
+                assign_keyframe_aq_segments(
+                    &mut kf_plan,
+                    kf_targets,
+                    mi_cols,
+                    mi_rows,
+                    u32::from(fmt.bit_depth),
+                )
+            } else {
+                let mut c = SegSymbolCounts::default();
+                for _ in 0..kf_plan.leaves.len() {
+                    c.count_tree(0);
+                }
+                c
+            };
+            kf_hdr.segmentation = seg_params_for(
+                seg_mode,
+                false,
+                counts.tree_probs(),
+                [255; 3],
+                [0; AQ_SEGMENTS],
+            );
+        }
         let encode_kf = |hdr2: &Vp9FrameHeader| {
             encode_keyframe_lossy_tree_elect_skip_with_state(hdr2, kf_targets, &kf_plan)
         };
         let (kf0, kf_recon0, kf_state0) = encode_kf(&kf_hdr)?;
         self.prev_field = Some(PrevMotionField::from_state(&kf_state0));
-        let (kf_bytes, kf_recon) = finish_frame_with_filter(
-            &kf_hdr, kf0, kf_recon0, kf_state0, kf_targets, w, h, encode_kf,
-        )?;
+        self.prev_seg_map = seg_mode.enabled().then(|| kf_state0.segment_ids.clone());
+        // §7.2 setup_past_independence( ) on the keyframe: the delta
+        // baseline and the feature table restart before the election
+        // (the keyframe always codes update_data = 1).
         self.lf_persist = LfDeltaState::default();
+        self.seg_persist = None;
+        let kf_seg_map = kf_state0.segment_ids.clone();
+        let (kf_bytes, kf_recon, kf_final_hdr) = finish_frame_lossy(
+            &kf_hdr,
+            kf0,
+            kf_recon0,
+            kf_state0,
+            kf_targets,
+            w,
+            h,
+            &mut self.lf_persist,
+            seg_mode.enabled().then_some(&mut self.seg_persist),
+            encode_kf,
+        )?;
+        self.headers.push(kf_final_hdr);
+        self.seg_maps.push(seg_mode.enabled().then_some(kf_seg_map));
         let kf_crop = self.crop(&kf_recon);
         self.slots = [Some(kf_crop.clone()), Some(kf_crop.clone()), Some(kf_crop)];
         self.last_slot = 0;
@@ -5296,12 +6003,12 @@ impl AltrefPyramidEncoder {
         self.alt_slot = 2;
         self.recons.push(Some(kf_recon));
 
-        let mut out = Vec::with_capacity(frame_targets.len() + frame_targets.len() / self.interval);
+        let mut out = Vec::with_capacity(frame_targets.len() + frame_targets.len() / interval);
         out.push(kf_bytes);
 
         let mut i = 0usize;
         while i < rest.len() {
-            let group_end = (i + self.interval - 1).min(rest.len() - 1);
+            let group_end = (i + interval - 1).min(rest.len() - 1);
             if group_end == i {
                 // A lone frame: plain shown P-frame over LAST / GOLDEN.
                 let last_slot = self.last_slot;
@@ -5329,27 +6036,28 @@ impl AltrefPyramidEncoder {
     }
 }
 
-/// [`encode_sequence_lossy_planes`] on the alt-ref pyramid GOP
-/// structure ([`AltrefPyramidEncoder`]).
-pub(crate) fn encode_sequence_lossy_pyramid_planes(
+/// [`encode_sequence_lossy_planes`] on the structured GOP encoder
+/// ([`StructuredGopEncoder`]).
+pub(crate) fn encode_sequence_lossy_structured_planes(
     frame_targets: &[[Plane; 3]],
     width: u32,
     height: u32,
     base_q_idx: u8,
     fmt: LossyFormat,
-    interval: usize,
+    structure: GopStructure,
 ) -> Result<Vec<Vec<u8>>, Error> {
-    AltrefPyramidEncoder::new(width, height, base_q_idx, fmt, interval)?.encode(frame_targets)
+    StructuredGopEncoder::new(width, height, base_q_idx, fmt, structure)?.encode(frame_targets)
 }
 
-/// 8-bit planar-`u8` front end of [`encode_sequence_lossy_pyramid_planes`].
-pub(crate) fn encode_sequence_lossy_pyramid_u8(
+/// 8-bit planar-`u8` front end of
+/// [`encode_sequence_lossy_structured_planes`].
+pub(crate) fn encode_sequence_lossy_structured_u8(
     frames: &[&[u8]],
     width: u32,
     height: u32,
     base_q_idx: u8,
     fmt: LossyFormat,
-    interval: usize,
+    structure: GopStructure,
 ) -> Result<Vec<Vec<u8>>, Error> {
     if frames.is_empty() {
         return Err(Error::Unsupported);
@@ -5363,7 +6071,7 @@ pub(crate) fn encode_sequence_lossy_pyramid_u8(
         .iter()
         .map(|f| padded_targets_from_u8(f, width, height, fmt))
         .collect();
-    encode_sequence_lossy_pyramid_planes(&targets, width, height, base_q_idx, fmt, interval)
+    encode_sequence_lossy_structured_planes(&targets, width, height, base_q_idx, fmt, structure)
 }
 
 /// [`encode_sequence_lossy_420`] on **non-error-resilient chain
@@ -5864,90 +6572,324 @@ mod tests {
         px
     }
 
-    /// Alt-ref pyramid GOP (round 452): the packets decode through the
-    /// crate's own sequence decoder to exactly `frames.len()` shown
-    /// frames, each equal sample-for-sample to the encoder's
-    /// reconstruction in display order — the hidden alt-ref's
-    /// reconstruction surfaces at its `show_existing_frame` position —
-    /// and the structure is exactly keyframe + per-group (hidden ARF,
-    /// interval-1 shown P-frames, one show-existing packet).
-    #[test]
-    fn altref_pyramid_gop_decodes_to_encoder_reconstruction() {
+    /// What [`assert_structured_gop_mirror`] hands back: the packets,
+    /// the coded headers, the decoded shown frames, and the per-packet
+    /// coded segment maps.
+    type StructuredGopProducts = (
+        Vec<Vec<u8>>,
+        Vec<Vp9FrameHeader>,
+        Vec<crate::decode_frame::Vp9DecodedFrame>,
+        Vec<Option<Vec<u8>>>,
+    );
+
+    /// Encode `src` (8-bit 4:2:0 planar frames) through the structured
+    /// GOP encoder and pin the decoder-mirror: the crate's own sequence
+    /// decoder yields exactly `src.len()` shown frames, each equal
+    /// sample-for-sample to the encoder's reconstruction in display
+    /// order (hidden alt-refs surfacing at their `show_existing_frame`
+    /// position), and the encode is byte-deterministic. Returns the
+    /// packets, the coded headers, and the decoded frames.
+    fn assert_structured_gop_mirror(
+        src: &[Vec<u8>],
+        w: u32,
+        h: u32,
+        q: u8,
+        structure: GopStructure,
+    ) -> StructuredGopProducts {
         use crate::decode_frame::decode_vp9_sequence;
-        let (w, h) = (64u32, 48u32);
-        let n = 8usize;
-        let interval = 3usize;
-        let src: Vec<Vec<u8>> = (0..n)
-            .map(|k| moving_scene_frame(w as usize, h as usize, k))
-            .collect();
         let fmt = LossyFormat::YUV420_8;
         let targets: Vec<[Plane; 3]> = src
             .iter()
             .map(|f| padded_targets_from_u8(f, w, h, fmt))
             .collect();
-        let mut enc = AltrefPyramidEncoder::new(w, h, 100, fmt, interval).expect("enc");
+        let mut enc = StructuredGopEncoder::new(w, h, q, fmt, structure).expect("enc");
         let packets = enc.encode(&targets).expect("encode");
-        // kf + groups: [1,2,3] -> ARF(3),P1,P2,SE ; [4,5,6] -> ARF,P,P,SE ; [7] -> P.
-        assert_eq!(packets.len(), 1 + 4 + 4 + 1);
         assert_eq!(enc.recons.len(), packets.len());
-        // The show-existing packets are one-byte §6.2 headers.
-        assert_eq!(packets[4].len(), 1);
-        assert_eq!(packets[8].len(), 1);
+        assert_eq!(enc.headers.len(), packets.len());
 
         let refs: Vec<&[u8]> = packets.iter().map(|p| p.as_slice()).collect();
         let decoded = decode_vp9_sequence(&refs).expect("decode");
-        assert_eq!(decoded.len(), n);
+        assert_eq!(decoded.len(), src.len());
 
-        // Display-order reconstruction list: keyframe, then per group
-        // the shown P-frames followed by the ARF recon.
-        let mut display: Vec<&ReconState> = Vec::new();
-        display.push(enc.recons[0].as_ref().unwrap());
-        for g in [1usize, 5] {
-            display.push(enc.recons[g + 1].as_ref().unwrap());
-            display.push(enc.recons[g + 2].as_ref().unwrap());
-            display.push(enc.recons[g].as_ref().unwrap());
+        // Display order: a decoded shown frame displays itself; a
+        // show_existing packet displays the slot's last writer.
+        let mut slot_writer: [Option<usize>; 8] = [None; 8];
+        let mut display: Vec<usize> = Vec::new();
+        for (i, hdr) in enc.headers.iter().enumerate() {
+            if hdr.show_existing_frame {
+                display.push(slot_writer[hdr.frame_to_show_map_idx.unwrap() as usize].unwrap());
+                continue;
+            }
+            for (slot, writer) in slot_writer.iter_mut().enumerate() {
+                if hdr.refresh_frame_flags & (1 << slot) != 0 {
+                    *writer = Some(i);
+                }
+            }
+            if hdr.show_frame {
+                display.push(i);
+            }
         }
-        display.push(enc.recons[9].as_ref().unwrap());
-        for (i, (d, r)) in decoded.iter().zip(display.iter()).enumerate() {
-            let vis = visible_crop_planes(r, w as usize, h as usize, 32, 24);
+        assert_eq!(display.len(), src.len());
+        let (cw, ch) = fmt.chroma_dims(w, h);
+        for (k, (d, &pi)) in decoded.iter().zip(display.iter()).enumerate() {
+            let r = enc.recons[pi].as_ref().expect("decoded packet has a recon");
+            let vis = visible_crop_planes(r, w as usize, h as usize, cw, ch);
             let dy: Vec<i32> = d.y.iter().map(|&v| i32::from(v)).collect();
             let du: Vec<i32> = d.u.iter().map(|&v| i32::from(v)).collect();
             let dv: Vec<i32> = d.v.iter().map(|&v| i32::from(v)).collect();
-            assert_eq!(dy, vis[0], "frame {i} luma != encoder recon");
-            assert_eq!(du, vis[1], "frame {i} U != encoder recon");
-            assert_eq!(dv, vis[2], "frame {i} V != encoder recon");
+            assert_eq!(dy, vis[0], "display frame {k} luma != encoder recon");
+            assert_eq!(du, vis[1], "display frame {k} U != encoder recon");
+            assert_eq!(dv, vis[2], "display frame {k} V != encoder recon");
         }
-        // Byte-determinism (fixture staging relies on it).
-        let again = AltrefPyramidEncoder::new(w, h, 100, fmt, interval)
+        let again = StructuredGopEncoder::new(w, h, q, fmt, structure)
             .unwrap()
             .encode(&targets)
             .unwrap();
-        assert_eq!(packets, again);
-        if let Some(dir) = std::env::var_os("OXIDEAV_VP9_R452_DUMP") {
-            let mut ivf = Vec::new();
-            ivf.extend_from_slice(b"DKIF");
-            ivf.extend_from_slice(&0u16.to_le_bytes());
-            ivf.extend_from_slice(&32u16.to_le_bytes());
-            ivf.extend_from_slice(b"VP90");
-            ivf.extend_from_slice(&(w as u16).to_le_bytes());
-            ivf.extend_from_slice(&(h as u16).to_le_bytes());
-            ivf.extend_from_slice(&25u32.to_le_bytes());
-            ivf.extend_from_slice(&1u32.to_le_bytes());
-            ivf.extend_from_slice(&(packets.len() as u32).to_le_bytes());
-            ivf.extend_from_slice(&0u32.to_le_bytes());
-            for (i, f) in packets.iter().enumerate() {
-                ivf.extend_from_slice(&(f.len() as u32).to_le_bytes());
-                ivf.extend_from_slice(&(i as u64).to_le_bytes());
-                ivf.extend_from_slice(f);
+        assert_eq!(packets, again, "byte-determinism");
+        (packets, enc.headers, decoded, enc.seg_maps)
+    }
+
+    fn dump_ivf(
+        name: &str,
+        packets: &[Vec<u8>],
+        w: u32,
+        h: u32,
+        decoded: &[crate::decode_frame::Vp9DecodedFrame],
+    ) {
+        let Some(dir) = std::env::var_os("OXIDEAV_VP9_R452_DUMP") else {
+            return;
+        };
+        let mut ivf = Vec::new();
+        ivf.extend_from_slice(b"DKIF");
+        ivf.extend_from_slice(&0u16.to_le_bytes());
+        ivf.extend_from_slice(&32u16.to_le_bytes());
+        ivf.extend_from_slice(b"VP90");
+        ivf.extend_from_slice(&(w as u16).to_le_bytes());
+        ivf.extend_from_slice(&(h as u16).to_le_bytes());
+        ivf.extend_from_slice(&25u32.to_le_bytes());
+        ivf.extend_from_slice(&1u32.to_le_bytes());
+        ivf.extend_from_slice(&(packets.len() as u32).to_le_bytes());
+        ivf.extend_from_slice(&0u32.to_le_bytes());
+        for (i, f) in packets.iter().enumerate() {
+            ivf.extend_from_slice(&(f.len() as u32).to_le_bytes());
+            ivf.extend_from_slice(&(i as u64).to_le_bytes());
+            ivf.extend_from_slice(f);
+        }
+        let dir = std::path::Path::new(&dir);
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(format!("{name}.ivf")), ivf).unwrap();
+        let mut yuv = Vec::new();
+        for f in decoded {
+            yuv.extend_from_slice(&f.to_planar_bytes());
+        }
+        std::fs::write(dir.join(format!("{name}-crate.yuv")), yuv).unwrap();
+    }
+
+    /// Alt-ref pyramid GOP (round 452): decoder-mirror over the moving
+    /// scene, plus the structure pin — keyframe + per group (hidden
+    /// ARF, interval-1 shown P-frames, one show-existing packet).
+    #[test]
+    fn altref_pyramid_gop_decodes_to_encoder_reconstruction() {
+        let (w, h) = (64u32, 48u32);
+        let n = 8usize;
+        let src: Vec<Vec<u8>> = (0..n)
+            .map(|k| moving_scene_frame(w as usize, h as usize, k))
+            .collect();
+        let structure = GopStructure {
+            altref_interval: 3,
+            segmentation: SegMode::Off,
+        };
+        let (packets, headers, decoded, _) =
+            assert_structured_gop_mirror(&src, w, h, 100, structure);
+        // kf + groups: [1,2,3] -> ARF(3),P1,P2,SE ; [4,5,6] -> ARF,P,P,SE ; [7] -> P.
+        assert_eq!(packets.len(), 1 + 4 + 4 + 1);
+        assert_eq!(packets[4].len(), 1);
+        assert_eq!(packets[8].len(), 1);
+        assert!(!headers[1].show_frame && headers[1].refresh_frame_flags == 0x04);
+        assert!(headers[2].show_frame && headers[2].refresh_frame_flags == 0x01);
+        assert_eq!(headers[2].ref_frame_idx, Some([0, 1, 2]));
+        assert!(headers[4].show_existing_frame);
+        assert!(!headers[5].show_frame && headers[5].refresh_frame_flags == 0x01);
+        assert_eq!(headers[6].ref_frame_idx, Some([2, 1, 0]));
+        assert!(headers.iter().all(|h| !h.segmentation.enabled));
+        dump_ivf("altref", &packets, w, h, &decoded);
+    }
+
+    /// Source frame `k` of a half-static scene: the left half is a
+    /// fixed textured field (the static-skip segment's habitat), the
+    /// right half the moving scene.
+    fn half_static_frame(w: usize, h: usize, k: usize) -> Vec<u8> {
+        let mut px = moving_scene_frame(w, h, k);
+        for y in 0..h {
+            for x in 0..w / 2 {
+                px[y * w + x] = ((x >> 1) + (y >> 1) + 60) as u8;
             }
-            let dir = std::path::Path::new(&dir);
-            std::fs::create_dir_all(dir).unwrap();
-            std::fs::write(dir.join("altref.ivf"), ivf).unwrap();
-            let mut yuv = Vec::new();
-            for f in &decoded {
-                yuv.extend_from_slice(&f.to_planar_bytes());
+        }
+        // The static half is static in chroma too (the moving scene's
+        // chroma translates with k, which would keep every left-half
+        // residual alive).
+        let cw = w.div_ceil(2);
+        let ch = h.div_ceil(2);
+        for plane in 0..2usize {
+            let base = w * h + plane * cw * ch;
+            for y in 0..ch {
+                for x in 0..cw / 2 {
+                    px[base + y * cw + x] = (x + y + 90 + plane * 40) as u8;
+                }
             }
-            std::fs::write(dir.join("altref-crate.yuv"), yuv).unwrap();
+        }
+        px
+    }
+
+    /// Segmentation emission (round 452): all four `SEG_LVL_*`
+    /// features on a pyramid GOP — decoder-mirror, plus header pins:
+    /// every decoded frame codes `update_map = 1` with a fitted tree,
+    /// P-frames with a predictor code `temporal_update = 1`, the
+    /// feature table carries ALT_Q on the activity classes and SKIP +
+    /// REF_FRAME on the static segment, the static half actually lands
+    /// on the static segment (the coded ids are observable through the
+    /// decoder-mirror: a wrong id would desync the residual read), and
+    /// the static-skip P-frames code fewer bytes than the plain chain.
+    #[test]
+    fn segmentation_full_gop_decodes_to_encoder_reconstruction() {
+        use crate::dequant::SEG_LVL_ALT_Q;
+        use crate::loop_filter::SEG_LVL_ALT_L;
+        use crate::mode_info::{SEG_LVL_REF_FRAME, SEG_LVL_SKIP};
+        let (w, h) = (64u32, 48u32);
+        let src: Vec<Vec<u8>> = (0..7)
+            .map(|k| half_static_frame(w as usize, h as usize, k))
+            .collect();
+        let full = GopStructure {
+            altref_interval: 3,
+            segmentation: SegMode::Full,
+        };
+        let (packets, headers, decoded, seg_maps) =
+            assert_structured_gop_mirror(&src, w, h, 100, full);
+        let mut update_data_frames = 0usize;
+        for (i, hdr) in headers.iter().enumerate() {
+            if hdr.show_existing_frame {
+                continue;
+            }
+            let seg = &hdr.segmentation;
+            assert!(seg.enabled && seg.update_map, "packet {i}");
+            assert_eq!(seg.temporal_update, i > 0, "packet {i} temporal_update");
+            assert!(seg.update_data || i > 0, "the keyframe codes the table");
+            if !seg.update_data {
+                // §7.2.10: an update-free frame codes no table bits; the
+                // encoder-side header carries the persisted table it
+                // quantized / filtered with.
+                continue;
+            }
+            update_data_frames += 1;
+            assert!(!seg.abs_or_delta_update);
+            for (s, &dq) in AQ_DELTA_Q.iter().enumerate() {
+                assert!(seg.feature_enabled[s][SEG_LVL_ALT_Q]);
+                assert_eq!(seg.feature_data[s][SEG_LVL_ALT_Q], dq);
+            }
+            assert!(seg.feature_enabled[STATIC_SKIP_SEGMENT][SEG_LVL_SKIP]);
+            assert!(seg.feature_enabled[STATIC_SKIP_SEGMENT][SEG_LVL_REF_FRAME]);
+            assert_eq!(
+                seg.feature_data[STATIC_SKIP_SEGMENT][SEG_LVL_REF_FRAME],
+                crate::mode_info::LAST_FRAME as i16
+            );
+            assert!(!seg.feature_enabled[STATIC_SKIP_SEGMENT][SEG_LVL_ALT_Q]);
+        }
+        // At least one frame elected a per-segment SEG_LVL_ALT_L.
+        assert!(
+            headers
+                .iter()
+                .any(|hd| (0..AQ_SEGMENTS)
+                    .any(|s| hd.segmentation.feature_enabled[s][SEG_LVL_ALT_L])),
+            "no frame elected SEG_LVL_ALT_L"
+        );
+        // The keyframe's leaves span several activity classes (tree probs
+        // not all 255).
+        let kf_probs = headers[0].segmentation.tree_probs.unwrap();
+        assert!(
+            kf_probs.iter().filter(|&&p| p != 255).count() >= 2,
+            "{kf_probs:?}"
+        );
+        // §7.2.10 persistence: at least one inter frame reused the table
+        // (update_data = 0) — the table only moves when the ALT_L
+        // election moves.
+        let decoded_frames = headers.iter().filter(|hd| !hd.show_existing_frame).count();
+        assert!(
+            update_data_frames < decoded_frames,
+            "every frame re-coded the feature table ({update_data_frames}/{decoded_frames})"
+        );
+        // The election is observable in the coded maps: on the shown
+        // P-frames the static left half lands on the static segment,
+        // the moving right half does not, and the keyframe's activity
+        // classes are not all the same.
+        let mi_cols = w.div_ceil(8) as usize;
+        let mi_rows = h.div_ceil(8) as usize;
+        let mut left_total = 0usize;
+        let mut right_total = 0usize;
+        let mut majority_frames = 0usize;
+        let mut shown_p = 0usize;
+        for (i, hd) in headers.iter().enumerate() {
+            if hd.show_existing_frame || i == 0 || !hd.show_frame {
+                continue;
+            }
+            shown_p += 1;
+            let map = seg_maps[i].as_ref().unwrap();
+            let left_static = (0..mi_rows)
+                .flat_map(|r| (0..mi_cols / 2).map(move |c| (r, c)))
+                .filter(|&(r, c)| map[r * mi_cols + c] == STATIC_SKIP_SEGMENT as u8)
+                .count();
+            let right_static = (0..mi_rows)
+                .flat_map(|r| (mi_cols / 2..mi_cols).map(move |c| (r, c)))
+                .filter(|&(r, c)| map[r * mi_cols + c] == STATIC_SKIP_SEGMENT as u8)
+                .count();
+            left_total += left_static;
+            right_total += right_static;
+            if left_static * 2 > mi_rows * (mi_cols / 2) {
+                majority_frames += 1;
+            }
+        }
+        // The static election is plan-dependent (a leaf straddling the
+        // halves cannot elect), so the pin is aggregate: the static
+        // half dominates the moving half heavily, and at least one
+        // shown P-frame is majority-static on the left.
+        assert!(shown_p >= 2);
+        assert!(
+            left_total > 3 * right_total.max(1),
+            "left {left_total} vs right {right_total} static MIs"
+        );
+        assert!(
+            majority_frames >= 1,
+            "no majority-static frame (left {left_total})"
+        );
+        let kf_map = seg_maps[0].as_ref().unwrap();
+        let classes: std::collections::BTreeSet<u8> = kf_map.iter().copied().collect();
+        assert!(classes.len() >= 2 && classes.iter().all(|&c| (c as usize) < AQ_SEGMENTS));
+        dump_ivf("seg-full", &packets, w, h, &decoded);
+
+        // The two single-feature modes mirror as well.
+        for mode in [SegMode::AdaptiveQuant, SegMode::StaticSkip] {
+            let st = GopStructure {
+                altref_interval: 2,
+                segmentation: mode,
+            };
+            let (pk, hs, dec, _) = assert_structured_gop_mirror(&src[..4], w, h, 120, st);
+            assert!(hs
+                .iter()
+                .filter(|hd| !hd.show_existing_frame)
+                .all(|hd| hd.segmentation.enabled));
+            assert_eq!(
+                hs[0].segmentation.feature_enabled[STATIC_SKIP_SEGMENT][SEG_LVL_SKIP],
+                mode == SegMode::StaticSkip
+            );
+            assert_eq!(
+                hs[0].segmentation.feature_enabled[0][SEG_LVL_ALT_Q],
+                mode == SegMode::AdaptiveQuant
+            );
+            let name = if mode == SegMode::AdaptiveQuant {
+                "seg-aq"
+            } else {
+                "seg-skip"
+            };
+            dump_ivf(name, &pk, w, h, &dec);
         }
     }
 
@@ -9472,6 +10414,7 @@ mod tests {
             8,
             &seg,
             &quant,
+            0,
         );
         assert!(!all_zero, "gradient residual must quantize to tokens");
         assert_eq!(tx, 3, "smooth residual should elect TX_32X32");
@@ -9498,6 +10441,7 @@ mod tests {
             8,
             &seg,
             &quant,
+            0,
         );
         assert!(!all_zero);
         assert!(

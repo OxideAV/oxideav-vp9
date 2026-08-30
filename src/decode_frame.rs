@@ -1128,6 +1128,12 @@ struct PrevFrameState<'a> {
     mvs: &'a [(i16, i16)],
     /// `SegmentId[ ][ ]` stored `[mi]`.
     segment_ids: &'a [u8],
+    /// §7.2.6 condition (c): `show_frame` of the previous
+    /// `compute_image_size( )` invocation. Gates `UsePrevFrameMvs`
+    /// ONLY — §8.1 step 3 refreshes `PrevSegmentIds` after every decoded
+    /// `update_map = 1` frame, shown or hidden, so the §6.4.14 predictor
+    /// stays readable behind a hidden alt-ref.
+    prev_shown: bool,
 }
 
 /// The read-only per-frame inputs every §6.4.2 `decode_tile( )` call
@@ -1679,7 +1685,7 @@ fn decode_single_frame(
     // §7.2.6 UsePrevFrameMvs: requires a same-dimension prev frame that
     // was shown, error_resilient_mode == 0, and FrameIsIntra == 0.
     let use_prev_frame_mvs = is_inter_frame
-        && prev.is_some()
+        && prev.as_ref().is_some_and(|p| p.prev_shown)
         && prev_mvs.len() == zero_prev_mvs.len()
         && !hdr.error_resilient_mode;
 
@@ -2228,14 +2234,19 @@ impl Vp9SequenceDecoder {
 
         // §6.5 / §6.4.14 previous-frame snapshot (same-dimension only).
         // §6.5 MV/ref prediction reads the immediately-preceding decoded
-        // frame; §6.4.14 segment prediction reads the separately-tracked
-        // `prev_segment_ids_map` (last `update_map == 1` frame).
+        // frame (and only when it was shown — §7.2.6 (c), applied
+        // inside decode_frame_with_prev through `prev_shown`); §6.4.14
+        // segment prediction reads the separately-tracked
+        // `prev_segment_ids_map` (last `update_map == 1` frame), which a
+        // hidden predecessor does NOT invalidate (§8.1 step 3 has no
+        // show_frame condition).
         let prev = prev_state.as_ref().and_then(|(ps, pw, ph, shown)| {
-            if *pw == hdr.frame_width && *ph == hdr.frame_height && *shown {
+            if *pw == hdr.frame_width && *ph == hdr.frame_height {
                 Some(PrevFrameState {
                     ref_frames: &ps.ref_frames,
                     mvs: &ps.mvs,
                     segment_ids: prev_seg_slice.unwrap_or(&ps.segment_ids),
+                    prev_shown: *shown,
                 })
             } else {
                 None

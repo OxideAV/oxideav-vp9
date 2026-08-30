@@ -10,7 +10,8 @@
 //! byte-determinism, and rejections.
 
 use oxideav_vp9::{
-    decode_vp9_sequence, encode_vp9_lossy_sequence, encode_vp9_lossy_sequence_altref, Error,
+    decode_vp9_sequence, encode_vp9_lossy_sequence, encode_vp9_lossy_sequence_altref,
+    encode_vp9_lossy_sequence_with, Error, Vp9GopConfig, Vp9Segmentation,
 };
 
 /// Source frame `k` of a translating 4:2:0 scene (a ramp plus a sharp
@@ -170,6 +171,56 @@ fn altref_pyramid_rejections() {
     );
     assert_eq!(
         encode_vp9_lossy_sequence_altref(&[&f], 0, 16, 100, 2).unwrap_err(),
+        Error::Unsupported
+    );
+}
+
+/// The [`Vp9GopConfig`] entry: default config is a plain chain (one
+/// packet per frame), the alt-ref entry is a thin wrapper (byte-identical
+/// packets), and every [`Vp9Segmentation`] mode yields a decodable GOP
+/// with exactly the input frame count at bounded distortion.
+#[test]
+fn gop_config_entry_contract() {
+    let (w, h) = (64u32, 48u32);
+    let src: Vec<Vec<u8>> = (0..5).map(|k| scene_frame(64, 48, k)).collect();
+
+    let base = encode_vp9_lossy_sequence_with(&refs(&src), w, h, &Vp9GopConfig::new(110))
+        .expect("default config");
+    assert_eq!(base.len(), 5);
+
+    let mut alt = Vp9GopConfig::new(110);
+    alt.altref_interval = 2;
+    let via_cfg = encode_vp9_lossy_sequence_with(&refs(&src), w, h, &alt).expect("cfg altref");
+    let via_entry =
+        encode_vp9_lossy_sequence_altref(&refs(&src), w, h, 110, 2).expect("entry altref");
+    assert_eq!(via_cfg, via_entry, "the altref entry is a thin wrapper");
+
+    for seg in [
+        Vp9Segmentation::AdaptiveQuant,
+        Vp9Segmentation::StaticSkip,
+        Vp9Segmentation::Full,
+    ] {
+        let mut cfg = Vp9GopConfig::new(110);
+        cfg.altref_interval = 3;
+        cfg.segmentation = seg;
+        let packets = encode_vp9_lossy_sequence_with(&refs(&src), w, h, &cfg).expect("seg cfg");
+        let decoded = decode_vp9_sequence(&refs(&packets)).expect("decode");
+        assert_eq!(decoded.len(), 5, "{seg:?}");
+        for (k, f) in decoded.iter().enumerate() {
+            let p = psnr_luma(&f.y, &src[k], (w * h) as usize);
+            assert!(p > 28.0, "{seg:?} frame {k} luma PSNR {p:.2} dB");
+        }
+        // Byte-determinism.
+        assert_eq!(
+            packets,
+            encode_vp9_lossy_sequence_with(&refs(&src), w, h, &cfg).unwrap()
+        );
+    }
+
+    let mut bad = Vp9GopConfig::new(0);
+    bad.segmentation = Vp9Segmentation::Full;
+    assert_eq!(
+        encode_vp9_lossy_sequence_with(&refs(&src), w, h, &bad).unwrap_err(),
         Error::Unsupported
     );
 }

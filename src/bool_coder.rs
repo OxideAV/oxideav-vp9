@@ -101,15 +101,14 @@ impl<'a> BoolCoder<'a> {
     pub(crate) fn read_bool(&mut self, p: u32) -> Result<u32, Error> {
         debug_assert!(p <= 255);
         let split = 1 + (((self.bool_range - 1) * p) >> 8);
-        let bit;
-        if self.bool_value < split {
+        let bit = if self.bool_value < split {
             self.bool_range = split;
-            bit = 0;
+            0
         } else {
             self.bool_range -= split;
             self.bool_value -= split;
-            bit = 1;
-        }
+            1
+        };
         // Renormalise: while BoolRange < 128, shift in fresh bits.
         while self.bool_range < 128 {
             let new_bit = if self.bool_max_bits > 0 {

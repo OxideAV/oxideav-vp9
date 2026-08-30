@@ -374,6 +374,33 @@ const LF_DELTA_CANDIDATES: [i8; 11] = [-16, -8, -4, -2, -1, 0, 1, 2, 4, 8, 16];
 /// One pass of per-axis coordinate descent from `baseline` (the §7.2.8
 /// resolved persistent values for this frame), each axis sweeping
 /// [`LF_DELTA_CANDIDATES`]; ties keep the baseline.
+/// The visible-extent SSE (all three planes) of `recon` after the §8.8
+/// filter under `hdr` (level / sharpness / segmentation feature table)
+/// at the given resolved §8.8.1 delta arrays — the score every
+/// header-side filter election compares. `recon` is not modified.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn filtered_sse(
+    recon: &ReconState,
+    state: &Vp9FrameState,
+    hdr: &Vp9FrameHeader,
+    targets: &[Plane; 3],
+    vis_w: usize,
+    vis_h: usize,
+    ref_deltas: [i8; 4],
+    mode_deltas: [i8; 2],
+) -> u64 {
+    let ssx = hdr.color_config.subsampling_x;
+    let ssy = hdr.color_config.subsampling_y;
+    let arrays = FilterMiArrays::from_state(state);
+    let mut probe = recon.planes.clone();
+    if hdr.loop_filter.level != 0 {
+        let lvl_lookup =
+            loop_filter_frame_init(&hdr.loop_filter, &hdr.segmentation, ref_deltas, mode_deltas);
+        run_filter(&mut probe, &arrays, state, hdr, &lvl_lookup);
+    }
+    visible_sse(&probe, targets, vis_w, vis_h, ssx, ssy)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn elect_lf_deltas(
     recon: &ReconState,

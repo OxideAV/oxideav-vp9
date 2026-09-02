@@ -822,7 +822,19 @@ the pre-455 default-bank framing) reproduce the earlier bytes.
   `PrevSegmentIds` was wrongly invalidated by a *hidden* predecessor
   (the `show_frame` gate belongs to §7.2.6 (c) `UsePrevFrameMvs`
   only; §8.1 step 3 has no such condition) — fixed and black-box
-  validated. Remaining encoder gaps, honestly:
+  validated. **Round 455 closes the three entropy-and-rate gaps below
+  and lands the format wrappers.** Remaining encoder gaps, honestly:
+  * the sub-8x8 cell walk and the scaled-reference (resized) leaves
+    still code `EIGHTTAP` under the switchable frame filter;
+  * the forward-update election scores coefficient cells on the
+    `more_coefs` / `ZERO` / `ONE` / `TWO+` nodes only (the §8.4.3
+    small-token split) — the Pareto-derived tail probabilities are
+    not modeled, so a slab update is accepted on the node estimate and
+    then kept only when the measured frame is shorter;
+  * two-pass rate control is the plain 4:2:0 chain (no structured-GOP
+    / HBD two-pass), its first pass is one extra full encode at a fixed
+    probe quantizer, and the allocation is first-pass-size proportional
+    (no explicit scene-cut / keyframe placement decisions);
   * ~~structured-GOP / resized entries public at 8-bit 4:2:0 only~~ —
     **round 455 lands the format-matrix wrappers**:
     [`encode_vp9_lossy_sequence_with_444`] / [`_422`](encode_vp9_lossy_sequence_with_422)
@@ -877,7 +889,7 @@ the pre-455 default-bank framing) reproduce the earlier bytes.
 
 ## Testing
 
-The crate carries 1280+ tests (lib unit tests plus integration suites
+The crate carries 1290+ tests (lib unit tests plus integration suites
 in `tests/`, including the keyframe **and inter** encoder writers, each
 round-tripped back through the in-crate decoder; `encode_keyframe`
 exercising the public `encode_vp9` → decode **byte-exact lossless**

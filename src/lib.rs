@@ -1484,8 +1484,82 @@ pub fn encode_vp9_lossy_sequence_with(
     height: u32,
     cfg: &Vp9GopConfig,
 ) -> Result<Vec<Vec<u8>>, Error> {
-    let fmt = pixel_encoder::LossyFormat::new(8, true, true)?;
-    let structure = pixel_encoder::GopStructure {
+    encode_vp9_lossy_sequence_with_fmt(frames, width, height, cfg, true, true)
+}
+
+/// [`encode_vp9_lossy_sequence_with`] at **8-bit 4:4:4** (profile 1;
+/// each frame `Y` then full-resolution `U` / `V`).
+pub fn encode_vp9_lossy_sequence_with_444(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    cfg: &Vp9GopConfig,
+) -> Result<Vec<Vec<u8>>, Error> {
+    encode_vp9_lossy_sequence_with_fmt(frames, width, height, cfg, false, false)
+}
+
+/// [`encode_vp9_lossy_sequence_with`] at **8-bit 4:2:2** (profile 1;
+/// chroma `ceil(width / 2) × height`).
+pub fn encode_vp9_lossy_sequence_with_422(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    cfg: &Vp9GopConfig,
+) -> Result<Vec<Vec<u8>>, Error> {
+    encode_vp9_lossy_sequence_with_fmt(frames, width, height, cfg, true, false)
+}
+
+/// [`encode_vp9_lossy_sequence_with`] at **8-bit 4:4:0** (profile 1;
+/// chroma `width × ceil(height / 2)`).
+pub fn encode_vp9_lossy_sequence_with_440(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    cfg: &Vp9GopConfig,
+) -> Result<Vec<Vec<u8>>, Error> {
+    encode_vp9_lossy_sequence_with_fmt(frames, width, height, cfg, false, true)
+}
+
+/// [`encode_vp9_lossy_sequence_with`] at **10 / 12-bit** on native
+/// `u16` samples (profile 2 at 4:2:0 when `subsample`, profile 3 at
+/// 4:4:4 otherwise), the [`encode_vp9_lossy_sequence_hbd`] layout.
+pub fn encode_vp9_lossy_sequence_with_hbd(
+    frames: &[&[u16]],
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    subsample: bool,
+    cfg: &Vp9GopConfig,
+) -> Result<Vec<Vec<u8>>, Error> {
+    encode_vp9_lossy_sequence_with_fmt_u16(
+        frames, width, height, bit_depth, subsample, subsample, cfg,
+    )
+}
+
+/// [`encode_vp9_lossy_sequence_with_hbd`] at **4:2:2** (profile 3).
+pub fn encode_vp9_lossy_sequence_with_hbd_422(
+    frames: &[&[u16]],
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    cfg: &Vp9GopConfig,
+) -> Result<Vec<Vec<u8>>, Error> {
+    encode_vp9_lossy_sequence_with_fmt_u16(frames, width, height, bit_depth, true, false, cfg)
+}
+
+/// [`encode_vp9_lossy_sequence_with_hbd`] at **4:4:0** (profile 3).
+pub fn encode_vp9_lossy_sequence_with_hbd_440(
+    frames: &[&[u16]],
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    cfg: &Vp9GopConfig,
+) -> Result<Vec<Vec<u8>>, Error> {
+    encode_vp9_lossy_sequence_with_fmt_u16(frames, width, height, bit_depth, false, true, cfg)
+}
+
+fn gop_structure_of(cfg: &Vp9GopConfig) -> pixel_encoder::GopStructure {
+    pixel_encoder::GopStructure {
         altref_interval: cfg.altref_interval as usize,
         segmentation: match cfg.segmentation {
             Vp9Segmentation::Off => pixel_encoder::SegMode::Off,
@@ -1498,14 +1572,48 @@ pub fn encode_vp9_lossy_sequence_with(
         intra_only_altref: cfg.intra_only_altref,
         entropy_adaptation: cfg.entropy_adaptation,
         switchable_interp: cfg.switchable_interp_filter,
-    };
+    }
+}
+
+fn encode_vp9_lossy_sequence_with_fmt(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    cfg: &Vp9GopConfig,
+    ssx: bool,
+    ssy: bool,
+) -> Result<Vec<Vec<u8>>, Error> {
+    let fmt = pixel_encoder::LossyFormat::new(8, ssx, ssy)?;
     pixel_encoder::encode_sequence_lossy_structured_u8(
         frames,
         width,
         height,
         cfg.base_q_idx,
         fmt,
-        structure,
+        gop_structure_of(cfg),
+    )
+}
+
+fn encode_vp9_lossy_sequence_with_fmt_u16(
+    frames: &[&[u16]],
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    ssx: bool,
+    ssy: bool,
+    cfg: &Vp9GopConfig,
+) -> Result<Vec<Vec<u8>>, Error> {
+    if bit_depth != 10 && bit_depth != 12 {
+        return Err(Error::Unsupported);
+    }
+    let fmt = pixel_encoder::LossyFormat::new(bit_depth, ssx, ssy)?;
+    pixel_encoder::encode_sequence_lossy_structured_u16(
+        frames,
+        width,
+        height,
+        cfg.base_q_idx,
+        fmt,
+        gop_structure_of(cfg),
     )
 }
 
@@ -1532,7 +1640,95 @@ pub fn encode_vp9_lossy_sequence_resized(
     sizes: &[(u32, u32)],
     base_q_idx: u8,
 ) -> Result<Vec<Vec<u8>>, Error> {
-    pixel_encoder::encode_sequence_lossy_resized_u8(frames, sizes, base_q_idx, true)
+    pixel_encoder::encode_sequence_lossy_resized_u8(
+        frames,
+        sizes,
+        base_q_idx,
+        pixel_encoder::LossyFormat::YUV420_8,
+        true,
+    )
+}
+
+/// [`encode_vp9_lossy_sequence_resized`] at **8-bit 4:4:4** (profile
+/// 1): every `frames[ i ]` is `Y` then full-resolution `U` / `V` at
+/// `sizes[ i ]`.
+pub fn encode_vp9_lossy_sequence_resized_444(
+    frames: &[&[u8]],
+    sizes: &[(u32, u32)],
+    base_q_idx: u8,
+) -> Result<Vec<Vec<u8>>, Error> {
+    let fmt = pixel_encoder::LossyFormat::new(8, false, false)?;
+    pixel_encoder::encode_sequence_lossy_resized_u8(frames, sizes, base_q_idx, fmt, true)
+}
+
+/// [`encode_vp9_lossy_sequence_resized`] at **8-bit 4:2:2** (profile 1).
+pub fn encode_vp9_lossy_sequence_resized_422(
+    frames: &[&[u8]],
+    sizes: &[(u32, u32)],
+    base_q_idx: u8,
+) -> Result<Vec<Vec<u8>>, Error> {
+    let fmt = pixel_encoder::LossyFormat::new(8, true, false)?;
+    pixel_encoder::encode_sequence_lossy_resized_u8(frames, sizes, base_q_idx, fmt, true)
+}
+
+/// [`encode_vp9_lossy_sequence_resized`] at **8-bit 4:4:0** (profile 1).
+pub fn encode_vp9_lossy_sequence_resized_440(
+    frames: &[&[u8]],
+    sizes: &[(u32, u32)],
+    base_q_idx: u8,
+) -> Result<Vec<Vec<u8>>, Error> {
+    let fmt = pixel_encoder::LossyFormat::new(8, false, true)?;
+    pixel_encoder::encode_sequence_lossy_resized_u8(frames, sizes, base_q_idx, fmt, true)
+}
+
+/// [`encode_vp9_lossy_sequence_resized`] at **10 / 12-bit** on native
+/// `u16` samples (profile 2 at 4:2:0 when `subsample`, profile 3 at
+/// 4:4:4 otherwise).
+pub fn encode_vp9_lossy_sequence_resized_hbd(
+    frames: &[&[u16]],
+    sizes: &[(u32, u32)],
+    bit_depth: u8,
+    subsample: bool,
+    base_q_idx: u8,
+) -> Result<Vec<Vec<u8>>, Error> {
+    encode_vp9_lossy_sequence_resized_u16_fmt(
+        frames, sizes, bit_depth, subsample, subsample, base_q_idx,
+    )
+}
+
+/// [`encode_vp9_lossy_sequence_resized_hbd`] at **4:2:2** (profile 3).
+pub fn encode_vp9_lossy_sequence_resized_hbd_422(
+    frames: &[&[u16]],
+    sizes: &[(u32, u32)],
+    bit_depth: u8,
+    base_q_idx: u8,
+) -> Result<Vec<Vec<u8>>, Error> {
+    encode_vp9_lossy_sequence_resized_u16_fmt(frames, sizes, bit_depth, true, false, base_q_idx)
+}
+
+/// [`encode_vp9_lossy_sequence_resized_hbd`] at **4:4:0** (profile 3).
+pub fn encode_vp9_lossy_sequence_resized_hbd_440(
+    frames: &[&[u16]],
+    sizes: &[(u32, u32)],
+    bit_depth: u8,
+    base_q_idx: u8,
+) -> Result<Vec<Vec<u8>>, Error> {
+    encode_vp9_lossy_sequence_resized_u16_fmt(frames, sizes, bit_depth, false, true, base_q_idx)
+}
+
+fn encode_vp9_lossy_sequence_resized_u16_fmt(
+    frames: &[&[u16]],
+    sizes: &[(u32, u32)],
+    bit_depth: u8,
+    ssx: bool,
+    ssy: bool,
+    base_q_idx: u8,
+) -> Result<Vec<Vec<u8>>, Error> {
+    if bit_depth != 10 && bit_depth != 12 {
+        return Err(Error::Unsupported);
+    }
+    let fmt = pixel_encoder::LossyFormat::new(bit_depth, ssx, ssy)?;
+    pixel_encoder::encode_sequence_lossy_resized_u16(frames, sizes, base_q_idx, fmt, true)
 }
 
 /// [`encode_vp9_lossy_sequence_resized`] under a [`Vp9GopConfig`]
@@ -1559,6 +1755,7 @@ pub fn encode_vp9_lossy_sequence_resized_with(
         frames,
         sizes,
         cfg.base_q_idx,
+        pixel_encoder::LossyFormat::YUV420_8,
         cfg.entropy_adaptation,
     )
 }

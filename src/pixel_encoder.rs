@@ -5350,10 +5350,9 @@ pub(crate) fn encode_sequence_lossy_resized_u8(
     frames: &[&[u8]],
     sizes: &[(u32, u32)],
     base_q_idx: u8,
+    fmt: LossyFormat,
     entropy_adaptation: bool,
 ) -> Result<Vec<Vec<u8>>, Error> {
-    let fmt = LossyFormat::YUV420_8;
-    let adaptive = entropy_adaptation;
     if frames.is_empty() || frames.len() != sizes.len() {
         return Err(Error::Unsupported);
     }
@@ -5363,14 +5362,65 @@ pub(crate) fn encode_sequence_lossy_resized_u8(
             return Err(Error::Unsupported);
         }
     }
+    let targets: Vec<[Plane; 3]> = frames
+        .iter()
+        .zip(sizes)
+        .map(|(f, &(w, h))| padded_targets_from_u8(f, w, h, fmt))
+        .collect();
+    encode_sequence_lossy_resized_planes(&targets, sizes, base_q_idx, fmt, entropy_adaptation)
+}
+
+/// Native-`u16` (10 / 12-bit) front end of
+/// [`encode_sequence_lossy_resized_planes`].
+pub(crate) fn encode_sequence_lossy_resized_u16(
+    frames: &[&[u16]],
+    sizes: &[(u32, u32)],
+    base_q_idx: u8,
+    fmt: LossyFormat,
+    entropy_adaptation: bool,
+) -> Result<Vec<Vec<u8>>, Error> {
+    if frames.is_empty() || frames.len() != sizes.len() {
+        return Err(Error::Unsupported);
+    }
+    let max = (1u32 << fmt.bit_depth) - 1;
+    for (f, &(w, h)) in frames.iter().zip(sizes) {
+        validate_lossy_args(w, h, base_q_idx)?;
+        if f.len() < fmt.planar_len(w, h) || f.iter().any(|&v| u32::from(v) > max) {
+            return Err(Error::Unsupported);
+        }
+    }
+    let targets: Vec<[Plane; 3]> = frames
+        .iter()
+        .zip(sizes)
+        .map(|(f, &(w, h))| padded_targets_from_u16(f, w, h, fmt))
+        .collect();
+    encode_sequence_lossy_resized_planes(&targets, sizes, base_q_idx, fmt, entropy_adaptation)
+}
+
+/// The format-generic resized chain over MI-padded targets (one
+/// `[Plane; 3]` per frame at its own `sizes[ i ]`), at any §7.2
+/// [`LossyFormat`] (round 455: the §8.5.2.3 scaled sampler and the
+/// §6.2 header were already format-generic; this lifts the 4:2:0
+/// 8-bit pin off the entry).
+pub(crate) fn encode_sequence_lossy_resized_planes(
+    frame_targets: &[[Plane; 3]],
+    sizes: &[(u32, u32)],
+    base_q_idx: u8,
+    fmt: LossyFormat,
+    entropy_adaptation: bool,
+) -> Result<Vec<Vec<u8>>, Error> {
+    let adaptive = entropy_adaptation;
+    if frame_targets.is_empty() || frame_targets.len() != sizes.len() {
+        return Err(Error::Unsupported);
+    }
     let (kw, kh) = sizes[0];
-    let kf_targets = padded_targets_from_u8(frames[0], kw, kh, fmt);
+    let kf_targets = &frame_targets[0];
     let mut kf_hdr = lossy_keyframe_header_fmt(kw, kh, base_q_idx, fmt);
     if adaptive {
         set_adaptive_entropy_flags(&mut kf_hdr);
     }
     let kf_plan = plan_keyframe_tree(
-        &kf_targets,
+        kf_targets,
         (kh + 7) >> 3,
         (kw + 7) >> 3,
         fmt.ssx,
@@ -5392,7 +5442,7 @@ pub(crate) fn encode_sequence_lossy_resized_u8(
     let encode_kf = |hdr2: &Vp9FrameHeader| {
         encode_keyframe_lossy_tree_elect_skip_ctx(
             hdr2,
-            &kf_targets,
+            kf_targets,
             &kf_plan,
             adaptive.then_some(&kf_eopts),
         )
@@ -5405,7 +5455,7 @@ pub(crate) fn encode_sequence_lossy_resized_u8(
         kf0,
         kf_recon0,
         kf_state0,
-        &kf_targets,
+        kf_targets,
         kw as usize,
         kh as usize,
         &mut lf_persist,
@@ -5415,17 +5465,16 @@ pub(crate) fn encode_sequence_lossy_resized_u8(
     if adaptive {
         kf_stash.finish(&mut entropy, &kf_hdr, kf_idx);
     }
-    let mut out = Vec::with_capacity(frames.len());
+    let mut out = Vec::with_capacity(frame_targets.len());
     out.push(kf_bytes);
 
     let mut prev_recon = kf_recon;
     let (mut pw, mut ph) = (kw, kh);
-    for (f, &(w, h)) in frames.iter().zip(sizes).skip(1) {
+    for (targets, &(w, h)) in frame_targets.iter().zip(sizes).skip(1) {
         // §5 scaling bounds between consecutive coded sizes.
         if 2 * w < pw || 2 * h < ph || w > 16 * pw || h > 16 * ph {
             return Err(Error::Unsupported);
         }
-        let targets = padded_targets_from_u8(f, w, h, fmt);
         let (pcw, pch) = fmt.chroma_dims(pw, ph);
         let prev_crop = visible_crop_planes(&prev_recon, pw as usize, ph as usize, pcw, pch);
         let prev_views = stored_ref_view(&prev_crop, pw as usize, pcw);
@@ -5454,7 +5503,7 @@ pub(crate) fn encode_sequence_lossy_resized_u8(
         let encode = |hdr2: &Vp9FrameHeader| {
             encode_pframe_lossy_scaled(
                 hdr2,
-                &targets,
+                targets,
                 &prev_views,
                 pw,
                 ph,
@@ -5468,7 +5517,7 @@ pub(crate) fn encode_sequence_lossy_resized_u8(
             p0,
             recon0,
             state0,
-            &targets,
+            targets,
             w as usize,
             h as usize,
             &mut lf_persist,
@@ -7324,6 +7373,35 @@ pub(crate) fn encode_sequence_lossy_structured_planes(
 
 /// 8-bit planar-`u8` front end of
 /// [`encode_sequence_lossy_structured_planes`].
+pub(crate) fn encode_sequence_lossy_structured_u16(
+    frames: &[&[u16]],
+    width: u32,
+    height: u32,
+    base_q_idx: u8,
+    fmt: LossyFormat,
+    structure: GopStructure,
+) -> Result<Vec<Vec<u8>>, Error> {
+    if frames.is_empty() {
+        return Err(Error::Unsupported);
+    }
+    validate_lossy_args(width, height, base_q_idx)?;
+    let need = fmt.planar_len(width, height);
+    let max = (1u32 << fmt.bit_depth) - 1;
+    if frames
+        .iter()
+        .any(|f| f.len() < need || f.iter().any(|&v| u32::from(v) > max))
+    {
+        return Err(Error::Unsupported);
+    }
+    let targets: Vec<[Plane; 3]> = frames
+        .iter()
+        .map(|f| padded_targets_from_u16(f, width, height, fmt))
+        .collect();
+    encode_sequence_lossy_structured_planes(&targets, width, height, base_q_idx, fmt, structure)
+}
+
+/// 8-bit planar-`u8` front end of
+/// [`encode_sequence_lossy_structured_planes`].
 pub(crate) fn encode_sequence_lossy_structured_u8(
     frames: &[&[u8]],
     width: u32,
@@ -8231,7 +8309,9 @@ mod tests {
             .map(|(k, &(w, h))| moving_scene_frame(w as usize, h as usize, k))
             .collect();
         let refs: Vec<&[u8]> = src.iter().map(|f| f.as_slice()).collect();
-        let packets = encode_sequence_lossy_resized_u8(&refs, &sizes, 110, true).expect("encode");
+        let packets =
+            encode_sequence_lossy_resized_u8(&refs, &sizes, 110, LossyFormat::YUV420_8, true)
+                .expect("encode");
         assert_eq!(packets.len(), 4);
         let prefs: Vec<&[u8]> = packets.iter().map(|p| p.as_slice()).collect();
         let decoded = decode_vp9_sequence(&prefs).expect("decode");
@@ -8244,7 +8324,8 @@ mod tests {
         // pinned below — so the mirror is checked through a
         // re-instrumented encode.)
         let again =
-            encode_sequence_lossy_resized_u8(&refs, &sizes, 110, true).expect("encode again");
+            encode_sequence_lossy_resized_u8(&refs, &sizes, 110, LossyFormat::YUV420_8, true)
+                .expect("encode again");
         assert_eq!(packets, again, "byte-determinism");
         // Distortion bound: each frame stays within the quantizer
         // regime of its own content (a scaled-prediction failure would

@@ -823,10 +823,22 @@ the pre-455 default-bank framing) reproduce the earlier bytes.
   (the `show_frame` gate belongs to §7.2.6 (c) `UsePrevFrameMvs`
   only; §8.1 step 3 has no such condition) — fixed and black-box
   validated. Remaining encoder gaps, honestly:
-  * the structured-GOP / resized entries are public at 8-bit 4:2:0
-    (the internal pipeline is format-generic; HBD / 4:4:4 / 4:2:2 /
-    4:4:0 public wrappers for them are a thin follow-up — the classic
-    chain entries already cover the full §7.2 matrix);
+  * ~~structured-GOP / resized entries public at 8-bit 4:2:0 only~~ —
+    **round 455 lands the format-matrix wrappers**:
+    [`encode_vp9_lossy_sequence_with_444`] / [`_422`](encode_vp9_lossy_sequence_with_422)
+    / [`_440`](encode_vp9_lossy_sequence_with_440) /
+    [`_hbd`](encode_vp9_lossy_sequence_with_hbd) /
+    [`_hbd_422`](encode_vp9_lossy_sequence_with_hbd_422) /
+    [`_hbd_440`](encode_vp9_lossy_sequence_with_hbd_440) under a
+    [`Vp9GopConfig`], and [`encode_vp9_lossy_sequence_resized_444`] /
+    [`_422`](encode_vp9_lossy_sequence_resized_422) /
+    [`_440`](encode_vp9_lossy_sequence_resized_440) /
+    [`_hbd`](encode_vp9_lossy_sequence_resized_hbd) /
+    [`_hbd_422`](encode_vp9_lossy_sequence_resized_hbd_422) /
+    [`_hbd_440`](encode_vp9_lossy_sequence_resized_hbd_440) (the
+    resized chain lifted off its 4:2:0 8-bit pin onto the format-generic
+    core); all fourteen wrapper streams black-box validated byte-exact
+    at 39–42 dB.
   * ~~writer-side §8.4 backward adaptation~~ — **closed in round 455**
     (see "Encoder-side entropy model" below): every public lossy
     sequence entry codes `refresh_frame_context = 1` with

@@ -62,8 +62,11 @@ fn psnr(packets: &[Vec<u8>], source: &[Vec<u8>]) -> f64 {
     }
 }
 
-/// The GOP shapes: (name, frames, w, h, target bytes per frame).
-fn shapes() -> Vec<(&'static str, Vec<Vec<u8>>, u32, u32, usize)> {
+/// One GOP shape: `(name, frames, w, h, target bytes per frame)`.
+type Shape = (&'static str, Vec<Vec<u8>>, u32, u32, usize);
+
+/// The GOP shapes.
+fn shapes() -> Vec<Shape> {
     let (w, h) = (64usize, 48usize);
     // Static: every frame identical.
     let static_gop: Vec<Vec<u8>> = (0..6).map(|_| scene(w, h, 0, 1)).collect();

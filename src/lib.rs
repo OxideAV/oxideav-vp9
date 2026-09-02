@@ -1244,6 +1244,76 @@ pub fn encode_vp9_lossy_sequence_rc(
     )
 }
 
+/// Per-frame outcome of [`encode_vp9_lossy_sequence_rc_two_pass`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Vp9TwoPassFrame {
+    /// First-pass coded bytes at the fixed probe quantizer
+    /// (`base_q_idx = 110`): the keyframe's intra cost, a P-frame's
+    /// inter cost against its real predecessor.
+    pub first_pass_bytes: usize,
+    /// First-pass motion activity: mean `|mv_row| + |mv_col|` in
+    /// eighth-pel over the frame's inter blocks (0 on the keyframe and
+    /// on all-`ZEROMV` frames).
+    pub motion_activity: u32,
+    /// The second-pass byte budget the frame was coded against.
+    pub budget: usize,
+    /// The coded size.
+    pub coded_bytes: usize,
+    /// The landed quantizer.
+    pub base_q_idx: u8,
+}
+
+/// **Two-pass rate-controlled** lossy sequence encode (round 455).
+///
+/// Pass one codes the whole sequence at a fixed probe quantizer through
+/// the adaptive chain and records each frame's coded size and motion
+/// activity. Pass two allocates the sequence budget
+/// `target_bytes_per_frame × frames.len()` in proportion to those
+/// first-pass sizes — a keyframe, a scene change or a high-motion frame
+/// draws more of the pool than a static one — and codes the frames
+/// under a leaky-bucket VBV model of `vbv_bytes` (`0` selects twice the
+/// per-frame target): the buffer starts full, drains by each coded
+/// frame and refills by `target_bytes_per_frame` per frame; frame `i`
+/// is bisected to `min( allocation_i + unspent carry, buffer level )`,
+/// so the stream never exceeds the sequence total, never underflows
+/// the buffer, and bytes a cheap frame leaves on the table flow to the
+/// frames after it. Every frame otherwise rides the one-pass chain of
+/// [`encode_vp9_lossy_sequence_rc`] (which stays intact as the
+/// single-pass entry): entropy model, §6.2.8 delta election under the
+/// budget, best-effort `q == 255` below the syntax floor, decoder-mirror
+/// reconstruction. Returns the packets and the per-frame report.
+///
+/// Returns [`Error::Unsupported`] for an empty sequence, a zero
+/// target, degenerate dimensions, or any too-short frame buffer.
+pub fn encode_vp9_lossy_sequence_rc_two_pass(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    target_bytes_per_frame: usize,
+    vbv_bytes: usize,
+) -> Result<(Vec<Vec<u8>>, Vec<Vp9TwoPassFrame>), Error> {
+    let (packets, report) = pixel_encoder::encode_sequence_lossy_rc_two_pass_420(
+        frames,
+        width,
+        height,
+        target_bytes_per_frame,
+        vbv_bytes,
+        pixel_encoder::ChainModel::Adaptive,
+    )?;
+    let report = report
+        .into_iter()
+        .map(|f| Vp9TwoPassFrame {
+            first_pass_bytes: f.first_pass.bytes,
+            motion_activity: f.first_pass.motion_activity,
+            budget: f.budget,
+            coded_bytes: f.coded_bytes,
+            base_q_idx: f.base_q_idx,
+        })
+        .collect();
+    Ok((packets, report))
+}
+
 /// Encode an 8-bit 4:2:0 sequence as a lossy **alt-ref pyramid** GOP
 /// (round 452): a keyframe, then groups of `altref_interval` display
 /// frames each coded as a **hidden alt-ref** (`show_frame = 0`, the

@@ -4119,6 +4119,20 @@ impl EntropyStash {
     }
 }
 
+/// Mean `|row| + |col|` (eighth-pel) of the list-0 motion vector over
+/// the inter MIs of a §6.4.4 motion field (0 when none).
+fn motion_activity(field: &crate::frame_writer::PrevMotionField) -> u32 {
+    let mut sum = 0u64;
+    let mut count = 0u64;
+    for (i, mv) in field.mvs.iter().enumerate().step_by(2) {
+        if field.ref_frames[i] > crate::mode_info::INTRA_FRAME {
+            sum += u64::from(mv.0.unsigned_abs()) + u64::from(mv.1.unsigned_abs());
+            count += 1;
+        }
+    }
+    sum.checked_div(count).unwrap_or(0) as u32
+}
+
 /// Header flags of the round-455 adaptive framing: the frame saves its
 /// §8.4-adapted bank (`refresh_frame_context = 1`) and the decoder runs
 /// the adaptation (`frame_parallel_decoding_mode = 0`); only meaningful
@@ -5947,6 +5961,10 @@ pub(crate) struct LossyGopEncoder {
     /// The last chained frame's §9.3.4 counts (decoder-mirror tests).
     #[cfg(test)]
     last_counts: Option<Box<crate::prob_adapt::FrameCounts>>,
+    /// The last pushed frame's motion activity — mean `|row| + |col|`
+    /// (eighth-pel) of the list-0 motion vector over its inter MIs (0
+    /// for the keyframe) — the two-pass first-pass statistic.
+    pub(crate) last_motion_activity: u32,
 }
 
 impl LossyGopEncoder {
@@ -5974,6 +5992,7 @@ impl LossyGopEncoder {
             entropy: crate::entropy_model::EntropyModel::new(),
             #[cfg(test)]
             last_counts: None,
+            last_motion_activity: 0,
         })
     }
 
@@ -6100,6 +6119,7 @@ impl LossyGopEncoder {
             // the store happens after §8.1 step 2.
             self.golden = Some(self.visible_crop(&kf_recon));
             self.prev_recon = Some(kf_recon);
+            self.last_motion_activity = 0;
             return Ok(kf_bytes);
         };
 
@@ -6183,11 +6203,9 @@ impl LossyGopEncoder {
             .map(|f| stash.record(f))
         };
         let (p0, recon0, state0) = re_encode(&hdr)?;
-        let next_field = if chained {
-            Some(PrevMotionField::from_state(&state0))
-        } else {
-            None
-        };
+        let field = PrevMotionField::from_state(&state0);
+        self.last_motion_activity = motion_activity(&field);
+        let next_field = if chained { Some(field) } else { None };
         // Chain-model P-frames elect the §6.2.8 loop-filter deltas on
         // top of (level, sharpness), threading the §7.2.8 persistent
         // baseline; the classic framing keeps its exact historical
@@ -7410,6 +7428,25 @@ pub(crate) fn encode_sequence_lossy_rc_420(
     target_bytes_per_frame: usize,
     model: ChainModel,
 ) -> Result<Vec<Vec<u8>>, Error> {
+    encode_sequence_lossy_rc_420_budgeted(frames, width, height, model, &mut |_, _| {
+        target_bytes_per_frame
+    })
+    .map(|(packets, _)| packets)
+}
+
+/// The rate-controlled chain over a **per-frame budget policy**:
+/// `budget(i, coded)` yields frame `i`'s byte budget given the sizes
+/// of the frames already coded (`coded[..i]`), so a two-pass allocator
+/// can carry unspent bytes forward under a buffer model while the
+/// one-pass entry passes a constant. Returns the packets and each
+/// frame's landed `base_q_idx`.
+pub(crate) fn encode_sequence_lossy_rc_420_budgeted(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    model: ChainModel,
+    budget: &mut dyn FnMut(usize, &[usize]) -> usize,
+) -> Result<(Vec<Vec<u8>>, Vec<u8>), Error> {
     if !model.chained() {
         return Err(Error::Unsupported);
     }
@@ -7490,6 +7527,9 @@ pub(crate) fn encode_sequence_lossy_rc_420(
             adaptive.then_some(&kf_eopts),
         )
     };
+    let mut coded_sizes: Vec<usize> = Vec::with_capacity(frames.len());
+    let mut qs: Vec<u8> = Vec::with_capacity(frames.len());
+    let kf_budget = budget(0, &coded_sizes);
     let (kf0, (kf_recon0, kf_state0, kf_q, kf_counts, kf_coding, kf_tx), _) = bisect_q(
         |q| {
             kf_encode_at(&kf_hdr_at(q), q).map(|f| {
@@ -7499,7 +7539,7 @@ pub(crate) fn encode_sequence_lossy_rc_420(
                 )
             })
         },
-        target_bytes_per_frame,
+        kf_budget,
     )?;
     // Chain framing (round 445): the keyframe's §6.4.4 motion field
     // (invariant under the filter-level re-encode) seeds the §7.2.6
@@ -7523,6 +7563,8 @@ pub(crate) fn encode_sequence_lossy_rc_420(
     let mut lf_persist = LfDeltaState::default();
 
     let mut out = Vec::with_capacity(frames.len());
+    coded_sizes.push(kf_bytes.len());
+    qs.push(kf_q);
     out.push(kf_bytes);
 
     // Long-term GOLDEN reference (see `encode_sequence_lossy_420`) —
@@ -7536,7 +7578,8 @@ pub(crate) fn encode_sequence_lossy_rc_420(
     ];
     let mut prev_recon = kf_recon;
 
-    for &frame in frames.iter().skip(1) {
+    for (i, &frame) in frames.iter().enumerate().skip(1) {
+        let frame_budget = budget(i, &coded_sizes);
         let targets = padded_targets(frame);
         let prev = visible_crop(&prev_recon);
         let reference: [(&[i32], usize); 3] = [
@@ -7598,7 +7641,7 @@ pub(crate) fn encode_sequence_lossy_rc_420(
                     )
                 })
             },
-            target_bytes_per_frame,
+            frame_budget,
         )?;
         // The per-MI state is invariant under the filter re-encodes, so
         // state0 is this frame's final §6.4.4 motion field.
@@ -7617,15 +7660,151 @@ pub(crate) fn encode_sequence_lossy_rc_420(
             w,
             h,
             &mut lf_persist,
-            target_bytes_per_frame,
+            frame_budget,
             |hdr2| encode_at(hdr2).map(EncodedFrame::into_parts),
         )?;
         entropy.end_frame(&pframe_hdr(p_q), idx, &p_coding, &p_counts, p_tx);
+        coded_sizes.push(bytes.len());
+        qs.push(p_q);
         out.push(bytes);
         prev_recon = recon;
         prev_field = next_field;
     }
-    Ok(out)
+    Ok((out, qs))
+}
+
+/// The fixed probe quantizer of the two-pass first pass: every frame
+/// is coded once at this `base_q_idx` so its coded size measures its
+/// intra / inter complexity on a common scale.
+pub(crate) const TWO_PASS_PROBE_Q: u8 = 110;
+
+/// First-pass statistics of one frame ([`encode_sequence_lossy_rc_two_pass_420`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FirstPassStat {
+    /// Coded bytes at [`TWO_PASS_PROBE_Q`] (the keyframe: intra cost;
+    /// P-frames: inter cost against the chain).
+    pub bytes: usize,
+    /// Mean `|mv_row| + |mv_col|` (eighth-pel) over the frame's inter
+    /// MIs — 0 for the keyframe and for all-`ZEROMV` frames.
+    pub motion_activity: u32,
+}
+
+/// Per-frame outcome of the two-pass encode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TwoPassFrame {
+    pub first_pass: FirstPassStat,
+    /// The second-pass byte budget the frame was bisected against.
+    pub budget: usize,
+    /// The coded size.
+    pub coded_bytes: usize,
+    /// The landed quantizer.
+    pub base_q_idx: u8,
+}
+
+/// **Two-pass** rate control (round 455) over the adaptive chain.
+///
+/// *First pass*: the whole sequence is coded once at
+/// [`TWO_PASS_PROBE_Q`] through the chain encoder, recording each
+/// frame's coded size (the keyframe's intra cost, every P-frame's
+/// inter cost against its real predecessor) and its motion activity
+/// (mean eighth-pel `|mv|` over inter MIs from the frame's §6.4.4
+/// motion field).
+///
+/// *Second pass*: the sequence budget `target_bytes_per_frame ×
+/// frames` is allocated in proportion to the first-pass sizes (a
+/// complex frame — the keyframe, a scene change, high-motion content
+/// — draws more of the pool than a static one), then coded frame by
+/// frame under a leaky-bucket **VBV model** of `vbv_bytes` (`0` → twice
+/// the per-frame target): the decoder buffer starts full, drains by
+/// each coded frame and refills by `target_bytes_per_frame` per frame;
+/// frame `i`'s budget is `min( allocation_i + carry, buffer level )`
+/// where `carry` is the running unspent allocation, so the stream
+/// never overshoots the sequence total, never underflows the buffer
+/// (the only exception being the `q == 255` syntax floor, which the
+/// one-pass chain shares), and hands bytes a cheap frame left on the
+/// table to the frames after it. Each frame is then bisected to its
+/// budget exactly as the one-pass chain does (entropy model, §6.2.8
+/// delta election under the budget, decoder-mirror reconstruction).
+pub(crate) fn encode_sequence_lossy_rc_two_pass_420(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    target_bytes_per_frame: usize,
+    vbv_bytes: usize,
+    model: ChainModel,
+) -> Result<(Vec<Vec<u8>>, Vec<TwoPassFrame>), Error> {
+    if frames.is_empty() || target_bytes_per_frame == 0 || !model.chained() {
+        return Err(Error::Unsupported);
+    }
+    validate_lossy_args(width, height, TWO_PASS_PROBE_Q)?;
+    let fmt = LossyFormat::YUV420_8;
+    if frames
+        .iter()
+        .any(|f| f.len() < fmt.planar_len(width, height))
+    {
+        return Err(Error::Unsupported);
+    }
+
+    // First pass.
+    let mut probe = LossyGopEncoder::new(width, height, TWO_PASS_PROBE_Q, fmt, model)?;
+    let mut first_pass: Vec<FirstPassStat> = Vec::with_capacity(frames.len());
+    for &f in frames {
+        let targets = padded_targets_from_u8(f, width, height, fmt);
+        let bytes = probe.push(&targets)?;
+        first_pass.push(FirstPassStat {
+            bytes: bytes.len(),
+            motion_activity: probe.last_motion_activity,
+        });
+    }
+
+    // Allocation: the sequence pool split by first-pass complexity,
+    // the integer remainder handed to the keyframe.
+    let n = frames.len();
+    let total = target_bytes_per_frame.saturating_mul(n);
+    let weights: Vec<u64> = first_pass.iter().map(|s| s.bytes.max(1) as u64).collect();
+    let weight_sum: u64 = weights.iter().sum();
+    let mut alloc: Vec<usize> = weights
+        .iter()
+        .map(|&w| ((total as u128 * w as u128) / weight_sum as u128) as usize)
+        .collect();
+    let spent: usize = alloc.iter().sum();
+    alloc[0] += total - spent;
+
+    // Second pass under the VBV model.
+    let vbv = if vbv_bytes == 0 {
+        2 * target_bytes_per_frame
+    } else {
+        vbv_bytes.max(target_bytes_per_frame)
+    };
+    let mut budgets: Vec<usize> = Vec::with_capacity(n);
+    let mut level = vbv;
+    let mut carry: i64 = 0;
+    let mut policy = |i: usize, coded: &[usize]| -> usize {
+        if i > 0 {
+            // Fold the previous frame's outcome into the bucket.
+            let prev_alloc = alloc[i - 1] as i64;
+            carry += prev_alloc - coded[i - 1] as i64;
+            level = (level.saturating_sub(coded[i - 1]) + target_bytes_per_frame).min(vbv);
+        }
+        let want = (alloc[i] as i64 + carry).max(1) as usize;
+        let b = want.min(level).max(1);
+        budgets.push(b);
+        b
+    };
+    let (packets, qs) =
+        encode_sequence_lossy_rc_420_budgeted(frames, width, height, model, &mut policy)?;
+    let report = first_pass
+        .iter()
+        .zip(&budgets)
+        .zip(packets.iter().zip(&qs))
+        .map(|((&fp, &budget), (bytes, &q))| TwoPassFrame {
+            first_pass: fp,
+            budget,
+            coded_bytes: bytes.len(),
+            base_q_idx: q,
+        })
+        .collect();
+    Ok((packets, report))
 }
 
 /// Encode a sequence of 8-bit 4:2:0 planar frames (each `Y` then `U`

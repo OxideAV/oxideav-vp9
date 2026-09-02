@@ -834,8 +834,23 @@ the pre-455 default-bank framing) reproduce the earlier bytes.
     §8.4-adapted bank plus cost-elected §6.3 forward updates —
     −7.4 % bytes across the crate's encode corpus at bit-identical
     reconstruction;
-  * no two-pass rate control (the per-frame bisection of
-    `encode_vp9_lossy_sequence_rc` is one-pass);
+  * ~~no two-pass rate control~~ — **round 455 adds
+    [`encode_vp9_lossy_sequence_rc_two_pass`]**: a first pass codes the
+    sequence at a fixed probe quantizer and records each frame's coded
+    size (intra / inter cost) and motion activity (mean eighth-pel
+    `|mv|` over inter blocks); the second pass allocates the sequence
+    pool in proportion to those sizes and codes under a leaky-bucket
+    VBV model (`vbv_bytes`, default twice the per-frame target: buffer
+    starts full, drains per coded frame, refills by the target; frame
+    budget = `min( allocation + unspent carry, buffer level )`), each
+    frame then bisected exactly as the one-pass chain — which stays
+    intact as [`encode_vp9_lossy_sequence_rc`]. Measured across four
+    GOP shapes (static / translating / scene cut / tight budget):
+    **99.9–100 % of the sequence target** (the one-pass chain lands
+    98.5–99.6 %) at **+0.2…+6.8 dB PSNR** over one-pass (the pool moves
+    to the keyframe and the scene-cut frame); the per-frame report
+    (`Vp9TwoPassFrame`) exposes first-pass bytes, motion activity,
+    budget, coded bytes and landed `base_q_idx`.
   * ~~frame-level `EIGHTTAP`~~ — **round 455 elects the §8.5.2.4
     kernel per leaf** under `interpolation_filter = SWITCHABLE`: every
     leaf with non-zero motion is predicted under `EIGHTTAP` /

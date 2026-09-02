@@ -4,6 +4,10 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- encoder-side entropy model (round 455) - writer-side §8.4 backward adaptation + cost-elected §6.3 forward updates: every symbol writer counts its §9.3.4 events exactly as the decoder does (more_coefs errata rule, corner-inferred PARTITION_SPLIT, absent mv_hp counted), `entropy_model::EntropyModel` mirrors the decoder's FrameContext[4] banks (§6.2 setup_past_independence / reset_frame_context resets, §6.1.2 refresh_probs via the decoder's own §8.4.2-§8.4.4 code with §7.1.2 load_probs semantics and LastFrameType), and `elect_forward_updates` picks per-cell diff_update_prob / update_mv_prob transitions by integer-log2 bit cost (tree cells on §8.4.2 node counts, coefficient slabs against their update_probs bit), the updated assembly kept only when strictly shorter; the compressed-header writers code base→coding transitions (term_subexp encoder, reachable-delta search); every public lossy sequence entry (chain, 4:4:4/4:2:2/4:4:0/HBD, rc, structured, resized) now codes refresh_frame_context = 1 / frame_parallel_decoding_mode = 0 (`ChainModel::Adaptive`); new `Vp9GopConfig::entropy_adaptation` (default on) and `encode_vp9_lossy_sequence_resized_with`; the staged round-441/445/448 fixture builders pin the pre-455 `ChainModel::Chained` framing; measured 30495 -> 28253 bytes (-7.4 %) across the six-shape encode corpus at bit-identical reconstruction, black-box validated; pinned by per-frame decoder-mirror tests (writer counts == decoder counts, encoder bank == decoder FrameContext[0] on chained + every structured shape), forward-update header round-trips, and the corpus measurement test
+
 ## [0.0.13](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.12...v0.0.13) - 2026-08-30
 
 ### Other

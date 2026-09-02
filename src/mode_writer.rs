@@ -23,6 +23,7 @@ use crate::mode_info::{
     BINARY_TREE, INTRA_MODE_TREE, KF_UV_MODE_PROBS, KF_Y_MODE_PROBS, SEGMENT_TREE, TX_SIZE_16_TREE,
     TX_SIZE_32_TREE, TX_SIZE_8_TREE,
 };
+use crate::prob_adapt::CountsNonCoef;
 use crate::Error;
 
 /// Resolve the §9.3.1 tree bit path that `tree_decode` walks to reach the
@@ -87,18 +88,22 @@ where
 
 /// §6.4.8 `read_skip` inverse. When `seg_feature_skip_active`, the
 /// decoder hardwires `skip = 1` and reads no bits, so nothing is written
-/// — the caller must pass `skip == true` in that case.
+/// (and nothing is counted) — the caller must pass `skip == true` in
+/// that case. A coded flag is counted into `counts_skip[ ctx ][ skip ]`
+/// exactly as the decoder's §9.3.4 step does.
 pub(crate) fn write_skip(
     enc: &mut BoolEncoder,
     skip: bool,
     seg_feature_skip_active: bool,
     skip_prob: &[u8; 3],
     ctx: usize,
+    counts: &mut CountsNonCoef,
 ) -> Result<(), Error> {
     if seg_feature_skip_active {
         debug_assert!(skip, "seg_feature_active(SKIP) forces skip == 1");
         return Ok(());
     }
+    counts.skip[ctx][usize::from(skip)] += 1;
     tree_encode(enc, &BINARY_TREE, i32::from(skip), |_| skip_prob[ctx])
 }
 
@@ -160,18 +165,23 @@ pub(crate) fn write_default_uv_mode(
 /// §6.4.10 `read_tx_size` inverse. Only emits bits when the decoder
 /// would read them (`allow_select && tx_mode == TX_MODE_SELECT &&
 /// MiSize >= BLOCK_8X8`); otherwise the tx size is inferred and nothing
-/// is written. `max_tx_size` is `MAX_TXSIZE_LOOKUP[ MiSize ]` and `ctx`
-/// is the §9.3.2 `tx_size_context`.
+/// is written (or counted). `max_tx_size` is `MAX_TXSIZE_LOOKUP[ MiSize ]`
+/// and `ctx` is the §9.3.2 `tx_size_context` (`tx_probs_row` is
+/// `tx_probs[ max_tx_size ][ ctx ]`). A coded size is counted into
+/// `counts_tx_size[ maxTxSize ][ ctx ][ tx_size ]` (§9.3.4).
 pub(crate) fn write_tx_size(
     enc: &mut BoolEncoder,
     tx_size: u32,
     coded: bool,
     max_tx_size: u32,
     tx_probs_row: &[u8; 3],
+    ctx: usize,
+    counts: &mut CountsNonCoef,
 ) -> Result<(), Error> {
     if !coded {
         return Ok(());
     }
+    counts.tx_size[max_tx_size as usize][ctx][tx_size as usize] += 1;
     let tree: &[i32] = match max_tx_size {
         3 => &TX_SIZE_32_TREE,
         2 => &TX_SIZE_16_TREE,
@@ -211,7 +221,15 @@ mod tests {
         for ctx in 0..3usize {
             for skip in [false, true] {
                 let mut enc = BoolEncoder::new();
-                write_skip(&mut enc, skip, false, &skip_prob, ctx).unwrap();
+                write_skip(
+                    &mut enc,
+                    skip,
+                    false,
+                    &skip_prob,
+                    ctx,
+                    &mut Default::default(),
+                )
+                .unwrap();
                 let buf = enc.finish();
                 let mut dec = BoolCoder::init_bool(&buf, buf.len()).unwrap();
                 // The decoder derives ctx from neighbours; drive it
@@ -241,7 +259,7 @@ mod tests {
     fn seg_skip_active_writes_nothing() {
         let skip_prob = [192u8, 128, 64];
         let mut enc = BoolEncoder::new();
-        write_skip(&mut enc, true, true, &skip_prob, 0).unwrap();
+        write_skip(&mut enc, true, true, &skip_prob, 0, &mut Default::default()).unwrap();
         let buf = enc.finish();
         // Only the marker + flush — decoding read_skip with
         // seg_feature_active short-circuits to 1 reading nothing.
@@ -325,7 +343,16 @@ mod tests {
             };
             for tx in 0..=max_tx {
                 let mut enc = BoolEncoder::new();
-                write_tx_size(&mut enc, tx, true, max_tx, row).unwrap();
+                write_tx_size(
+                    &mut enc,
+                    tx,
+                    true,
+                    max_tx,
+                    row,
+                    ctx,
+                    &mut Default::default(),
+                )
+                .unwrap();
                 let buf = enc.finish();
                 let mut dec = BoolCoder::init_bool(&buf, buf.len()).unwrap();
                 let got = read_tx_size(
@@ -349,7 +376,7 @@ mod tests {
         let row = &tx_probs[3][0];
         // coded == false: nothing written, inferred value used.
         let mut enc = BoolEncoder::new();
-        write_tx_size(&mut enc, 0, false, 3, row).unwrap();
+        write_tx_size(&mut enc, 0, false, 3, row, 0, &mut Default::default()).unwrap();
         let buf = enc.finish();
         // Marker only; decode with the non-select path reading no bits.
         let mut dec = BoolCoder::init_bool(&buf, buf.len()).unwrap();

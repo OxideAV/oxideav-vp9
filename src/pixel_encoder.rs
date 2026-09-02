@@ -1732,6 +1732,21 @@ pub(crate) fn encode_keyframe_lossy_tree_elect_skip_with_state(
     targets: &[Plane; 3],
     plan: &crate::frame_writer::KeyframeTreePlan,
 ) -> Result<(Vec<u8>, ReconState, crate::decode_block::Vp9FrameState), Error> {
+    encode_keyframe_lossy_tree_elect_skip_ctx(hdr, targets, plan, None)
+        .map(EncodedFrame::into_parts)
+}
+
+/// [`encode_keyframe_lossy_tree_elect_skip_with_state`] under
+/// [`EntropyOpts`] (round 455): the skip-elected plan is assembled
+/// against the loaded bank, its counts elect the §6.3.2 / §6.3.7 /
+/// §6.3.8 forward updates, and the updated assembly replaces it when
+/// strictly shorter.
+pub(crate) fn encode_keyframe_lossy_tree_elect_skip_ctx(
+    hdr: &Vp9FrameHeader,
+    targets: &[Plane; 3],
+    plan: &crate::frame_writer::KeyframeTreePlan,
+    entropy: Option<&EntropyOpts<'_>>,
+) -> Result<EncodedFrame, Error> {
     use std::cell::RefCell;
     use std::collections::HashMap;
 
@@ -1861,18 +1876,34 @@ pub(crate) fn encode_keyframe_lossy_tree_elect_skip_with_state(
     // is the prediction, which pass 1 already produced (adding the
     // zero residual moved nothing), so `recon` is the frame's exact
     // decoder output either way.
-    let mut cache = token_cache.into_inner();
+    let cache = token_cache.into_inner();
     let mut drain: Box<FrameCoefSource<'_>> = Box::new(
-        move |_mi_r: u32, _mi_c: u32, plane: usize, sx: u32, sy: u32, _b: usize| -> Vec<i64> {
+        |_mi_r: u32, _mi_c: u32, plane: usize, sx: u32, sy: u32, _b: usize| -> Vec<i64> {
             cache
-                .remove(&(plane, sx, sy))
+                .get(&(plane, sx, sy))
+                .cloned()
                 .expect("pass 1 cached this block's tokens")
         },
     );
-    let (bytes, state) =
-        crate::frame_writer::assemble_keyframe_tree_with_state(hdr, &plan2, &mut *drain)?;
+    let gates = crate::entropy_model::ForwardGates {
+        frame_is_intra: true,
+        tx_mode: plan2.tx_mode,
+        reference_mode: crate::compressed::ReferenceMode::SingleReference,
+        interp_filter_switchable: false,
+        allow_high_precision_mv: false,
+    };
+    let (bytes, state, counts, coding) = assemble_with_entropy(entropy, gates, |fe| {
+        crate::frame_writer::assemble_keyframe_tree_ctx(hdr, &plan2, &mut *drain, Some(fe))
+    })?;
 
-    Ok((bytes, recon, state))
+    Ok(EncodedFrame {
+        bytes,
+        recon,
+        state,
+        counts,
+        coding,
+        tx_mode: plan2.tx_mode,
+    })
 }
 
 // ----- Lossless inter (P-frame) encoding -----
@@ -3911,6 +3942,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion_with_state(
             ..InterEncodeOpts::default()
         },
     )
+    .map(EncodedFrame::into_parts)
 }
 
 /// Round-452 options of the inter tree encoder (the structured-GOP
@@ -3933,6 +3965,101 @@ pub(crate) struct InterEncodeOpts<'a> {
     /// segment ids and the symbol counts the header probabilities are
     /// fitted from. `None` codes single-segment frames.
     pub seg: Option<&'a SegElection<'a>>,
+    /// The §6.1.2 entropy state the frame codes under ([`EntropyOpts`]);
+    /// `None` codes against the §10.5 defaults with no forward updates
+    /// (the historical output).
+    pub entropy: Option<&'a EntropyOpts<'a>>,
+}
+
+/// Round-455 entropy options of one frame encode: the loaded
+/// probability bank and whether to elect §6.3 forward updates on it.
+#[derive(Clone, Copy)]
+pub(crate) struct EntropyOpts<'a> {
+    /// The §6.1.2 `load_probs( frame_context_idx )` bank
+    /// ([`crate::entropy_model::EntropyModel::bank`]).
+    pub base: &'a crate::compressed::FrameContext,
+    /// Elect forward updates by measured cost
+    /// ([`crate::entropy_model::elect_forward_updates`]): the frame is
+    /// assembled against `base`, the election runs on its counts, and
+    /// the updated assembly replaces it only when its coded length is
+    /// strictly smaller (the symbols are identical either way).
+    pub forward_updates: bool,
+}
+
+/// One coded frame plus the state the encoder-side §6.1.2 mirror
+/// needs after it.
+pub(crate) struct EncodedFrame {
+    /// The §6.1 frame bytes.
+    pub bytes: Vec<u8>,
+    /// The (unfiltered) in-loop reconstruction.
+    pub recon: ReconState,
+    /// The writer's final §6.4.4 per-MI state.
+    pub state: crate::decode_block::Vp9FrameState,
+    /// The frame's §9.3.4 symbol counts.
+    pub counts: Box<crate::prob_adapt::FrameCounts>,
+    /// The bank the tile data was coded against (the loaded bank plus
+    /// the elected forward updates).
+    pub coding: Box<crate::compressed::FrameContext>,
+    /// The §6.3.1 `tx_mode` the frame coded (gates the §8.4.4 tx-size
+    /// adaptation).
+    pub tx_mode: crate::compressed::TxMode,
+}
+
+impl EncodedFrame {
+    /// The historical `(bytes, recon, state)` triple.
+    pub fn into_parts(self) -> (Vec<u8>, ReconState, crate::decode_block::Vp9FrameState) {
+        (self.bytes, self.recon, self.state)
+    }
+}
+
+/// The encoder-side §6.1.2 products of a frame's *final* encode —
+/// counts, coding bank, tx_mode — stashed by the `(bytes, recon,
+/// state)` closures the finish helpers drive (every encode of one
+/// frame codes the identical symbols, so the last call's products are
+/// the frame's).
+#[derive(Default)]
+struct EntropyStash(std::cell::RefCell<Option<EntropyProducts>>);
+
+/// `(counts, coding bank, tx_mode)` of one frame encode.
+type EntropyProducts = (
+    Box<crate::prob_adapt::FrameCounts>,
+    Box<crate::compressed::FrameContext>,
+    crate::compressed::TxMode,
+);
+
+impl EntropyStash {
+    fn record(&self, f: EncodedFrame) -> (Vec<u8>, ReconState, crate::decode_block::Vp9FrameState) {
+        *self.0.borrow_mut() = Some((f.counts, f.coding, f.tx_mode));
+        (f.bytes, f.recon, f.state)
+    }
+
+    /// Fold the stashed products into `model` for the frame `hdr`
+    /// coded against bank `idx`; returns the counts.
+    fn finish(
+        &self,
+        model: &mut crate::entropy_model::EntropyModel,
+        hdr: &Vp9FrameHeader,
+        idx: usize,
+    ) -> Box<crate::prob_adapt::FrameCounts> {
+        let (counts, coding, tx_mode) = self
+            .0
+            .borrow_mut()
+            .take()
+            .expect("the frame was encoded at least once");
+        model.end_frame(hdr, idx, &coding, &counts, tx_mode);
+        counts
+    }
+}
+
+/// Header flags of the round-455 adaptive framing: the frame saves its
+/// §8.4-adapted bank (`refresh_frame_context = 1`) and the decoder runs
+/// the adaptation (`frame_parallel_decoding_mode = 0`); only meaningful
+/// with `error_resilient_mode = 0`.
+fn set_adaptive_entropy_flags(hdr: &mut Vp9FrameHeader) {
+    debug_assert!(!hdr.error_resilient_mode);
+    hdr.refresh_frame_context = true;
+    hdr.frame_parallel_decoding_mode = false;
+    hdr.frame_context_idx = 0;
 }
 
 /// [`encode_pframe_lossy_tree_motion_with_state`] under
@@ -3950,7 +4077,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion_opts(
     subpel: bool,
     sub8x8: bool,
     opts: &InterEncodeOpts<'_>,
-) -> Result<(Vec<u8>, ReconState, crate::decode_block::Vp9FrameState), Error> {
+) -> Result<EncodedFrame, Error> {
     use crate::frame_writer::{InterFrameTreePlan, InterTreeLeaf, InterTreePlanner};
     let altref = opts.altref;
     let prev_frame_mvs = opts.prev_frame_mvs;
@@ -4570,11 +4697,29 @@ pub(crate) fn encode_pframe_lossy_tree_motion_opts(
             }
         });
 
+    // Replay cache (round 455): the leaf decisions and their tokens are
+    // memoised so the forward-update re-assembly below rewrites the
+    // identical symbols without re-running the search (the decisions
+    // depend on the running §6.4.4 state, which the re-assembly
+    // reproduces exactly, never on the probabilities).
+    let leaf_cache: RefCell<std::collections::HashMap<(u32, u32), InterTreeLeaf>> =
+        RefCell::new(std::collections::HashMap::new());
+    let planner_ref = &mut *planner;
+    let mut cached_planner: Box<InterTreePlanner<'_>> =
+        Box::new(|r: u32, c: u32, subsize: u8, state| -> InterTreeLeaf {
+            if let Some(leaf) = leaf_cache.borrow().get(&(r, c)) {
+                return *leaf;
+            }
+            let leaf = planner_ref(r, c, subsize, state);
+            leaf_cache.borrow_mut().insert((r, c), leaf);
+            leaf
+        });
     let mut coeffs: Box<FrameCoefSource<'_>> = Box::new(
         |_mi_r: u32, _mi_c: u32, plane: usize, sx: u32, sy: u32, _b: usize| -> Vec<i64> {
             token_cache
-                .borrow_mut()
-                .remove(&(plane, sx, sy))
+                .borrow()
+                .get(&(plane, sx, sy))
+                .cloned()
                 .expect("planner pre-computed this block's tokens")
         },
     );
@@ -4593,15 +4738,89 @@ pub(crate) fn encode_pframe_lossy_tree_motion_opts(
         prev_frame_mvs_absent: !hdr.error_resilient_mode && prev_frame_mvs.is_none(),
         prev_frame_mvs: prev_frame_mvs.cloned(),
     };
-    let (bytes, state) = crate::frame_writer::assemble_inter_frame_tree_with_state(
-        hdr,
-        &plan,
-        &mut *planner,
-        &mut *coeffs,
-    )?;
+    let gates = crate::entropy_model::ForwardGates {
+        frame_is_intra: false,
+        tx_mode,
+        reference_mode,
+        interp_filter_switchable: hdr.interpolation_filter == crate::mode_info::SWITCHABLE,
+        allow_high_precision_mv: hdr.allow_high_precision_mv,
+    };
+    let (bytes, state, counts, coding) = assemble_with_entropy(opts.entropy, gates, |fe| {
+        crate::frame_writer::assemble_inter_frame_tree_ctx(
+            hdr,
+            &plan,
+            &mut *cached_planner,
+            &mut *coeffs,
+            Some(fe),
+        )
+    })?;
+    drop(cached_planner);
     drop(planner);
     drop(coeffs);
-    Ok((bytes, work.into_inner(), state))
+    Ok(EncodedFrame {
+        bytes,
+        recon: work.into_inner(),
+        state,
+        counts,
+        coding,
+        tx_mode,
+    })
+}
+
+/// Assemble one frame under [`EntropyOpts`]: first against the loaded
+/// bank, then — when forward updates are requested and the election
+/// moves any cell — once more against the elected bank, keeping the
+/// shorter stream. `assemble` is the entropy-parameterised assembler
+/// (its symbols must not depend on the bank; the replay caches
+/// guarantee that). Returns the bytes / state / counts / coding bank.
+#[allow(clippy::type_complexity)]
+fn assemble_with_entropy(
+    entropy: Option<&EntropyOpts<'_>>,
+    gates: crate::entropy_model::ForwardGates,
+    mut assemble: impl FnMut(
+        &crate::frame_writer::FrameEntropy<'_>,
+    ) -> Result<
+        (
+            Vec<u8>,
+            crate::decode_block::Vp9FrameState,
+            Box<crate::prob_adapt::FrameCounts>,
+        ),
+        Error,
+    >,
+) -> Result<
+    (
+        Vec<u8>,
+        crate::decode_block::Vp9FrameState,
+        Box<crate::prob_adapt::FrameCounts>,
+        Box<crate::compressed::FrameContext>,
+    ),
+    Error,
+> {
+    let defaults = crate::compressed::FrameContext::default();
+    let (base, forward) = match entropy {
+        Some(e) => (e.base, e.forward_updates),
+        None => (&defaults, false),
+    };
+    let fe = crate::frame_writer::FrameEntropy { base, coding: base };
+    let (bytes0, state0, counts0) = assemble(&fe)?;
+    if forward {
+        let coding = crate::entropy_model::elect_forward_updates(base, &counts0, gates);
+        if coding != *base {
+            let fe2 = crate::frame_writer::FrameEntropy {
+                base,
+                coding: &coding,
+            };
+            let (bytes1, state1, counts1) = assemble(&fe2)?;
+            debug_assert!(
+                *counts1 == *counts0,
+                "forward-update re-assembly must code the identical symbols"
+            );
+            if bytes1.len() < bytes0.len() {
+                return Ok((bytes1, state1, counts1, Box::new(coding)));
+            }
+        }
+    }
+    Ok((bytes0, state0, counts0, Box::new(base.clone())))
 }
 
 /// Encode one lossy P-frame against a **differently-sized** reference —
@@ -4623,6 +4842,8 @@ pub(crate) fn encode_pframe_lossy_tree_motion_opts(
 /// then the per-leaf transform-size + skip elections of the ordinary
 /// inter path. Single reference (`ref_frame_idx = [ s, s, s ]`), no
 /// prev-frame motion field (§7.2.6 (b) fails across a size change).
+/// `entropy` selects the round-455 [`EntropyOpts`] (`None` = the
+/// default bank, no forward updates).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_pframe_lossy_scaled(
     hdr: &Vp9FrameHeader,
@@ -4630,7 +4851,8 @@ pub(crate) fn encode_pframe_lossy_scaled(
     reference: &[(&[i32], usize); 3],
     ref_w: u32,
     ref_h: u32,
-) -> Result<(Vec<u8>, ReconState, crate::decode_block::Vp9FrameState), Error> {
+    entropy: Option<&EntropyOpts<'_>>,
+) -> Result<EncodedFrame, Error> {
     use crate::frame_writer::{InterFrameTreePlan, InterTreeLeaf, InterTreePlanner};
     use crate::inter_decode::FrameStateMvSource;
     use crate::mode_info::{LAST_FRAME, NEARESTMV, NEARMV, NEWMV, NONE_REF_FRAME, ZEROMV};
@@ -4933,11 +5155,26 @@ pub(crate) fn encode_pframe_lossy_scaled(
     let mut coeffs: Box<FrameCoefSource<'_>> = Box::new(
         |_mi_r: u32, _mi_c: u32, plane: usize, sx: u32, sy: u32, _b: usize| -> Vec<i64> {
             token_cache
-                .borrow_mut()
-                .remove(&(plane, sx, sy))
+                .borrow()
+                .get(&(plane, sx, sy))
+                .cloned()
                 .expect("planner pre-computed this block's tokens")
         },
     );
+    // Replay cache for the forward-update re-assembly (see the unscaled
+    // encoder).
+    let leaf_cache: RefCell<std::collections::HashMap<(u32, u32), InterTreeLeaf>> =
+        RefCell::new(std::collections::HashMap::new());
+    let planner_ref = &mut *planner;
+    let mut cached_planner: Box<InterTreePlanner<'_>> =
+        Box::new(|r: u32, c: u32, subsize: u8, state| -> InterTreeLeaf {
+            if let Some(leaf) = leaf_cache.borrow().get(&(r, c)) {
+                return *leaf;
+            }
+            let leaf = planner_ref(r, c, subsize, state);
+            leaf_cache.borrow_mut().insert((r, c), leaf);
+            leaf
+        });
 
     let plan = InterFrameTreePlan {
         tx_mode,
@@ -4949,15 +5186,33 @@ pub(crate) fn encode_pframe_lossy_scaled(
         prev_frame_mvs_absent: true,
         prev_frame_mvs: None,
     };
-    let (bytes, state) = crate::frame_writer::assemble_inter_frame_tree_with_state(
-        hdr,
-        &plan,
-        &mut *planner,
-        &mut *coeffs,
-    )?;
+    let gates = crate::entropy_model::ForwardGates {
+        frame_is_intra: false,
+        tx_mode,
+        reference_mode: crate::compressed::ReferenceMode::SingleReference,
+        interp_filter_switchable: hdr.interpolation_filter == crate::mode_info::SWITCHABLE,
+        allow_high_precision_mv: hdr.allow_high_precision_mv,
+    };
+    let (bytes, state, counts, coding) = assemble_with_entropy(entropy, gates, |fe| {
+        crate::frame_writer::assemble_inter_frame_tree_ctx(
+            hdr,
+            &plan,
+            &mut *cached_planner,
+            &mut *coeffs,
+            Some(fe),
+        )
+    })?;
+    drop(cached_planner);
     drop(planner);
     drop(coeffs);
-    Ok((bytes, work.into_inner(), state))
+    Ok(EncodedFrame {
+        bytes,
+        recon: work.into_inner(),
+        state,
+        counts,
+        coding,
+        tx_mode,
+    })
 }
 
 /// Encode a lossy 8-bit 4:2:0 sequence whose frames change coded size
@@ -4971,8 +5226,10 @@ pub(crate) fn encode_sequence_lossy_resized_u8(
     frames: &[&[u8]],
     sizes: &[(u32, u32)],
     base_q_idx: u8,
+    entropy_adaptation: bool,
 ) -> Result<Vec<Vec<u8>>, Error> {
     let fmt = LossyFormat::YUV420_8;
+    let adaptive = entropy_adaptation;
     if frames.is_empty() || frames.len() != sizes.len() {
         return Err(Error::Unsupported);
     }
@@ -4984,7 +5241,10 @@ pub(crate) fn encode_sequence_lossy_resized_u8(
     }
     let (kw, kh) = sizes[0];
     let kf_targets = padded_targets_from_u8(frames[0], kw, kh, fmt);
-    let kf_hdr = lossy_keyframe_header_fmt(kw, kh, base_q_idx, fmt);
+    let mut kf_hdr = lossy_keyframe_header_fmt(kw, kh, base_q_idx, fmt);
+    if adaptive {
+        set_adaptive_entropy_flags(&mut kf_hdr);
+    }
     let kf_plan = plan_keyframe_tree(
         &kf_targets,
         (kh + 7) >> 3,
@@ -4994,8 +5254,25 @@ pub(crate) fn encode_sequence_lossy_resized_u8(
         u32::from(fmt.bit_depth),
         base_q_idx,
     );
+    // Round-455 entropy model across the size changes: the §6.1.2 banks
+    // are size-independent, so the adapted bank carries straight across
+    // a resize.
+    let mut entropy = crate::entropy_model::EntropyModel::new();
+    let kf_idx = entropy.begin_frame(&kf_hdr);
+    let kf_base = entropy.bank(kf_idx).clone();
+    let kf_eopts = EntropyOpts {
+        base: &kf_base,
+        forward_updates: true,
+    };
+    let kf_stash = EntropyStash::default();
     let encode_kf = |hdr2: &Vp9FrameHeader| {
-        encode_keyframe_lossy_tree_elect_skip_with_state(hdr2, &kf_targets, &kf_plan)
+        encode_keyframe_lossy_tree_elect_skip_ctx(
+            hdr2,
+            &kf_targets,
+            &kf_plan,
+            adaptive.then_some(&kf_eopts),
+        )
+        .map(|f| kf_stash.record(f))
     };
     let (kf0, kf_recon0, kf_state0) = encode_kf(&kf_hdr)?;
     let mut lf_persist = LfDeltaState::default();
@@ -5011,6 +5288,9 @@ pub(crate) fn encode_sequence_lossy_resized_u8(
         None,
         encode_kf,
     )?;
+    if adaptive {
+        kf_stash.finish(&mut entropy, &kf_hdr, kf_idx);
+    }
     let mut out = Vec::with_capacity(frames.len());
     out.push(kf_bytes);
 
@@ -5028,6 +5308,9 @@ pub(crate) fn encode_sequence_lossy_resized_u8(
 
         let mut hdr = lossless_pframe_header_fmt(w, h, fmt);
         hdr.error_resilient_mode = false;
+        if adaptive {
+            set_adaptive_entropy_flags(&mut hdr);
+        }
         hdr.refresh_frame_flags = 0x01;
         hdr.ref_frame_idx = Some([0, 0, 0]);
         hdr.quantization = QuantizationParams {
@@ -5037,8 +5320,24 @@ pub(crate) fn encode_sequence_lossy_resized_u8(
             delta_q_uv_ac: 0,
             lossless: false,
         };
-        let encode =
-            |hdr2: &Vp9FrameHeader| encode_pframe_lossy_scaled(hdr2, &targets, &prev_views, pw, ph);
+        let idx = entropy.begin_frame(&hdr);
+        let base = entropy.bank(idx).clone();
+        let eopts = EntropyOpts {
+            base: &base,
+            forward_updates: true,
+        };
+        let stash = EntropyStash::default();
+        let encode = |hdr2: &Vp9FrameHeader| {
+            encode_pframe_lossy_scaled(
+                hdr2,
+                &targets,
+                &prev_views,
+                pw,
+                ph,
+                adaptive.then_some(&eopts),
+            )
+            .map(|f| stash.record(f))
+        };
         let (p0, recon0, state0) = encode(&hdr)?;
         let (bytes, recon, _) = finish_frame_lossy(
             &hdr,
@@ -5052,6 +5351,9 @@ pub(crate) fn encode_sequence_lossy_resized_u8(
             None,
             encode,
         )?;
+        if adaptive {
+            stash.finish(&mut entropy, &hdr, idx);
+        }
         out.push(bytes);
         prev_recon = recon;
         (pw, ph) = (w, h);
@@ -5354,7 +5656,15 @@ pub(crate) fn encode_sequence_lossy_420(
     height: u32,
     base_q_idx: u8,
 ) -> Result<Vec<Vec<u8>>, Error> {
-    encode_sequence_lossy_u8(frames, width, height, base_q_idx, true, true, false)
+    encode_sequence_lossy_u8(
+        frames,
+        width,
+        height,
+        base_q_idx,
+        true,
+        true,
+        ChainModel::Classic,
+    )
 }
 
 /// Encode a lossy GOP from 8-bit planar frames at any chroma
@@ -5369,7 +5679,7 @@ pub(crate) fn encode_sequence_lossy_u8(
     base_q_idx: u8,
     ssx: bool,
     ssy: bool,
-    chained: bool,
+    model: ChainModel,
 ) -> Result<Vec<Vec<u8>>, Error> {
     if frames.is_empty() {
         return Err(Error::Unsupported);
@@ -5384,7 +5694,7 @@ pub(crate) fn encode_sequence_lossy_u8(
         .iter()
         .map(|f| padded_targets_from_u8(f, width, height, fmt))
         .collect();
-    encode_sequence_lossy_planes(&frame_targets, width, height, base_q_idx, fmt, chained)
+    encode_sequence_lossy_planes(&frame_targets, width, height, base_q_idx, fmt, model)
 }
 
 /// [`encode_sequence_lossy_u8`] over native 10/12-bit `u16` planar
@@ -5399,7 +5709,7 @@ pub(crate) fn encode_sequence_lossy_u16(
     base_q_idx: u8,
     ssx: bool,
     ssy: bool,
-    chained: bool,
+    model: ChainModel,
 ) -> Result<Vec<Vec<u8>>, Error> {
     if frames.is_empty() {
         return Err(Error::Unsupported);
@@ -5421,7 +5731,7 @@ pub(crate) fn encode_sequence_lossy_u16(
         .iter()
         .map(|f| padded_targets_from_u16(f, width, height, fmt))
         .collect();
-    encode_sequence_lossy_planes(&frame_targets, width, height, base_q_idx, fmt, chained)
+    encode_sequence_lossy_planes(&frame_targets, width, height, base_q_idx, fmt, model)
 }
 
 /// The unified lossy GOP encoder over MI-padded per-frame targets at
@@ -5448,17 +5758,47 @@ pub(crate) fn encode_sequence_lossy_planes(
     height: u32,
     base_q_idx: u8,
     fmt: LossyFormat,
-    chained: bool,
+    model: ChainModel,
 ) -> Result<Vec<Vec<u8>>, Error> {
     if frame_targets.is_empty() {
         return Err(Error::Unsupported);
     }
-    let mut enc = LossyGopEncoder::new(width, height, base_q_idx, fmt, chained)?;
+    let mut enc = LossyGopEncoder::new(width, height, base_q_idx, fmt, model)?;
     let mut out = Vec::with_capacity(frame_targets.len());
     for targets in frame_targets {
         out.push(enc.push(targets)?);
     }
     Ok(out)
+}
+
+/// Which framing a [`LossyGopEncoder`] codes its P-frames with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChainModel {
+    /// The classic framing: error-resilient P-frames, every frame reset
+    /// to the §10.5 default banks, no keyframe skip election (the
+    /// staged pre-round-441 packages pin these bytes).
+    Classic,
+    /// The round-445 chain: shown non-error-resilient P-frames, §7.2.6
+    /// prev-MV modeling, keyframe skip election, §6.2.8 delta election —
+    /// still against the default banks with `frame_parallel_decoding_mode
+    /// = 1` (the staged round-441 / 445 / 448 packages pin these bytes).
+    #[cfg_attr(not(test), allow(dead_code))]
+    Chained,
+    /// Round 455: the chain plus the entropy model — every frame codes
+    /// `refresh_frame_context = 1` / `frame_parallel_decoding_mode = 0`
+    /// against its predecessor's §8.4-adapted bank, with §6.3 forward
+    /// updates elected by measured cost. The default of every public
+    /// lossy sequence entry.
+    Adaptive,
+}
+
+impl ChainModel {
+    fn chained(self) -> bool {
+        self != ChainModel::Classic
+    }
+    fn adaptive(self) -> bool {
+        self == ChainModel::Adaptive
+    }
 }
 
 /// The **stateful** form of [`encode_sequence_lossy_planes`]: one coded
@@ -5483,11 +5823,20 @@ pub(crate) struct LossyGopEncoder {
     base_q_idx: u8,
     fmt: LossyFormat,
     chained: bool,
+    adaptive: bool,
     // Chain state — `None` / default until the keyframe push.
     golden: Option<[Vec<i32>; 3]>,
     prev_recon: Option<ReconState>,
     prev_field: Option<crate::frame_writer::PrevMotionField>,
     lf_persist: LfDeltaState,
+    /// The §6.1.2 bank mirror of the chain model (round 455): every
+    /// chained frame codes `refresh_frame_context = 1` /
+    /// `frame_parallel_decoding_mode = 0`, so the decoder's §8.4-adapted
+    /// bank — mirrored here — is what the next frame codes against.
+    entropy: crate::entropy_model::EntropyModel,
+    /// The last chained frame's §9.3.4 counts (decoder-mirror tests).
+    #[cfg(test)]
+    last_counts: Option<Box<crate::prob_adapt::FrameCounts>>,
 }
 
 impl LossyGopEncoder {
@@ -5498,7 +5847,7 @@ impl LossyGopEncoder {
         height: u32,
         base_q_idx: u8,
         fmt: LossyFormat,
-        chained: bool,
+        model: ChainModel,
     ) -> Result<Self, Error> {
         validate_lossy_args(width, height, base_q_idx)?;
         Ok(Self {
@@ -5506,12 +5855,22 @@ impl LossyGopEncoder {
             height,
             base_q_idx,
             fmt,
-            chained,
+            chained: model.chained(),
+            adaptive: model.adaptive(),
             golden: None,
             prev_recon: None,
             prev_field: None,
             lf_persist: LfDeltaState::default(),
+            entropy: crate::entropy_model::EntropyModel::new(),
+            #[cfg(test)]
+            last_counts: None,
         })
+    }
+
+    /// The §6.1.2 bank mirror (decoder-mirror tests).
+    #[cfg(test)]
+    pub(crate) fn entropy_bank(&self, idx: usize) -> &crate::compressed::FrameContext {
+        self.entropy.bank(idx)
     }
 
     /// §8.10 FrameStore crop of a reconstruction: the visible extents.
@@ -5543,6 +5902,7 @@ impl LossyGopEncoder {
 
         let (width, height) = (self.width, self.height);
         let (base_q_idx, fmt, chained) = (self.base_q_idx, self.fmt, self.chained);
+        let adaptive = self.adaptive;
         let w = width as usize;
         let h = height as usize;
         let (cw, ch) = fmt.chroma_dims(width, height);
@@ -5551,7 +5911,10 @@ impl LossyGopEncoder {
             // Lossy keyframe over the content-adaptive partition/tx
             // tree, with the elected §8.8 filter params and the
             // filtered reconstruction.
-            let kf_hdr = lossy_keyframe_header_fmt(width, height, base_q_idx, fmt);
+            let mut kf_hdr = lossy_keyframe_header_fmt(width, height, base_q_idx, fmt);
+            if adaptive {
+                set_adaptive_entropy_flags(&mut kf_hdr);
+            }
             let kf_plan = plan_keyframe_tree(
                 targets,
                 (height + 7) >> 3,
@@ -5561,14 +5924,30 @@ impl LossyGopEncoder {
                 u32::from(fmt.bit_depth),
                 base_q_idx,
             );
+            // §6.2 / §6.1.2 mirror: the keyframe resets every bank and
+            // codes against the defaults (with elected forward updates).
+            let kf_idx = self.entropy.begin_frame(&kf_hdr);
+            let kf_base = self.entropy.bank(kf_idx).clone();
+            let kf_eopts = EntropyOpts {
+                base: &kf_base,
+                forward_updates: true,
+            };
+            let kf_stash = EntropyStash::default();
             // Chain-model sequences take the round-441 keyframe skip
             // election (all-zero-residual leaves code skip = 1 —
-            // identical reconstruction, strictly fewer bytes); the
-            // classic framing keeps its exact historical bytes (the
-            // staged self-encoded fixtures pin them).
+            // identical reconstruction, strictly fewer bytes) and the
+            // round-455 entropy model; the classic framing keeps its
+            // exact historical bytes (the staged self-encoded fixtures
+            // pin them).
             let encode_kf = |hdr2: &Vp9FrameHeader| {
                 if chained {
-                    encode_keyframe_lossy_tree_elect_skip_with_state(hdr2, targets, &kf_plan)
+                    encode_keyframe_lossy_tree_elect_skip_ctx(
+                        hdr2,
+                        targets,
+                        &kf_plan,
+                        adaptive.then_some(&kf_eopts),
+                    )
+                    .map(|f| kf_stash.record(f))
                 } else {
                     encode_keyframe_lossy_tree_with_state(hdr2, targets, &kf_plan)
                 }
@@ -5586,6 +5965,15 @@ impl LossyGopEncoder {
             let (kf_bytes, kf_recon) = finish_frame_with_filter(
                 &kf_hdr, kf0, kf_recon0, kf_state0, targets, w, h, encode_kf,
             )?;
+            if adaptive {
+                let counts = kf_stash.finish(&mut self.entropy, &kf_hdr, kf_idx);
+                #[cfg(test)]
+                {
+                    self.last_counts = Some(counts);
+                }
+                #[cfg(not(test))]
+                drop(counts);
+            }
 
             // §7.2 setup_past_independence( ) runs on the keyframe
             // (and, for the classic framing, on every error-resilient
@@ -5640,6 +6028,9 @@ impl LossyGopEncoder {
             // bias below genuinely admits compound here, unlike the
             // error-resilient chain where §7.2 zeroes it.
             hdr.error_resilient_mode = false;
+            if adaptive {
+                set_adaptive_entropy_flags(&mut hdr);
+            }
         }
         hdr.ref_frame_idx = Some([0, 1, 1]);
         // ALTREF (also slot 1) carries the opposite sign bias so the
@@ -5654,25 +6045,15 @@ impl LossyGopEncoder {
             lossless: false,
         };
         let prev_field = self.prev_field.as_ref();
-        let (p0, recon0, state0) = encode_pframe_lossy_tree_motion_with_state(
-            &hdr,
-            targets,
-            &reference,
-            Some(&golden_ref),
-            width,
-            height,
-            PFRAME_SEARCH_RANGE,
-            true,
-            true,
-            prev_field,
-        )?;
-        let next_field = if chained {
-            Some(PrevMotionField::from_state(&state0))
-        } else {
-            None
+        let idx = self.entropy.begin_frame(&hdr);
+        let base = self.entropy.bank(idx).clone();
+        let eopts = EntropyOpts {
+            base: &base,
+            forward_updates: true,
         };
+        let stash = EntropyStash::default();
         let re_encode = |hdr2: &Vp9FrameHeader| {
-            encode_pframe_lossy_tree_motion_with_state(
+            encode_pframe_lossy_tree_motion_opts(
                 hdr2,
                 targets,
                 &reference,
@@ -5682,8 +6063,19 @@ impl LossyGopEncoder {
                 PFRAME_SEARCH_RANGE,
                 true,
                 true,
-                prev_field,
+                &InterEncodeOpts {
+                    prev_frame_mvs: prev_field,
+                    entropy: adaptive.then_some(&eopts),
+                    ..InterEncodeOpts::default()
+                },
             )
+            .map(|f| stash.record(f))
+        };
+        let (p0, recon0, state0) = re_encode(&hdr)?;
+        let next_field = if chained {
+            Some(PrevMotionField::from_state(&state0))
+        } else {
+            None
         };
         // Chain-model P-frames elect the §6.2.8 loop-filter deltas on
         // top of (level, sharpness), threading the §7.2.8 persistent
@@ -5705,6 +6097,15 @@ impl LossyGopEncoder {
         } else {
             finish_frame_with_filter(&hdr, p0, recon0, state0, targets, w, h, re_encode)?
         };
+        if adaptive {
+            let counts = stash.finish(&mut self.entropy, &hdr, idx);
+            #[cfg(test)]
+            {
+                self.last_counts = Some(counts);
+            }
+            #[cfg(not(test))]
+            drop(counts);
+        }
         self.prev_recon = Some(recon);
         self.prev_field = next_field;
         Ok(bytes)
@@ -6205,6 +6606,12 @@ pub(crate) struct GopStructure {
     /// mid-GOP refresh point that cuts the prediction chain without a
     /// keyframe's full reset of the display stream.
     pub intra_only_altref: bool,
+    /// Round-455 entropy model: every decoded frame codes
+    /// `refresh_frame_context = 1` / `frame_parallel_decoding_mode = 0`
+    /// against the §8.4-adapted bank of its predecessor, with §6.3
+    /// forward updates elected by measured cost. `false` keeps the
+    /// round-452 default-bank bytes.
+    pub entropy_adaptation: bool,
 }
 
 /// Lossy **structured GOP** encoder (round 452): the two-slot chain of
@@ -6269,6 +6676,8 @@ pub(crate) struct StructuredGopEncoder {
     /// §7.2.10 persisted feature table (see [`SegTablePersist`]).
     seg_persist: Option<SegTablePersist>,
     lf_persist: LfDeltaState,
+    /// The §6.1.2 bank mirror ([`GopStructure::entropy_adaptation`]).
+    entropy: crate::entropy_model::EntropyModel,
     /// Per coded packet: the frame's coded §6.4.4 `SegmentIds` map
     /// (`None` for `show_existing_frame` packets) — tests pin the
     /// election.
@@ -6311,10 +6720,17 @@ impl StructuredGopEncoder {
             prev_seg_map: None,
             seg_persist: None,
             lf_persist: LfDeltaState::default(),
+            entropy: crate::entropy_model::EntropyModel::new(),
             recons: Vec::new(),
             headers: Vec::new(),
             seg_maps: Vec::new(),
         })
+    }
+
+    /// The §6.1.2 bank mirror (decoder-mirror tests).
+    #[cfg(test)]
+    pub(crate) fn entropy_bank(&self, idx: usize) -> &crate::compressed::FrameContext {
+        self.entropy.bank(idx)
     }
 
     fn crop(&self, recon: &ReconState) -> StoredRef {
@@ -6355,10 +6771,14 @@ impl StructuredGopEncoder {
             None
         };
 
+        let adapt = self.structure.entropy_adaptation;
         let mut hdr = lossless_pframe_header_fmt(width, height, fmt);
         hdr.tile_info.tile_cols_log2 = self.structure.tile_cols_log2;
         hdr.tile_info.tile_rows_log2 = self.structure.tile_rows_log2;
         hdr.error_resilient_mode = false;
+        if adapt {
+            set_adaptive_entropy_flags(&mut hdr);
+        }
         hdr.show_frame = shown;
         let alt_idx = if use_alt {
             self.alt_slot
@@ -6396,6 +6816,14 @@ impl StructuredGopEncoder {
             prev_map: if temporal { prev_map } else { None },
             counts: std::cell::RefCell::new(SegSymbolCounts::default()),
         };
+        // §6.2 / §6.1.2 mirror: the bank this frame loads.
+        let idx = self.entropy.begin_frame(&hdr);
+        let base = self.entropy.bank(idx).clone();
+        let eopts = EntropyOpts {
+            base: &base,
+            forward_updates: true,
+        };
+        let stash = EntropyStash::default();
         let encode = |hdr2: &Vp9FrameHeader| {
             // Every encode of this frame re-collects the counts from
             // scratch (byte-determinism: the fit only reads the probe's).
@@ -6414,8 +6842,10 @@ impl StructuredGopEncoder {
                     altref: alt_v.as_ref(),
                     prev_frame_mvs: prev_field,
                     seg: seg_mode.enabled().then_some(&seg_election),
+                    entropy: adapt.then_some(&eopts),
                 },
             )
+            .map(|f| stash.record(f))
         };
         if seg_mode.enabled() {
             // Probe encode → fitted §6.2.11 probabilities.
@@ -6446,6 +6876,9 @@ impl StructuredGopEncoder {
             seg_mode.enabled().then_some(&mut self.seg_persist),
             encode,
         )?;
+        if adapt {
+            stash.finish(&mut self.entropy, &final_hdr, idx);
+        }
         self.headers.push(final_hdr);
         self.seg_maps
             .push(seg_mode.enabled().then_some(next_seg_map.clone()));
@@ -6488,12 +6921,16 @@ impl StructuredGopEncoder {
         let mi_rows = (height + 7) >> 3;
         let seg_mode = self.structure.segmentation;
 
+        let adapt = self.structure.entropy_adaptation;
         let mut hdr = lossy_keyframe_header_fmt(width, height, base_q_idx, fmt);
         hdr.frame_type = FrameType::NonKeyFrame;
         hdr.intra_only = true;
         hdr.show_frame = false;
         hdr.error_resilient_mode = false;
         hdr.reset_frame_context = 3;
+        if adapt {
+            set_adaptive_entropy_flags(&mut hdr);
+        }
         hdr.refresh_frame_flags = 1u8 << refresh_slot;
         hdr.tile_info.tile_cols_log2 = self.structure.tile_cols_log2;
         hdr.tile_info.tile_rows_log2 = self.structure.tile_rows_log2;
@@ -6531,8 +6968,19 @@ impl StructuredGopEncoder {
                 [0; AQ_SEGMENTS],
             );
         }
+        // §6.2 mirror: reset_frame_context = 3 resets every bank; the
+        // frame codes against the defaults (plus elected forward
+        // updates) and saves its §8.4-adapted coefficient bank.
+        let idx = self.entropy.begin_frame(&hdr);
+        let base = self.entropy.bank(idx).clone();
+        let eopts = EntropyOpts {
+            base: &base,
+            forward_updates: true,
+        };
+        let stash = EntropyStash::default();
         let encode = |hdr2: &Vp9FrameHeader| {
-            encode_keyframe_lossy_tree_elect_skip_with_state(hdr2, targets, &plan)
+            encode_keyframe_lossy_tree_elect_skip_ctx(hdr2, targets, &plan, adapt.then_some(&eopts))
+                .map(|f| stash.record(f))
         };
         let (b0, recon0, state0) = encode(&hdr)?;
         // §7.2 setup_past_independence( ) — encoder-side mirror.
@@ -6551,6 +6999,9 @@ impl StructuredGopEncoder {
             seg_mode.enabled().then_some(&mut self.seg_persist),
             encode,
         )?;
+        if adapt {
+            stash.finish(&mut self.entropy, &final_hdr, idx);
+        }
         self.headers.push(final_hdr);
         self.seg_maps.push(seg_mode.enabled().then_some(seg_map));
         self.slots[refresh_slot] = Some(self.crop(&recon));
@@ -6594,9 +7045,13 @@ impl StructuredGopEncoder {
         // Keyframe: the chain-model keyframe of the default sequence
         // entry (planner tree, skip election, filter election),
         // refreshing every slot, plus the activity-class segment map.
+        let adapt = self.structure.entropy_adaptation;
         let mut kf_hdr = lossy_keyframe_header_fmt(width, height, base_q_idx, fmt);
         kf_hdr.tile_info.tile_cols_log2 = self.structure.tile_cols_log2;
         kf_hdr.tile_info.tile_rows_log2 = self.structure.tile_rows_log2;
+        if adapt {
+            set_adaptive_entropy_flags(&mut kf_hdr);
+        }
         let mut kf_plan = plan_keyframe_tree(
             kf_targets,
             mi_rows,
@@ -6630,8 +7085,21 @@ impl StructuredGopEncoder {
                 [0; AQ_SEGMENTS],
             );
         }
+        let kf_idx = self.entropy.begin_frame(&kf_hdr);
+        let kf_base = self.entropy.bank(kf_idx).clone();
+        let kf_eopts = EntropyOpts {
+            base: &kf_base,
+            forward_updates: true,
+        };
+        let kf_stash = EntropyStash::default();
         let encode_kf = |hdr2: &Vp9FrameHeader| {
-            encode_keyframe_lossy_tree_elect_skip_with_state(hdr2, kf_targets, &kf_plan)
+            encode_keyframe_lossy_tree_elect_skip_ctx(
+                hdr2,
+                kf_targets,
+                &kf_plan,
+                adapt.then_some(&kf_eopts),
+            )
+            .map(|f| kf_stash.record(f))
         };
         let (kf0, kf_recon0, kf_state0) = encode_kf(&kf_hdr)?;
         self.prev_field = Some(PrevMotionField::from_state(&kf_state0));
@@ -6654,6 +7122,9 @@ impl StructuredGopEncoder {
             seg_mode.enabled().then_some(&mut self.seg_persist),
             encode_kf,
         )?;
+        if adapt {
+            kf_stash.finish(&mut self.entropy, &kf_final_hdr, kf_idx);
+        }
         self.headers.push(kf_final_hdr);
         self.seg_maps.push(seg_mode.enabled().then_some(kf_seg_map));
         let kf_crop = self.crop(&kf_recon);
@@ -6755,7 +7226,15 @@ pub(crate) fn encode_sequence_lossy_chained_420(
     height: u32,
     base_q_idx: u8,
 ) -> Result<Vec<Vec<u8>>, Error> {
-    encode_sequence_lossy_u8(frames, width, height, base_q_idx, true, true, true)
+    encode_sequence_lossy_u8(
+        frames,
+        width,
+        height,
+        base_q_idx,
+        true,
+        true,
+        ChainModel::Adaptive,
+    )
 }
 
 /// Bisect `base_q_idx` for the **lowest** quantizer whose coded frame
@@ -6810,7 +7289,12 @@ pub(crate) fn encode_sequence_lossy_rc_420(
     width: u32,
     height: u32,
     target_bytes_per_frame: usize,
+    model: ChainModel,
 ) -> Result<Vec<Vec<u8>>, Error> {
+    if !model.chained() {
+        return Err(Error::Unsupported);
+    }
+    let adaptive = model.adaptive();
     if frames.is_empty() {
         return Err(Error::Unsupported);
     }
@@ -6861,14 +7345,40 @@ pub(crate) fn encode_sequence_lossy_rc_420(
     let mi_cols = (width + 7) >> 3;
     let mi_rows = (height + 7) >> 3;
     let kf_targets = padded_targets(frames[0]);
+    // Round-455 entropy model: the keyframe and every P-frame code the
+    // adaptive framing; the bank each frame loads is fixed before its
+    // quantizer search (the search only moves the residual symbols).
+    let mut entropy = crate::entropy_model::EntropyModel::new();
+    let kf_hdr_at = |q: u8| {
+        let mut hdr = lossy_keyframe_header_420(width, height, q);
+        if adaptive {
+            set_adaptive_entropy_flags(&mut hdr);
+        }
+        hdr
+    };
+    let kf_idx = entropy.begin_frame(&kf_hdr_at(1));
+    let kf_base = entropy.bank(kf_idx).clone();
+    let kf_eopts = EntropyOpts {
+        base: &kf_base,
+        forward_updates: true,
+    };
     let kf_encode_at = |hdr: &Vp9FrameHeader, q: u8| {
         let plan = plan_keyframe_tree(&kf_targets, mi_rows, mi_cols, true, true, 8, q);
-        encode_keyframe_lossy_tree_elect_skip_with_state(hdr, &kf_targets, &plan)
+        encode_keyframe_lossy_tree_elect_skip_ctx(
+            hdr,
+            &kf_targets,
+            &plan,
+            adaptive.then_some(&kf_eopts),
+        )
     };
-    let (kf0, (kf_recon0, kf_state0, kf_q), _) = bisect_q(
+    let (kf0, (kf_recon0, kf_state0, kf_q, kf_counts, kf_coding, kf_tx), _) = bisect_q(
         |q| {
-            kf_encode_at(&lossy_keyframe_header_420(width, height, q), q)
-                .map(|(b, r, s)| (b, (r, s, q)))
+            kf_encode_at(&kf_hdr_at(q), q).map(|f| {
+                (
+                    f.bytes,
+                    (f.recon, f.state, q, f.counts, f.coding, f.tx_mode),
+                )
+            })
         },
         target_bytes_per_frame,
     )?;
@@ -6876,7 +7386,7 @@ pub(crate) fn encode_sequence_lossy_rc_420(
     // (invariant under the filter-level re-encode) seeds the §7.2.6
     // UsePrevFrameMvs model for the first P-frame.
     let mut prev_field = Some(crate::frame_writer::PrevMotionField::from_state(&kf_state0));
-    let kf_hdr = lossy_keyframe_header_420(width, height, kf_q);
+    let kf_hdr = kf_hdr_at(kf_q);
     let (kf_bytes, kf_recon) = finish_frame_with_filter(
         &kf_hdr,
         kf0,
@@ -6885,8 +7395,9 @@ pub(crate) fn encode_sequence_lossy_rc_420(
         &kf_targets,
         w,
         h,
-        |hdr2| kf_encode_at(hdr2, kf_q),
+        |hdr2| kf_encode_at(hdr2, kf_q).map(EncodedFrame::into_parts),
     )?;
+    entropy.end_frame(&kf_hdr, kf_idx, &kf_coding, &kf_counts, kf_tx);
 
     // §7.2 setup_past_independence( ) on the keyframe: the chain's
     // persistent §7.2.8 delta baseline starts at the defaults.
@@ -6920,6 +7431,9 @@ pub(crate) fn encode_sequence_lossy_rc_420(
             // P-frames — §7.2.6 derives UsePrevFrameMvs = 1 and the
             // coded sign biases stay live (compound election).
             hdr.error_resilient_mode = false;
+            if adaptive {
+                set_adaptive_entropy_flags(&mut hdr);
+            }
             hdr.ref_frame_idx = Some([0, 1, 1]);
             hdr.ref_frame_sign_bias = [false, false, true];
             hdr.quantization = QuantizationParams {
@@ -6931,8 +7445,14 @@ pub(crate) fn encode_sequence_lossy_rc_420(
             };
             hdr
         };
+        let idx = entropy.begin_frame(&pframe_hdr(1));
+        let base = entropy.bank(idx).clone();
+        let eopts = EntropyOpts {
+            base: &base,
+            forward_updates: true,
+        };
         let encode_at = |hdr: &Vp9FrameHeader| {
-            encode_pframe_lossy_tree_motion_with_state(
+            encode_pframe_lossy_tree_motion_opts(
                 hdr,
                 &targets,
                 &reference,
@@ -6942,11 +7462,22 @@ pub(crate) fn encode_sequence_lossy_rc_420(
                 PFRAME_SEARCH_RANGE,
                 true,
                 true,
-                prev_field.as_ref(),
+                &InterEncodeOpts {
+                    prev_frame_mvs: prev_field.as_ref(),
+                    entropy: adaptive.then_some(&eopts),
+                    ..InterEncodeOpts::default()
+                },
             )
         };
-        let (p0, (recon0, state0, p_q), _) = bisect_q(
-            |q| encode_at(&pframe_hdr(q)).map(|(b, r, s)| (b, (r, s, q))),
+        let (p0, (recon0, state0, p_q, p_counts, p_coding, p_tx), _) = bisect_q(
+            |q| {
+                encode_at(&pframe_hdr(q)).map(|f| {
+                    (
+                        f.bytes,
+                        (f.recon, f.state, q, f.counts, f.coding, f.tx_mode),
+                    )
+                })
+            },
             target_bytes_per_frame,
         )?;
         // The per-MI state is invariant under the filter re-encodes, so
@@ -6967,8 +7498,9 @@ pub(crate) fn encode_sequence_lossy_rc_420(
             h,
             &mut lf_persist,
             target_bytes_per_frame,
-            |hdr2| encode_at(hdr2),
+            |hdr2| encode_at(hdr2).map(EncodedFrame::into_parts),
         )?;
+        entropy.end_frame(&pframe_hdr(p_q), idx, &p_coding, &p_counts, p_tx);
         out.push(bytes);
         prev_recon = recon;
         prev_field = next_field;
@@ -7366,6 +7898,7 @@ mod tests {
             tile_cols_log2: 0,
             tile_rows_log2: 0,
             intra_only_altref: false,
+            entropy_adaptation: true,
         };
         let (packets, headers, decoded, _) =
             assert_structured_gop_mirror(&src, w, h, 100, structure);
@@ -7398,7 +7931,7 @@ mod tests {
             .map(|(k, &(w, h))| moving_scene_frame(w as usize, h as usize, k))
             .collect();
         let refs: Vec<&[u8]> = src.iter().map(|f| f.as_slice()).collect();
-        let packets = encode_sequence_lossy_resized_u8(&refs, &sizes, 110).expect("encode");
+        let packets = encode_sequence_lossy_resized_u8(&refs, &sizes, 110, true).expect("encode");
         assert_eq!(packets.len(), 4);
         let prefs: Vec<&[u8]> = packets.iter().map(|p| p.as_slice()).collect();
         let decoded = decode_vp9_sequence(&prefs).expect("decode");
@@ -7410,7 +7943,8 @@ mod tests {
         // (The driver is stateless per call and byte-deterministic —
         // pinned below — so the mirror is checked through a
         // re-instrumented encode.)
-        let again = encode_sequence_lossy_resized_u8(&refs, &sizes, 110).expect("encode again");
+        let again =
+            encode_sequence_lossy_resized_u8(&refs, &sizes, 110, true).expect("encode again");
         assert_eq!(packets, again, "byte-determinism");
         // Distortion bound: each frame stays within the quantizer
         // regime of its own content (a scaled-prediction failure would
@@ -7479,6 +8013,7 @@ mod tests {
             tile_cols_log2: 0,
             tile_rows_log2: 0,
             intra_only_altref: true,
+            entropy_adaptation: true,
         };
         let (packets, headers, decoded, _) =
             assert_structured_gop_mirror(&src, w, h, 100, structure);
@@ -7527,6 +8062,7 @@ mod tests {
             tile_cols_log2: 1,
             tile_rows_log2: 0,
             intra_only_altref: false,
+            entropy_adaptation: true,
         };
         let (packets, headers, decoded, _) =
             assert_structured_gop_mirror(&src, w, h, 140, structure);
@@ -7562,6 +8098,7 @@ mod tests {
             tile_cols_log2: 0,
             tile_rows_log2: 1,
             intra_only_altref: false,
+            entropy_adaptation: true,
         };
         let (pk2, hs2, dec2, _) = assert_structured_gop_mirror(&src2, w2, h2, 120, rows);
         for hd in hs2.iter().filter(|hd| !hd.show_existing_frame) {
@@ -7620,6 +8157,7 @@ mod tests {
             tile_cols_log2: 0,
             tile_rows_log2: 0,
             intra_only_altref: false,
+            entropy_adaptation: true,
         };
         let (packets, headers, decoded, seg_maps) =
             assert_structured_gop_mirror(&src, w, h, 100, full);
@@ -7731,6 +8269,7 @@ mod tests {
                 tile_cols_log2: 0,
                 tile_rows_log2: 0,
                 intra_only_altref: false,
+                entropy_adaptation: true,
             };
             let (pk, hs, dec, _) = assert_structured_gop_mirror(&src[..4], w, h, 120, st);
             assert!(hs
@@ -8459,7 +8998,8 @@ mod tests {
             .collect();
         let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
         let budget = 1500usize;
-        let coded = encode_sequence_lossy_rc_420(&refs, w, h, budget).expect("rc encode");
+        let coded = encode_sequence_lossy_rc_420(&refs, w, h, budget, ChainModel::Adaptive)
+            .expect("rc encode");
         assert_eq!(coded.len(), 4);
 
         let kf_hdr = parse_uncompressed_header(&coded[0]).expect("kf header");
@@ -8483,7 +9023,8 @@ mod tests {
         assert_eq!(decode_vp9_sequence(&coded_refs).expect("decode").len(), 4);
         assert_eq!(
             coded,
-            encode_sequence_lossy_rc_420(&refs, w, h, budget).expect("determinism")
+            encode_sequence_lossy_rc_420(&refs, w, h, budget, ChainModel::Adaptive)
+                .expect("determinism")
         );
     }
 
@@ -8516,8 +9057,14 @@ mod tests {
             .collect();
         let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
         for budget in [400usize, 2500usize] {
-            let coded =
-                encode_sequence_lossy_rc_420(&refs, w as u32, h as u32, budget).expect("rc");
+            let coded = encode_sequence_lossy_rc_420(
+                &refs,
+                w as u32,
+                h as u32,
+                budget,
+                ChainModel::Adaptive,
+            )
+            .expect("rc");
             for (i, f) in coded.iter().enumerate() {
                 assert!(
                     f.len() <= budget,
@@ -8548,7 +9095,8 @@ mod tests {
         let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
 
         let budget = 2000usize;
-        let coded = encode_sequence_lossy_rc_420(&refs, w, h, budget).expect("rc encode");
+        let coded = encode_sequence_lossy_rc_420(&refs, w, h, budget, ChainModel::Adaptive)
+            .expect("rc encode");
         assert_eq!(coded.len(), 3);
         for (i, f) in coded.iter().enumerate() {
             assert!(
@@ -8573,7 +9121,8 @@ mod tests {
         let refs: Vec<&[u8]> = vec![px.as_slice()];
 
         let mse_at = |budget: usize| -> f64 {
-            let coded = encode_sequence_lossy_rc_420(&refs, w, h, budget).expect("rc");
+            let coded = encode_sequence_lossy_rc_420(&refs, w, h, budget, ChainModel::Adaptive)
+                .expect("rc");
             assert!(coded[0].len() <= budget, "budget {budget} not met");
             let coded_refs: Vec<&[u8]> = coded.iter().map(|f| f.as_slice()).collect();
             let dec = decode_vp9_sequence(&coded_refs).expect("decode");
@@ -8763,7 +9312,8 @@ mod tests {
         let n = (w * h) as usize + 2 * 32 * 32;
         let px: Vec<u8> = (0..n).map(|i| ((i * 31 + 3) % 256) as u8).collect();
         let refs: Vec<&[u8]> = vec![px.as_slice()];
-        let coded = encode_sequence_lossy_rc_420(&refs, w, h, 4).expect("best effort");
+        let coded = encode_sequence_lossy_rc_420(&refs, w, h, 4, ChainModel::Adaptive)
+            .expect("best effort");
         assert!(coded[0].len() > 4, "a 4-byte frame is not representable");
         let coded_refs: Vec<&[u8]> = coded.iter().map(|f| f.as_slice()).collect();
         decode_vp9_sequence(&coded_refs).expect("decode");
@@ -8773,17 +9323,19 @@ mod tests {
     #[test]
     fn rc_rejects_bad_inputs() {
         assert_eq!(
-            encode_sequence_lossy_rc_420(&[], 64, 64, 1000).unwrap_err(),
+            encode_sequence_lossy_rc_420(&[], 64, 64, 1000, ChainModel::Adaptive).unwrap_err(),
             Error::Unsupported
         );
         let short = vec![0u8; 10];
         assert_eq!(
-            encode_sequence_lossy_rc_420(&[short.as_slice()], 64, 64, 1000).unwrap_err(),
+            encode_sequence_lossy_rc_420(&[short.as_slice()], 64, 64, 1000, ChainModel::Adaptive)
+                .unwrap_err(),
             Error::Unsupported
         );
         let px = vec![0u8; 64 * 64 + 2 * 32 * 32];
         assert_eq!(
-            encode_sequence_lossy_rc_420(&[px.as_slice()], 0, 64, 1000).unwrap_err(),
+            encode_sequence_lossy_rc_420(&[px.as_slice()], 0, 64, 1000, ChainModel::Adaptive)
+                .unwrap_err(),
             Error::Unsupported
         );
     }
@@ -12244,5 +12796,199 @@ mod lossy_matrix_tests {
         assert_eq!(LossyFormat::new(10, false, false).unwrap().profile, 3);
         assert_eq!(LossyFormat::new(12, true, false).unwrap().profile, 3);
         assert!(LossyFormat::new(9, true, true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod entropy_mirror_tests {
+    //! Round-455 decoder-mirror pins of the encoder-side §6.1.2 entropy
+    //! model: after every chained frame the writer's §9.3.4 counts and
+    //! its §8.4-adapted bank equal what the crate's decoder derives from
+    //! the bytes, and the streams shrink against the default-bank
+    //! framing at identical reconstruction.
+    use super::*;
+    use crate::decode_frame::Vp9SequenceDecoder;
+
+    /// A translating textured scene (luma ramp + moving patch, chroma
+    /// ramps), 8-bit 4:2:0 planar.
+    pub(crate) fn scene(w: usize, h: usize, k: usize) -> Vec<u8> {
+        let cw = w.div_ceil(2);
+        let ch = h.div_ceil(2);
+        let mut px = Vec::with_capacity(w * h + 2 * cw * ch);
+        for y in 0..h {
+            for x in 0..w {
+                let mut v = ((x + 2 * k) * 3 + y * 2) % 200 + 20;
+                let px_x = x as i64 - 2 * k as i64;
+                if (8..24).contains(&px_x) && (8..24).contains(&y) {
+                    v = (px_x as usize * 37 + y * 53) % 255;
+                }
+                if (x * 7 + y * 11 + k) % 29 == 0 {
+                    v = (v + 40) % 256;
+                }
+                px.push(v as u8);
+            }
+        }
+        for plane in 0..2usize {
+            for y in 0..ch {
+                for x in 0..cw {
+                    px.push(((x + k) * 5 + y * 3 + plane * 90) as u8);
+                }
+            }
+        }
+        px
+    }
+
+    fn planar_to_yuv(f: &crate::decode_frame::Vp9DecodedFrame) -> Vec<u8> {
+        f.to_planar_bytes()
+    }
+
+    #[test]
+    fn chained_gop_counts_and_banks_mirror_the_decoder() {
+        let (w, h) = (72u32, 56u32);
+        let fmt = LossyFormat::YUV420_8;
+        let mut enc = LossyGopEncoder::new(w, h, 90, fmt, ChainModel::Adaptive).expect("enc");
+        let mut dec = Vp9SequenceDecoder::new();
+        for k in 0..5 {
+            let src = scene(w as usize, h as usize, k);
+            let targets = padded_targets_from_u8(&src, w, h, fmt);
+            let bytes = enc.push(&targets).expect("push");
+            let ref_dims = [(w, h); 8];
+            let hdr = crate::header::parse_uncompressed_header_with_refs(
+                &bytes,
+                Some(crate::header::RefFrameState {
+                    ref_dims: &ref_dims,
+                    color_config: lossy_keyframe_header_fmt(w, h, 90, fmt).color_config,
+                }),
+            )
+            .expect("hdr");
+            assert!(
+                hdr.refresh_frame_context,
+                "frame {k}: refresh_frame_context"
+            );
+            assert!(!hdr.frame_parallel_decoding_mode, "frame {k}: non-parallel");
+            assert!(!hdr.error_resilient_mode, "frame {k}: chained");
+            let out = dec.push_frame(&bytes).expect("decode").expect("shown");
+            // Counts: the writer's bank equals the decoder's, cell for cell.
+            let dc = dec.last_frame_counts().expect("decoded counts");
+            let ec = enc.last_counts.as_deref().expect("encoder counts");
+            assert!(ec.token == dc.token, "frame {k}: counts_token differ");
+            assert!(
+                ec.more_coefs == dc.more_coefs,
+                "frame {k}: counts_more_coefs differ"
+            );
+            assert!(
+                ec.noncoef == dc.noncoef,
+                "frame {k}: non-coefficient counts differ"
+            );
+            // Banks: the §8.4-adapted context the decoder saved equals
+            // the encoder's mirror.
+            assert!(
+                *enc.entropy_bank(0) == *dec.frame_context(0),
+                "frame {k}: FrameContext[0] differs"
+            );
+            // Reconstruction mirror.
+            let recon = enc.prev_recon.as_ref().expect("recon");
+            let (cw, ch) = fmt.chroma_dims(w, h);
+            let crop = visible_crop_planes(recon, w as usize, h as usize, cw, ch);
+            let mut expect = Vec::new();
+            for p in &crop {
+                expect.extend(p.iter().map(|&v| v as u8));
+            }
+            assert_eq!(planar_to_yuv(&out), expect, "frame {k}: decode != recon");
+        }
+    }
+
+    /// Every structured-GOP shape (alt-ref pyramid, full segmentation,
+    /// intra-only alt-refs, tiles) leaves the decoder holding exactly the
+    /// bank the encoder mirrored, with every shown frame equal to the
+    /// encoder's reconstruction.
+    #[test]
+    fn structured_gops_mirror_the_decoder_banks() {
+        let shapes = [
+            (64u32, 48u32, 3usize, SegMode::Off, false, 0u8, 0u8),
+            (64, 48, 3, SegMode::Full, false, 0, 0),
+            (64, 48, 3, SegMode::Full, true, 0, 0),
+            (512, 32, 2, SegMode::AdaptiveQuant, false, 1, 0),
+            (64, 96, 2, SegMode::StaticSkip, false, 0, 1),
+        ];
+        for (w, h, interval, seg, intra_only, tc, tr) in shapes {
+            let fmt = LossyFormat::YUV420_8;
+            let structure = GopStructure {
+                altref_interval: interval,
+                segmentation: seg,
+                tile_cols_log2: tc,
+                tile_rows_log2: tr,
+                intra_only_altref: intra_only,
+                entropy_adaptation: true,
+            };
+            let src: Vec<Vec<u8>> = (0..7).map(|k| scene(w as usize, h as usize, k)).collect();
+            let targets: Vec<[Plane; 3]> = src
+                .iter()
+                .map(|f| padded_targets_from_u8(f, w, h, fmt))
+                .collect();
+            let mut enc = StructuredGopEncoder::new(w, h, 100, fmt, structure).expect("enc");
+            let packets = enc.encode(&targets).expect("encode");
+            let mut dec = Vp9SequenceDecoder::new();
+            let mut shown = Vec::new();
+            for p in &packets {
+                if let Some(f) = dec.push_frame(p).expect("decode") {
+                    shown.push(f);
+                }
+            }
+            assert_eq!(shown.len(), src.len(), "{structure:?}: shown frames");
+            assert!(
+                *enc.entropy_bank(0) == *dec.frame_context(0),
+                "{structure:?}: FrameContext[0] differs after the GOP"
+            );
+            // Display-order reconstruction mirror: the recons are in
+            // decode order with the hidden alt-ref surfacing at its
+            // show_existing_frame position.
+            let (cw, ch) = fmt.chroma_dims(w, h);
+            let mut display: Vec<Vec<u8>> = Vec::new();
+            let mut hidden: Option<Vec<u8>> = None;
+            for (i, r) in enc.recons.iter().enumerate() {
+                match r {
+                    Some(recon) => {
+                        let crop = visible_crop_planes(recon, w as usize, h as usize, cw, ch);
+                        let mut bytes = Vec::new();
+                        for p in &crop {
+                            bytes.extend(p.iter().map(|&v| v as u8));
+                        }
+                        if enc.headers[i].show_frame {
+                            display.push(bytes);
+                        } else {
+                            hidden = Some(bytes);
+                        }
+                    }
+                    None => display.push(hidden.take().expect("show_existing of a hidden frame")),
+                }
+            }
+            assert_eq!(display.len(), shown.len());
+            for (k, (d, s)) in display.iter().zip(&shown).enumerate() {
+                assert_eq!(
+                    &s.to_planar_bytes(),
+                    d,
+                    "{structure:?}: frame {k} decode != recon"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn adaptive_chain_is_strictly_smaller_than_the_default_bank_chain() {
+        let (w, h) = (96u32, 64u32);
+        let src: Vec<Vec<u8>> = (0..6).map(|k| scene(w as usize, h as usize, k)).collect();
+        let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
+        let adaptive = encode_sequence_lossy_chained_420(&refs, w, h, 100).expect("adaptive");
+        // The classic (error-resilient, default-bank) framing of the
+        // same content — every frame resets to the §10.5 defaults.
+        let classic = encode_sequence_lossy_420(&refs, w, h, 100).expect("classic");
+        let a: usize = adaptive.iter().map(Vec::len).sum();
+        let c: usize = classic.iter().map(Vec::len).sum();
+        assert!(a < c, "adaptive {a} bytes vs classic {c}");
+        // Every frame decodes.
+        let frames: Vec<&[u8]> = adaptive.iter().map(Vec::as_slice).collect();
+        let dec = crate::decode_frame::decode_vp9_sequence(&frames).expect("decode");
+        assert_eq!(dec.len(), src.len());
     }
 }

@@ -267,6 +267,32 @@ pub(crate) fn assemble_keyframe_tree_with_state(
     plan: &KeyframeTreePlan,
     coeffs: &mut FrameCoefSource<'_>,
 ) -> Result<(Vec<u8>, Vp9FrameState), Error> {
+    assemble_keyframe_tree_ctx(hdr, plan, coeffs, None).map(|(b, s, _)| (b, s))
+}
+
+/// The §6.1.2 entropy state one frame assembly codes under: `base` is
+/// the `load_probs( frame_context_idx )` bank the decoder holds when the
+/// frame starts (the §10.5 defaults on a fresh / reset context),
+/// `coding` the bank after the frame's §6.3 forward updates — the
+/// probabilities every tile symbol is actually coded against. The
+/// compressed header is written as the `base → coding` transitions.
+#[derive(Clone, Copy)]
+pub(crate) struct FrameEntropy<'a> {
+    pub base: &'a crate::compressed::FrameContext,
+    pub coding: &'a crate::compressed::FrameContext,
+}
+
+/// [`assemble_keyframe_tree_with_state`] under an explicit
+/// [`FrameEntropy`] (`None` = the default-bank, no-forward-update path
+/// every earlier round coded), additionally returning the frame's
+/// §9.3.4 symbol counts — the input of the encoder-side §8.4 backward
+/// adaptation ([`crate::entropy_model::EntropyModel::end_frame`]).
+pub(crate) fn assemble_keyframe_tree_ctx(
+    hdr: &Vp9FrameHeader,
+    plan: &KeyframeTreePlan,
+    coeffs: &mut FrameCoefSource<'_>,
+    entropy: Option<&FrameEntropy<'_>>,
+) -> Result<(Vec<u8>, Vp9FrameState, Box<crate::prob_adapt::FrameCounts>), Error> {
     if !header_is_intra_frame(hdr) {
         return Err(Error::Unsupported);
     }
@@ -274,8 +300,19 @@ pub(crate) fn assemble_keyframe_tree_with_state(
     let mi_cols = (hdr.frame_width + 7) >> 3;
     let mi_rows = (hdr.frame_height + 7) >> 3;
 
-    // §6.3 compressed header (default-probability path).
-    let chdr_bytes = write_compressed_header_intra(plan.tx_mode, hdr.quantization.lossless)?;
+    // §6.3 compressed header: the base → coding forward updates (none on
+    // the default path).
+    let defaults = crate::compressed::FrameContext::default();
+    let (base, coding) = match entropy {
+        Some(e) => (e.base, e.coding),
+        None => (&defaults, &defaults),
+    };
+    let chdr_bytes = crate::compressed_writer::write_compressed_header_intra_ctx(
+        plan.tx_mode,
+        hdr.quantization.lossless,
+        base,
+        coding,
+    )?;
 
     // §6.2 uncompressed header with header_size_in_bytes = compressed len.
     // (`write_tile_info` validates `tile_cols_log2` against the §6.2.14
@@ -306,6 +343,12 @@ pub(crate) fn assemble_keyframe_tree_with_state(
     ];
     let mut pctx = PartitionContextState::new(sb64_cols as usize, sb64_rows as usize);
     let mut token_cache = vec![0u8; 1024];
+    // §8.3 clear_counts( ): the frame's §9.3.4 symbol-count bank (the
+    // partition counts accumulate separately so the leaf closure can
+    // hold the rest of the bank).
+    let mut counts = crate::prob_adapt::FrameCounts::new_boxed();
+    let mut partition_counts =
+        [[0u32; crate::partition::PARTITION_TYPES]; crate::partition::PARTITION_CONTEXTS];
 
     let fctx = BlockWriteFrameCtx {
         mi_cols,
@@ -411,10 +454,11 @@ pub(crate) fn assemble_keyframe_tree_with_state(
                             &mut nz,
                             &mut token_cache,
                             tree_probs.as_ref(),
-                            &DEFAULT_SKIP_PROB,
-                            &DEFAULT_TX_PROBS,
-                            &DEFAULT_COEF_PROBS,
+                            &coding.skip_prob,
+                            &coding.tx_probs,
+                            &coding.coef_probs,
                             &mut src,
+                            &mut counts,
                         )
                     };
                     write_partition_tree(
@@ -428,6 +472,7 @@ pub(crate) fn assemble_keyframe_tree_with_state(
                         PartitionProbsKind::Keyframe,
                         &mut layout,
                         &mut leaf,
+                        &mut partition_counts,
                     )?;
                     c += 8;
                 }
@@ -439,7 +484,8 @@ pub(crate) fn assemble_keyframe_tree_with_state(
     }
 
     let out = concat_frame_bytes(&uhdr_bytes, &chdr_bytes, &tiles)?;
-    Ok((out, state))
+    counts.noncoef.partition = partition_counts;
+    Ok((out, state, counts))
 }
 
 /// Concatenate uncompressed header + compressed header + the §6.4 tile
@@ -542,6 +588,9 @@ fn assemble_tile(
     ];
     let mut pctx = PartitionContextState::new(sb64_cols as usize, sb64_rows as usize);
     let mut token_cache = vec![0u8; 1024];
+    // Legacy all-8x8 assembler: the §9.3.4 counts are collected but not
+    // surfaced (the classic error-resilient framing never adapts).
+    let mut counts = crate::prob_adapt::FrameCounts::new_boxed();
 
     let fctx = BlockWriteFrameCtx {
         mi_cols,
@@ -599,6 +648,7 @@ fn assemble_tile(
                         &DEFAULT_TX_PROBS,
                         &DEFAULT_COEF_PROBS,
                         &mut src,
+                        &mut counts,
                     )
                 };
             write_partition_8x8(
@@ -1097,8 +1147,21 @@ pub(crate) fn assemble_inter_frame_tree_with_state(
     planner: &mut InterTreePlanner<'_>,
     coeffs: &mut FrameCoefSource<'_>,
 ) -> Result<(Vec<u8>, Vp9FrameState), Error> {
+    assemble_inter_frame_tree_ctx(hdr, plan, planner, coeffs, None).map(|(b, s, _)| (b, s))
+}
+
+/// [`assemble_inter_frame_tree_with_state`] under an explicit
+/// [`FrameEntropy`] (`None` = the default-bank path), additionally
+/// returning the frame's §9.3.4 symbol counts.
+pub(crate) fn assemble_inter_frame_tree_ctx(
+    hdr: &Vp9FrameHeader,
+    plan: &InterFrameTreePlan,
+    planner: &mut InterTreePlanner<'_>,
+    coeffs: &mut FrameCoefSource<'_>,
+    entropy: Option<&FrameEntropy<'_>>,
+) -> Result<(Vec<u8>, Vp9FrameState, Box<crate::prob_adapt::FrameCounts>), Error> {
     use crate::compressed::{setup_compound_reference_mode, RefFrameSignBias, ReferenceMode};
-    use crate::compressed_writer::write_compressed_header_inter;
+    use crate::compressed_writer::write_compressed_header_inter_ctx;
     use crate::inter_block_writer::{
         write_inter_block, InterBlockFrameCtx, InterBlockProbs, InterBlockSpec,
     };
@@ -1145,16 +1208,23 @@ pub(crate) fn assemble_inter_frame_tree_with_state(
         ]
     };
 
-    // §6.3 compressed header (default-probability path). The write
-    // validates `reference_mode` against the sign-bias-derived
+    // §6.3 compressed header: the base → coding forward updates. The
+    // write validates `reference_mode` against the sign-bias-derived
     // `compoundReferenceAllowed` exactly as the §6.3.12 parser does.
-    let chdr_bytes = write_compressed_header_inter(
+    let defaults = crate::compressed::FrameContext::default();
+    let (base, coding) = match entropy {
+        Some(e) => (e.base, e.coding),
+        None => (&defaults, &defaults),
+    };
+    let chdr_bytes = write_compressed_header_inter_ctx(
         tx_mode,
         hdr.quantization.lossless,
         reference_mode,
         switchable,
         hdr.allow_high_precision_mv,
         &sign_bias,
+        base,
+        coding,
     )?;
 
     // §6.2 uncompressed header with header_size_in_bytes = compressed len.
@@ -1169,7 +1239,8 @@ pub(crate) fn assemble_inter_frame_tree_with_state(
     let sb64_cols = ((mi_cols + 7) >> 3) * 8;
     let sb64_rows = ((mi_rows + 7) >> 3) * 8;
 
-    let ctx = crate::compressed::FrameContext::default();
+    // The tile symbols are coded against the forward-updated bank.
+    let ctx = coding;
     // §6.3.18: the same shared derivation the decoder's compressed-header
     // parse runs on the non-SingleReference arms.
     let comp_config = setup_compound_reference_mode(&RefFrameSignBias::from_inter_biases(
@@ -1192,6 +1263,12 @@ pub(crate) fn assemble_inter_frame_tree_with_state(
     ];
     let mut pctx = PartitionContextState::new(sb64_cols as usize, sb64_rows as usize);
     let mut token_cache = vec![0u8; 1024];
+    // §8.3 clear_counts( ): the frame's §9.3.4 symbol-count bank (the
+    // partition counts accumulate separately so the leaf closure can
+    // hold the rest of the bank).
+    let mut counts = crate::prob_adapt::FrameCounts::new_boxed();
+    let mut partition_counts =
+        [[0u32; crate::partition::PARTITION_TYPES]; crate::partition::PARTITION_CONTEXTS];
 
     // §6.4.12 temporal-update state: the §7.4 seg-pred context strips
     // (per-tile above reset here; per-superblock-row left reset below,
@@ -1401,6 +1478,7 @@ pub(crate) fn assemble_inter_frame_tree_with_state(
                             &mut nz,
                             &mut token_cache,
                             &mut src,
+                            &mut counts,
                         )
                     };
                     write_partition_tree(
@@ -1414,6 +1492,7 @@ pub(crate) fn assemble_inter_frame_tree_with_state(
                         PartitionProbsKind::Inter(&ctx.partition_probs),
                         &mut layout,
                         &mut leaf,
+                        &mut partition_counts,
                     )?;
                     c += 8;
                 }
@@ -1425,7 +1504,8 @@ pub(crate) fn assemble_inter_frame_tree_with_state(
     }
 
     let out = concat_frame_bytes(&uhdr_bytes, &chdr_bytes, &tiles)?;
-    Ok((out, state))
+    counts.noncoef.partition = partition_counts;
+    Ok((out, state, counts))
 }
 
 #[cfg(test)]

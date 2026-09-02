@@ -127,6 +127,7 @@ pub(crate) fn write_keyframe_intra_block(
     tx_probs: &[[[u8; 3]; 2]; 4],
     coef_probs: &crate::coef_probs::CoefProbs,
     coef_src: &mut CoefSource<'_>,
+    counts: &mut crate::prob_adapt::FrameCounts,
 ) -> Result<(), Error> {
     if spec.mi_size < BLOCK_8X8 {
         // Sub-8x8 per-4x4 mode walk is a later milestone.
@@ -197,7 +198,14 @@ pub(crate) fn write_keyframe_intra_block(
     // §6.4.6 read_skip( ). seg_feature_skip_active is not handled in this
     // milestone (keyframe corpus paths don't force SKIP); pass false.
     let skip_ctx = skip_context(&nb_skip);
-    write_skip(enc, spec.skip, false, skip_prob, skip_ctx)?;
+    write_skip(
+        enc,
+        spec.skip,
+        false,
+        skip_prob,
+        skip_ctx,
+        &mut counts.noncoef,
+    )?;
 
     // §6.4.10 read_tx_size( 1 ): coded only under TX_MODE_SELECT for
     // MiSize >= BLOCK_8X8.
@@ -206,7 +214,15 @@ pub(crate) fn write_keyframe_intra_block(
     if coded {
         let ctx = tx_size_context(nb_tx, max_tx_size);
         let row = &tx_probs[max_tx_size as usize][ctx];
-        write_tx_size(enc, spec.tx_size, true, max_tx_size, row)?;
+        write_tx_size(
+            enc,
+            spec.tx_size,
+            true,
+            max_tx_size,
+            row,
+            ctx,
+            &mut counts.noncoef,
+        )?;
     }
 
     // §6.4.6 default_intra_mode (MiSize >= BLOCK_8X8 arm).
@@ -255,6 +271,7 @@ pub(crate) fn write_keyframe_intra_block(
         nz,
         token_cache,
         coef_src,
+        counts,
     )?;
 
     // §6.4.4 fan-out. (Intra: the EobTotal skip-rewrite is a no-op.)
@@ -347,6 +364,7 @@ mod tests {
                 &DEFAULT_TX_PROBS,
                 &DEFAULT_COEF_PROBS,
                 &mut src,
+                &mut crate::prob_adapt::FrameCounts::new_boxed(),
             )
             .unwrap();
         }
@@ -463,6 +481,7 @@ mod tests {
             &DEFAULT_TX_PROBS,
             &DEFAULT_COEF_PROBS,
             &mut src,
+            &mut crate::prob_adapt::FrameCounts::new_boxed(),
         );
         assert_eq!(r.unwrap_err(), Error::Unsupported);
     }

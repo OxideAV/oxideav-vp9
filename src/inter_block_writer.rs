@@ -221,6 +221,7 @@ pub(crate) fn write_inter_block(
     nz: &mut [crate::tokens::NonzeroContext; 3],
     token_cache: &mut [u8],
     coef_src: &mut CoefSource<'_>,
+    counts: &mut crate::prob_adapt::FrameCounts,
 ) -> Result<(), Error> {
     let is_sub8x8 = spec.mi_size < BLOCK_8X8;
     // A sub-8x8 block needs the per-cell walk spec, and §6.4.10 never
@@ -365,7 +366,14 @@ pub(crate) fn write_inter_block(
         return Err(Error::Unsupported);
     }
     let skip_ctx = usize::from(nb_skip.above.unwrap_or(0)) + usize::from(nb_skip.left.unwrap_or(0));
-    write_skip(enc, spec.skip, skip_active, probs.skip_prob, skip_ctx)?;
+    write_skip(
+        enc,
+        spec.skip,
+        skip_active,
+        probs.skip_prob,
+        skip_ctx,
+        &mut counts.noncoef,
+    )?;
 
     // §6.4.13 read_is_inter( ): on a SEG_LVL_REF_FRAME segment the flag
     // is derived from FeatureData (no bits) — this writer targets inter
@@ -377,7 +385,14 @@ pub(crate) fn write_inter_block(
             return Err(Error::Unsupported);
         }
     }
-    write_is_inter(enc, true, ref_active, probs.is_inter_prob, is_inter_nb)?;
+    write_is_inter(
+        enc,
+        true,
+        ref_active,
+        probs.is_inter_prob,
+        is_inter_nb,
+        &mut counts.noncoef,
+    )?;
 
     // §6.4.10 read_tx_size( !skip || !is_inter ): allow_select = !skip
     // (is_inter is true). Coded only under TX_MODE_SELECT for >= 8x8.
@@ -387,7 +402,15 @@ pub(crate) fn write_inter_block(
     if coded {
         let ctx = tx_size_context(nb_tx, max_tx_size);
         let row = &probs.tx_probs[max_tx_size as usize][ctx];
-        write_tx_size(enc, spec.tx_size, true, max_tx_size, row)?;
+        write_tx_size(
+            enc,
+            spec.tx_size,
+            true,
+            max_tx_size,
+            row,
+            ctx,
+            &mut counts.noncoef,
+        )?;
     }
 
     // §6.4.17 read_ref_frames( ).
@@ -401,7 +424,7 @@ pub(crate) fn write_inter_block(
         single_ref_prob: probs.single_ref_prob,
         comp_ref_prob: probs.comp_ref_prob,
     };
-    write_ref_frames(enc, spec.ref_frame, &ref_args)?;
+    write_ref_frames(enc, spec.ref_frame, &ref_args, &mut counts.noncoef)?;
     let is_compound = spec.ref_frame[1] > INTRA_FRAME;
 
     // §6.5 MV-reference scan — shared decode code, reading `state`.
@@ -448,7 +471,13 @@ pub(crate) fn write_inter_block(
                 return Err(Error::Unsupported);
             }
         } else {
-            write_inter_mode(enc, spec.y_mode, mode_ctx, probs.inter_mode_probs)?;
+            write_inter_mode(
+                enc,
+                spec.y_mode,
+                mode_ctx,
+                probs.inter_mode_probs,
+                &mut counts.noncoef,
+            )?;
         }
     }
 
@@ -460,6 +489,7 @@ pub(crate) fn write_inter_block(
         fctx.interpolation_filter,
         probs.interp_filter_probs,
         interp_nb,
+        &mut counts.noncoef,
     )?;
 
     // §6.4.16 / §6.4.18: the motion-vector syntax, building the decoder's
@@ -480,7 +510,13 @@ pub(crate) fn write_inter_block(
                 // Per-cell inter_mode: the same block-level ModeContext
                 // row selects the probabilities for every cell (§9.3.2:
                 // ctx = ModeContext[ ref_frame[ 0 ] ]).
-                write_inter_mode(enc, mode, mode_ctx, probs.inter_mode_probs)?;
+                write_inter_mode(
+                    enc,
+                    mode,
+                    mode_ctx,
+                    probs.inter_mode_probs,
+                    &mut counts.noncoef,
+                )?;
 
                 // §6.5.14 append_sub8x8_mvs( ) rewrites this cell's
                 // NearestMv / NearMv per reference list; BestMv keeps the
@@ -509,6 +545,7 @@ pub(crate) fn write_inter_block(
                     &sub_preds,
                     &sub.mvs[block],
                     fctx.allow_high_precision_mv,
+                    &mut counts.noncoef,
                 )?;
 
                 // §6.4.16: replicate across the (num4x4h × num4x4w) span.
@@ -536,6 +573,7 @@ pub(crate) fn write_inter_block(
             &preds,
             &spec.mv,
             fctx.allow_high_precision_mv,
+            &mut counts.noncoef,
         )?;
         for (rl, slot) in block_mvs.iter_mut().enumerate().take(ref_count) {
             for cell in slot.iter_mut() {
@@ -564,6 +602,7 @@ pub(crate) fn write_inter_block(
         nz,
         token_cache,
         coef_src,
+        counts,
     )?;
 
     // §6.4.4 fan-out. The interp_filter the decoder stores is the
@@ -697,6 +736,7 @@ mod tests {
                 &mut nz,
                 &mut cache,
                 &mut src,
+                &mut crate::prob_adapt::FrameCounts::new_boxed(),
             )
             .unwrap();
         }
@@ -858,7 +898,16 @@ mod tests {
             v
         });
         write_inter_block(
-            &mut enc, &fc, &s, &probs, &mut state, None, &mut nz, &mut cache, &mut src,
+            &mut enc,
+            &fc,
+            &s,
+            &probs,
+            &mut state,
+            None,
+            &mut nz,
+            &mut cache,
+            &mut src,
+            &mut crate::prob_adapt::FrameCounts::new_boxed(),
         )
         .unwrap();
         let bytes = enc.finish();
@@ -1126,7 +1175,16 @@ mod tests {
             v
         });
         write_inter_block(
-            &mut enc, &fc, &s, &probs, &mut state, None, &mut nz, &mut cache, &mut src,
+            &mut enc,
+            &fc,
+            &s,
+            &probs,
+            &mut state,
+            None,
+            &mut nz,
+            &mut cache,
+            &mut src,
+            &mut crate::prob_adapt::FrameCounts::new_boxed(),
         )
         .unwrap();
         drop(src);
@@ -1172,7 +1230,16 @@ mod tests {
         let s = base_spec(0, 0, BLOCK_4X4);
         let mut src = no_coeffs();
         let r = write_inter_block(
-            &mut enc, &fc, &s, &probs, &mut state, None, &mut nz, &mut cache, &mut src,
+            &mut enc,
+            &fc,
+            &s,
+            &probs,
+            &mut state,
+            None,
+            &mut nz,
+            &mut cache,
+            &mut src,
+            &mut crate::prob_adapt::FrameCounts::new_boxed(),
         );
         assert_eq!(r.unwrap_err(), Error::Unsupported);
         // Non-TX_4X4 tx_size on a sub-8x8 block.
@@ -1180,7 +1247,16 @@ mod tests {
         s2.tx_size = 1;
         let mut src2 = no_coeffs();
         let r2 = write_inter_block(
-            &mut enc, &fc, &s2, &probs, &mut state, None, &mut nz, &mut cache, &mut src2,
+            &mut enc,
+            &fc,
+            &s2,
+            &probs,
+            &mut state,
+            None,
+            &mut nz,
+            &mut cache,
+            &mut src2,
+            &mut crate::prob_adapt::FrameCounts::new_boxed(),
         );
         assert_eq!(r2.unwrap_err(), Error::Unsupported);
     }
@@ -1262,7 +1338,16 @@ mod tests {
         s.skip = false;
         let mut src = no_coeffs();
         let r = write_inter_block(
-            &mut enc, &fc, &s, &probs, &mut state, None, &mut nz, &mut cache, &mut src,
+            &mut enc,
+            &fc,
+            &s,
+            &probs,
+            &mut state,
+            None,
+            &mut nz,
+            &mut cache,
+            &mut src,
+            &mut crate::prob_adapt::FrameCounts::new_boxed(),
         );
         assert_eq!(r.unwrap_err(), Error::Unsupported);
     }
@@ -1283,7 +1368,16 @@ mod tests {
         s.ref_frame = [LAST_FRAME, NONE_REF_FRAME]; // override says GOLDEN
         let mut src = no_coeffs();
         let r = write_inter_block(
-            &mut enc, &fc, &s, &probs, &mut state, None, &mut nz, &mut cache, &mut src,
+            &mut enc,
+            &fc,
+            &s,
+            &probs,
+            &mut state,
+            None,
+            &mut nz,
+            &mut cache,
+            &mut src,
+            &mut crate::prob_adapt::FrameCounts::new_boxed(),
         );
         assert_eq!(r.unwrap_err(), Error::Unsupported);
     }
@@ -1388,7 +1482,16 @@ mod tests {
         let mut cache = vec![0u8; 4096];
         let mut enc = BoolEncoder::new();
         let r = write_inter_block(
-            &mut enc, &fc, &s, &probs, &mut state, None, &mut nz, &mut cache, &mut src,
+            &mut enc,
+            &fc,
+            &s,
+            &probs,
+            &mut state,
+            None,
+            &mut nz,
+            &mut cache,
+            &mut src,
+            &mut crate::prob_adapt::FrameCounts::new_boxed(),
         );
         assert_eq!(r.unwrap_err(), Error::Unsupported);
 
@@ -1406,6 +1509,7 @@ mod tests {
             &mut nz,
             &mut cache,
             &mut src,
+            &mut crate::prob_adapt::FrameCounts::new_boxed(),
         );
         assert_eq!(r2.unwrap_err(), Error::Unsupported);
 
@@ -1424,6 +1528,7 @@ mod tests {
             &mut nz,
             &mut cache,
             &mut src,
+            &mut crate::prob_adapt::FrameCounts::new_boxed(),
         );
         assert_eq!(r3.unwrap_err(), Error::InvalidBitstream);
 
@@ -1441,6 +1546,7 @@ mod tests {
             &mut nz,
             &mut cache,
             &mut src,
+            &mut crate::prob_adapt::FrameCounts::new_boxed(),
         );
         assert_eq!(r4.unwrap_err(), Error::Unsupported);
     }

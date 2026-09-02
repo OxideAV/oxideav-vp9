@@ -504,6 +504,7 @@ mod compressed_writer;
 mod decode_block;
 mod decode_frame;
 mod dequant;
+mod entropy_model;
 mod filter_mask;
 mod filter_size;
 mod frame_loop_filter;
@@ -1068,7 +1069,15 @@ pub fn encode_vp9_lossy_sequence_444(
     height: u32,
     base_q_idx: u8,
 ) -> Result<Vec<Vec<u8>>, Error> {
-    pixel_encoder::encode_sequence_lossy_u8(frames, width, height, base_q_idx, false, false, true)
+    pixel_encoder::encode_sequence_lossy_u8(
+        frames,
+        width,
+        height,
+        base_q_idx,
+        false,
+        false,
+        pixel_encoder::ChainModel::Adaptive,
+    )
 }
 
 /// [`encode_vp9_lossy_sequence_444`] at **4:2:2** (chroma planes
@@ -1080,7 +1089,15 @@ pub fn encode_vp9_lossy_sequence_422(
     height: u32,
     base_q_idx: u8,
 ) -> Result<Vec<Vec<u8>>, Error> {
-    pixel_encoder::encode_sequence_lossy_u8(frames, width, height, base_q_idx, true, false, true)
+    pixel_encoder::encode_sequence_lossy_u8(
+        frames,
+        width,
+        height,
+        base_q_idx,
+        true,
+        false,
+        pixel_encoder::ChainModel::Adaptive,
+    )
 }
 
 /// [`encode_vp9_lossy_sequence_444`] at **4:4:0** (chroma planes
@@ -1093,7 +1110,15 @@ pub fn encode_vp9_lossy_sequence_440(
     height: u32,
     base_q_idx: u8,
 ) -> Result<Vec<Vec<u8>>, Error> {
-    pixel_encoder::encode_sequence_lossy_u8(frames, width, height, base_q_idx, false, true, true)
+    pixel_encoder::encode_sequence_lossy_u8(
+        frames,
+        width,
+        height,
+        base_q_idx,
+        false,
+        true,
+        pixel_encoder::ChainModel::Adaptive,
+    )
 }
 
 /// Encode a **sequence** of 10/12-bit planar frames (native `u16`
@@ -1118,7 +1143,14 @@ pub fn encode_vp9_lossy_sequence_hbd(
     base_q_idx: u8,
 ) -> Result<Vec<Vec<u8>>, Error> {
     pixel_encoder::encode_sequence_lossy_u16(
-        frames, width, height, bit_depth, base_q_idx, subsample, subsample, true,
+        frames,
+        width,
+        height,
+        bit_depth,
+        base_q_idx,
+        subsample,
+        subsample,
+        pixel_encoder::ChainModel::Adaptive,
     )
 }
 
@@ -1134,7 +1166,14 @@ pub fn encode_vp9_lossy_sequence_hbd_422(
     base_q_idx: u8,
 ) -> Result<Vec<Vec<u8>>, Error> {
     pixel_encoder::encode_sequence_lossy_u16(
-        frames, width, height, bit_depth, base_q_idx, true, false, true,
+        frames,
+        width,
+        height,
+        bit_depth,
+        base_q_idx,
+        true,
+        false,
+        pixel_encoder::ChainModel::Adaptive,
     )
 }
 
@@ -1150,7 +1189,14 @@ pub fn encode_vp9_lossy_sequence_hbd_440(
     base_q_idx: u8,
 ) -> Result<Vec<Vec<u8>>, Error> {
     pixel_encoder::encode_sequence_lossy_u16(
-        frames, width, height, bit_depth, base_q_idx, false, true, true,
+        frames,
+        width,
+        height,
+        bit_depth,
+        base_q_idx,
+        false,
+        true,
+        pixel_encoder::ChainModel::Adaptive,
     )
 }
 
@@ -1189,7 +1235,13 @@ pub fn encode_vp9_lossy_sequence_rc(
     height: u32,
     target_bytes_per_frame: usize,
 ) -> Result<Vec<Vec<u8>>, Error> {
-    pixel_encoder::encode_sequence_lossy_rc_420(frames, width, height, target_bytes_per_frame)
+    pixel_encoder::encode_sequence_lossy_rc_420(
+        frames,
+        width,
+        height,
+        target_bytes_per_frame,
+        pixel_encoder::ChainModel::Adaptive,
+    )
 }
 
 /// Encode an 8-bit 4:2:0 sequence as a lossy **alt-ref pyramid** GOP
@@ -1294,11 +1346,22 @@ pub struct Vp9GopConfig {
     /// `show_existing_frame` packet). Requires `altref_interval >= 2`
     /// to have any effect.
     pub intra_only_altref: bool,
+    /// **Entropy adaptation** (round 455, on by default): every decoded
+    /// frame codes `refresh_frame_context = 1` with
+    /// `frame_parallel_decoding_mode = 0`, so the decoder's §6.1.2
+    /// `refresh_probs( )` backward adaptation (§8.4) runs after each
+    /// frame and the next frame is coded against the adapted bank —
+    /// the encoder mirrors the adaptation from its own §9.3.4 symbol
+    /// counts — plus per-cell §6.3 forward probability updates elected
+    /// by measured bit cost. `false` codes every frame against the
+    /// §10.5 default bank with no forward updates (the round-452
+    /// bytes; the reconstruction is identical either way).
+    pub entropy_adaptation: bool,
 }
 
 impl Vp9GopConfig {
     /// A plain two-slot-equivalent chain at `base_q_idx`: no alt-refs,
-    /// no segmentation.
+    /// no segmentation, entropy adaptation on.
     pub fn new(base_q_idx: u8) -> Self {
         Self {
             base_q_idx,
@@ -1307,6 +1370,7 @@ impl Vp9GopConfig {
             tile_cols_log2: 0,
             tile_rows_log2: 0,
             intra_only_altref: false,
+            entropy_adaptation: true,
         }
     }
 }
@@ -1354,6 +1418,7 @@ pub fn encode_vp9_lossy_sequence_with(
         tile_cols_log2: cfg.tile_cols_log2,
         tile_rows_log2: cfg.tile_rows_log2,
         intra_only_altref: cfg.intra_only_altref,
+        entropy_adaptation: cfg.entropy_adaptation,
     };
     pixel_encoder::encode_sequence_lossy_structured_u8(
         frames,
@@ -1388,7 +1453,35 @@ pub fn encode_vp9_lossy_sequence_resized(
     sizes: &[(u32, u32)],
     base_q_idx: u8,
 ) -> Result<Vec<Vec<u8>>, Error> {
-    pixel_encoder::encode_sequence_lossy_resized_u8(frames, sizes, base_q_idx)
+    pixel_encoder::encode_sequence_lossy_resized_u8(frames, sizes, base_q_idx, true)
+}
+
+/// [`encode_vp9_lossy_sequence_resized`] under a [`Vp9GopConfig`]
+/// (round 455): `base_q_idx` and `entropy_adaptation` apply (the §6.1.2
+/// banks are size-independent, so the adapted bank carries straight
+/// across a resize). The resized chain is a plain shown-P-frame,
+/// single-reference, single-tile stream, so a config asking for
+/// alt-refs, segmentation, intra-only alt-refs or tiles returns
+/// [`Error::Unsupported`].
+pub fn encode_vp9_lossy_sequence_resized_with(
+    frames: &[&[u8]],
+    sizes: &[(u32, u32)],
+    cfg: &Vp9GopConfig,
+) -> Result<Vec<Vec<u8>>, Error> {
+    if cfg.altref_interval != 1
+        || cfg.segmentation != Vp9Segmentation::Off
+        || cfg.intra_only_altref
+        || cfg.tile_cols_log2 != 0
+        || cfg.tile_rows_log2 != 0
+    {
+        return Err(Error::Unsupported);
+    }
+    pixel_encoder::encode_sequence_lossy_resized_u8(
+        frames,
+        sizes,
+        cfg.base_q_idx,
+        cfg.entropy_adaptation,
+    )
 }
 
 /// Encode a minimal VP9 **inter (P-frame) sequence** of `width × height`:
@@ -1442,6 +1535,13 @@ oxideav_core::register!("vp9", register);
 #[cfg(test)]
 mod encode_roundtrip_tests {
     use super::*;
+
+    /// The framing the staged round-441 / 445 / 448 packages were
+    /// minted under: the round-445 chain against the default banks
+    /// (`frame_parallel_decoding_mode = 1`). The public entries moved on
+    /// to [`pixel_encoder::ChainModel::Adaptive`] in round 455; the
+    /// staged corpus stays byte-identical to THIS framing.
+    const STAGED_MODEL: pixel_encoder::ChainModel = pixel_encoder::ChainModel::Chained;
 
     /// `encode_vp9` produces a stream that `decode_vp9` reconstructs
     /// **byte-exact** back to the input (lossless contract).
@@ -3456,7 +3556,8 @@ mod encode_roundtrip_tests {
             .map(|k| matrix_gop_frame_u8(64, 48, 64, 48, k))
             .collect();
         let refs: Vec<&[u8]> = inputs.iter().map(|f| f.as_slice()).collect();
-        encode_vp9_lossy_sequence_444(&refs, 64, 48, 110).expect("444 GOP encode")
+        pixel_encoder::encode_sequence_lossy_u8(&refs, 64, 48, 110, false, false, STAGED_MODEL)
+            .expect("444 GOP encode")
     }
 
     /// Build the round-441 **lossy 10-bit GOP** (profile 2, 4:2:0,
@@ -3491,7 +3592,8 @@ mod encode_roundtrip_tests {
             })
             .collect();
         let refs: Vec<&[u16]> = inputs.iter().map(|f| f.as_slice()).collect();
-        encode_vp9_lossy_sequence_hbd(&refs, 64, 48, 10, true, 110).expect("hbd10 GOP encode")
+        pixel_encoder::encode_sequence_lossy_u16(&refs, 64, 48, 10, 110, true, true, STAGED_MODEL)
+            .expect("hbd10 GOP encode")
     }
 
     /// Build the round-441 **loop-filter-delta GOP** (profile 0, 8-bit
@@ -3524,7 +3626,8 @@ mod encode_roundtrip_tests {
             })
             .collect();
         let refs: Vec<&[u8]> = inputs.iter().map(|f| f.as_slice()).collect();
-        encode_vp9_lossy_sequence_chained(&refs, 64, 48, 170).expect("lf-deltas GOP encode")
+        pixel_encoder::encode_sequence_lossy_u8(&refs, 64, 48, 170, true, true, STAGED_MODEL)
+            .expect("lf-deltas GOP encode")
     }
 
     /// The 4:4:4 GOP decodes end-to-end at profile 1 with full-res
@@ -3741,7 +3844,8 @@ mod encode_roundtrip_tests {
             })
             .collect();
         let refs: Vec<&[u16]> = inputs.iter().map(|f| f.as_slice()).collect();
-        encode_vp9_lossy_sequence_hbd_422(&refs, 64, 48, 12, 110).expect("hbd12-422 GOP encode")
+        pixel_encoder::encode_sequence_lossy_u16(&refs, 64, 48, 12, 110, true, false, STAGED_MODEL)
+            .expect("hbd12-422 GOP encode")
     }
 
     /// Build the round-445 **rate-controlled GOP** (profile 0, 8-bit
@@ -3774,7 +3878,8 @@ mod encode_roundtrip_tests {
             })
             .collect();
         let refs: Vec<&[u8]> = inputs.iter().map(|f| f.as_slice()).collect();
-        encode_vp9_lossy_sequence_rc(&refs, 64, 48, 1000).expect("rc GOP encode")
+        pixel_encoder::encode_sequence_lossy_rc_420(&refs, 64, 48, 1000, STAGED_MODEL)
+            .expect("rc GOP encode")
     }
 
     /// The lossless chained GOP pins the r445 default-path shape:
@@ -3963,7 +4068,8 @@ mod encode_roundtrip_tests {
             .map(|k| matrix_gop_frame_u8(64, 48, 64, 24, k))
             .collect();
         let refs: Vec<&[u8]> = inputs.iter().map(|f| f.as_slice()).collect();
-        encode_vp9_lossy_sequence_440(&refs, 64, 48, 110).expect("440 GOP encode")
+        pixel_encoder::encode_sequence_lossy_u8(&refs, 64, 48, 110, false, true, STAGED_MODEL)
+            .expect("440 GOP encode")
     }
 
     /// Build the round-448 **12-bit 4:4:0 GOP** (profile 3, 64x48,
@@ -4000,7 +4106,8 @@ mod encode_roundtrip_tests {
             })
             .collect();
         let refs: Vec<&[u16]> = inputs.iter().map(|f| f.as_slice()).collect();
-        encode_vp9_lossy_sequence_hbd_440(&refs, 64, 48, 12, 110).expect("hbd12-440 GOP encode")
+        pixel_encoder::encode_sequence_lossy_u16(&refs, 64, 48, 12, 110, false, true, STAGED_MODEL)
+            .expect("hbd12-440 GOP encode")
     }
 
     /// The 4:4:0 GOP decodes end-to-end at profile 1 with the

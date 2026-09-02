@@ -688,6 +688,46 @@ covers the whole counting + adaptation chain. The inter-frame
 `uv_mode_probs` table joined the persisted bank (§8.4.4 adapts it; §6.3
 carries no forward update for it).
 
+### Encoder-side entropy model (round 455)
+
+The writer now holds the same persistent entropy state the decoder
+does. Every symbol writer (`partition`, `skip`, `tx_size`, `is_inter`,
+`comp_mode` / `comp_ref` / `single_ref_p1/p2`, `inter_mode`,
+`interp_filter`, the mv family, `token` / `more_coefs`) counts what it
+codes into a §9.3.4 `FrameCounts` bank exactly as the decoder does —
+the `more_coefs` errata rule, the corner-inferred `PARTITION_SPLIT`
+and the absent `mv_hp` bit included — and after each frame the
+encoder mirrors §6.1.2 `refresh_probs( )` with the *decoder's own*
+§8.4.2–§8.4.4 code (`load_probs( )` semantics per §7.1.2: the
+adaptation starts from the loaded bank, an intra frame's forward
+`tx_probs` / `skip_prob` survive, `LastFrameType` selects the §8.4.3
+`updateFactor`), plus the §6.2 `setup_past_independence( )` /
+`reset_frame_context` resets (keyframes reset every bank, the
+intra-only alt-refs code `reset_frame_context = 3`). On top of the
+loaded bank the compressed header codes **forward updates elected by
+measured bit cost**: per cell, the §6.3.3 `diff_update_prob` (or
+§6.3.17 `update_mv_prob`) is taken only when the flag + §6.3.4
+`decode_term_subexp` bits are outweighed by the frame's symbol-cost
+change under the new probability (tree cells elected on the same
+per-node counts §8.4.2 `merge_probs( )` folds; coefficient slabs
+elected as a whole against their `update_probs` bit), costs from an
+integer log2 table so the election is platform-deterministic, and the
+updated assembly replaces the plain one only when the coded frame is
+strictly shorter — the symbols never depend on the bank, so the
+reconstruction is invariant. Pinned by per-frame decoder-mirror tests
+(the writer's counts equal the decoder's cell for cell; the
+`FrameContext[ 0 ]` the decoder saves equals the encoder's bank on the
+chained and on every structured-GOP shape — pyramid, all four
+segmentation modes, intra-only alt-refs, tile columns / rows), by the
+forward-update header writers round-tripping random reachable banks
+through the parser, and by the corpus measurement in
+`tests/encode_entropy.rs`: **30 495 → 28 253 bytes (−7.4 %)** across
+six GOP shapes at bit-identical reconstruction, every stream
+black-box validated (external decode byte-identical to the crate's,
+PSNR 29–44 dB vs source at q 60–180). `Vp9GopConfig::entropy_adaptation
+= false` (and the round-441/445/448 staged-fixture builders, which pin
+the pre-455 default-bank framing) reproduce the earlier bytes.
+
 ### Not yet supported
 
 * ~~Scaled-reference inter prediction~~ — decode **corpus-validated
@@ -787,10 +827,13 @@ carries no forward update for it).
     (the internal pipeline is format-generic; HBD / 4:4:4 / 4:2:2 /
     4:4:0 public wrappers for them are a thin follow-up — the classic
     chain entries already cover the full §7.2 matrix);
-  * writer-side §8.4 backward adaptation (`refresh_frame_context = 1`
-    with `frame_parallel_decoding_mode = 0`) is not modeled — every
-    frame codes forward-updates-only default probabilities, leaving
-    entropy-rate on the table;
+  * ~~writer-side §8.4 backward adaptation~~ — **closed in round 455**
+    (see "Encoder-side entropy model" below): every public lossy
+    sequence entry codes `refresh_frame_context = 1` with
+    `frame_parallel_decoding_mode = 0` against its predecessor's
+    §8.4-adapted bank plus cost-elected §6.3 forward updates —
+    −7.4 % bytes across the crate's encode corpus at bit-identical
+    reconstruction;
   * no two-pass rate control (the per-frame bisection of
     `encode_vp9_lossy_sequence_rc` is one-pass), and the
     interpolation filter is frame-level `EIGHTTAP` (no switchable

@@ -123,6 +123,7 @@ pub(crate) fn write_residual_intra(
     nz: &mut [NonzeroContext; 3],
     token_cache: &mut [u8],
     coef_src: &mut CoefSource<'_>,
+    counts: &mut crate::prob_adapt::FrameCounts,
 ) -> Result<u32, Error> {
     let (r, c) = coords;
     // §6.4.21: bsize = MiSize < BLOCK_8X8 ? BLOCK_8X8 : MiSize.
@@ -201,6 +202,7 @@ pub(crate) fn write_residual_intra(
                         &nz[plane],
                         &coeffs,
                         &mut token_cache[..seg_eob],
+                        counts,
                     )?;
                     eob_total += u32::from(nonzero);
                 }
@@ -259,6 +261,7 @@ pub(crate) fn write_residual_inter(
     nz: &mut [NonzeroContext; 3],
     token_cache: &mut [u8],
     coef_src: &mut CoefSource<'_>,
+    counts: &mut crate::prob_adapt::FrameCounts,
 ) -> Result<u32, Error> {
     let (r, c) = coords;
     let bsize = mi_size.max(BLOCK_8X8);
@@ -326,6 +329,7 @@ pub(crate) fn write_residual_inter(
                         &nz[plane],
                         &coeffs,
                         &mut token_cache[..seg_eob],
+                        counts,
                     )?;
                     eob_total += u32::from(nonzero);
                 }
@@ -523,6 +527,7 @@ mod tests {
                 &mut nz,
                 &mut cache,
                 &mut src,
+                &mut crate::prob_adapt::FrameCounts::new_boxed(),
             )
             .unwrap();
         }
@@ -636,6 +641,7 @@ mod tests {
             &mut nz,
             &mut cache,
             &mut src,
+            &mut crate::prob_adapt::FrameCounts::new_boxed(),
         )
         .unwrap();
         assert_eq!(eob, 0, "skip block has no EOB total");

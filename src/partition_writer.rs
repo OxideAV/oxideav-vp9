@@ -24,9 +24,9 @@ use crate::bool_encoder::BoolEncoder;
 use crate::mode_writer::tree_encode;
 use crate::partition::{
     partition_plane_context, write_back_partition_context, PartitionContextState,
-    PartitionProbsKind, COLS_PARTITION_TREE, NUM_8X8_BLOCKS_WIDE_LOOKUP, PARTITION_HORZ,
-    PARTITION_NONE, PARTITION_SPLIT, PARTITION_TREE, PARTITION_VERT, ROWS_PARTITION_TREE,
-    SUBSIZE_LOOKUP,
+    PartitionProbsKind, COLS_PARTITION_TREE, NUM_8X8_BLOCKS_WIDE_LOOKUP, PARTITION_CONTEXTS,
+    PARTITION_HORZ, PARTITION_NONE, PARTITION_SPLIT, PARTITION_TREE, PARTITION_TYPES,
+    PARTITION_VERT, ROWS_PARTITION_TREE, SUBSIZE_LOOKUP,
 };
 use crate::residual::{BLOCK_8X8, BLOCK_SIZES};
 use crate::Error;
@@ -298,6 +298,7 @@ pub(crate) fn write_partition_tree(
     probs_kind: PartitionProbsKind<'_>,
     layout: &mut PartitionSource<'_>,
     on_leaf: &mut LeafWriter<'_>,
+    counts: &mut [[u32; PARTITION_TYPES]; PARTITION_CONTEXTS],
 ) -> Result<(), Error> {
     // §6.4.3 line 2354: out-of-frame quadrants emit nothing.
     if r >= mi_rows || c >= mi_cols {
@@ -340,6 +341,10 @@ pub(crate) fn write_partition_tree(
 
     let partition = layout(r, c, bsize);
     write_partition_type(enc, has_rows, has_cols, partition, &probs_row)?;
+    // §9.3 step 2 / §9.3.4: `counts_partition[ ctx ][ partition ]` fires
+    // for every parsed `partition` element — the bit-free corner-inferred
+    // SPLIT included — exactly as the decoder's `record_partition` hook.
+    counts[ctx][partition as usize] += 1;
     let subsize = SUBSIZE_LOOKUP[partition as usize][bsize as usize];
 
     // §6.4.3 lines 2362-2385: leaf vs recursive dispatch, mirroring
@@ -359,7 +364,7 @@ pub(crate) fn write_partition_tree(
     } else {
         // PARTITION_SPLIT: TL → TR → BL → BR.
         write_partition_tree(
-            enc, r, c, subsize, mi_rows, mi_cols, ctx_state, probs_kind, layout, on_leaf,
+            enc, r, c, subsize, mi_rows, mi_cols, ctx_state, probs_kind, layout, on_leaf, counts,
         )?;
         write_partition_tree(
             enc,
@@ -372,6 +377,7 @@ pub(crate) fn write_partition_tree(
             probs_kind,
             layout,
             on_leaf,
+            counts,
         )?;
         write_partition_tree(
             enc,
@@ -384,6 +390,7 @@ pub(crate) fn write_partition_tree(
             probs_kind,
             layout,
             on_leaf,
+            counts,
         )?;
         write_partition_tree(
             enc,
@@ -396,6 +403,7 @@ pub(crate) fn write_partition_tree(
             probs_kind,
             layout,
             on_leaf,
+            counts,
         )?;
     }
 
@@ -574,6 +582,7 @@ mod tests {
                         });
                         Ok(())
                     },
+                    &mut [[0u32; PARTITION_TYPES]; PARTITION_CONTEXTS],
                 )
                 .expect("write partition tree");
                 c += 8;
@@ -730,6 +739,7 @@ mod tests {
             PartitionProbsKind::Keyframe,
             &mut |_r, _c, _b| PARTITION_NONE,
             &mut |_enc, _lr, _lc, _ls| Ok(()),
+            &mut [[0u32; PARTITION_TYPES]; PARTITION_CONTEXTS],
         )
         .unwrap_err();
         assert_eq!(err, Error::Unsupported);

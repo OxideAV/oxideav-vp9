@@ -231,6 +231,7 @@ pub(crate) fn write_tokens(
     nz: &crate::tokens::NonzeroContext,
     coeffs: &[i64],
     token_cache: &mut [u8],
+    counts: &mut crate::prob_adapt::FrameCounts,
 ) -> Result<bool, Error> {
     use crate::tokens::{
         build_token_probs, coef_band, token_cache_neighbours, ENERGY_CLASS, ZERO_TOKEN,
@@ -284,20 +285,26 @@ pub(crate) fn write_tokens(
         let cell = &tx_slab[band][ctx];
 
         // §6.4.24: the `more_coefs` flag is read (and so written) only
-        // when `check_eob`; after a `ZERO_TOKEN` it is suppressed.
+        // when `check_eob`; after a `ZERO_TOKEN` it is suppressed. The
+        // §9.3.4 `more_coefs` count fires only where the flag is
+        // actually coded (the errata #249 reconstruction).
         if check_eob {
+            counts.more_coefs[tx_sz as usize][plane_gt0][is_inter][band][ctx][1] += 1;
             write_more_coefs(enc, true, cell[0]);
         }
 
         let value = coeffs[pos];
         let token_probs = build_token_probs(cell);
         if value == 0 {
+            counts.token[tx_sz as usize][plane_gt0][is_inter][band][ctx][0] += 1;
             write_token(enc, ZERO_TOKEN, &token_probs)?;
             token_cache[pos] = ENERGY_CLASS[ZERO_TOKEN as usize];
             check_eob = false;
         } else {
             let mag = value.unsigned_abs() as u32;
             let token = token_for_magnitude(mag);
+            counts.token[tx_sz as usize][plane_gt0][is_inter][band][ctx]
+                [(token as usize).min(2)] += 1;
             write_token(enc, token, &token_probs)?;
             write_coef(enc, token, mag, block.bit_depth)?;
             enc.write_literal(u32::from(value < 0), 1);
@@ -330,6 +337,7 @@ pub(crate) fn write_tokens(
             let (nb0, nb1) = token_cache_neighbours(eob, pos, tx_sz, block.tx_type);
             (1 + token_cache[nb0] as usize + token_cache[nb1] as usize) >> 1
         };
+        counts.more_coefs[tx_sz as usize][plane_gt0][is_inter][band][ctx][0] += 1;
         write_more_coefs(enc, false, tx_slab[band][ctx][0]);
     }
 
@@ -502,6 +510,7 @@ mod tests {
             nz,
             coeffs,
             &mut wcache,
+            &mut crate::prob_adapt::FrameCounts::new_boxed(),
         )
         .expect("write tokens");
         let buf = enc.finish();

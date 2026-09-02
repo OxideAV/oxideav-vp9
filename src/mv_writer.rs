@@ -36,6 +36,7 @@ use crate::mv::{
     use_mv_hp, MvPredictors, MV_CLASS_0, MV_CLASS_TREE, MV_FR_TREE, MV_JOINT_HNZVNZ,
     MV_JOINT_HNZVZ, MV_JOINT_HZVNZ, MV_JOINT_TREE, MV_JOINT_ZERO,
 };
+use crate::prob_adapt::CountsNonCoef;
 use crate::Error;
 
 /// `CLASS0_SIZE == 1 << 1` per §3 — the class-0 integer-part shift, mirror
@@ -61,13 +62,16 @@ pub(crate) fn write_mv_component(
     comp: usize,
     value: i32,
     use_hp: bool,
+    counts: &mut CountsNonCoef,
 ) -> Result<(), Error> {
     // value == 0 is never a coded component: the §6.4.20 mag is always
     // >= 1, so a zero component means the joint excluded it.
     if value == 0 {
         return Err(Error::Unsupported);
     }
+    let mc = &mut counts.mv_comp[comp];
     let mv_sign = u32::from(value < 0);
+    mc.sign[mv_sign as usize] += 1;
     enc.write_bool(mv_sign, u32::from(probs.sign_prob[comp]));
 
     let mag = value.unsigned_abs();
@@ -79,19 +83,30 @@ pub(crate) fn write_mv_component(
     // where d has `class` bits, so the class-`k` band is
     // [base_k + 1, 2·base_k] with base_k = CLASS0_SIZE << (k+2).
     let mv_class = mv_class_of(mag);
+    mc.class[mv_class as usize] += 1;
     let class_probs = &probs.class_probs[comp];
     tree_encode(enc, &MV_CLASS_TREE, mv_class as i32, |node| {
         class_probs[node]
     })?;
 
+    // §9.3.4 counting mirrors the decoder cell for cell — including the
+    // `mv_class0_hp` / `mv_hp` element, which the §9.3.1 tree-selection
+    // process still yields (as the fixed value 1) when `UseHp == 0`, so
+    // it is counted whether or not a bit was written.
     if mv_class == MV_CLASS_0 as u32 {
         let bracket = mag - 1; // 0..=15
         let mv_class0_bit = (bracket >> 3) & 1;
         let mv_class0_fr = (bracket >> 1) & 3;
         let mv_class0_hp = bracket & 1;
+        mc.class0_bit[mv_class0_bit as usize] += 1;
         enc.write_bool(mv_class0_bit, u32::from(probs.class0_bit_prob[comp]));
         let fr_probs = &probs.class0_fr_probs[comp][mv_class0_bit as usize];
+        mc.class0_fr[mv_class0_bit as usize][mv_class0_fr as usize] += 1;
         tree_encode(enc, &MV_FR_TREE, mv_class0_fr as i32, |node| fr_probs[node])?;
+        if !use_hp && mv_class0_hp != 1 {
+            return Err(Error::Unsupported);
+        }
+        mc.class0_hp[mv_class0_hp as usize] += 1;
         write_hp(enc, probs.class0_hp_prob[comp], mv_class0_hp, use_hp);
     } else {
         let base = 1u32 << (CLASS0_SIZE_SHIFT + mv_class + 2);
@@ -103,10 +118,16 @@ pub(crate) fn write_mv_component(
         // bits_prob[comp][i] exactly as the decode loop reads them.
         for i in 0..mv_class as usize {
             let mv_bit = (d >> i) & 1;
+            mc.bits[i][mv_bit as usize] += 1;
             enc.write_bool(mv_bit, u32::from(probs.bits_prob[comp][i]));
         }
         let fr_probs = &probs.fr_probs[comp];
+        mc.fr[mv_fr as usize] += 1;
         tree_encode(enc, &MV_FR_TREE, mv_fr as i32, |node| fr_probs[node])?;
+        if !use_hp && mv_hp != 1 {
+            return Err(Error::Unsupported);
+        }
+        mc.hp[mv_hp as usize] += 1;
         write_hp(enc, probs.hp_prob[comp], mv_hp, use_hp);
     }
     Ok(())
@@ -161,18 +182,21 @@ pub(crate) fn write_mv(
     mv: [i32; 2],
     best_mv: [i32; 2],
     allow_hp: bool,
+    counts: &mut CountsNonCoef,
 ) -> Result<(), Error> {
     let use_hp = allow_hp && use_mv_hp(best_mv);
     let diff = [mv[0] - best_mv[0], mv[1] - best_mv[1]];
 
     let joint = mv_joint_of(diff);
+    // §9.3.4: counts_mv_joint[ syntax ] += 1.
+    counts.mv_joint[joint as usize] += 1;
     tree_encode(enc, &MV_JOINT_TREE, joint, |node| probs.joint_probs[node])?;
 
     if joint == MV_JOINT_HZVNZ || joint == MV_JOINT_HNZVNZ {
-        write_mv_component(enc, probs, 0, diff[0], use_hp)?;
+        write_mv_component(enc, probs, 0, diff[0], use_hp, counts)?;
     }
     if joint == MV_JOINT_HNZVZ || joint == MV_JOINT_HNZVNZ {
-        write_mv_component(enc, probs, 1, diff[1], use_hp)?;
+        write_mv_component(enc, probs, 1, diff[1], use_hp, counts)?;
     }
     Ok(())
 }
@@ -196,6 +220,7 @@ fn mv_joint_of(diff: [i32; 2]) -> i32 {
 /// caller's `mv` must equal the corresponding predictor for those modes —
 /// the writer verifies this (a mismatch is a caller bug, returned as
 /// `Error::Unsupported`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_assign_mv(
     enc: &mut BoolEncoder,
     probs: &MvProbs,
@@ -204,11 +229,12 @@ pub(crate) fn write_assign_mv(
     preds: &[MvPredictors; 2],
     mv: &[[i32; 2]; 2],
     allow_hp: bool,
+    counts: &mut CountsNonCoef,
 ) -> Result<(), Error> {
     let count = if is_compound { 2 } else { 1 };
     for i in 0..count {
         match y_mode {
-            NEWMV => write_mv(enc, probs, mv[i], preds[i].best, allow_hp)?,
+            NEWMV => write_mv(enc, probs, mv[i], preds[i].best, allow_hp, counts)?,
             NEARESTMV => {
                 if mv[i] != preds[i].nearest {
                     return Err(Error::Unsupported);
@@ -260,7 +286,8 @@ mod tests {
                 };
                 for &v in mags {
                     let mut enc = BoolEncoder::new();
-                    write_mv_component(&mut enc, &probs, comp, v, use_hp).unwrap();
+                    write_mv_component(&mut enc, &probs, comp, v, use_hp, &mut Default::default())
+                        .unwrap();
                     let mut dec = enc_to_dec(enc);
                     let got =
                         read_mv_component(&mut dec, &probs, comp, use_hp, &mut Default::default())
@@ -279,7 +306,8 @@ mod tests {
             // bracket is reachable).
             for &v in &[17, 33, 64, 100, 255, 600, -17, -64, -255, -600] {
                 let mut enc = BoolEncoder::new();
-                write_mv_component(&mut enc, &probs, comp, v, true).unwrap();
+                write_mv_component(&mut enc, &probs, comp, v, true, &mut Default::default())
+                    .unwrap();
                 let mut dec = enc_to_dec(enc);
                 let got = read_mv_component(&mut dec, &probs, comp, true, &mut Default::default())
                     .unwrap();
@@ -297,7 +325,7 @@ mod tests {
         for d in diffs {
             let mv = [best[0] + d[0], best[1] + d[1]];
             let mut enc = BoolEncoder::new();
-            write_mv(&mut enc, &probs, mv, best, true).unwrap();
+            write_mv(&mut enc, &probs, mv, best, true, &mut Default::default()).unwrap();
             let mut dec = enc_to_dec(enc);
             let got = read_mv(&mut dec, &probs, best, true, &mut Default::default()).unwrap();
             assert_eq!(got, mv, "diff {d:?}");
@@ -315,7 +343,7 @@ mod tests {
         // diff[0] = 2 => mag 2 => bracket 1 => hp == 1: reachable.
         let mv = [best[0] + 2, best[1]];
         let mut enc = BoolEncoder::new();
-        write_mv(&mut enc, &probs, mv, best, true).unwrap();
+        write_mv(&mut enc, &probs, mv, best, true, &mut Default::default()).unwrap();
         let mut dec = enc_to_dec(enc);
         let got = read_mv(&mut dec, &probs, best, true, &mut Default::default()).unwrap();
         assert_eq!(got, mv);
@@ -338,7 +366,17 @@ mod tests {
         ];
         let mv = [[5 + 8, 6 - 4], [-5 + 2, -6 + 10]];
         let mut enc = BoolEncoder::new();
-        write_assign_mv(&mut enc, &probs, NEWMV, true, &preds, &mv, true).unwrap();
+        write_assign_mv(
+            &mut enc,
+            &probs,
+            NEWMV,
+            true,
+            &preds,
+            &mv,
+            true,
+            &mut Default::default(),
+        )
+        .unwrap();
         let mut dec = enc_to_dec(enc);
         let got = assign_mv(
             &mut dec,
@@ -367,7 +405,17 @@ mod tests {
         // NEARESTMV single: mv must equal nearest, nothing coded.
         let mv = [[1, 2], [0, 0]];
         let mut enc = BoolEncoder::new();
-        write_assign_mv(&mut enc, &probs, NEARESTMV, false, &preds, &mv, true).unwrap();
+        write_assign_mv(
+            &mut enc,
+            &probs,
+            NEARESTMV,
+            false,
+            &preds,
+            &mv,
+            true,
+            &mut Default::default(),
+        )
+        .unwrap();
         let mut dec = enc_to_dec(enc);
         let got = assign_mv(
             &mut dec,
@@ -396,7 +444,16 @@ mod tests {
         // NEARMV but mv != near -> rejected.
         let mv = [[9, 9], [0, 0]];
         let mut enc = BoolEncoder::new();
-        let r = write_assign_mv(&mut enc, &probs, NEARMV, false, &preds, &mv, true);
+        let r = write_assign_mv(
+            &mut enc,
+            &probs,
+            NEARMV,
+            false,
+            &preds,
+            &mv,
+            true,
+            &mut Default::default(),
+        );
         assert_eq!(r.unwrap_err(), Error::Unsupported);
     }
 

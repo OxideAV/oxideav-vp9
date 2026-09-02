@@ -2029,6 +2029,9 @@ pub struct Vp9SequenceDecoder {
     // otherwise, per the framework contract); tile-column fan-out is
     // bounded by `exec.effective_workers( tileCols )` per frame.
     exec: ExecutionContext,
+    // The last decoded frame's §9.3.4 count bank — the encoder-side
+    // decoder-mirror tests compare the writer's counts against it.
+    last_counts: Option<Box<crate::prob_adapt::FrameCounts>>,
 }
 
 impl std::fmt::Debug for Vp9SequenceDecoder {
@@ -2067,7 +2070,22 @@ impl Vp9SequenceDecoder {
             persist_mode_deltas: DEFAULT_LOOP_FILTER_MODE_DELTAS,
             prev_segment_ids_map: None,
             exec: ExecutionContext::serial(),
+            last_counts: None,
         }
+    }
+
+    /// The §7.2 `FrameContext[ idx ]` bank as the decoder holds it after
+    /// the last pushed frame (encoder-mirror tests).
+    #[cfg(test)]
+    pub(crate) fn frame_context(&self, idx: usize) -> &FrameContext {
+        &self.frame_contexts[idx & 3]
+    }
+
+    /// The last decoded frame's §9.3.4 counts (`None` before the first
+    /// decoded frame and after a `show_existing_frame` packet).
+    #[cfg(test)]
+    pub(crate) fn last_frame_counts(&self) -> Option<&crate::prob_adapt::FrameCounts> {
+        self.last_counts.as_deref()
     }
 
     /// Set the threading authority for the §6.4 tile walk of every
@@ -2105,7 +2123,9 @@ impl Vp9SequenceDecoder {
             persist_mode_deltas,
             prev_segment_ids_map,
             exec,
+            last_counts,
         } = self;
+        *last_counts = None;
         // Peek the uncompressed header (with inherited ref state so inter
         // frames parse).
         let ref_dims: Vec<(u32, u32)> = (0..8)
@@ -2414,6 +2434,7 @@ impl Vp9SequenceDecoder {
         }
 
         let shown = hdr.show_frame;
+        *last_counts = Some(products.counts);
         *prev_state = Some((products.state, hdr.frame_width, hdr.frame_height, shown));
 
         // §8.10 step 1: store the decoded frame into the `FrameStore[ ]`

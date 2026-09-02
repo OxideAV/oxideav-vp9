@@ -35,8 +35,8 @@ use oxideav_core::{
 
 use crate::decode_frame::{Vp9DecodedFrame, Vp9SequenceDecoder};
 use crate::pixel_encoder::{
-    padded_targets_from_u16, padded_targets_from_u8, LosslessGopEncoder420, LossyFormat,
-    LossyGopEncoder,
+    padded_targets_from_u16, padded_targets_from_u8, ChainModel, LosslessGopEncoder420,
+    LossyFormat, LossyGopEncoder,
 };
 use crate::superframe::split_superframe;
 
@@ -334,7 +334,7 @@ enum GopBackend {
     /// 8-bit 4:2:0 lossless chain ([`LosslessGopEncoder420`]).
     Lossless(LosslessGopEncoder420),
     /// Lossy chain at any §7.2 matrix format ([`LossyGopEncoder`]).
-    Lossy(LossyGopEncoder),
+    Lossy(Box<LossyGopEncoder>),
 }
 
 /// Framework [`Encoder`] riding the §7.2.6 **chain-framed default GOP
@@ -407,9 +407,10 @@ impl Vp9Encoder {
                 .filter(|&q| q >= 1)
                 .ok_or_else(|| CoreError::invalid("vp9 encoder: q must be in 1..=255"))?;
             let lossy_fmt = LossyFormat::new(bit_depth, ssx, ssy).map_err(map_err)?;
-            GopBackend::Lossy(
-                LossyGopEncoder::new(width, height, q, lossy_fmt, true).map_err(map_err)?,
-            )
+            GopBackend::Lossy(Box::new(
+                LossyGopEncoder::new(width, height, q, lossy_fmt, ChainModel::Adaptive)
+                    .map_err(map_err)?,
+            ))
         };
 
         let mut output = CodecParameters::video(CodecId::new(VP9_CODEC_ID));

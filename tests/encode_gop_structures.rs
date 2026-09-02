@@ -11,8 +11,8 @@
 
 use oxideav_vp9::{
     decode_vp9_sequence, encode_vp9_lossy_sequence, encode_vp9_lossy_sequence_altref,
-    encode_vp9_lossy_sequence_resized, encode_vp9_lossy_sequence_with, Error, Vp9GopConfig,
-    Vp9Segmentation,
+    encode_vp9_lossy_sequence_resized, encode_vp9_lossy_sequence_resized_with,
+    encode_vp9_lossy_sequence_with, Error, Vp9GopConfig, Vp9Segmentation,
 };
 
 /// Source frame `k` of a translating 4:2:0 scene (a ramp plus a sharp
@@ -358,6 +358,15 @@ fn ivf_wrap(packets: &[Vec<u8>], w: u16, h: u16) -> Vec<u8> {
 /// and the resized stream additionally with output auto-scaling
 /// disabled)`.
 fn build_r452_fixture_streams() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
+    // The packages pin the ROUND-452 framing: the default probability
+    // banks with `frame_parallel_decoding_mode = 1`. Round 455 moved the
+    // public default to the adaptive entropy model, so every builder
+    // opts out explicitly and the staged bytes stay reproducible.
+    let r452 = |q: u8| {
+        let mut cfg = Vp9GopConfig::new(q);
+        cfg.entropy_adaptation = false;
+        cfg
+    };
     let yuv_of = |packets: &[Vec<u8>]| -> Vec<u8> {
         let decoded = decode_vp9_sequence(&refs(packets)).expect("fixture decodes");
         let mut yuv = Vec::new();
@@ -372,8 +381,9 @@ fn build_r452_fixture_streams() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
     // alt-ref + show_existing_frame stream (three-slot election).
     {
         let src: Vec<Vec<u8>> = (0..8).map(|k| scene_frame(64, 48, k)).collect();
-        let packets =
-            encode_vp9_lossy_sequence_altref(&refs(&src), 64, 48, 100, 3).expect("pyramid");
+        let mut cfg = r452(100);
+        cfg.altref_interval = 3;
+        let packets = encode_vp9_lossy_sequence_with(&refs(&src), 64, 48, &cfg).expect("pyramid");
         let yuv = yuv_of(&packets);
         out.push(("altref-pyramid-gop", ivf_wrap(&packets, 64, 48), yuv));
     }
@@ -382,7 +392,7 @@ fn build_r452_fixture_streams() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
     // table) on the pyramid framing.
     {
         let src: Vec<Vec<u8>> = (0..6).map(|k| half_static_scene(64, 48, k)).collect();
-        let mut cfg = Vp9GopConfig::new(100);
+        let mut cfg = r452(100);
         cfg.altref_interval = 3;
         cfg.segmentation = Vp9Segmentation::Full;
         let packets = encode_vp9_lossy_sequence_with(&refs(&src), 64, 48, &cfg).expect("seg");
@@ -394,7 +404,7 @@ fn build_r452_fixture_streams() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
     // consumer-side twin).
     {
         let src: Vec<Vec<u8>> = (0..3).map(|k| scene_frame(512, 32, k)).collect();
-        let mut cfg = Vp9GopConfig::new(140);
+        let mut cfg = r452(140);
         cfg.altref_interval = 2;
         cfg.tile_cols_log2 = 1;
         let packets = encode_vp9_lossy_sequence_with(&refs(&src), 512, 32, &cfg).expect("tiles");
@@ -406,7 +416,7 @@ fn build_r452_fixture_streams() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
     // show_existing_frame), with the full segmentation emission.
     {
         let src: Vec<Vec<u8>> = (0..7).map(|k| half_static_scene(64, 48, k)).collect();
-        let mut cfg = Vp9GopConfig::new(100);
+        let mut cfg = r452(100);
         cfg.altref_interval = 3;
         cfg.segmentation = Vp9Segmentation::Full;
         cfg.intra_only_altref = true;
@@ -424,7 +434,8 @@ fn build_r452_fixture_streams() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
             .enumerate()
             .map(|(k, &(w, h))| scene_frame(w as usize, h as usize, k))
             .collect();
-        let packets = encode_vp9_lossy_sequence_resized(&refs(&src), &sizes, 110).expect("resized");
+        let packets = encode_vp9_lossy_sequence_resized_with(&refs(&src), &sizes, &r452(110))
+            .expect("resized");
         let yuv = yuv_of(&packets);
         out.push(("resized-encoded-gop", ivf_wrap(&packets, 128, 96), yuv));
     }

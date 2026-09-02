@@ -38,6 +38,7 @@ use crate::mode_info::{
     SWITCHABLE, SWITCHABLE_FILTERS,
 };
 use crate::mode_writer::tree_encode;
+use crate::prob_adapt::CountsNonCoef;
 use crate::Error;
 
 /// §6.4.13 `read_is_inter( )` inverse.
@@ -54,11 +55,14 @@ pub(crate) fn write_is_inter(
     seg_feature_ref_frame_active: bool,
     is_inter_prob: &[u8; IS_INTER_CONTEXTS],
     nb: IsInterNeighbours,
+    counts: &mut CountsNonCoef,
 ) -> Result<(), Error> {
     if seg_feature_ref_frame_active {
         return Ok(());
     }
     let ctx = is_inter_context(nb);
+    // §9.3.4: counts_is_inter[ ctx ][ syntax ] += 1.
+    counts.is_inter[ctx][usize::from(is_inter)] += 1;
     tree_encode(enc, &BINARY_TREE, i32::from(is_inter), |_| {
         is_inter_prob[ctx]
     })
@@ -98,6 +102,7 @@ pub(crate) fn write_ref_frames(
     enc: &mut BoolEncoder,
     ref_frame: [i32; 2],
     args: &RefFramesWriteArgs<'_>,
+    counts: &mut CountsNonCoef,
 ) -> Result<(), Error> {
     let is_compound = ref_frame[1] > crate::mode_info::INTRA_FRAME;
 
@@ -121,6 +126,8 @@ pub(crate) fn write_ref_frames(
                 },
                 args.comp_config.fixed_ref,
             );
+            // §9.3.4: counts_comp_mode[ ctx ][ syntax ] += 1.
+            counts.comp_mode[ctx][usize::from(is_compound)] += 1;
             tree_encode(enc, &BINARY_TREE, i32::from(is_compound), |_| {
                 args.comp_mode_prob[ctx]
             })?;
@@ -154,11 +161,15 @@ pub(crate) fn write_ref_frames(
             return Err(Error::Unsupported);
         };
         let ctx = comp_ref_context(args.nb, args.comp_config.var_ref, args.fix_ref_idx);
+        // §9.3.4: counts_comp_ref[ ctx ][ syntax ] += 1.
+        counts.comp_ref[ctx][comp_ref as usize] += 1;
         tree_encode(enc, &BINARY_TREE, comp_ref, |_| args.comp_ref_prob[ctx])?;
     } else {
         // single_ref_p1: 0 => LAST_FRAME; 1 => golden/altref pair.
         let single_ref_p1 = i32::from(ref_frame[0] != LAST_FRAME);
         let ctx1 = single_ref_p1_context(args.nb);
+        // §9.3.4: counts_single_ref[ ctx ][ 0 ][ syntax ] += 1.
+        counts.single_ref[ctx1][0][single_ref_p1 as usize] += 1;
         tree_encode(enc, &BINARY_TREE, single_ref_p1, |_| {
             args.single_ref_prob[ctx1][0]
         })?;
@@ -170,6 +181,8 @@ pub(crate) fn write_ref_frames(
                 _ => return Err(Error::Unsupported),
             };
             let ctx2 = single_ref_p2_context(args.nb);
+            // §9.3.4: counts_single_ref[ ctx ][ 1 ][ syntax ] += 1.
+            counts.single_ref[ctx2][1][single_ref_p2 as usize] += 1;
             tree_encode(enc, &BINARY_TREE, single_ref_p2, |_| {
                 args.single_ref_prob[ctx2][1]
             })?;
@@ -195,8 +208,14 @@ pub(crate) fn write_inter_mode(
     y_mode: u8,
     mode_ctx: usize,
     inter_mode_probs: &[[u8; INTER_MODES - 1]; INTER_MODE_CONTEXTS],
+    counts: &mut CountsNonCoef,
 ) -> Result<(), Error> {
     let inter_mode = i32::from(y_mode) - i32::from(NEARESTMV);
+    if !(0..INTER_MODES as i32).contains(&inter_mode) {
+        return Err(Error::Unsupported);
+    }
+    // §9.3.4: counts_inter_mode[ ctx ][ syntax ] += 1.
+    counts.inter_mode[mode_ctx][inter_mode as usize] += 1;
     tree_encode(enc, &INTER_MODE_TREE, inter_mode, |node| {
         inter_mode_probs[mode_ctx][node]
     })
@@ -213,11 +232,17 @@ pub(crate) fn write_interp_filter(
     interpolation_filter: u8,
     interp_filter_probs: &[[u8; SWITCHABLE_FILTERS - 1]; INTERP_FILTER_CONTEXTS],
     nb: InterpFilterNeighbours,
+    counts: &mut CountsNonCoef,
 ) -> Result<(), Error> {
     if interpolation_filter != SWITCHABLE {
         return Ok(());
     }
+    if usize::from(interp_filter) >= SWITCHABLE_FILTERS {
+        return Err(Error::Unsupported);
+    }
     let ctx = interp_filter_context(nb);
+    // §9.3.4: counts_interp_filter[ ctx ][ syntax ] += 1.
+    counts.interp_filter[ctx][usize::from(interp_filter)] += 1;
     tree_encode(enc, &INTERP_FILTER_TREE, i32::from(interp_filter), |node| {
         interp_filter_probs[ctx][node]
     })
@@ -252,7 +277,15 @@ mod tests {
                 left: None,
             };
             let mut enc = BoolEncoder::new();
-            write_is_inter(&mut enc, is_inter, false, &prob, nb).unwrap();
+            write_is_inter(
+                &mut enc,
+                is_inter,
+                false,
+                &prob,
+                nb,
+                &mut Default::default(),
+            )
+            .unwrap();
             let mut dec = enc_to_dec(enc);
             let got =
                 read_is_inter(&mut dec, false, 0, &prob, nb, &mut Default::default()).unwrap();
@@ -269,7 +302,7 @@ mod tests {
         };
         // segment override LAST_FRAME => is_inter true; no bits coded.
         let mut enc = BoolEncoder::new();
-        write_is_inter(&mut enc, true, true, &prob, nb).unwrap();
+        write_is_inter(&mut enc, true, true, &prob, nb, &mut Default::default()).unwrap();
         let mut dec = enc_to_dec(enc);
         let got = read_is_inter(
             &mut dec,
@@ -334,7 +367,7 @@ mod tests {
             let pair = [rf0, NONE_REF_FRAME];
             let mut enc = BoolEncoder::new();
             let args = ref_args(ReferenceMode::SingleReference, comp_config, &chdr);
-            write_ref_frames(&mut enc, pair, &args).unwrap();
+            write_ref_frames(&mut enc, pair, &args, &mut Default::default()).unwrap();
             let mut dec = enc_to_dec(enc);
             let got =
                 decode_ref_frames(&mut dec, ReferenceMode::SingleReference, comp_config, &chdr);
@@ -355,7 +388,7 @@ mod tests {
             let pair = [ALTREF_FRAME, var];
             let mut enc = BoolEncoder::new();
             let args = ref_args(ReferenceMode::CompoundReference, comp_config, &chdr);
-            write_ref_frames(&mut enc, pair, &args).unwrap();
+            write_ref_frames(&mut enc, pair, &args, &mut Default::default()).unwrap();
             let mut dec = enc_to_dec(enc);
             let got = decode_ref_frames(
                 &mut dec,
@@ -380,7 +413,7 @@ mod tests {
         for pair in [single, compound] {
             let mut enc = BoolEncoder::new();
             let args = ref_args(ReferenceMode::ReferenceModeSelect, comp_config, &chdr);
-            write_ref_frames(&mut enc, pair, &args).unwrap();
+            write_ref_frames(&mut enc, pair, &args, &mut Default::default()).unwrap();
             let mut dec = enc_to_dec(enc);
             let got = decode_ref_frames(
                 &mut dec,
@@ -403,7 +436,14 @@ mod tests {
                 crate::mode_info::NEWMV,
             ] {
                 let mut enc = BoolEncoder::new();
-                write_inter_mode(&mut enc, ym, ctx, &chdr.inter_mode_probs).unwrap();
+                write_inter_mode(
+                    &mut enc,
+                    ym,
+                    ctx,
+                    &chdr.inter_mode_probs,
+                    &mut Default::default(),
+                )
+                .unwrap();
                 let mut dec = enc_to_dec(enc);
                 let inter_mode = tree_decode(&mut dec, &INTER_MODE_TREE, |node| {
                     chdr.inter_mode_probs[ctx][node]
@@ -421,7 +461,15 @@ mod tests {
         let nb = InterpFilterNeighbours::default();
         for filt in 0..(SWITCHABLE_FILTERS as u8) {
             let mut enc = BoolEncoder::new();
-            write_interp_filter(&mut enc, filt, SWITCHABLE, &chdr.interp_filter_probs, nb).unwrap();
+            write_interp_filter(
+                &mut enc,
+                filt,
+                SWITCHABLE,
+                &chdr.interp_filter_probs,
+                nb,
+                &mut Default::default(),
+            )
+            .unwrap();
             let mut dec = enc_to_dec(enc);
             let ctx = interp_filter_context(nb);
             let got = tree_decode(&mut dec, &INTERP_FILTER_TREE, |node| {
@@ -438,7 +486,15 @@ mod tests {
         let nb = InterpFilterNeighbours::default();
         // EIGHTTAP frame-level filter -> no per-block bits.
         let mut enc = BoolEncoder::new();
-        write_interp_filter(&mut enc, 0, 0, &chdr.interp_filter_probs, nb).unwrap();
+        write_interp_filter(
+            &mut enc,
+            0,
+            0,
+            &chdr.interp_filter_probs,
+            nb,
+            &mut Default::default(),
+        )
+        .unwrap();
         let buf = enc.finish();
         // A bit-free write still produces the marker + flush; decoding
         // nothing from it is trivially consistent.

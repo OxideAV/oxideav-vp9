@@ -835,9 +835,18 @@ the pre-455 default-bank framing) reproduce the earlier bytes.
     −7.4 % bytes across the crate's encode corpus at bit-identical
     reconstruction;
   * no two-pass rate control (the per-frame bisection of
-    `encode_vp9_lossy_sequence_rc` is one-pass), and the
-    interpolation filter is frame-level `EIGHTTAP` (no switchable
-    per-block election).
+    `encode_vp9_lossy_sequence_rc` is one-pass);
+  * ~~frame-level `EIGHTTAP`~~ — **round 455 elects the §8.5.2.4
+    kernel per leaf** under `interpolation_filter = SWITCHABLE`: every
+    leaf with non-zero motion is predicted under `EIGHTTAP` /
+    `EIGHTTAP_SMOOTH` / `EIGHTTAP_SHARP` and keeps the least
+    full-leaf SSE, coded as §6.4.16 `interp_filter` under the adapted
+    `interp_filter_probs` (`Vp9GopConfig::switchable_interp_filter`,
+    on by default; the entropy model makes the per-block symbol nearly
+    free). Corpus: +0.01…+0.33 dB PSNR on every sequence at
+    28 253 → 28 102 bytes; every stream black-box validated with the
+    three kernels live. The sub-8x8 cell walk and the scaled-reference
+    leaves still code `EIGHTTAP`.
 
 ## Testing
 

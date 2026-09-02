@@ -95,16 +95,43 @@ fn corpus() -> Vec<CorpusEntry> {
     out
 }
 
-/// Adaptive vs default-bank framing: identical reconstruction, strictly
-/// fewer bytes on every corpus sequence (the keyframe alone already
-/// carries elected coefficient updates).
+/// PSNR (dB, all planes) of a decoded stream against its 8-bit source.
+fn psnr(packets: &[Vec<u8>], source: &[Vec<u8>]) -> f64 {
+    let dec = decoded_yuv(packets);
+    let src = source.concat();
+    assert_eq!(dec.len(), src.len());
+    let sse: f64 = dec
+        .iter()
+        .zip(&src)
+        .map(|(&a, &b)| {
+            let d = f64::from(a) - f64::from(b);
+            d * d
+        })
+        .sum();
+    let mse = sse / dec.len() as f64;
+    if mse == 0.0 {
+        99.0
+    } else {
+        10.0 * (255.0 * 255.0 / mse).log10()
+    }
+}
+
+/// Entropy model vs default-bank framing (frame-level `EIGHTTAP` on
+/// both): identical reconstruction, strictly fewer bytes on every
+/// corpus sequence (the keyframe alone already carries elected
+/// coefficient updates). Then the switchable-filter election on top:
+/// bytes and PSNR reported per sequence, PSNR never below the
+/// frame-level `EIGHTTAP` stream by more than 0.05 dB.
 #[test]
 fn entropy_model_shrinks_every_corpus_sequence_at_identical_reconstruction() {
     let mut sum_on = 0usize;
     let mut sum_off = 0usize;
+    let mut sum_filt = 0usize;
     for (name, frames, w, h, cfg) in corpus() {
-        let on = encode_vp9_lossy_sequence_with(&refs(&frames), w, h, &cfg).expect("adaptive");
-        let mut off_cfg = cfg;
+        let mut on_cfg = cfg;
+        on_cfg.switchable_interp_filter = false;
+        let on = encode_vp9_lossy_sequence_with(&refs(&frames), w, h, &on_cfg).expect("adaptive");
+        let mut off_cfg = on_cfg;
         off_cfg.entropy_adaptation = false;
         let off = encode_vp9_lossy_sequence_with(&refs(&frames), w, h, &off_cfg).expect("default");
         assert_eq!(on.len(), off.len(), "{name}: packet count");
@@ -115,15 +142,24 @@ fn entropy_model_shrinks_every_corpus_sequence_at_identical_reconstruction() {
         );
         let (a, b) = (total(&on), total(&off));
         assert!(a < b, "{name}: adaptive {a} bytes vs default-bank {b}");
+        // Switchable interpolation filter election on top.
+        let filt = encode_vp9_lossy_sequence_with(&refs(&frames), w, h, &cfg).expect("filter");
+        let (pa, pf) = (psnr(&on, &frames), psnr(&filt, &frames));
+        let f = total(&filt);
+        assert!(
+            pf + 0.05 >= pa,
+            "{name}: switchable PSNR {pf:.2} vs EIGHTTAP {pa:.2}"
+        );
         eprintln!(
-            "{name}: {b} -> {a} bytes ({:.1}%)",
+            "{name}: default-bank {b} -> entropy {a} bytes ({:.1}%) @ {pa:.2} dB; + switchable filter {f} bytes @ {pf:.2} dB",
             100.0 * (b - a) as f64 / b as f64
         );
         sum_on += a;
         sum_off += b;
+        sum_filt += f;
     }
     eprintln!(
-        "corpus: {sum_off} -> {sum_on} bytes ({:.1}%)",
+        "corpus: default-bank {sum_off} -> entropy {sum_on} bytes ({:.1}%); + switchable filter {sum_filt} bytes",
         100.0 * (sum_off - sum_on) as f64 / sum_off as f64
     );
 }

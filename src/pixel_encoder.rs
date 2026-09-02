@@ -2024,6 +2024,7 @@ fn predict_inter_leaf(
         ssx,
         ssy,
         bit_depth,
+        0,
     );
 }
 
@@ -2049,10 +2050,26 @@ fn predict_inter_leaf2(
     ssx: bool,
     ssy: bool,
     bit_depth: u32,
+    interp_filter: u8,
 ) {
     predict_inter_leaf2_scaled(
-        pred, reference, second, vis_w, vis_h, vis_w, vis_h, r, c, mi_size, mv, mi_cols, mi_rows,
-        ssx, ssy, bit_depth,
+        pred,
+        reference,
+        second,
+        vis_w,
+        vis_h,
+        vis_w,
+        vis_h,
+        r,
+        c,
+        mi_size,
+        mv,
+        mi_cols,
+        mi_rows,
+        ssx,
+        ssy,
+        bit_depth,
+        interp_filter,
     )
 }
 
@@ -2080,6 +2097,7 @@ fn predict_inter_leaf2_scaled(
     ssx: bool,
     ssy: bool,
     bit_depth: u32,
+    interp_filter: u8,
 ) {
     use crate::partition::{NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP};
     let num8x8w = u32::from(NUM_8X8_BLOCKS_WIDE_LOOKUP[mi_size as usize]);
@@ -2135,7 +2153,7 @@ fn predict_inter_leaf2_scaled(
             w: region,
             h: region_h,
             block_idx: 0,
-            interp_filter: 0, // EIGHTTAP.
+            interp_filter: usize::from(interp_filter),
             bit_depth,
             is_compound: second.is_some(),
         };
@@ -2390,6 +2408,7 @@ pub(crate) fn encode_pframe_lossless_layout(
                     ssx,
                     ssy,
                     bit_depth,
+                    0,
                 );
             }
             leaf
@@ -3524,6 +3543,55 @@ fn select_inter_leaf_tx(
     (tx, blocks, all_zero)
 }
 
+/// §6.4.16 `interp_filter` election for one `>= BLOCK_8X8` leaf whose
+/// motion is decided: under a `SWITCHABLE` frame filter and non-zero
+/// motion, predict the leaf under every §8.5.2.4 kernel (`EIGHTTAP` /
+/// `EIGHTTAP_SMOOTH` / `EIGHTTAP_SHARP`) into `scratch` and return the
+/// kernel with the least full-leaf SSE against the targets (ties keep
+/// the lower index, i.e. `EIGHTTAP`). Zero motion — kernel-invariant,
+/// phase 0 being the identity tap — and non-switchable frames return
+/// `EIGHTTAP` (the frame value is what the writer codes).
+#[allow(clippy::too_many_arguments)]
+fn elect_leaf_interp_filter(
+    hdr: &Vp9FrameHeader,
+    targets: &[Plane; 3],
+    scratch: &mut [Plane; 3],
+    reference: &[(&[i32], usize); 3],
+    second: Option<&[(&[i32], usize); 3]>,
+    ref_w: u32,
+    ref_h: u32,
+    r: u32,
+    c: u32,
+    mi_size: u8,
+    mv: [[i32; 2]; 2],
+    is_compound: bool,
+    mi_cols: u32,
+    mi_rows: u32,
+    ssx: bool,
+    ssy: bool,
+    bit_depth: u32,
+) -> u8 {
+    if hdr.interpolation_filter != crate::mode_info::SWITCHABLE {
+        return 0;
+    }
+    let lists = 1 + usize::from(is_compound);
+    if mv[..lists].iter().all(|m| *m == [0, 0]) {
+        return 0;
+    }
+    let mut best = (u64::MAX, 0u8);
+    for f in 0..crate::mode_info::SWITCHABLE_FILTERS as u8 {
+        predict_inter_leaf2(
+            scratch, reference, second, ref_w, ref_h, r, c, mi_size, mv, mi_cols, mi_rows, ssx,
+            ssy, bit_depth, f,
+        );
+        let sse = leaf_sse(targets, scratch, r, c, mi_size, mi_cols, mi_rows, ssx, ssy);
+        if sse < best.0 {
+            best = (sse, f);
+        }
+    }
+    best.1
+}
+
 /// Sum of squared `target − work` errors over one leaf's region, all
 /// three planes, clipped to the MI-padded plane extents.
 #[allow(clippy::too_many_arguments)]
@@ -4062,6 +4130,13 @@ fn set_adaptive_entropy_flags(hdr: &mut Vp9FrameHeader) {
     hdr.frame_context_idx = 0;
 }
 
+/// §6.2.7 `interpolation_filter = SWITCHABLE` (round 455): the per-leaf
+/// kernel election ([`elect_leaf_interp_filter`]) codes its §6.4.16
+/// `interp_filter` under the (adapted) `interp_filter_probs`.
+fn set_switchable_interp(hdr: &mut Vp9FrameHeader) {
+    hdr.interpolation_filter = crate::mode_info::SWITCHABLE;
+}
+
 /// [`encode_pframe_lossy_tree_motion_with_state`] under
 /// [`InterEncodeOpts`]: the three-slot reference set and the
 /// segmentation election of the structured GOP encoder.
@@ -4324,6 +4399,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion_opts(
                         ssx,
                         ssy,
                         bit_depth,
+                        0,
                     );
                     let (_tx, _blocks, all_zero) = select_inter_leaf_tx(
                         targets,
@@ -4359,6 +4435,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion_opts(
                         ssx,
                         ssy,
                         bit_depth,
+                        0,
                     );
                     let seg_id = STATIC_SKIP_SEGMENT as u8;
                     if let Some(se) = seg_election {
@@ -4459,6 +4536,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion_opts(
                             ssx,
                             ssy,
                             bit_depth,
+                            0,
                         );
                         leaf_luma_sad(targets, &sc, r, c, subsize, mi_cols, mi_rows)
                     };
@@ -4559,6 +4637,32 @@ pub(crate) fn encode_pframe_lossy_tree_motion_opts(
                 None
             };
 
+            // §6.4.16 switchable interpolation filter election (round
+            // 455): under a SWITCHABLE frame filter a leaf with non-zero
+            // motion predicts under all three §8.5.2.4 kernels and keeps
+            // the least full-leaf SSE (ties → EIGHTTAP); zero motion is
+            // kernel-invariant (phase 0 is the identity) and codes
+            // EIGHTTAP.
+            let filt = elect_leaf_interp_filter(
+                hdr,
+                targets,
+                &mut scratch3.borrow_mut(),
+                ref_planes,
+                second_planes,
+                ref_w,
+                ref_h,
+                r,
+                c,
+                subsize,
+                choice.2,
+                is_compound,
+                mi_cols,
+                mi_rows,
+                ssx,
+                ssy,
+                bit_depth,
+            );
+
             let mut work = work.borrow_mut();
             predict_inter_leaf2(
                 &mut work.planes,
@@ -4575,6 +4679,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion_opts(
                 ssx,
                 ssy,
                 bit_depth,
+                filt,
             );
 
             // Per-leaf transform-size election + skip election, then the
@@ -4671,6 +4776,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion_opts(
                         ssx,
                         ssy,
                         bit_depth,
+                        filt,
                     );
                     skip = true;
                 }
@@ -4688,7 +4794,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion_opts(
                 mi_size: subsize,
                 tx_size: if skip { max_tx } else { tx },
                 y_mode: choice.1,
-                interp_filter: 0,
+                interp_filter: filt,
                 ref_frame: choice.0,
                 mv: choice.2,
                 skip,
@@ -4905,6 +5011,7 @@ pub(crate) fn encode_pframe_lossy_scaled(
                     ssx,
                     ssy,
                     bit_depth,
+                    0,
                 );
                 c += 8;
             }
@@ -4961,6 +5068,7 @@ pub(crate) fn encode_pframe_lossy_scaled(
                     ssx,
                     ssy,
                     bit_depth,
+                    0,
                 );
                 leaf_luma_sad(targets, &sc, r, c, subsize, mi_cols, mi_rows)
             };
@@ -5053,6 +5161,7 @@ pub(crate) fn encode_pframe_lossy_scaled(
                 ssx,
                 ssy,
                 bit_depth,
+                0,
             );
             let (tx, blocks, all_zero) = select_inter_leaf_tx(
                 targets,
@@ -5135,6 +5244,7 @@ pub(crate) fn encode_pframe_lossy_scaled(
                         ssx,
                         ssy,
                         bit_depth,
+                        0,
                     );
                     skip = true;
                 }
@@ -6030,6 +6140,7 @@ impl LossyGopEncoder {
             hdr.error_resilient_mode = false;
             if adaptive {
                 set_adaptive_entropy_flags(&mut hdr);
+                set_switchable_interp(&mut hdr);
             }
         }
         hdr.ref_frame_idx = Some([0, 1, 1]);
@@ -6612,6 +6723,11 @@ pub(crate) struct GopStructure {
     /// forward updates elected by measured cost. `false` keeps the
     /// round-452 default-bank bytes.
     pub entropy_adaptation: bool,
+    /// Round-455 per-leaf §6.4.16 interpolation-filter election under
+    /// `interpolation_filter = SWITCHABLE` (see
+    /// [`elect_leaf_interp_filter`]); `false` codes frame-level
+    /// `EIGHTTAP`.
+    pub switchable_interp: bool,
 }
 
 /// Lossy **structured GOP** encoder (round 452): the two-slot chain of
@@ -6778,6 +6894,9 @@ impl StructuredGopEncoder {
         hdr.error_resilient_mode = false;
         if adapt {
             set_adaptive_entropy_flags(&mut hdr);
+        }
+        if self.structure.switchable_interp {
+            set_switchable_interp(&mut hdr);
         }
         hdr.show_frame = shown;
         let alt_idx = if use_alt {
@@ -7433,6 +7552,7 @@ pub(crate) fn encode_sequence_lossy_rc_420(
             hdr.error_resilient_mode = false;
             if adaptive {
                 set_adaptive_entropy_flags(&mut hdr);
+                set_switchable_interp(&mut hdr);
             }
             hdr.ref_frame_idx = Some([0, 1, 1]);
             hdr.ref_frame_sign_bias = [false, false, true];
@@ -7899,6 +8019,7 @@ mod tests {
             tile_rows_log2: 0,
             intra_only_altref: false,
             entropy_adaptation: true,
+            switchable_interp: true,
         };
         let (packets, headers, decoded, _) =
             assert_structured_gop_mirror(&src, w, h, 100, structure);
@@ -8014,6 +8135,7 @@ mod tests {
             tile_rows_log2: 0,
             intra_only_altref: true,
             entropy_adaptation: true,
+            switchable_interp: true,
         };
         let (packets, headers, decoded, _) =
             assert_structured_gop_mirror(&src, w, h, 100, structure);
@@ -8063,6 +8185,7 @@ mod tests {
             tile_rows_log2: 0,
             intra_only_altref: false,
             entropy_adaptation: true,
+            switchable_interp: true,
         };
         let (packets, headers, decoded, _) =
             assert_structured_gop_mirror(&src, w, h, 140, structure);
@@ -8099,6 +8222,7 @@ mod tests {
             tile_rows_log2: 1,
             intra_only_altref: false,
             entropy_adaptation: true,
+            switchable_interp: true,
         };
         let (pk2, hs2, dec2, _) = assert_structured_gop_mirror(&src2, w2, h2, 120, rows);
         for hd in hs2.iter().filter(|hd| !hd.show_existing_frame) {
@@ -8158,6 +8282,7 @@ mod tests {
             tile_rows_log2: 0,
             intra_only_altref: false,
             entropy_adaptation: true,
+            switchable_interp: true,
         };
         let (packets, headers, decoded, seg_maps) =
             assert_structured_gop_mirror(&src, w, h, 100, full);
@@ -8270,6 +8395,7 @@ mod tests {
                 tile_rows_log2: 0,
                 intra_only_altref: false,
                 entropy_adaptation: true,
+                switchable_interp: true,
             };
             let (pk, hs, dec, _) = assert_structured_gop_mirror(&src[..4], w, h, 120, st);
             assert!(hs
@@ -12920,6 +13046,7 @@ mod entropy_mirror_tests {
                 tile_rows_log2: tr,
                 intra_only_altref: intra_only,
                 entropy_adaptation: true,
+                switchable_interp: true,
             };
             let src: Vec<Vec<u8>> = (0..7).map(|k| scene(w as usize, h as usize, k)).collect();
             let targets: Vec<[Plane; 3]> = src

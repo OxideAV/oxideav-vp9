@@ -365,6 +365,7 @@ fn build_r452_fixture_streams() -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
     let r452 = |q: u8| {
         let mut cfg = Vp9GopConfig::new(q);
         cfg.entropy_adaptation = false;
+        cfg.switchable_interp_filter = false;
         cfg
     };
     let yuv_of = |packets: &[Vec<u8>]| -> Vec<u8> {

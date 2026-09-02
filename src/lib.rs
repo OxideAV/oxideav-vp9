@@ -1357,6 +1357,13 @@ pub struct Vp9GopConfig {
     /// §10.5 default bank with no forward updates (the round-452
     /// bytes; the reconstruction is identical either way).
     pub entropy_adaptation: bool,
+    /// **Switchable interpolation filter** (round 455, on by default):
+    /// every P-frame codes `interpolation_filter = SWITCHABLE` and each
+    /// leaf with non-zero motion elects the §8.5.2.4 kernel (`EIGHTTAP`
+    /// / `EIGHTTAP_SMOOTH` / `EIGHTTAP_SHARP`) with the least full-leaf
+    /// prediction SSE, coded per block as §6.4.16 `interp_filter`.
+    /// `false` codes frame-level `EIGHTTAP` (the round-452 filter).
+    pub switchable_interp_filter: bool,
 }
 
 impl Vp9GopConfig {
@@ -1371,6 +1378,7 @@ impl Vp9GopConfig {
             tile_rows_log2: 0,
             intra_only_altref: false,
             entropy_adaptation: true,
+            switchable_interp_filter: true,
         }
     }
 }
@@ -1419,6 +1427,7 @@ pub fn encode_vp9_lossy_sequence_with(
         tile_rows_log2: cfg.tile_rows_log2,
         intra_only_altref: cfg.intra_only_altref,
         entropy_adaptation: cfg.entropy_adaptation,
+        switchable_interp: cfg.switchable_interp_filter,
     };
     pixel_encoder::encode_sequence_lossy_structured_u8(
         frames,

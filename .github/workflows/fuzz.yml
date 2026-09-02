@@ -24,6 +24,13 @@ name: Fuzz
 #     rows) plus the §8.5.2.3 resized-sequence arm; the emitted
 #     packets must decode to exactly the source frame count of shown
 #     frames at the declared sizes.
+#   * encode_adaptive_chain — oracle-carrying round-trip over the
+#     round-455 adaptive chain (encoder-side §8.4 backward adaptation,
+#     cost-elected §6.3 forward updates, per-leaf switchable
+#     interpolation filter) and the two-pass rate-controlled chain
+#     (first-pass statistics, VBV allocation): the emitted packets
+#     must decode to exactly the source frame count, every two-pass
+#     frame within its reported budget (or at the q == 255 floor).
 #
 # Seed corpus entries (corpus/*/seed-*) are derived from the crate's
 # synthetic test vectors and tracked in git; fuzz-grown corpus persists

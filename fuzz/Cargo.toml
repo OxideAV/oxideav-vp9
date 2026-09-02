@@ -88,3 +88,10 @@ bench = false
 
 [workspace]
 members = ["."]
+
+[[bin]]
+name = "encode_adaptive_chain"
+path = "fuzz_targets/encode_adaptive_chain.rs"
+test = false
+doc = false
+bench = false

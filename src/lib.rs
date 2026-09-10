@@ -1262,6 +1262,11 @@ pub struct Vp9TwoPassFrame {
     pub coded_bytes: usize,
     /// The landed quantizer.
     pub base_q_idx: u8,
+    /// The packet is a one-byte §6.2 `show_existing_frame` packet
+    /// (structured GOPs only — never set by the plain chain entry):
+    /// `first_pass_bytes == coded_bytes` (one byte; two on profile 3),
+    /// `budget == 0`, `base_q_idx == 0`.
+    pub show_existing: bool,
 }
 
 /// **Two-pass rate-controlled** lossy sequence encode (round 455).
@@ -1309,9 +1314,278 @@ pub fn encode_vp9_lossy_sequence_rc_two_pass(
             budget: f.budget,
             coded_bytes: f.coded_bytes,
             base_q_idx: f.base_q_idx,
+            show_existing: false,
         })
         .collect();
     Ok((packets, report))
+}
+
+/// **Two-pass rate control over a structured GOP** (round 458):
+/// [`encode_vp9_lossy_sequence_rc_two_pass`] generalised over a
+/// [`Vp9GopConfig`] — the alt-ref pyramid, §6.2.11 segmentation, tile
+/// columns / rows, intra-only alt-refs, the entropy model and the
+/// switchable filter all ride the two-pass allocation.
+///
+/// Pass one codes the GOP through the structured encoder at
+/// `cfg.base_q_idx` — which is the **first-pass probe quantizer**
+/// here, not a fixed second-pass quantizer — recording each packet's
+/// coded size and motion activity. Pass two codes the identical packet
+/// sequence (keyframe; per alt-ref group: hidden alt-ref, shown frames,
+/// `show_existing_frame`) with every decoded packet bisected to its
+/// budget: the sequence pool `target_bytes_per_frame × frames.len()`
+/// (less the `show_existing_frame` packets) is split over the decoded
+/// packets in proportion to their first-pass sizes — the hidden
+/// alt-ref, the group's most-referenced frame, draws its share like
+/// any other — under the leaky-bucket VBV model of `vbv_bytes`: the
+/// buffer starts full, drains by every coded packet and refills by the
+/// per-frame target at every **display** point (a shown frame, or the
+/// `show_existing_frame` packet that presents a hidden alt-ref — a
+/// hidden alt-ref's bytes drain with no display before the group's
+/// first shown frame, so `vbv_bytes == 0` selects `max( 2,
+/// altref_interval + 1 ) × target_bytes_per_frame` rather than the
+/// plain chain's two-frame default; an explicit buffer smaller than a
+/// group starves the frame decoded right after the alt-ref down to the
+/// `q == 255` floor); packet budget = `min( allocation + unspent carry,
+/// buffer level )`. Every frame otherwise
+/// rides the structured pipeline of [`encode_vp9_lossy_sequence_with`]
+/// (decoder-mirror reconstruction, best-effort `q == 255` below the
+/// syntax floor).
+///
+/// Returns the packets in decode order and one [`Vp9TwoPassFrame`] per
+/// **packet** (decode order, `show_existing_frame` packets flagged), so
+/// `report.len() == packets.len()`. Returns [`Error::Unsupported`] for
+/// an empty sequence, a zero target, `base_q_idx == 0`,
+/// `altref_interval == 0`, degenerate dimensions, an invalid tile
+/// layout, or any too-short frame buffer.
+pub fn encode_vp9_lossy_sequence_rc_two_pass_with(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    cfg: &Vp9GopConfig,
+    target_bytes_per_frame: usize,
+    vbv_bytes: usize,
+) -> Result<(Vec<Vec<u8>>, Vec<Vp9TwoPassFrame>), Error> {
+    two_pass_with_fmt_u8(
+        frames,
+        width,
+        height,
+        cfg,
+        true,
+        true,
+        target_bytes_per_frame,
+        vbv_bytes,
+    )
+}
+
+/// [`encode_vp9_lossy_sequence_rc_two_pass_with`] at **8-bit 4:4:4**
+/// (profile 1; each frame `Y` then full-resolution `U` / `V`).
+pub fn encode_vp9_lossy_sequence_rc_two_pass_with_444(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    cfg: &Vp9GopConfig,
+    target_bytes_per_frame: usize,
+    vbv_bytes: usize,
+) -> Result<(Vec<Vec<u8>>, Vec<Vp9TwoPassFrame>), Error> {
+    two_pass_with_fmt_u8(
+        frames,
+        width,
+        height,
+        cfg,
+        false,
+        false,
+        target_bytes_per_frame,
+        vbv_bytes,
+    )
+}
+
+/// [`encode_vp9_lossy_sequence_rc_two_pass_with`] at **8-bit 4:2:2**
+/// (profile 1; `U` / `V` half width, full height).
+pub fn encode_vp9_lossy_sequence_rc_two_pass_with_422(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    cfg: &Vp9GopConfig,
+    target_bytes_per_frame: usize,
+    vbv_bytes: usize,
+) -> Result<(Vec<Vec<u8>>, Vec<Vp9TwoPassFrame>), Error> {
+    two_pass_with_fmt_u8(
+        frames,
+        width,
+        height,
+        cfg,
+        true,
+        false,
+        target_bytes_per_frame,
+        vbv_bytes,
+    )
+}
+
+/// [`encode_vp9_lossy_sequence_rc_two_pass_with`] at **8-bit 4:4:0**
+/// (profile 1; `U` / `V` full width, half height).
+pub fn encode_vp9_lossy_sequence_rc_two_pass_with_440(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    cfg: &Vp9GopConfig,
+    target_bytes_per_frame: usize,
+    vbv_bytes: usize,
+) -> Result<(Vec<Vec<u8>>, Vec<Vp9TwoPassFrame>), Error> {
+    two_pass_with_fmt_u8(
+        frames,
+        width,
+        height,
+        cfg,
+        false,
+        true,
+        target_bytes_per_frame,
+        vbv_bytes,
+    )
+}
+
+/// [`encode_vp9_lossy_sequence_rc_two_pass_with`] at **10 / 12-bit** on
+/// native `u16` samples (profile 2 at 4:2:0 when `subsample`, profile 3
+/// at 4:4:4 otherwise), the [`encode_vp9_lossy_sequence_hbd`] layout.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_vp9_lossy_sequence_rc_two_pass_with_hbd(
+    frames: &[&[u16]],
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    subsample: bool,
+    cfg: &Vp9GopConfig,
+    target_bytes_per_frame: usize,
+    vbv_bytes: usize,
+) -> Result<(Vec<Vec<u8>>, Vec<Vp9TwoPassFrame>), Error> {
+    two_pass_with_fmt_u16(
+        frames,
+        width,
+        height,
+        bit_depth,
+        subsample,
+        subsample,
+        cfg,
+        target_bytes_per_frame,
+        vbv_bytes,
+    )
+}
+
+/// [`encode_vp9_lossy_sequence_rc_two_pass_with_hbd`] at **4:2:2**
+/// (profile 3).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_vp9_lossy_sequence_rc_two_pass_with_hbd_422(
+    frames: &[&[u16]],
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    cfg: &Vp9GopConfig,
+    target_bytes_per_frame: usize,
+    vbv_bytes: usize,
+) -> Result<(Vec<Vec<u8>>, Vec<Vp9TwoPassFrame>), Error> {
+    two_pass_with_fmt_u16(
+        frames,
+        width,
+        height,
+        bit_depth,
+        true,
+        false,
+        cfg,
+        target_bytes_per_frame,
+        vbv_bytes,
+    )
+}
+
+/// [`encode_vp9_lossy_sequence_rc_two_pass_with_hbd`] at **4:4:0**
+/// (profile 3).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_vp9_lossy_sequence_rc_two_pass_with_hbd_440(
+    frames: &[&[u16]],
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    cfg: &Vp9GopConfig,
+    target_bytes_per_frame: usize,
+    vbv_bytes: usize,
+) -> Result<(Vec<Vec<u8>>, Vec<Vp9TwoPassFrame>), Error> {
+    two_pass_with_fmt_u16(
+        frames,
+        width,
+        height,
+        bit_depth,
+        false,
+        true,
+        cfg,
+        target_bytes_per_frame,
+        vbv_bytes,
+    )
+}
+
+fn two_pass_report(report: Vec<pixel_encoder::TwoPassPacket>) -> Vec<Vp9TwoPassFrame> {
+    report
+        .into_iter()
+        .map(|f| Vp9TwoPassFrame {
+            first_pass_bytes: f.first_pass.bytes,
+            motion_activity: f.first_pass.motion_activity,
+            budget: f.budget,
+            coded_bytes: f.coded_bytes,
+            base_q_idx: f.base_q_idx,
+            show_existing: f.show_existing,
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn two_pass_with_fmt_u8(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    cfg: &Vp9GopConfig,
+    ssx: bool,
+    ssy: bool,
+    target_bytes_per_frame: usize,
+    vbv_bytes: usize,
+) -> Result<(Vec<Vec<u8>>, Vec<Vp9TwoPassFrame>), Error> {
+    let fmt = pixel_encoder::LossyFormat::new(8, ssx, ssy)?;
+    let (packets, report) = pixel_encoder::encode_sequence_lossy_structured_two_pass_u8(
+        frames,
+        width,
+        height,
+        fmt,
+        gop_structure_of(cfg),
+        cfg.base_q_idx,
+        target_bytes_per_frame,
+        vbv_bytes,
+    )?;
+    Ok((packets, two_pass_report(report)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn two_pass_with_fmt_u16(
+    frames: &[&[u16]],
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    ssx: bool,
+    ssy: bool,
+    cfg: &Vp9GopConfig,
+    target_bytes_per_frame: usize,
+    vbv_bytes: usize,
+) -> Result<(Vec<Vec<u8>>, Vec<Vp9TwoPassFrame>), Error> {
+    if bit_depth != 10 && bit_depth != 12 {
+        return Err(Error::Unsupported);
+    }
+    let fmt = pixel_encoder::LossyFormat::new(bit_depth, ssx, ssy)?;
+    let (packets, report) = pixel_encoder::encode_sequence_lossy_structured_two_pass_u16(
+        frames,
+        width,
+        height,
+        fmt,
+        gop_structure_of(cfg),
+        cfg.base_q_idx,
+        target_bytes_per_frame,
+        vbv_bytes,
+    )?;
+    Ok((packets, two_pass_report(report)))
 }
 
 /// Encode an 8-bit 4:2:0 sequence as a lossy **alt-ref pyramid** GOP

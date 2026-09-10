@@ -4151,6 +4151,14 @@ impl EntropyStash {
         (f.bytes, f.recon, f.state)
     }
 
+    /// Take the stashed products out (the deferred-commit path).
+    fn take(&self) -> EntropyProducts {
+        self.0
+            .borrow_mut()
+            .take()
+            .expect("the frame was encoded at least once")
+    }
+
     /// Fold the stashed products into `model` for the frame `hdr`
     /// coded against bank `idx`; returns the counts.
     fn finish(
@@ -6971,6 +6979,10 @@ pub(crate) struct StructuredGopEncoder {
     /// segmentation table — an `update_data = 0` frame's table is the
     /// persisted one the decoder holds).
     pub headers: Vec<Vp9FrameHeader>,
+    /// Per coded packet (decode order): size, motion activity, landed
+    /// quantizer, budget — the first-pass statistics of the two-pass
+    /// structured entry ([`PacketStat`]).
+    pub stats: Vec<PacketStat>,
 }
 
 impl StructuredGopEncoder {
@@ -7003,6 +7015,7 @@ impl StructuredGopEncoder {
             recons: Vec::new(),
             headers: Vec::new(),
             seg_maps: Vec::new(),
+            stats: Vec::new(),
         })
     }
 
@@ -7017,16 +7030,23 @@ impl StructuredGopEncoder {
         visible_crop_planes(recon, self.width as usize, self.height as usize, cw, ch)
     }
 
-    /// Code one P-frame (shown or hidden) against the current slot
-    /// roles; `use_alt` admits the distinct alt-ref slot as the third
-    /// reference (false while the group's alt-ref is being built).
-    fn code_pframe(
-        &mut self,
+    /// Header + planner products of one P-frame at quantizer `q` against
+    /// the current slot roles, coded and finished but **not committed**:
+    /// the probe half of the probe / commit split the rate-controlled
+    /// entries bisect over (round 458). `use_alt` admits the distinct
+    /// alt-ref slot as the third reference (false while the group's
+    /// alt-ref is being built). Reads the encoder state only; every
+    /// persistent side effect (slot refresh, §7.2.6 field, §6.4.14 map,
+    /// §7.2.8 baseline, §7.2.10 table, §6.1.2 bank) rides the returned
+    /// [`PendingFrame`] into [`Self::commit`].
+    fn prepare_pframe(
+        &self,
         targets: &[Plane; 3],
         shown: bool,
         use_alt: bool,
         refresh_slot: usize,
-    ) -> Result<Vec<u8>, Error> {
+        q: u8,
+    ) -> Result<PendingFrame, Error> {
         use crate::frame_writer::PrevMotionField;
         let (width, height, fmt) = (self.width, self.height, self.fmt);
         let w = width as usize;
@@ -7071,7 +7091,7 @@ impl StructuredGopEncoder {
         hdr.ref_frame_sign_bias = [false, false, true];
         hdr.refresh_frame_flags = 1u8 << refresh_slot;
         hdr.quantization = QuantizationParams {
-            base_q_idx: self.base_q_idx,
+            base_q_idx: q,
             delta_q_y_dc: 0,
             delta_q_uv_dc: 0,
             delta_q_uv_ac: 0,
@@ -7098,8 +7118,10 @@ impl StructuredGopEncoder {
             prev_map: if temporal { prev_map } else { None },
             counts: std::cell::RefCell::new(SegSymbolCounts::default()),
         };
-        // §6.2 / §6.1.2 mirror: the bank this frame loads.
-        let idx = self.entropy.begin_frame(&hdr);
+        // §6.2 / §6.1.2 mirror: the bank this frame loads (begin_frame
+        // is idempotent — a P-frame resets nothing — so every probe of
+        // the bisection sees the same bank).
+        let idx = self.entropy.begin_frame_view(&hdr);
         let base = self.entropy.bank(idx).clone();
         let eopts = EntropyOpts {
             base: &base,
@@ -7145,7 +7167,10 @@ impl StructuredGopEncoder {
         }
         let (p0, recon0, state0) = encode(&hdr)?;
         let next_field = PrevMotionField::from_state(&state0);
+        let motion = motion_activity(&next_field);
         let next_seg_map = state0.segment_ids.clone();
+        let mut lf_persist = self.lf_persist;
+        let mut seg_persist = self.seg_persist;
         let (bytes, recon, final_hdr) = finish_frame_lossy(
             &hdr,
             p0,
@@ -7154,69 +7179,90 @@ impl StructuredGopEncoder {
             targets,
             w,
             h,
-            &mut self.lf_persist,
-            seg_mode.enabled().then_some(&mut self.seg_persist),
+            &mut lf_persist,
+            seg_mode.enabled().then_some(&mut seg_persist),
             encode,
         )?;
-        if adapt {
-            stash.finish(&mut self.entropy, &final_hdr, idx);
-        }
-        self.headers.push(final_hdr);
-        self.seg_maps
-            .push(seg_mode.enabled().then_some(next_seg_map.clone()));
-        self.slots[refresh_slot] = Some(self.crop(&recon));
-        self.recons.push(Some(recon));
-        // §7.2.6 (c): a hidden frame leaves the next decoded frame
-        // without a usable prev field.
-        self.prev_field = if shown { Some(next_field) } else { None };
-        if seg_mode.enabled() {
-            // §8.1 step 3: a decoded update_map = 1 frame's SegmentIds
-            // become PrevSegmentIds.
-            self.prev_seg_map = Some(next_seg_map);
-        }
-        Ok(bytes)
+        Ok(PendingFrame {
+            bytes,
+            recon,
+            final_hdr,
+            // §7.2.6 (c): a hidden frame leaves the next decoded frame
+            // without a usable prev field.
+            next_field: shown.then_some(next_field),
+            next_seg_map: seg_mode.enabled().then_some(next_seg_map),
+            lf_persist,
+            seg_persist,
+            entropy: adapt.then(|| (idx, stash.take())),
+            q,
+            motion_activity: motion,
+        })
     }
 
-    /// Code one hidden §6.2 **intra-only** frame into `refresh_slot` —
-    /// the intra-only alt-ref of the pyramid. §6.2 codes the
-    /// `intra_only` flag only for `show_frame = 0` headers; the frame
-    /// runs the keyframe planner + tree encoder (mode_info( )
-    /// dispatches on `FrameIsIntra`, so key and hidden intra-only
-    /// frames code the identical §6.3/§6.4 intra body), refreshes only
-    /// its slot, and codes `reset_frame_context = 3` (all four §7.2
-    /// context banks back to the defaults the writer models).
+    /// One hidden §6.2 **intra-only** frame into `refresh_slot` at
+    /// quantizer `q` — the intra-only alt-ref of the pyramid — prepared
+    /// but not committed. §6.2 codes the `intra_only` flag only for
+    /// `show_frame = 0` headers; the frame runs the keyframe planner +
+    /// tree encoder (mode_info( ) dispatches on `FrameIsIntra`, so key
+    /// and hidden intra-only frames code the identical §6.3/§6.4 intra
+    /// body), refreshes only its slot, and codes `reset_frame_context =
+    /// 3` (all four §7.2 context banks back to the defaults the writer
+    /// models).
     ///
     /// §7.2 `setup_past_independence( )` runs on the decode side for
     /// every intra-only frame: the encoder mirrors it by restarting the
     /// §7.2.8 delta baseline and the §7.2.10 feature table (the frame
     /// codes `update_data = 1`), and clearing the §6.4.14 map before
     /// the frame's own `update_map = 1` walk replaces it (§8.1 step 3).
-    fn code_intra_only_arf(
-        &mut self,
+    fn prepare_intra_only_arf(
+        &self,
         targets: &[Plane; 3],
         refresh_slot: usize,
-    ) -> Result<Vec<u8>, Error> {
-        let (width, height, base_q_idx, fmt) = (self.width, self.height, self.base_q_idx, self.fmt);
-        let w = width as usize;
-        let h = height as usize;
-        let mi_cols = (width + 7) >> 3;
-        let mi_rows = (height + 7) >> 3;
-        let seg_mode = self.structure.segmentation;
-
-        let adapt = self.structure.entropy_adaptation;
-        let mut hdr = lossy_keyframe_header_fmt(width, height, base_q_idx, fmt);
+        q: u8,
+    ) -> Result<PendingFrame, Error> {
+        let (width, height, fmt) = (self.width, self.height, self.fmt);
+        let mut hdr = lossy_keyframe_header_fmt(width, height, q, fmt);
         hdr.frame_type = FrameType::NonKeyFrame;
         hdr.intra_only = true;
         hdr.show_frame = false;
         hdr.error_resilient_mode = false;
         hdr.reset_frame_context = 3;
+        hdr.refresh_frame_flags = 1u8 << refresh_slot;
+        self.prepare_intra(hdr, targets, q)
+    }
+
+    /// The keyframe at quantizer `q`, prepared but not committed: the
+    /// chain-model keyframe of the default sequence entry (planner
+    /// tree, skip election, filter election), refreshing every slot,
+    /// plus the activity-class segment map.
+    fn prepare_keyframe(&self, targets: &[Plane; 3], q: u8) -> Result<PendingFrame, Error> {
+        let (width, height, fmt) = (self.width, self.height, self.fmt);
+        let hdr = lossy_keyframe_header_fmt(width, height, q, fmt);
+        self.prepare_intra(hdr, targets, q)
+    }
+
+    /// The shared intra body of [`Self::prepare_keyframe`] and
+    /// [`Self::prepare_intra_only_arf`] over a `FrameIsIntra` header.
+    fn prepare_intra(
+        &self,
+        mut hdr: Vp9FrameHeader,
+        targets: &[Plane; 3],
+        q: u8,
+    ) -> Result<PendingFrame, Error> {
+        use crate::frame_writer::PrevMotionField;
+        let (width, height, fmt) = (self.width, self.height, self.fmt);
+        let w = width as usize;
+        let h = height as usize;
+        let mi_cols = (width + 7) >> 3;
+        let mi_rows = (height + 7) >> 3;
+        let seg_mode = self.structure.segmentation;
+        let adapt = self.structure.entropy_adaptation;
+        let is_key = hdr.frame_type == FrameType::KeyFrame;
+        hdr.tile_info.tile_cols_log2 = self.structure.tile_cols_log2;
+        hdr.tile_info.tile_rows_log2 = self.structure.tile_rows_log2;
         if adapt {
             set_adaptive_entropy_flags(&mut hdr);
         }
-        hdr.refresh_frame_flags = 1u8 << refresh_slot;
-        hdr.tile_info.tile_cols_log2 = self.structure.tile_cols_log2;
-        hdr.tile_info.tile_rows_log2 = self.structure.tile_rows_log2;
-
         let mut plan = plan_keyframe_tree(
             targets,
             mi_rows,
@@ -7224,7 +7270,7 @@ impl StructuredGopEncoder {
             fmt.ssx,
             fmt.ssy,
             u32::from(fmt.bit_depth),
-            base_q_idx,
+            q,
         );
         if seg_mode.enabled() {
             let counts = if seg_mode.adaptive_quant() {
@@ -7250,11 +7296,11 @@ impl StructuredGopEncoder {
                 [0; AQ_SEGMENTS],
             );
         }
-        // §6.2 mirror: reset_frame_context = 3 resets every bank; the
-        // frame codes against the defaults (plus elected forward
-        // updates) and saves its §8.4-adapted coefficient bank.
-        let idx = self.entropy.begin_frame(&hdr);
-        let base = self.entropy.bank(idx).clone();
+        // §6.2 mirror: a keyframe / reset_frame_context = 3 frame resets
+        // every bank; the frame codes against the defaults (plus
+        // elected forward updates) and saves its §8.4-adapted bank.
+        let idx = self.entropy.begin_frame_view(&hdr);
+        let base = self.entropy.bank_after_begin(&hdr, idx);
         let eopts = EntropyOpts {
             base: &base,
             forward_updates: true,
@@ -7265,9 +7311,12 @@ impl StructuredGopEncoder {
                 .map(|f| stash.record(f))
         };
         let (b0, recon0, state0) = encode(&hdr)?;
-        // §7.2 setup_past_independence( ) — encoder-side mirror.
-        self.lf_persist = LfDeltaState::default();
-        self.seg_persist = None;
+        // §7.2 setup_past_independence( ) — encoder-side mirror: the
+        // delta baseline and the feature table restart before the
+        // election (the frame always codes update_data = 1).
+        let mut lf_persist = LfDeltaState::default();
+        let mut seg_persist = None;
+        let next_field = PrevMotionField::from_state(&state0);
         let seg_map = state0.segment_ids.clone();
         let (bytes, recon, final_hdr) = finish_frame_lossy(
             &hdr,
@@ -7277,24 +7326,106 @@ impl StructuredGopEncoder {
             targets,
             w,
             h,
-            &mut self.lf_persist,
-            seg_mode.enabled().then_some(&mut self.seg_persist),
+            &mut lf_persist,
+            seg_mode.enabled().then_some(&mut seg_persist),
             encode,
         )?;
-        if adapt {
-            stash.finish(&mut self.entropy, &final_hdr, idx);
+        Ok(PendingFrame {
+            bytes,
+            recon,
+            final_hdr,
+            // A shown keyframe seeds the §7.2.6 field; a hidden
+            // intra-only frame leaves it absent (§7.2.6 (c), and (e)
+            // would zero it anyway: FrameIsIntra).
+            next_field: is_key.then_some(next_field),
+            next_seg_map: seg_mode.enabled().then_some(seg_map),
+            lf_persist,
+            seg_persist,
+            entropy: adapt.then(|| (idx, stash.take())),
+            q,
+            motion_activity: 0,
+        })
+    }
+
+    /// Commit a prepared frame: the packet is recorded, the refreshed
+    /// slots take its cropped reconstruction, and every persistent
+    /// encoder-side mirror advances exactly as the decoder's state
+    /// does after decoding it.
+    fn commit(&mut self, p: PendingFrame, budget: Option<usize>) -> Vec<u8> {
+        let PendingFrame {
+            bytes,
+            recon,
+            final_hdr,
+            next_field,
+            next_seg_map,
+            lf_persist,
+            seg_persist,
+            entropy,
+            q,
+            motion_activity,
+        } = p;
+        if let Some((idx, (counts, coding, tx_mode))) = entropy {
+            // §6.2 resets first (begin_frame), then the §6.1.2 refresh.
+            self.entropy.begin_frame(&final_hdr);
+            self.entropy
+                .end_frame(&final_hdr, idx, &coding, &counts, tx_mode);
+        }
+        self.lf_persist = lf_persist;
+        self.seg_persist = seg_persist;
+        let crop = self.crop(&recon);
+        // §8.10: a keyframe refreshes every slot; other frames the
+        // slots of refresh_frame_flags.
+        let mask = if final_hdr.frame_type == FrameType::KeyFrame {
+            0xff
+        } else {
+            final_hdr.refresh_frame_flags
+        };
+        for slot in 0..3 {
+            if mask & (1 << slot) != 0 {
+                self.slots[slot] = Some(crop.clone());
+            }
+        }
+        self.prev_field = next_field;
+        if let Some(map) = next_seg_map.clone() {
+            // §8.1 step 3: a decoded update_map = 1 frame's SegmentIds
+            // become PrevSegmentIds.
+            self.prev_seg_map = Some(map);
         }
         self.headers.push(final_hdr);
-        self.seg_maps.push(seg_mode.enabled().then_some(seg_map));
-        self.slots[refresh_slot] = Some(self.crop(&recon));
+        self.seg_maps.push(next_seg_map);
         self.recons.push(Some(recon));
-        // Hidden frame: §7.2.6 (c) — no usable prev field for the next
-        // decoded frame (and (e) would zero it anyway: FrameIsIntra).
-        self.prev_field = None;
-        if seg_mode.enabled() {
-            self.prev_seg_map = Some(self.seg_maps.last().unwrap().clone().unwrap());
-        }
-        Ok(bytes)
+        let shown = final_hdr.show_frame;
+        self.stats.push(PacketStat {
+            bytes: bytes.len(),
+            motion_activity,
+            base_q_idx: q,
+            budget,
+            show_existing: false,
+            shown,
+        });
+        bytes
+    }
+
+    /// Prepare one frame under the quantizer policy's verdict for the
+    /// next packet — a fixed quantizer, or a byte budget bisected over
+    /// [`bisect_q`] exactly as the rate-controlled chain does (lowest
+    /// `base_q_idx` whose finished frame fits; best-effort `q == 255`
+    /// below the syntax floor) — then commit it.
+    fn code_under(
+        &mut self,
+        policy: &mut QPolicy<'_>,
+        prepare: impl Fn(&Self, u8) -> Result<PendingFrame, Error>,
+    ) -> Result<Vec<u8>, Error> {
+        let coded: Vec<usize> = self.stats.iter().map(|s| s.bytes).collect();
+        let verdict = policy(coded.len(), &coded);
+        let (pending, budget) = match verdict {
+            FrameQ::Fixed(q) => (prepare(self, q)?, None),
+            FrameQ::Budget(b) => {
+                let (_, p, _) = bisect_q(|q| prepare(self, q).map(|p| (p.bytes.clone(), p)), b)?;
+                (p, Some(b))
+            }
+        };
+        Ok(self.commit(pending, budget))
     }
 
     /// The §6.2 `show_existing_frame` packet displaying `slot`.
@@ -7305,116 +7436,52 @@ impl StructuredGopEncoder {
         self.recons.push(None);
         self.headers.push(hdr);
         self.seg_maps.push(None);
-        crate::header_writer::write_uncompressed_header(&hdr)
+        let bytes = crate::header_writer::write_uncompressed_header(&hdr)?;
+        self.stats.push(PacketStat {
+            bytes: bytes.len(),
+            motion_activity: 0,
+            base_q_idx: 0,
+            budget: None,
+            show_existing: true,
+            shown: true,
+        });
+        Ok(bytes)
     }
 
-    /// Encode the whole GOP: keyframe, then alt-ref groups. Returns the
-    /// packets in decode order (one `Vec<u8>` per §6.1 frame; hidden
-    /// alt-refs and `show_existing_frame` packets included).
+    /// Encode the whole GOP at the configured `base_q_idx`: keyframe,
+    /// then alt-ref groups. Returns the packets in decode order (one
+    /// `Vec<u8>` per §6.1 frame; hidden alt-refs and
+    /// `show_existing_frame` packets included).
     pub fn encode(&mut self, frame_targets: &[[Plane; 3]]) -> Result<Vec<Vec<u8>>, Error> {
-        use crate::frame_writer::PrevMotionField;
+        let q = self.base_q_idx;
+        self.encode_with(frame_targets, &mut |_, _| FrameQ::Fixed(q))
+    }
+
+    /// [`Self::encode`] under a per-packet quantizer policy (round 458):
+    /// `policy( i, coded )` is consulted for the `i`-th packet in decode
+    /// order (`coded` = the sizes of the packets already emitted,
+    /// `show_existing_frame` packets included) and answers with a fixed
+    /// `base_q_idx` or a byte budget to bisect to — the structured-GOP
+    /// twin of the chain's [`encode_sequence_lossy_rc_420_budgeted`].
+    /// The packet sequence (keyframe, per group: hidden alt-ref, shown
+    /// frames, `show_existing_frame`) depends only on the frame count
+    /// and the structure, never on the content or the quantizers, so a
+    /// first pass's per-packet statistics index a second pass one for
+    /// one ([`Self::stats`]).
+    pub fn encode_with(
+        &mut self,
+        frame_targets: &[[Plane; 3]],
+        policy: &mut QPolicy<'_>,
+    ) -> Result<Vec<Vec<u8>>, Error> {
         let Some((kf_targets, rest)) = frame_targets.split_first() else {
             return Err(Error::Unsupported);
         };
-        let (width, height, base_q_idx, fmt) = (self.width, self.height, self.base_q_idx, self.fmt);
-        let w = width as usize;
-        let h = height as usize;
-        let mi_cols = (width + 7) >> 3;
-        let mi_rows = (height + 7) >> 3;
-        let seg_mode = self.structure.segmentation;
         let interval = self.structure.altref_interval;
 
-        // Keyframe: the chain-model keyframe of the default sequence
-        // entry (planner tree, skip election, filter election),
-        // refreshing every slot, plus the activity-class segment map.
-        let adapt = self.structure.entropy_adaptation;
-        let mut kf_hdr = lossy_keyframe_header_fmt(width, height, base_q_idx, fmt);
-        kf_hdr.tile_info.tile_cols_log2 = self.structure.tile_cols_log2;
-        kf_hdr.tile_info.tile_rows_log2 = self.structure.tile_rows_log2;
-        if adapt {
-            set_adaptive_entropy_flags(&mut kf_hdr);
-        }
-        let mut kf_plan = plan_keyframe_tree(
-            kf_targets,
-            mi_rows,
-            mi_cols,
-            fmt.ssx,
-            fmt.ssy,
-            u32::from(fmt.bit_depth),
-            base_q_idx,
-        );
-        if seg_mode.enabled() {
-            let counts = if seg_mode.adaptive_quant() {
-                assign_keyframe_aq_segments(
-                    &mut kf_plan,
-                    kf_targets,
-                    mi_cols,
-                    mi_rows,
-                    u32::from(fmt.bit_depth),
-                )
-            } else {
-                let mut c = SegSymbolCounts::default();
-                for _ in 0..kf_plan.leaves.len() {
-                    c.count_tree(0);
-                }
-                c
-            };
-            kf_hdr.segmentation = seg_params_for(
-                seg_mode,
-                false,
-                counts.tree_probs(),
-                [255; 3],
-                [0; AQ_SEGMENTS],
-            );
-        }
-        let kf_idx = self.entropy.begin_frame(&kf_hdr);
-        let kf_base = self.entropy.bank(kf_idx).clone();
-        let kf_eopts = EntropyOpts {
-            base: &kf_base,
-            forward_updates: true,
-        };
-        let kf_stash = EntropyStash::default();
-        let encode_kf = |hdr2: &Vp9FrameHeader| {
-            encode_keyframe_lossy_tree_elect_skip_ctx(
-                hdr2,
-                kf_targets,
-                &kf_plan,
-                adapt.then_some(&kf_eopts),
-            )
-            .map(|f| kf_stash.record(f))
-        };
-        let (kf0, kf_recon0, kf_state0) = encode_kf(&kf_hdr)?;
-        self.prev_field = Some(PrevMotionField::from_state(&kf_state0));
-        self.prev_seg_map = seg_mode.enabled().then(|| kf_state0.segment_ids.clone());
-        // §7.2 setup_past_independence( ) on the keyframe: the delta
-        // baseline and the feature table restart before the election
-        // (the keyframe always codes update_data = 1).
-        self.lf_persist = LfDeltaState::default();
-        self.seg_persist = None;
-        let kf_seg_map = kf_state0.segment_ids.clone();
-        let (kf_bytes, kf_recon, kf_final_hdr) = finish_frame_lossy(
-            &kf_hdr,
-            kf0,
-            kf_recon0,
-            kf_state0,
-            kf_targets,
-            w,
-            h,
-            &mut self.lf_persist,
-            seg_mode.enabled().then_some(&mut self.seg_persist),
-            encode_kf,
-        )?;
-        if adapt {
-            kf_stash.finish(&mut self.entropy, &kf_final_hdr, kf_idx);
-        }
-        self.headers.push(kf_final_hdr);
-        self.seg_maps.push(seg_mode.enabled().then_some(kf_seg_map));
-        let kf_crop = self.crop(&kf_recon);
-        self.slots = [Some(kf_crop.clone()), Some(kf_crop.clone()), Some(kf_crop)];
+        let kf_bytes = self.code_under(policy, |enc, q| enc.prepare_keyframe(kf_targets, q))?;
         self.last_slot = 0;
         self.golden_slot = 1;
         self.alt_slot = 2;
-        self.recons.push(Some(kf_recon));
 
         let mut out = Vec::with_capacity(frame_targets.len() + frame_targets.len() / interval);
         out.push(kf_bytes);
@@ -7425,22 +7492,32 @@ impl StructuredGopEncoder {
             if group_end == i {
                 // A lone frame: plain shown P-frame over LAST / GOLDEN.
                 let last_slot = self.last_slot;
-                out.push(self.code_pframe(&rest[i], true, false, last_slot)?);
+                let t = &rest[i];
+                out.push(self.code_under(policy, |enc, q| {
+                    enc.prepare_pframe(t, true, false, last_slot, q)
+                })?);
                 i += 1;
                 continue;
             }
             // 1. Hidden alt-ref: the group's last frame into the free
             // slot — a P-frame, or an intra-only refresh point.
             let alt_slot = self.alt_slot;
+            let t = &rest[group_end];
             if self.structure.intra_only_altref {
-                out.push(self.code_intra_only_arf(&rest[group_end], alt_slot)?);
+                out.push(
+                    self.code_under(policy, |enc, q| enc.prepare_intra_only_arf(t, alt_slot, q))?,
+                );
             } else {
-                out.push(self.code_pframe(&rest[group_end], false, false, alt_slot)?);
+                out.push(self.code_under(policy, |enc, q| {
+                    enc.prepare_pframe(t, false, false, alt_slot, q)
+                })?);
             }
             // 2. The group's shown frames over [ LAST, GOLDEN, ALTREF ].
             for targets in &rest[i..group_end] {
                 let last_slot = self.last_slot;
-                out.push(self.code_pframe(targets, true, true, last_slot)?);
+                out.push(self.code_under(policy, |enc, q| {
+                    enc.prepare_pframe(targets, true, true, last_slot, q)
+                })?);
             }
             // 3. Display the alt-ref; it becomes LAST, the old LAST slot
             // is freed for the next group's alt-ref.
@@ -7453,6 +7530,59 @@ impl StructuredGopEncoder {
         Ok(out)
     }
 }
+
+/// One prepared-but-uncommitted frame of the [`StructuredGopEncoder`]
+/// (see [`StructuredGopEncoder::commit`]).
+struct PendingFrame {
+    bytes: Vec<u8>,
+    recon: ReconState,
+    final_hdr: Vp9FrameHeader,
+    /// The §7.2.6 field the next decoded frame models (`None` after a
+    /// hidden frame).
+    next_field: Option<crate::frame_writer::PrevMotionField>,
+    /// The frame's coded `SegmentIds` (segmentation on).
+    next_seg_map: Option<Vec<u8>>,
+    lf_persist: LfDeltaState,
+    seg_persist: Option<SegTablePersist>,
+    /// `(bank idx, products)` of the adaptive framing.
+    entropy: Option<(usize, EntropyProducts)>,
+    q: u8,
+    motion_activity: u32,
+}
+
+/// Per-packet record of a structured GOP encode (decode order).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PacketStat {
+    /// Coded size.
+    pub bytes: usize,
+    /// Mean eighth-pel `|mv|` over the frame's inter MIs (0 on intra
+    /// frames and `show_existing_frame` packets).
+    pub motion_activity: u32,
+    /// The landed `base_q_idx` (0 on `show_existing_frame` packets).
+    pub base_q_idx: u8,
+    /// The byte budget the packet was bisected to (`None` at a fixed
+    /// quantizer / on `show_existing_frame` packets).
+    pub budget: Option<usize>,
+    /// The one-byte §6.2 `show_existing_frame` packet.
+    pub show_existing: bool,
+    /// The packet presents a display frame (`show_frame = 1`, or a
+    /// `show_existing_frame` packet) — the VBV refill points.
+    pub shown: bool,
+}
+
+/// The quantizer policy's verdict for one packet ([`QPolicy`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrameQ {
+    /// Code at this `base_q_idx`.
+    Fixed(u8),
+    /// Bisect to the lowest `base_q_idx` whose frame fits this many
+    /// bytes (best-effort `q == 255` below the floor).
+    Budget(usize),
+}
+
+/// Per-packet quantizer policy of [`StructuredGopEncoder::encode_with`]:
+/// `(packet index in decode order, sizes of the packets already coded)`.
+pub(crate) type QPolicy<'a> = dyn FnMut(usize, &[usize]) -> FrameQ + 'a;
 
 /// [`encode_sequence_lossy_planes`] on the structured GOP encoder
 /// ([`StructuredGopEncoder`]).
@@ -7519,6 +7649,242 @@ pub(crate) fn encode_sequence_lossy_structured_u8(
         .map(|f| padded_targets_from_u8(f, width, height, fmt))
         .collect();
     encode_sequence_lossy_structured_planes(&targets, width, height, base_q_idx, fmt, structure)
+}
+
+/// Per-packet outcome of the two-pass **structured** encode
+/// ([`encode_sequence_lossy_structured_two_pass_planes`]), decode
+/// order, `show_existing_frame` packets included.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TwoPassPacket {
+    pub first_pass: FirstPassStat,
+    /// The second-pass byte budget (0 on `show_existing_frame` packets).
+    pub budget: usize,
+    /// The coded size.
+    pub coded_bytes: usize,
+    /// The landed quantizer (0 on `show_existing_frame` packets).
+    pub base_q_idx: u8,
+    /// The one-byte `show_existing_frame` packet.
+    pub show_existing: bool,
+}
+
+/// The two-pass allocation + VBV policy over a first pass's per-packet
+/// statistics (round 458): the sequence pool `target_bytes_per_frame ×
+/// display frames` less the `show_existing_frame` packets (one byte —
+/// two on profile 3, whose §6.2 header carries the reserved bit) is
+/// split over the decoded packets in proportion to their first-pass
+/// sizes (the integer remainder to the keyframe), then handed out under
+/// the leaky-bucket VBV model of the chain's two-pass entry — the
+/// buffer starts full at `vbv`, drains by every coded packet, and
+/// refills by the per-frame target at every **display** point (a shown
+/// frame, or the `show_existing_frame` packet presenting a hidden
+/// alt-ref — the alt-ref's bytes drained when it was decoded, with no
+/// display between it and the group's first shown frame); packet
+/// `i`'s budget is `min( allocation_i + unspent carry, buffer level )`.
+/// `vbv_bytes == 0` selects `max( 2, altref_interval + 1 ) × target`:
+/// a pyramid group's hidden alt-ref must fit the buffer ahead of the
+/// group's display points, so the two-frame default of the plain chain
+/// would starve the frame decoded right after it. Returns the
+/// per-packet allocations and the policy closure.
+fn two_pass_policy(
+    stats: &[PacketStat],
+    display_frames: usize,
+    target_bytes_per_frame: usize,
+    vbv_bytes: usize,
+    altref_interval: usize,
+) -> (Vec<usize>, impl FnMut(usize, &[usize]) -> FrameQ + '_) {
+    let se_bytes: usize = stats
+        .iter()
+        .filter(|s| s.show_existing)
+        .map(|s| s.bytes)
+        .sum();
+    let n_se = stats.iter().filter(|s| s.show_existing).count();
+    let total = target_bytes_per_frame
+        .saturating_mul(display_frames)
+        .saturating_sub(se_bytes)
+        .max(stats.len() - n_se);
+    let weights: Vec<u64> = stats
+        .iter()
+        .map(|s| {
+            if s.show_existing {
+                0
+            } else {
+                s.bytes.max(1) as u64
+            }
+        })
+        .collect();
+    let weight_sum: u64 = weights.iter().sum();
+    let mut alloc: Vec<usize> = weights
+        .iter()
+        .map(|&w| ((total as u128 * w as u128) / weight_sum as u128) as usize)
+        .collect();
+    let spent: usize = alloc.iter().sum();
+    alloc[0] += total - spent;
+    let vbv = if vbv_bytes == 0 {
+        altref_interval.max(1).saturating_add(1).max(2) * target_bytes_per_frame
+    } else {
+        vbv_bytes.max(target_bytes_per_frame)
+    };
+    let alloc_for_policy = alloc.clone();
+    let mut level = vbv;
+    let mut carry: i64 = 0;
+    let mut folded = 0usize;
+    let policy = move |i: usize, coded: &[usize]| -> FrameQ {
+        // Fold every packet since the last verdict into the bucket
+        // (show_existing packets drain their byte and refill).
+        while folded < i {
+            let j = folded;
+            carry += alloc_for_policy[j] as i64 - coded[j] as i64;
+            level = level.saturating_sub(coded[j]);
+            if stats[j].shown {
+                level = (level + target_bytes_per_frame).min(vbv);
+            }
+            folded += 1;
+        }
+        let want = (alloc_for_policy[i] as i64 + carry).max(1) as usize;
+        FrameQ::Budget(want.min(level).max(1))
+    };
+    (alloc, policy)
+}
+
+/// **Two-pass** rate control over the structured GOP encoder (round
+/// 458) — every [`GopStructure`] axis (alt-ref pyramid, segmentation,
+/// tiles, intra-only alt-refs, entropy model, switchable filter) and
+/// every [`LossyFormat`] under the two-pass allocation of
+/// [`encode_sequence_lossy_rc_two_pass_420`]:
+///
+/// *First pass*: the GOP is coded once at `probe_q` through
+/// [`StructuredGopEncoder::encode`], recording each packet's size and
+/// motion activity ([`StructuredGopEncoder::stats`]).
+///
+/// *Second pass*: a fresh encoder codes the identical packet sequence
+/// under [`two_pass_policy`] — each decoded packet bisected to its
+/// budget through the probe / commit split ([`FrameQ::Budget`]), the
+/// hidden alt-refs included (a hidden alt-ref is the group's most
+/// referenced frame, and its first-pass size draws its share of the
+/// pool like any other packet).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_sequence_lossy_structured_two_pass_planes(
+    frame_targets: &[[Plane; 3]],
+    width: u32,
+    height: u32,
+    fmt: LossyFormat,
+    structure: GopStructure,
+    probe_q: u8,
+    target_bytes_per_frame: usize,
+    vbv_bytes: usize,
+) -> Result<(Vec<Vec<u8>>, Vec<TwoPassPacket>), Error> {
+    if frame_targets.is_empty() || target_bytes_per_frame == 0 {
+        return Err(Error::Unsupported);
+    }
+    // First pass.
+    let mut probe = StructuredGopEncoder::new(width, height, probe_q, fmt, structure)?;
+    probe.encode(frame_targets)?;
+    let stats = probe.stats.clone();
+    drop(probe);
+
+    // Second pass.
+    let (_, mut policy) = two_pass_policy(
+        &stats,
+        frame_targets.len(),
+        target_bytes_per_frame,
+        vbv_bytes,
+        structure.altref_interval,
+    );
+    let mut enc = StructuredGopEncoder::new(width, height, probe_q, fmt, structure)?;
+    let packets = enc.encode_with(frame_targets, &mut policy)?;
+    let report = stats
+        .iter()
+        .zip(&enc.stats)
+        .map(|(fp, sp)| TwoPassPacket {
+            first_pass: FirstPassStat {
+                bytes: fp.bytes,
+                motion_activity: fp.motion_activity,
+            },
+            budget: sp.budget.unwrap_or(0),
+            coded_bytes: sp.bytes,
+            base_q_idx: sp.base_q_idx,
+            show_existing: sp.show_existing,
+        })
+        .collect();
+    Ok((packets, report))
+}
+
+/// `u8` front end of [`encode_sequence_lossy_structured_two_pass_planes`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_sequence_lossy_structured_two_pass_u8(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    fmt: LossyFormat,
+    structure: GopStructure,
+    probe_q: u8,
+    target_bytes_per_frame: usize,
+    vbv_bytes: usize,
+) -> Result<(Vec<Vec<u8>>, Vec<TwoPassPacket>), Error> {
+    if frames.is_empty() {
+        return Err(Error::Unsupported);
+    }
+    validate_lossy_args(width, height, probe_q)?;
+    let need = fmt.planar_len(width, height);
+    if frames.iter().any(|f| f.len() < need) {
+        return Err(Error::Unsupported);
+    }
+    let targets: Vec<[Plane; 3]> = frames
+        .iter()
+        .map(|f| padded_targets_from_u8(f, width, height, fmt))
+        .collect();
+    encode_sequence_lossy_structured_two_pass_planes(
+        &targets,
+        width,
+        height,
+        fmt,
+        structure,
+        probe_q,
+        target_bytes_per_frame,
+        vbv_bytes,
+    )
+}
+
+/// Native-`u16` front end of
+/// [`encode_sequence_lossy_structured_two_pass_planes`] (samples above
+/// the declared depth reject).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_sequence_lossy_structured_two_pass_u16(
+    frames: &[&[u16]],
+    width: u32,
+    height: u32,
+    fmt: LossyFormat,
+    structure: GopStructure,
+    probe_q: u8,
+    target_bytes_per_frame: usize,
+    vbv_bytes: usize,
+) -> Result<(Vec<Vec<u8>>, Vec<TwoPassPacket>), Error> {
+    if frames.is_empty() {
+        return Err(Error::Unsupported);
+    }
+    validate_lossy_args(width, height, probe_q)?;
+    let need = fmt.planar_len(width, height);
+    let max = (1u32 << fmt.bit_depth) - 1;
+    if frames
+        .iter()
+        .any(|f| f.len() < need || f.iter().any(|&v| u32::from(v) > max))
+    {
+        return Err(Error::Unsupported);
+    }
+    let targets: Vec<[Plane; 3]> = frames
+        .iter()
+        .map(|f| padded_targets_from_u16(f, width, height, fmt))
+        .collect();
+    encode_sequence_lossy_structured_two_pass_planes(
+        &targets,
+        width,
+        height,
+        fmt,
+        structure,
+        probe_q,
+        target_bytes_per_frame,
+        vbv_bytes,
+    )
 }
 
 /// [`encode_sequence_lossy_420`] on **non-error-resilient chain

@@ -835,10 +835,20 @@ the pre-455 default-bank framing) reproduce the earlier bytes.
     small-token split) — the Pareto-derived tail probabilities are
     not modeled, so a slab update is accepted on the node estimate and
     then kept only when the measured frame is shorter;
-  * two-pass rate control is the plain 4:2:0 chain (no structured-GOP
-    / HBD two-pass), its first pass is one extra full encode at a fixed
-    probe quantizer, and the allocation is first-pass-size proportional
-    (no explicit scene-cut / keyframe placement decisions);
+  * ~~two-pass rate control is the plain 4:2:0 chain (no structured-GOP
+    / HBD two-pass)~~ — **round 458 lands
+    [`encode_vp9_lossy_sequence_rc_two_pass_with`]** (+ `_444` /
+    `_422` / `_440` / `_hbd` / `_hbd_422` / `_hbd_440`): every
+    [`Vp9GopConfig`] axis at every §7.2 format under the two-pass
+    allocation, the structured encoder refactored into a probe / commit
+    split with a per-packet quantizer policy (fixed-quantizer bytes
+    unchanged), hidden alt-refs drawing their first-pass share, VBV
+    refills at display points with a structure-aware default buffer;
+    99.8–99.9 % of the pool on every shape / format, all ten dumped
+    streams black-box validated;
+  * the two-pass first pass is one extra full encode at a fixed probe
+    quantizer, and the allocation is first-pass-size proportional (no
+    explicit scene-cut / keyframe placement decisions);
   * ~~structured-GOP / resized entries public at 8-bit 4:2:0 only~~ —
     **round 455 lands the format-matrix wrappers**:
     [`encode_vp9_lossy_sequence_with_444`] / [`_422`](encode_vp9_lossy_sequence_with_422)

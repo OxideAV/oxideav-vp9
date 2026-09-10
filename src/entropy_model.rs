@@ -553,6 +553,34 @@ impl EntropyModel {
         &self.banks[idx]
     }
 
+    /// [`Self::begin_frame`] without the mutation: the effective
+    /// `frame_context_idx` the frame would load (round 458 probe /
+    /// commit split — the probes of a quantizer bisection read the
+    /// model, the elected frame's commit applies the resets).
+    pub fn begin_frame_view(&self, hdr: &Vp9FrameHeader) -> usize {
+        if frame_is_intra(hdr) || hdr.error_resilient_mode {
+            0
+        } else {
+            usize::from(hdr.frame_context_idx & 3)
+        }
+    }
+
+    /// The bank the frame loads once [`Self::begin_frame`]'s resets have
+    /// applied — a copy, the model untouched.
+    pub fn bank_after_begin(&self, hdr: &Vp9FrameHeader, idx: usize) -> FrameContext {
+        if frame_is_intra(hdr) || hdr.error_resilient_mode {
+            let reset_all = hdr.frame_type == FrameType::KeyFrame
+                || hdr.error_resilient_mode
+                || hdr.reset_frame_context == 3;
+            if reset_all
+                || (hdr.reset_frame_context == 2 && idx == usize::from(hdr.frame_context_idx & 3))
+            {
+                return FrameContext::default();
+            }
+        }
+        self.banks[idx].clone()
+    }
+
     /// §6.1.2 `refresh_probs( )` mirror after the frame's tile data:
     /// `coding` is the bank the frame's compressed header produced (the
     /// loaded bank plus its forward updates), `counts` the frame's

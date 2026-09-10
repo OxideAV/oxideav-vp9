@@ -1646,6 +1646,7 @@ pub fn encode_vp9_lossy_sequence_resized(
         base_q_idx,
         pixel_encoder::LossyFormat::YUV420_8,
         true,
+        true,
     )
 }
 
@@ -1658,7 +1659,7 @@ pub fn encode_vp9_lossy_sequence_resized_444(
     base_q_idx: u8,
 ) -> Result<Vec<Vec<u8>>, Error> {
     let fmt = pixel_encoder::LossyFormat::new(8, false, false)?;
-    pixel_encoder::encode_sequence_lossy_resized_u8(frames, sizes, base_q_idx, fmt, true)
+    pixel_encoder::encode_sequence_lossy_resized_u8(frames, sizes, base_q_idx, fmt, true, true)
 }
 
 /// [`encode_vp9_lossy_sequence_resized`] at **8-bit 4:2:2** (profile 1).
@@ -1668,7 +1669,7 @@ pub fn encode_vp9_lossy_sequence_resized_422(
     base_q_idx: u8,
 ) -> Result<Vec<Vec<u8>>, Error> {
     let fmt = pixel_encoder::LossyFormat::new(8, true, false)?;
-    pixel_encoder::encode_sequence_lossy_resized_u8(frames, sizes, base_q_idx, fmt, true)
+    pixel_encoder::encode_sequence_lossy_resized_u8(frames, sizes, base_q_idx, fmt, true, true)
 }
 
 /// [`encode_vp9_lossy_sequence_resized`] at **8-bit 4:4:0** (profile 1).
@@ -1678,7 +1679,7 @@ pub fn encode_vp9_lossy_sequence_resized_440(
     base_q_idx: u8,
 ) -> Result<Vec<Vec<u8>>, Error> {
     let fmt = pixel_encoder::LossyFormat::new(8, false, true)?;
-    pixel_encoder::encode_sequence_lossy_resized_u8(frames, sizes, base_q_idx, fmt, true)
+    pixel_encoder::encode_sequence_lossy_resized_u8(frames, sizes, base_q_idx, fmt, true, true)
 }
 
 /// [`encode_vp9_lossy_sequence_resized`] at **10 / 12-bit** on native
@@ -1728,7 +1729,7 @@ fn encode_vp9_lossy_sequence_resized_u16_fmt(
         return Err(Error::Unsupported);
     }
     let fmt = pixel_encoder::LossyFormat::new(bit_depth, ssx, ssy)?;
-    pixel_encoder::encode_sequence_lossy_resized_u16(frames, sizes, base_q_idx, fmt, true)
+    pixel_encoder::encode_sequence_lossy_resized_u16(frames, sizes, base_q_idx, fmt, true, true)
 }
 
 /// [`encode_vp9_lossy_sequence_resized`] under a [`Vp9GopConfig`]
@@ -1757,6 +1758,7 @@ pub fn encode_vp9_lossy_sequence_resized_with(
         cfg.base_q_idx,
         pixel_encoder::LossyFormat::YUV420_8,
         cfg.entropy_adaptation,
+        cfg.switchable_interp_filter,
     )
 }
 

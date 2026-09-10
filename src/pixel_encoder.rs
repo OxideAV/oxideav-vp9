@@ -2186,6 +2186,7 @@ fn predict_inter_leaf_sub8x8(
     ssx: bool,
     ssy: bool,
     bit_depth: u32,
+    interp_filter: u8,
 ) {
     debug_assert!(mi_size < BLOCK_8X8);
     for (plane, pred_plane) in pred.iter_mut().enumerate() {
@@ -2243,7 +2244,7 @@ fn predict_inter_leaf_sub8x8(
                     w: 4,
                     h: 4,
                     block_idx: (y * num4x4w + x) as usize,
-                    interp_filter: 0, // EIGHTTAP.
+                    interp_filter: usize::from(interp_filter),
                     bit_depth,
                     is_compound: second.is_some(),
                 };
@@ -2390,6 +2391,7 @@ pub(crate) fn encode_pframe_lossless_layout(
                         ssx,
                         ssy,
                         bit_depth,
+                        0,
                     );
                 }
             } else {
@@ -3702,6 +3704,7 @@ fn leaf_contains(
 fn plan_sub8x8_leaf(
     hint: &Sub8x8Hint,
     allow_high_precision_mv: bool,
+    interp_switchable: bool,
     targets: &[Plane; 3],
     reference: &[(&[i32], usize); 3],
     ref_w: u32,
@@ -3775,8 +3778,53 @@ fn plan_sub8x8_leaf(
     }
     let sub = InterSubBlockSpec { modes, mvs };
 
-    // Decoder-mirror per-blockIdx §8.5.2 prediction.
+    // Decoder-mirror per-blockIdx §8.5.2 prediction — under a
+    // SWITCHABLE frame filter (round 458) the leaf's single §6.4.16
+    // `interp_filter` is elected over the whole per-cell walk: every
+    // cell shares the one coded kernel, so the election scores the
+    // full leaf under each of the three §8.5.2.4 kernels and keeps the
+    // least SSE (ties → EIGHTTAP; an all-ZEROMV walk is
+    // kernel-invariant and codes EIGHTTAP).
     let block_mvs = sub8x8_block_mvs(subsize, &sub);
+    let any_motion = cells.iter().any(|&cell| modes[cell] != ZEROMV);
+    let mut filt = 0u8;
+    if interp_switchable && any_motion {
+        let mut best = u64::MAX;
+        for f in 0..crate::mode_info::SWITCHABLE_FILTERS as u8 {
+            predict_inter_leaf_sub8x8(
+                &mut work.planes,
+                reference,
+                None,
+                ref_w,
+                ref_h,
+                r,
+                c,
+                subsize,
+                &block_mvs,
+                mi_cols,
+                mi_rows,
+                ssx,
+                ssy,
+                bit_depth,
+                f,
+            );
+            let sse = leaf_sse(
+                targets,
+                &work.planes,
+                r,
+                c,
+                subsize,
+                mi_cols,
+                mi_rows,
+                ssx,
+                ssy,
+            );
+            if sse < best {
+                best = sse;
+                filt = f;
+            }
+        }
+    }
     predict_inter_leaf_sub8x8(
         &mut work.planes,
         reference,
@@ -3792,6 +3840,7 @@ fn plan_sub8x8_leaf(
         ssx,
         ssy,
         bit_depth,
+        filt,
     );
 
     // Trial quantization at the forced TX_4X4 (the only §6.4.10
@@ -3871,6 +3920,7 @@ fn plan_sub8x8_leaf(
                 ssx,
                 ssy,
                 bit_depth,
+                filt,
             );
             skip = true;
         }
@@ -3879,7 +3929,7 @@ fn plan_sub8x8_leaf(
         mi_size: subsize,
         tx_size: 0,
         y_mode: ZEROMV, // ignored for sub-8x8 (per-cell modes apply)
-        interp_filter: 0,
+        interp_filter: filt,
         ref_frame: [LAST_FRAME, NONE_REF_FRAME],
         mv: [[0, 0], [0, 0]],
         skip,
@@ -4261,6 +4311,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion_opts(
                 return plan_sub8x8_leaf(
                     &hint,
                     hdr.allow_high_precision_mv,
+                    hdr.interpolation_filter == crate::mode_info::SWITCHABLE,
                     targets,
                     reference,
                     ref_w,
@@ -5157,6 +5208,31 @@ pub(crate) fn encode_pframe_lossy_scaled(
                 choice = ([LAST_FRAME, NONE_REF_FRAME], mode, [mv, [0, 0]]);
             }
 
+            // §6.4.16 switchable interpolation filter election on the
+            // scaled leaf (round 458): the three §8.5.2.4 kernels are
+            // applied through the §8.5.2.3 scaled sampler (the kernel
+            // index selects the tap set the scaled position's fractional
+            // phase reads), the least full-leaf SSE wins; zero motion on
+            // a scaled reference is NOT kernel-invariant (the scaled
+            // phase is non-zero whenever xScale != 1 << 14), so every
+            // leaf is elected.
+            let mut filt = 0u8;
+            if hdr.interpolation_filter == crate::mode_info::SWITCHABLE {
+                let mut best = u64::MAX;
+                let mut sc = scratch3.borrow_mut();
+                for f in 0..crate::mode_info::SWITCHABLE_FILTERS as u8 {
+                    predict_inter_leaf2_scaled(
+                        &mut sc, reference, None, ref_w, ref_h, cur_w, cur_h, r, c, subsize,
+                        choice.2, mi_cols, mi_rows, ssx, ssy, bit_depth, f,
+                    );
+                    let sse = leaf_sse(targets, &sc, r, c, subsize, mi_cols, mi_rows, ssx, ssy);
+                    if sse < best {
+                        best = sse;
+                        filt = f;
+                    }
+                }
+            }
+
             let mut work = work.borrow_mut();
             predict_inter_leaf2_scaled(
                 &mut work.planes,
@@ -5175,7 +5251,7 @@ pub(crate) fn encode_pframe_lossy_scaled(
                 ssx,
                 ssy,
                 bit_depth,
-                0,
+                filt,
             );
             let (tx, blocks, all_zero) = select_inter_leaf_tx(
                 targets,
@@ -5258,7 +5334,7 @@ pub(crate) fn encode_pframe_lossy_scaled(
                         ssx,
                         ssy,
                         bit_depth,
-                        0,
+                        filt,
                     );
                     skip = true;
                 }
@@ -5267,7 +5343,7 @@ pub(crate) fn encode_pframe_lossy_scaled(
                 mi_size: subsize,
                 tx_size: if skip { max_tx } else { tx },
                 y_mode: choice.1,
-                interp_filter: 0,
+                interp_filter: filt,
                 ref_frame: choice.0,
                 mv: choice.2,
                 skip,
@@ -5352,6 +5428,7 @@ pub(crate) fn encode_sequence_lossy_resized_u8(
     base_q_idx: u8,
     fmt: LossyFormat,
     entropy_adaptation: bool,
+    switchable_interp: bool,
 ) -> Result<Vec<Vec<u8>>, Error> {
     if frames.is_empty() || frames.len() != sizes.len() {
         return Err(Error::Unsupported);
@@ -5367,7 +5444,14 @@ pub(crate) fn encode_sequence_lossy_resized_u8(
         .zip(sizes)
         .map(|(f, &(w, h))| padded_targets_from_u8(f, w, h, fmt))
         .collect();
-    encode_sequence_lossy_resized_planes(&targets, sizes, base_q_idx, fmt, entropy_adaptation)
+    encode_sequence_lossy_resized_planes(
+        &targets,
+        sizes,
+        base_q_idx,
+        fmt,
+        entropy_adaptation,
+        switchable_interp,
+    )
 }
 
 /// Native-`u16` (10 / 12-bit) front end of
@@ -5378,6 +5462,7 @@ pub(crate) fn encode_sequence_lossy_resized_u16(
     base_q_idx: u8,
     fmt: LossyFormat,
     entropy_adaptation: bool,
+    switchable_interp: bool,
 ) -> Result<Vec<Vec<u8>>, Error> {
     if frames.is_empty() || frames.len() != sizes.len() {
         return Err(Error::Unsupported);
@@ -5394,7 +5479,14 @@ pub(crate) fn encode_sequence_lossy_resized_u16(
         .zip(sizes)
         .map(|(f, &(w, h))| padded_targets_from_u16(f, w, h, fmt))
         .collect();
-    encode_sequence_lossy_resized_planes(&targets, sizes, base_q_idx, fmt, entropy_adaptation)
+    encode_sequence_lossy_resized_planes(
+        &targets,
+        sizes,
+        base_q_idx,
+        fmt,
+        entropy_adaptation,
+        switchable_interp,
+    )
 }
 
 /// The format-generic resized chain over MI-padded targets (one
@@ -5408,6 +5500,7 @@ pub(crate) fn encode_sequence_lossy_resized_planes(
     base_q_idx: u8,
     fmt: LossyFormat,
     entropy_adaptation: bool,
+    switchable_interp: bool,
 ) -> Result<Vec<Vec<u8>>, Error> {
     let adaptive = entropy_adaptation;
     if frame_targets.is_empty() || frame_targets.len() != sizes.len() {
@@ -5483,6 +5576,9 @@ pub(crate) fn encode_sequence_lossy_resized_planes(
         hdr.error_resilient_mode = false;
         if adaptive {
             set_adaptive_entropy_flags(&mut hdr);
+        }
+        if switchable_interp {
+            set_switchable_interp(&mut hdr);
         }
         hdr.refresh_frame_flags = 0x01;
         hdr.ref_frame_idx = Some([0, 0, 0]);
@@ -8310,7 +8406,7 @@ mod tests {
             .collect();
         let refs: Vec<&[u8]> = src.iter().map(|f| f.as_slice()).collect();
         let packets =
-            encode_sequence_lossy_resized_u8(&refs, &sizes, 110, LossyFormat::YUV420_8, true)
+            encode_sequence_lossy_resized_u8(&refs, &sizes, 110, LossyFormat::YUV420_8, true, true)
                 .expect("encode");
         assert_eq!(packets.len(), 4);
         let prefs: Vec<&[u8]> = packets.iter().map(|p| p.as_slice()).collect();
@@ -8324,7 +8420,7 @@ mod tests {
         // pinned below — so the mirror is checked through a
         // re-instrumented encode.)
         let again =
-            encode_sequence_lossy_resized_u8(&refs, &sizes, 110, LossyFormat::YUV420_8, true)
+            encode_sequence_lossy_resized_u8(&refs, &sizes, 110, LossyFormat::YUV420_8, true, true)
                 .expect("encode again");
         assert_eq!(packets, again, "byte-determinism");
         // Distortion bound: each frame stays within the quantizer
@@ -8346,6 +8442,86 @@ mod tests {
         // The size changes actually exercise the scaled sampler: a
         // 2x-downscale P-frame cannot be a §8.10 same-size copy.
         assert!(packets[1].len() > 1 && packets[2].len() > 1);
+
+        // Round 458: the scaled leaves elect the §6.4.16 kernel. Every
+        // P-frame header codes SWITCHABLE, the decoder's §9.3.4
+        // interp_filter counts show the election live on the scaled
+        // frames (a scaled ZEROMV leaf is NOT kernel-invariant — its
+        // §8.5.2.3 phase is non-zero — so the three kernels compete on
+        // every leaf), and the reconstruction is no worse than the
+        // frame-level EIGHTTAP chain's.
+        {
+            let mut dec = crate::decode_frame::Vp9SequenceDecoder::new();
+            let mut coded = [0u32; 3];
+            let mut ref_dims = [(128u32, 96u32); 8];
+            for (k, p) in packets.iter().enumerate() {
+                let hdr = crate::header::parse_uncompressed_header_with_refs(
+                    p,
+                    Some(crate::header::RefFrameState {
+                        ref_dims: &ref_dims,
+                        color_config: lossy_keyframe_header_420(128, 96, 110).color_config,
+                    }),
+                )
+                .expect("hdr");
+                if k > 0 {
+                    assert_eq!(
+                        hdr.interpolation_filter,
+                        crate::mode_info::SWITCHABLE,
+                        "frame {k}: SWITCHABLE"
+                    );
+                }
+                ref_dims = [sizes[k]; 8];
+                dec.push_frame(p).expect("decode").expect("shown");
+                if k > 0 {
+                    let c = dec.last_frame_counts().expect("counts");
+                    for (f, slot) in coded.iter_mut().enumerate() {
+                        *slot += c
+                            .noncoef
+                            .interp_filter
+                            .iter()
+                            .map(|ctx| ctx[f])
+                            .sum::<u32>();
+                    }
+                }
+            }
+            eprintln!("resized switchable election: interp_filter counts {coded:?}");
+            assert!(coded[1] + coded[2] > 0, "a non-EIGHTTAP kernel is elected");
+            let fixed = encode_sequence_lossy_resized_u8(
+                &refs,
+                &sizes,
+                110,
+                LossyFormat::YUV420_8,
+                true,
+                false,
+            )
+            .expect("fixed-kernel encode");
+            let fixed_dec =
+                decode_vp9_sequence(&fixed.iter().map(|p| p.as_slice()).collect::<Vec<_>>())
+                    .expect("decode fixed");
+            let sse_of = |dec: &[crate::decode_frame::Vp9DecodedFrame]| -> f64 {
+                dec.iter()
+                    .zip(src.iter())
+                    .map(|(d, s)| {
+                        d.to_planar_bytes()
+                            .iter()
+                            .zip(s.iter())
+                            .map(|(&a, &b)| {
+                                let e = f64::from(a) - f64::from(b);
+                                e * e
+                            })
+                            .sum::<f64>()
+                    })
+                    .sum()
+            };
+            let (sw, fx) = (sse_of(&decoded), sse_of(&fixed_dec));
+            let bytes = |p: &[Vec<u8>]| p.iter().map(Vec::len).sum::<usize>();
+            eprintln!(
+                "resized switchable: {} B / SSE {sw} vs EIGHTTAP {} B / SSE {fx}",
+                bytes(&packets),
+                bytes(&fixed)
+            );
+            assert!(sw <= fx * 1.01, "switchable SSE {sw} vs EIGHTTAP {fx}");
+        }
 
         if let Some(dir) = std::env::var_os("OXIDEAV_VP9_R452_DUMP") {
             let mut ivf = Vec::new();
@@ -12155,6 +12331,249 @@ mod tests {
                 assert_eq!(i32::from(d.v[y * 32 + x]), recon_on.planes[2].get(x, y));
             }
         }
+    }
+
+    /// Round 458: under a SWITCHABLE frame filter the sub-8x8 cell walk
+    /// elects its §6.4.16 `interp_filter` too. Content: the hash texture
+    /// with quadrant displacements that differ by **one pixel** (3 px vs
+    /// 2 px — the split is elected, the per-cell luma vectors stay
+    /// integer, hence kernel-invariant), so the §8.5.2.1 averaged chroma
+    /// vector of every elected cell is `2.5` luma px = `1.25` chroma px:
+    /// a fractional position where the three §8.5.2.4 kernels genuinely
+    /// differ. The chroma target of the three cells is the reference
+    /// interpolated there by the **`EIGHTTAP_SHARP`** kernel through the
+    /// decoder-mirror sub-8x8 predictor, so the sharp kernel predicts
+    /// those cells exactly and the least-SSE election must code it.
+    /// Pins: the switchable stream decodes mirror-exact (the sub-8x8
+    /// `interp_filter` symbol rides the same neighbour context as
+    /// `>= 8x8` leaves), the writer's §9.3.4 `interp_filter` counts show
+    /// `EIGHTTAP_SHARP` coded on every elected cell (every `>= 8x8` leaf
+    /// is static ZEROMV → EIGHTTAP), the decoder's counts equal the
+    /// writer's, and the reconstruction is strictly better than the
+    /// frame-level `EIGHTTAP` encode of the same content.
+    #[test]
+    fn sub8x8_leaves_elect_the_switchable_filter() {
+        use crate::mode_info::{EIGHTTAP_SHARP, SWITCHABLE};
+        use crate::residual::BLOCK_4X4;
+        let (w, h) = (64u32, 64u32);
+        let chroma_tex = |x: i64, y: i64| -> i32 { sub8x8_texture(x + 17, y + 29) };
+        // Luma displacement per quadrant (pixels): 3 vs 2 on the
+        // divergent axis.
+        let disp = |x: i64, y: i64| -> (i64, i64) {
+            let (cr, cc) = (y / 8, x / 8);
+            let (qr, qc) = ((y % 8) / 4, (x % 8) / 4);
+            let pick = |q: i64| if q == 0 { 3 } else { 2 };
+            match (cr, cc) {
+                (2, 2) => (0, pick(qc)),
+                (3, 6) => (pick(qr), 0),
+                (5, 5) => (pick(qr), pick(qc)),
+                _ => (0, 0),
+            }
+        };
+        let mut kf_px = vec![0u8; (64 * 64 + 2 * 32 * 32) as usize];
+        for y in 0..64i64 {
+            for x in 0..64i64 {
+                kf_px[(y * 64 + x) as usize] = sub8x8_texture(x, y) as u8;
+            }
+        }
+        for y in 0..32i64 {
+            for x in 0..32i64 {
+                kf_px[(64 * 64 + y * 32 + x) as usize] = chroma_tex(x, y) as u8;
+                kf_px[(64 * 64 + 32 * 32 + y * 32 + x) as usize] = chroma_tex(x + 5, y + 3) as u8;
+            }
+        }
+        let kf = crate::encode_vp9(&kf_px, w, h).expect("lossless keyframe");
+
+        let ref_y: Vec<i32> = (0..64i64)
+            .flat_map(|y| (0..64i64).map(move |x| sub8x8_texture(x, y)))
+            .collect();
+        let ref_u: Vec<i32> = (0..32i64)
+            .flat_map(|y| (0..32i64).map(move |x| chroma_tex(x, y)))
+            .collect();
+        let ref_v: Vec<i32> = (0..32i64)
+            .flat_map(|y| (0..32i64).map(move |x| chroma_tex(x + 5, y + 3)))
+            .collect();
+        let reference: [(&[i32], usize); 3] = [
+            (ref_y.as_slice(), 64),
+            (ref_u.as_slice(), 32),
+            (ref_v.as_slice(), 32),
+        ];
+
+        let mut targets = [Plane::new(64, 64), Plane::new(32, 32), Plane::new(32, 32)];
+        for y in 0..64i64 {
+            for x in 0..64i64 {
+                let (dy, dx) = disp(x, y);
+                targets[0].set(x as usize, y as usize, sub8x8_texture(x + dx, y + dy));
+            }
+        }
+        // Chroma: the reference (static cells), then the three divergent
+        // cells' 4x4 chroma blocks replaced by the EIGHTTAP_SHARP
+        // prediction at their averaged vector (the decoder's own
+        // per-blockIdx walk; the per-cell luma vectors in eighth-pel).
+        for y in 0..32usize {
+            for x in 0..32usize {
+                targets[1].set(x, y, chroma_tex(x as i64, y as i64));
+                targets[2].set(x, y, chroma_tex(x as i64 + 5, y as i64 + 3));
+            }
+        }
+        let mut sharp = ReconState::new(8, 8, true, true, 8);
+        for (r, c) in [(2u32, 2u32), (3, 6), (5, 5)] {
+            let mut block_mvs = [[[0i32; 2]; 4]; 2];
+            for (b, (qy, qx)) in [(0i64, 0i64), (0, 4), (4, 0), (4, 4)]
+                .into_iter()
+                .enumerate()
+            {
+                let (dy, dx) = disp(i64::from(c) * 8 + qx, i64::from(r) * 8 + qy);
+                block_mvs[0][b] = [8 * dy as i32, 8 * dx as i32];
+            }
+            predict_inter_leaf_sub8x8(
+                &mut sharp.planes,
+                &reference,
+                None,
+                w,
+                h,
+                r,
+                c,
+                BLOCK_4X4,
+                &block_mvs,
+                8,
+                8,
+                true,
+                true,
+                8,
+                EIGHTTAP_SHARP,
+            );
+            for (tgt, pred) in targets.iter_mut().zip(sharp.planes.iter()).skip(1) {
+                for y in 0..4usize {
+                    for x in 0..4usize {
+                        let (px, py) = (c as usize * 4 + x, r as usize * 4 + y);
+                        tgt.set(px, py, pred.get(px, py));
+                    }
+                }
+            }
+        }
+
+        let mut hdr = lossless_pframe_header(w, h);
+        hdr.quantization = QuantizationParams {
+            base_q_idx: 80,
+            delta_q_y_dc: 0,
+            delta_q_uv_dc: 0,
+            delta_q_uv_ac: 0,
+            lossless: false,
+        };
+        let encode = |hdr: &Vp9FrameHeader| {
+            encode_pframe_lossy_tree_motion_opts(
+                hdr,
+                &targets,
+                &reference,
+                None,
+                w,
+                h,
+                PFRAME_SEARCH_RANGE,
+                false,
+                true,
+                &InterEncodeOpts::default(),
+            )
+            .expect("lossy tree p-frame")
+        };
+        let fixed = encode(&hdr);
+        hdr.interpolation_filter = SWITCHABLE;
+        let sw = encode(&hdr);
+
+        // The elected sub-8x8 leaves exist and some code a non-EIGHTTAP
+        // kernel (the writer's own §9.3.4 counts).
+        let coded: [u32; 3] = (0..3)
+            .map(|f| {
+                sw.counts
+                    .noncoef
+                    .interp_filter
+                    .iter()
+                    .map(|ctx| ctx[f])
+                    .sum::<u32>()
+            })
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        eprintln!("sub-8x8 switchable election: interp_filter counts {coded:?}");
+        assert_eq!(coded[1], 0, "EIGHTTAP_SMOOTH never fits the sharp target");
+        assert!(
+            coded[2] >= 3,
+            "EIGHTTAP_SHARP elected on every divergent cell: {coded:?}"
+        );
+        let mut sub_leaves = 0usize;
+        for r in 0..8u32 {
+            for c in 0..8u32 {
+                if sw.state.get_mi_size(r, c).unwrap() < crate::residual::BLOCK_8X8 {
+                    sub_leaves += 1;
+                }
+            }
+        }
+        assert!(sub_leaves >= 3, "the divergent cells split below 8x8");
+
+        // Decoder mirror + counts mirror for the switchable stream.
+        let mut dec = crate::decode_frame::Vp9SequenceDecoder::new();
+        dec.push_frame(&kf).expect("kf").expect("shown");
+        let d = dec.push_frame(&sw.bytes).expect("decode").expect("shown");
+        for y in 0..64usize {
+            for x in 0..64usize {
+                assert_eq!(
+                    i32::from(d.y[y * 64 + x]),
+                    sw.recon.planes[0].get(x, y),
+                    "luma mirror ({x},{y})"
+                );
+            }
+        }
+        for y in 0..32usize {
+            for x in 0..32usize {
+                assert_eq!(i32::from(d.u[y * 32 + x]), sw.recon.planes[1].get(x, y));
+                assert_eq!(i32::from(d.v[y * 32 + x]), sw.recon.planes[2].get(x, y));
+            }
+        }
+        let dc = dec.last_frame_counts().expect("decoded counts");
+        assert!(
+            dc.noncoef.interp_filter == sw.counts.noncoef.interp_filter,
+            "interp_filter counts: writer == decoder"
+        );
+        {
+            let mut dec2 = crate::decode_frame::Vp9SequenceDecoder::new();
+            let decoded: Vec<_> = [&kf, &sw.bytes]
+                .into_iter()
+                .map(|p| dec2.push_frame(p).unwrap().unwrap())
+                .collect();
+            dump_ivf(
+                "sub8x8-switchable",
+                &[kf.clone(), sw.bytes.clone()],
+                w,
+                h,
+                &decoded,
+            );
+        }
+
+        // Quality: the elected kernels reconstruct no worse than the
+        // frame-level EIGHTTAP encode.
+        let sse = |recon: &ReconState| -> u64 {
+            leaf_sse(
+                &targets,
+                &recon.planes,
+                0,
+                0,
+                crate::residual::BLOCK_64X64,
+                8,
+                8,
+                true,
+                true,
+            )
+        };
+        let (sse_sw, sse_fixed) = (sse(&sw.recon), sse(&fixed.recon));
+        eprintln!(
+            "sub-8x8 switchable: {} B / SSE {sse_sw} vs EIGHTTAP {} B / SSE {sse_fixed}",
+            sw.bytes.len(),
+            fixed.bytes.len()
+        );
+        assert!(
+            sse_sw < sse_fixed,
+            "SSE {sse_sw} (switchable) vs {sse_fixed} (EIGHTTAP)"
+        );
     }
 
     /// The per-leaf inter transform-size election adapts to the residual:

@@ -824,8 +824,12 @@ the pre-455 default-bank framing) reproduce the earlier bytes.
   only; §8.1 step 3 has no such condition) — fixed and black-box
   validated. **Round 455 closes the three entropy-and-rate gaps below
   and lands the format wrappers.** Remaining encoder gaps, honestly:
-  * the sub-8x8 cell walk and the scaled-reference (resized) leaves
-    still code `EIGHTTAP` under the switchable frame filter;
+  * ~~the sub-8x8 cell walk and the scaled-reference (resized) leaves
+    still code `EIGHTTAP` under the switchable frame filter~~ —
+    **closed in round 458**: both elect the §6.4.16 kernel by
+    least-SSE (the scaled leaves on every leaf, ZEROMV included — a
+    scaled phase is never the identity tap); resized mirror GOP
+    8 492 → 8 371 bytes at SSE 475 937 → 449 230, black-box validated;
   * the forward-update election scores coefficient cells on the
     `more_coefs` / `ZERO` / `ONE` / `TWO+` nodes only (the §8.4.3
     small-token split) — the Pareto-derived tail probabilities are
@@ -884,8 +888,8 @@ the pre-455 default-bank framing) reproduce the earlier bytes.
     on by default; the entropy model makes the per-block symbol nearly
     free). Corpus: +0.01…+0.33 dB PSNR on every sequence at
     28 253 → 28 102 bytes; every stream black-box validated with the
-    three kernels live. The sub-8x8 cell walk and the scaled-reference
-    leaves still code `EIGHTTAP`.
+    three kernels live. Round 458 extends the election to the sub-8x8
+    cell walk and the scaled-reference leaves.
 
 ## Testing
 

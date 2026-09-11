@@ -536,6 +536,7 @@ mod partition;
 mod partition_writer;
 mod pixel_encoder;
 mod prob_adapt;
+mod rdoq;
 mod recon_filter;
 mod reconstruct;
 mod ref_buffer;
@@ -1743,6 +1744,16 @@ pub struct Vp9GopConfig {
     /// under `intra_only_altref` (a refresh period is a structural
     /// choice, not a prediction aid).
     pub adaptive_group_length: bool,
+    /// **Coefficient election** (round 458, on by default): every
+    /// trial quantisation re-elects its levels rate-distortion-wise
+    /// against the frame's own §6.1.2 bank — trailing `ONE` tokens are
+    /// trimmed and levels lowered by one wherever the bits saved
+    /// (token tree under the `pareto( )` tail, extra bits, sign,
+    /// `more_coefs` flags) outweigh the pixel-domain distortion added
+    /// (measured through the crate's own §8.7 inverse transform). The
+    /// reconstruction moves (it is an encoder decision); `false` keeps
+    /// the nearest-level scalar quantiser of round 455.
+    pub coefficient_rdo: bool,
 }
 
 impl Vp9GopConfig {
@@ -1760,6 +1771,7 @@ impl Vp9GopConfig {
             switchable_interp_filter: true,
             scene_cut_keyframes: true,
             adaptive_group_length: true,
+            coefficient_rdo: true,
         }
     }
 }
@@ -1885,6 +1897,7 @@ fn gop_structure_of(cfg: &Vp9GopConfig) -> pixel_encoder::GopStructure {
         switchable_interp: cfg.switchable_interp_filter,
         scene_cut_keyframes: cfg.scene_cut_keyframes,
         adaptive_group_length: cfg.adaptive_group_length,
+        coefficient_rdo: cfg.coefficient_rdo,
     }
 }
 

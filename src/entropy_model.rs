@@ -81,6 +81,17 @@ fn bit_cost_table() -> &'static [u32; 256] {
     })
 }
 
+/// Cost (1/256 bit) of coding `bit` under probability `p` (the
+/// coefficient election's rate model shares this table).
+#[inline]
+pub(crate) fn bool_cost(bit: u32, p: u8) -> u32 {
+    if bit == 0 {
+        bit_cost_table()[usize::from(p)]
+    } else {
+        bit_cost_table()[256 - usize::from(p)]
+    }
+}
+
 /// Cost (1/256 bit) of coding value `0` under probability `p`.
 #[inline]
 fn cost0(p: u8) -> u64 {

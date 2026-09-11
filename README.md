@@ -830,11 +830,24 @@ the pre-455 default-bank framing) reproduce the earlier bytes.
     least-SSE (the scaled leaves on every leaf, ZEROMV included — a
     scaled phase is never the identity tap); resized mirror GOP
     8 492 → 8 371 bytes at SSE 475 937 → 449 230, black-box validated;
-  * the forward-update election scores coefficient cells on the
+  * ~~no coefficient-level rate-distortion election~~ — **round 458
+    lands [`Vp9GopConfig::coefficient_rdo`]** (the `rdoq` module):
+    every trial quantisation re-elects its levels against the frame's
+    own bank — token-tree costs through the §9.3.2 `pareto( )` tail,
+    extra bits, sign and `more_coefs` flags against pixel-domain
+    distortion measured through the crate's own inverse transform —
+    trimming trailing `ONE`s and lowering levels by one where the bits
+    outweigh the error; on the corpus every sequence lands above the
+    plain scalar-quantiser RD curve (+0.19…+1.87 dB at equal bytes,
+    mean +4.8 % fewer bytes at equal PSNR), black-box validated;
+  * the forward-update election still scores coefficient cells on the
     `more_coefs` / `ZERO` / `ONE` / `TWO+` nodes only (the §8.4.3
-    small-token split) — the Pareto-derived tail probabilities are
-    not modeled, so a slab update is accepted on the node estimate and
-    then kept only when the measured frame is shorter;
+    small-token split), a slab update accepted on the node estimate
+    and kept only when the measured frame is shorter; the coefficient
+    election's DC context is an assumed mid value (the block's
+    above / left non-zero flags are not threaded into it) and
+    neighbour-context effects of a lowered level on later positions
+    are not modeled;
   * ~~two-pass rate control is the plain 4:2:0 chain (no structured-GOP
     / HBD two-pass)~~ — **round 458 lands
     [`encode_vp9_lossy_sequence_rc_two_pass_with`]** (+ `_444` /

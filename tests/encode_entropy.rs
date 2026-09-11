@@ -130,6 +130,9 @@ fn entropy_model_shrinks_every_corpus_sequence_at_identical_reconstruction() {
     for (name, frames, w, h, cfg) in corpus() {
         let mut on_cfg = cfg;
         on_cfg.switchable_interp_filter = false;
+        // The coefficient election reads the bank, so it is held off
+        // for the identical-reconstruction pin (its own test below).
+        on_cfg.coefficient_rdo = false;
         let on = encode_vp9_lossy_sequence_with(&refs(&frames), w, h, &on_cfg).expect("adaptive");
         let mut off_cfg = on_cfg;
         off_cfg.entropy_adaptation = false;
@@ -143,7 +146,9 @@ fn entropy_model_shrinks_every_corpus_sequence_at_identical_reconstruction() {
         let (a, b) = (total(&on), total(&off));
         assert!(a < b, "{name}: adaptive {a} bytes vs default-bank {b}");
         // Switchable interpolation filter election on top.
-        let filt = encode_vp9_lossy_sequence_with(&refs(&frames), w, h, &cfg).expect("filter");
+        let mut filt_cfg = cfg;
+        filt_cfg.coefficient_rdo = false;
+        let filt = encode_vp9_lossy_sequence_with(&refs(&frames), w, h, &filt_cfg).expect("filter");
         let (pa, pf) = (psnr(&on, &frames), psnr(&filt, &frames));
         let f = total(&filt);
         assert!(
@@ -305,4 +310,64 @@ fn dump_entropy_corpus_when_requested() {
         std::fs::write(sub.join("crate-decode.yuv"), decoded_yuv(&packets)).unwrap();
         std::fs::write(sub.join("source.yuv"), frames.concat()).unwrap();
     }
+}
+
+/// Round-458 coefficient election: on every corpus sequence the
+/// RDOQ stream at the configured quantizer lands **on or above the
+/// plain scalar-quantiser rate-distortion curve** — the plain encoder
+/// is swept over five quantizers around the configured one, its PSNR
+/// linearly interpolated at the RDOQ stream's byte count, and the
+/// RDOQ PSNR must not fall below that interpolation. The equivalent
+/// byte saving at equal PSNR (inverse interpolation) is reported.
+#[test]
+fn coefficient_election_lands_on_or_above_the_plain_rd_curve() {
+    let mut sum_saving = 0.0f64;
+    let mut count = 0usize;
+    for (name, frames, w, h, cfg) in corpus() {
+        let mut plain_cfg = cfg;
+        plain_cfg.coefficient_rdo = false;
+        let mut curve: Vec<(f64, f64)> = Vec::new();
+        for dq in [-24i32, -12, 0, 12, 24] {
+            let q = (i32::from(cfg.base_q_idx) + dq).clamp(1, 255) as u8;
+            let mut c = plain_cfg;
+            c.base_q_idx = q;
+            let p = encode_vp9_lossy_sequence_with(&refs(&frames), w, h, &c).expect("plain");
+            curve.push((total(&p) as f64, psnr(&p, &frames)));
+        }
+        curve.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        curve.dedup_by(|a, b| a.0 == b.0);
+        let rd = encode_vp9_lossy_sequence_with(&refs(&frames), w, h, &cfg).expect("rdoq");
+        let (b_r, p_r) = (total(&rd) as f64, psnr(&rd, &frames));
+        // Piecewise-linear interpolation / extrapolation on the curve.
+        let interp =
+            |xs: &dyn Fn(&(f64, f64)) -> f64, ys: &dyn Fn(&(f64, f64)) -> f64, x: f64| -> f64 {
+                let mut pts: Vec<(f64, f64)> = curve.iter().map(|p| (xs(p), ys(p))).collect();
+                pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                let i = pts
+                    .windows(2)
+                    .position(|w| x <= w[1].0)
+                    .unwrap_or(pts.len() - 2);
+                let (x0, y0) = pts[i];
+                let (x1, y1) = pts[i + 1];
+                y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+            };
+        let plain_psnr_at_bytes = interp(&|p| p.0, &|p| p.1, b_r);
+        let plain_bytes_at_psnr = interp(&|p| p.1, &|p| p.0, p_r);
+        let saving = 100.0 * (plain_bytes_at_psnr - b_r) / plain_bytes_at_psnr;
+        eprintln!(
+            "{name}: rdoq {b_r} B @ {p_r:.2} dB; plain curve {:?}; plain @ same bytes {plain_psnr_at_bytes:.2} dB ({:+.2} dB); bytes at equal PSNR {plain_bytes_at_psnr:.0} B ({saving:+.1}%)",
+            curve.iter().map(|(b, p)| format!("{b:.0}B/{p:.2}dB")).collect::<Vec<_>>(),
+            p_r - plain_psnr_at_bytes,
+        );
+        assert!(
+            p_r + 0.02 >= plain_psnr_at_bytes,
+            "{name}: rdoq {p_r:.2} dB below the plain curve {plain_psnr_at_bytes:.2} dB at {b_r} B"
+        );
+        sum_saving += saving;
+        count += 1;
+    }
+    eprintln!(
+        "corpus: mean equal-PSNR byte saving {:+.1}%",
+        sum_saving / count as f64
+    );
 }

@@ -1773,6 +1773,10 @@ pub(crate) fn encode_keyframe_lossy_tree_elect_skip_ctx(
     let seg = hdr.segmentation;
     let quant = hdr.quantization;
     let bd8 = hdr.color_config.bit_depth;
+    // Round-458 coefficient election against the loaded bank.
+    let rdoq_model = entropy
+        .filter(|e| e.rdoq)
+        .map(|e| crate::rdoq::RdoqModel::new(&e.base.coef_probs, bit_depth));
     let kf_tile_cols_log2 = u32::from(hdr.tile_info.tile_cols_log2);
 
     // Pass 1 — the identical decoder-mirror encode, caching every
@@ -1826,7 +1830,23 @@ pub(crate) fn encode_keyframe_lossy_tree_elect_skip_ctx(
                 let dc_q = get_dc_quant(plane, &seg, &quant, usize::from(lp.segment_id), bd8);
                 let ac_q = get_ac_quant(plane, &seg, &quant, usize::from(lp.segment_id), bd8);
                 crate::fwd_transform::forward_transform_2d(&mut block, tx_sz + 2, tx_type);
+                let orig = rdoq_model.as_ref().map(|_| block.clone());
                 crate::fwd_transform::quantize_block_tx(&mut block, dc_q, ac_q, tx_sz, bit_depth);
+                if let (Some(model), Some(orig)) = (rdoq_model.as_ref(), orig.as_deref()) {
+                    crate::rdoq::rdoq_block(
+                        model,
+                        &crate::rdoq::RdoqBlock {
+                            orig,
+                            tx_sz,
+                            tx_type,
+                            plane,
+                            is_inter: false,
+                            dc_q,
+                            ac_q,
+                        },
+                        &mut block,
+                    );
+                }
 
                 reconstruct_block(
                     &mut recon_ref.planes[plane],
@@ -3469,6 +3489,7 @@ fn select_inter_leaf_tx(
     seg: &SegmentationParams,
     quant: &QuantizationParams,
     segment_id: usize,
+    rdoq: Option<&crate::rdoq::RdoqModel>,
 ) -> (u32, Vec<LeafTokenBlock>, bool) {
     use crate::partition::NUM_8X8_BLOCKS_WIDE_LOOKUP;
     use crate::residual::MAX_TXSIZE_LOOKUP;
@@ -3520,9 +3541,25 @@ fn select_inter_leaf_tx(
                         }
                         // §6.4.25: inter blocks are DCT_DCT at every size.
                         crate::fwd_transform::forward_dct_2d(&mut block, tx_sz + 2);
+                        let orig = rdoq.map(|_| block.clone());
                         crate::fwd_transform::quantize_block_tx(
                             &mut block, dc_q, ac_q, tx_sz, bit_depth,
                         );
+                        if let (Some(model), Some(orig)) = (rdoq, orig.as_deref()) {
+                            crate::rdoq::rdoq_block(
+                                model,
+                                &crate::rdoq::RdoqBlock {
+                                    orig,
+                                    tx_sz,
+                                    tx_type: DCT_DCT,
+                                    plane,
+                                    is_inter: true,
+                                    dc_q,
+                                    ac_q,
+                                },
+                                &mut block,
+                            );
+                        }
                         let nonzero = block.iter().filter(|&&v| v != 0).count() as u64;
                         all_zero &= nonzero == 0;
                         cost += nonzero + 1;
@@ -3725,6 +3762,7 @@ fn plan_sub8x8_leaf(
     prev_src: Option<crate::inter_decode::PrevFrameMvs<'_>>,
     work: &mut ReconState,
     token_cache: &mut std::collections::HashMap<(usize, u32, u32), Vec<i64>>,
+    rdoq: Option<&crate::rdoq::RdoqModel>,
 ) -> crate::frame_writer::InterTreeLeaf {
     use crate::frame_writer::InterTreeLeaf;
     use crate::inter_block_writer::InterSubBlockSpec;
@@ -3859,6 +3897,7 @@ fn plan_sub8x8_leaf(
         seg,
         quant,
         0,
+        rdoq,
     );
     debug_assert_eq!(tx, 0, "sub-8x8 leaves are TX_4X4 only");
     let mut skip = all_zero;
@@ -4096,6 +4135,10 @@ pub(crate) struct EntropyOpts<'a> {
     /// The §6.1.2 `load_probs( frame_context_idx )` bank
     /// ([`crate::entropy_model::EntropyModel::bank`]).
     pub base: &'a crate::compressed::FrameContext,
+    /// Round-458 coefficient election ([`crate::rdoq`]): every trial
+    /// quantisation re-elects its levels against `base`'s
+    /// `coef_probs` (the cells the frame codes under).
+    pub rdoq: bool,
     /// Elect forward updates by measured cost
     /// ([`crate::entropy_model::elect_forward_updates`]): the frame is
     /// assembled against `base`, the election runs on its counts, and
@@ -4268,6 +4311,12 @@ pub(crate) fn encode_pframe_lossy_tree_motion_opts(
         prev_mvs: &p.mvs,
     });
     let use_prev = prev_src.is_some();
+    // Round-458 coefficient election: the rate model of the bank this
+    // frame codes under (None keeps the plain scalar quantiser).
+    let rdoq_model = opts
+        .entropy
+        .filter(|e| e.rdoq)
+        .map(|e| crate::rdoq::RdoqModel::new(&e.base.coef_probs, bit_depth));
 
     let (partitions, _hints, sub_hints) = plan_inter_partitions(
         targets,
@@ -4340,6 +4389,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion_opts(
                     prev_src,
                     &mut work.borrow_mut(),
                     &mut token_cache.borrow_mut(),
+                    rdoq_model.as_ref(),
                 );
             }
             let max_tx = MAX_TXSIZE_LOOKUP[subsize as usize];
@@ -4488,6 +4538,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion_opts(
                         &seg,
                         &quant,
                         STATIC_SKIP_SEGMENT,
+                        rdoq_model.as_ref(),
                     );
                     all_zero
                 };
@@ -4771,6 +4822,7 @@ pub(crate) fn encode_pframe_lossy_tree_motion_opts(
                 &seg,
                 &quant,
                 usize::from(leaf_seg),
+                rdoq_model.as_ref(),
             );
             let mut skip = all_zero;
             let bd8 = hdr.color_config.bit_depth;
@@ -5058,6 +5110,9 @@ pub(crate) fn encode_pframe_lossy_scaled(
     let sign_bias = [false; 4];
     let seg = hdr.segmentation;
     let quant = hdr.quantization;
+    let rdoq_model = entropy
+        .filter(|e| e.rdoq)
+        .map(|e| crate::rdoq::RdoqModel::new(&e.base.coef_probs, bit_depth));
 
     // Virtual reference: the ZEROMV scaled prediction of the whole
     // frame at the current size — the partition planner's stand-in.
@@ -5275,6 +5330,7 @@ pub(crate) fn encode_pframe_lossy_scaled(
                 &seg,
                 &quant,
                 0,
+                rdoq_model.as_ref(),
             );
             let mut skip = all_zero;
             let bd8 = hdr.color_config.bit_depth;
@@ -5538,6 +5594,7 @@ pub(crate) fn encode_sequence_lossy_resized_planes(
     let kf_eopts = EntropyOpts {
         base: &kf_base,
         forward_updates: true,
+        rdoq: true,
     };
     let kf_stash = EntropyStash::default();
     let encode_kf = |hdr2: &Vp9FrameHeader| {
@@ -5602,6 +5659,7 @@ pub(crate) fn encode_sequence_lossy_resized_planes(
         let eopts = EntropyOpts {
             base: &base,
             forward_updates: true,
+            rdoq: true,
         };
         let stash = EntropyStash::default();
         let encode = |hdr2: &Vp9FrameHeader| {
@@ -6213,6 +6271,7 @@ impl LossyGopEncoder {
             let kf_eopts = EntropyOpts {
                 base: &kf_base,
                 forward_updates: true,
+                rdoq: true,
             };
             let kf_stash = EntropyStash::default();
             // Chain-model sequences take the round-441 keyframe skip
@@ -6334,6 +6393,7 @@ impl LossyGopEncoder {
         let eopts = EntropyOpts {
             base: &base,
             forward_updates: true,
+            rdoq: true,
         };
         let stash = EntropyStash::default();
         let re_encode = |hdr2: &Vp9FrameHeader| {
@@ -6909,6 +6969,9 @@ pub(crate) struct GopStructure {
     /// [`HIGH_MOTION_ACTIVITY`] (halving until it fits or the group is
     /// a lone P-frame). Two-pass entries only.
     pub adaptive_group_length: bool,
+    /// Round-458 coefficient election ([`crate::rdoq`]) on every
+    /// trial quantisation of the adaptive framing.
+    pub coefficient_rdo: bool,
 }
 
 /// Lossy **structured GOP** encoder (round 452): the two-slot chain of
@@ -7136,6 +7199,7 @@ impl StructuredGopEncoder {
         let eopts = EntropyOpts {
             base: &base,
             forward_updates: true,
+            rdoq: self.structure.coefficient_rdo,
         };
         let stash = EntropyStash::default();
         let encode = |hdr2: &Vp9FrameHeader| {
@@ -7314,6 +7378,7 @@ impl StructuredGopEncoder {
         let eopts = EntropyOpts {
             base: &base,
             forward_updates: true,
+            rdoq: self.structure.coefficient_rdo,
         };
         let stash = EntropyStash::default();
         let encode = |hdr2: &Vp9FrameHeader| {
@@ -8377,6 +8442,7 @@ pub(crate) fn encode_sequence_lossy_rc_420_budgeted(
     let kf_eopts = EntropyOpts {
         base: &kf_base,
         forward_updates: true,
+        rdoq: true,
     };
     let kf_encode_at = |hdr: &Vp9FrameHeader, q: u8| {
         let plan = plan_keyframe_tree(&kf_targets, mi_rows, mi_cols, true, true, 8, q);
@@ -8473,6 +8539,7 @@ pub(crate) fn encode_sequence_lossy_rc_420_budgeted(
         let eopts = EntropyOpts {
             base: &base,
             forward_updates: true,
+            rdoq: true,
         };
         let encode_at = |hdr: &Vp9FrameHeader| {
             encode_pframe_lossy_tree_motion_opts(
@@ -9061,6 +9128,7 @@ mod tests {
             switchable_interp: true,
             scene_cut_keyframes: true,
             adaptive_group_length: true,
+            coefficient_rdo: true,
         };
         let (packets, headers, decoded, _) =
             assert_structured_gop_mirror(&src, w, h, 100, structure);
@@ -9262,6 +9330,7 @@ mod tests {
             switchable_interp: true,
             scene_cut_keyframes: true,
             adaptive_group_length: true,
+            coefficient_rdo: true,
         };
         let (packets, headers, decoded, _) =
             assert_structured_gop_mirror(&src, w, h, 100, structure);
@@ -9314,6 +9383,7 @@ mod tests {
             switchable_interp: true,
             scene_cut_keyframes: true,
             adaptive_group_length: true,
+            coefficient_rdo: true,
         };
         let (packets, headers, decoded, _) =
             assert_structured_gop_mirror(&src, w, h, 140, structure);
@@ -9353,6 +9423,7 @@ mod tests {
             switchable_interp: true,
             scene_cut_keyframes: true,
             adaptive_group_length: true,
+            coefficient_rdo: true,
         };
         let (pk2, hs2, dec2, _) = assert_structured_gop_mirror(&src2, w2, h2, 120, rows);
         for hd in hs2.iter().filter(|hd| !hd.show_existing_frame) {
@@ -9415,6 +9486,7 @@ mod tests {
             switchable_interp: true,
             scene_cut_keyframes: true,
             adaptive_group_length: true,
+            coefficient_rdo: true,
         };
         let (packets, headers, decoded, seg_maps) =
             assert_structured_gop_mirror(&src, w, h, 100, full);
@@ -9530,6 +9602,7 @@ mod tests {
                 switchable_interp: true,
                 scene_cut_keyframes: true,
                 adaptive_group_length: true,
+                coefficient_rdo: true,
             };
             let (pk, hs, dec, _) = assert_structured_gop_mirror(&src[..4], w, h, 120, st);
             assert!(hs
@@ -13331,6 +13404,7 @@ mod tests {
             &seg,
             &quant,
             0,
+            None,
         );
         assert!(!all_zero, "gradient residual must quantize to tokens");
         assert_eq!(tx, 3, "smooth residual should elect TX_32X32");
@@ -13358,6 +13432,7 @@ mod tests {
             &seg,
             &quant,
             0,
+            None,
         );
         assert!(!all_zero);
         assert!(
@@ -14426,6 +14501,7 @@ mod entropy_mirror_tests {
                 switchable_interp: true,
                 scene_cut_keyframes: true,
                 adaptive_group_length: true,
+                coefficient_rdo: true,
             };
             let src: Vec<Vec<u8>> = (0..7).map(|k| scene(w as usize, h as usize, k)).collect();
             let targets: Vec<[Plane; 3]> = src

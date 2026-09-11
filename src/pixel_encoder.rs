@@ -2603,7 +2603,7 @@ fn refine_leaf_mv_subpel(
     let region_h = (num8x8h * 8) as usize;
 
     let (samples, stride) = reference[0];
-    let mut sad_of = |mv: [i32; 2]| -> u64 {
+    let sad_of = |mv: [i32; 2]| -> u64 {
         let block_mvs = [[mv; 4], [[0i32; 2]; 4]];
         let refs = RefPlanes {
             list: [

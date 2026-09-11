@@ -846,9 +846,18 @@ the pre-455 default-bank framing) reproduce the earlier bytes.
     refills at display points with a structure-aware default buffer;
     99.8–99.9 % of the pool on every shape / format, all ten dumped
     streams black-box validated;
-  * the two-pass first pass is one extra full encode at a fixed probe
-    quantizer, and the allocation is first-pass-size proportional (no
-    explicit scene-cut / keyframe placement decisions);
+  * ~~no explicit scene-cut / keyframe placement decisions~~ — **round
+    458 plans the second pass**: [`Vp9GopConfig::scene_cut_keyframes`]
+    places a keyframe where the first-pass inter cost spikes and a
+    probe keyframe encode confirms it is no cheaper to predict (the
+    cut frame of the scene-cut GOP: +0.66 dB at equal bytes), and
+    [`Vp9GopConfig::adaptive_group_length`] halves alt-ref groups on
+    fast motion (+0.06…+1.04 dB across the shapes / formats; static
+    and intra-only GOPs byte-identical);
+  * the two-pass first pass is still one extra full encode at a fixed
+    probe quantizer (no downscaled / partial first pass), and the
+    allocation stays first-pass-size proportional (no explicit
+    per-frame quality targeting);
   * ~~structured-GOP / resized entries public at 8-bit 4:2:0 only~~ —
     **round 455 lands the format-matrix wrappers**:
     [`encode_vp9_lossy_sequence_with_444`] / [`_422`](encode_vp9_lossy_sequence_with_422)

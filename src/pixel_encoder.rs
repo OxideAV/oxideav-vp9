@@ -6899,6 +6899,16 @@ pub(crate) struct GopStructure {
     /// [`elect_leaf_interp_filter`]); `false` codes frame-level
     /// `EIGHTTAP`.
     pub switchable_interp: bool,
+    /// Round-458 two-pass planning: place a keyframe on every display
+    /// frame whose first-pass inter cost spikes above its neighbours
+    /// AND comes within [`SCENE_CUT_INTRA_RATIO`] of its intra cost
+    /// (a probe keyframe encode). Two-pass entries only.
+    pub scene_cut_keyframes: bool,
+    /// Round-458 two-pass planning: shorten an alt-ref group whose
+    /// frames' mean first-pass motion activity exceeds
+    /// [`HIGH_MOTION_ACTIVITY`] (halving until it fits or the group is
+    /// a lone P-frame). Two-pass entries only.
+    pub adaptive_group_length: bool,
 }
 
 /// Lossy **structured GOP** encoder (round 452): the two-slot chain of
@@ -7351,7 +7361,7 @@ impl StructuredGopEncoder {
     /// slots take its cropped reconstruction, and every persistent
     /// encoder-side mirror advances exactly as the decoder's state
     /// does after decoding it.
-    fn commit(&mut self, p: PendingFrame, budget: Option<usize>) -> Vec<u8> {
+    fn commit(&mut self, p: PendingFrame, budget: Option<usize>, frame: usize) -> Vec<u8> {
         let PendingFrame {
             bytes,
             recon,
@@ -7395,6 +7405,13 @@ impl StructuredGopEncoder {
         self.seg_maps.push(next_seg_map);
         self.recons.push(Some(recon));
         let shown = final_hdr.show_frame;
+        let keyframe = final_hdr.frame_type == FrameType::KeyFrame;
+        if keyframe {
+            // §8.10: every slot holds the keyframe; the roles restart.
+            self.last_slot = 0;
+            self.golden_slot = 1;
+            self.alt_slot = 2;
+        }
         self.stats.push(PacketStat {
             bytes: bytes.len(),
             motion_activity,
@@ -7402,6 +7419,9 @@ impl StructuredGopEncoder {
             budget,
             show_existing: false,
             shown,
+            frame,
+            keyframe,
+            intra: keyframe || final_hdr.intra_only,
         });
         bytes
     }
@@ -7414,6 +7434,7 @@ impl StructuredGopEncoder {
     fn code_under(
         &mut self,
         policy: &mut QPolicy<'_>,
+        frame: usize,
         prepare: impl Fn(&Self, u8) -> Result<PendingFrame, Error>,
     ) -> Result<Vec<u8>, Error> {
         let coded: Vec<usize> = self.stats.iter().map(|s| s.bytes).collect();
@@ -7425,11 +7446,12 @@ impl StructuredGopEncoder {
                 (p, Some(b))
             }
         };
-        Ok(self.commit(pending, budget))
+        Ok(self.commit(pending, budget, frame))
     }
 
-    /// The §6.2 `show_existing_frame` packet displaying `slot`.
-    fn show_existing_packet(&mut self, slot: usize) -> Result<Vec<u8>, Error> {
+    /// The §6.2 `show_existing_frame` packet displaying `slot` (the
+    /// alt-ref coded from display frame `frame`).
+    fn show_existing_packet(&mut self, slot: usize, frame: usize) -> Result<Vec<u8>, Error> {
         let mut hdr = lossless_pframe_header_fmt(self.width, self.height, self.fmt);
         hdr.show_existing_frame = true;
         hdr.frame_to_show_map_idx = Some(slot as u8);
@@ -7444,6 +7466,9 @@ impl StructuredGopEncoder {
             budget: None,
             show_existing: true,
             shown: true,
+            frame,
+            keyframe: false,
+            intra: false,
         });
         Ok(bytes)
     }
@@ -7463,9 +7488,10 @@ impl StructuredGopEncoder {
     /// `show_existing_frame` packets included) and answers with a fixed
     /// `base_q_idx` or a byte budget to bisect to — the structured-GOP
     /// twin of the chain's [`encode_sequence_lossy_rc_420_budgeted`].
-    /// The packet sequence (keyframe, per group: hidden alt-ref, shown
-    /// frames, `show_existing_frame`) depends only on the frame count
-    /// and the structure, never on the content or the quantizers, so a
+    /// The packet sequence is the structure's default
+    /// ([`GopPlan::default_for`]: one keyframe, groups of
+    /// `altref_interval`), so it depends only on the frame count and
+    /// the structure, never on the content or the quantizers, and a
     /// first pass's per-packet statistics index a second pass one for
     /// one ([`Self::stats`]).
     pub fn encode_with(
@@ -7473,62 +7499,187 @@ impl StructuredGopEncoder {
         frame_targets: &[[Plane; 3]],
         policy: &mut QPolicy<'_>,
     ) -> Result<Vec<Vec<u8>>, Error> {
-        let Some((kf_targets, rest)) = frame_targets.split_first() else {
+        let plan = GopPlan::default_for(frame_targets.len(), self.structure.altref_interval);
+        let seq = plan.packets(frame_targets.len(), self.structure.intra_only_altref);
+        self.encode_packets(frame_targets, &seq, policy)
+    }
+
+    /// Code an explicit packet sequence ([`GopPlan::packets`]) under the
+    /// quantizer policy — keyframes wherever the plan places them (a
+    /// mid-stream keyframe refreshes every slot and restarts the slot
+    /// roles, the §7.2 `setup_past_independence( )` mirrors, and the
+    /// §6.1.2 banks, exactly as the first one), hidden alt-refs (P or
+    /// intra-only per the structure) over groups of any length, shown
+    /// frames over `[ LAST, GOLDEN ]` or `[ LAST, GOLDEN, ALTREF ]`, and
+    /// the `show_existing_frame` packets that rotate the slot roles.
+    pub fn encode_packets(
+        &mut self,
+        frame_targets: &[[Plane; 3]],
+        seq: &[PlannedPacket],
+        policy: &mut QPolicy<'_>,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        if frame_targets.is_empty()
+            || seq.first().map(|p| p.kind) != Some(PacketKind::Key)
+            || seq.iter().any(|p| p.frame >= frame_targets.len())
+        {
             return Err(Error::Unsupported);
-        };
-        let interval = self.structure.altref_interval;
-
-        let kf_bytes = self.code_under(policy, |enc, q| enc.prepare_keyframe(kf_targets, q))?;
-        self.last_slot = 0;
-        self.golden_slot = 1;
-        self.alt_slot = 2;
-
-        let mut out = Vec::with_capacity(frame_targets.len() + frame_targets.len() / interval);
-        out.push(kf_bytes);
-
-        let mut i = 0usize;
-        while i < rest.len() {
-            let group_end = (i + interval - 1).min(rest.len() - 1);
-            if group_end == i {
-                // A lone frame: plain shown P-frame over LAST / GOLDEN.
-                let last_slot = self.last_slot;
-                let t = &rest[i];
-                out.push(self.code_under(policy, |enc, q| {
-                    enc.prepare_pframe(t, true, false, last_slot, q)
-                })?);
-                i += 1;
-                continue;
-            }
-            // 1. Hidden alt-ref: the group's last frame into the free
-            // slot — a P-frame, or an intra-only refresh point.
-            let alt_slot = self.alt_slot;
-            let t = &rest[group_end];
-            if self.structure.intra_only_altref {
-                out.push(
-                    self.code_under(policy, |enc, q| enc.prepare_intra_only_arf(t, alt_slot, q))?,
-                );
-            } else {
-                out.push(self.code_under(policy, |enc, q| {
-                    enc.prepare_pframe(t, false, false, alt_slot, q)
-                })?);
-            }
-            // 2. The group's shown frames over [ LAST, GOLDEN, ALTREF ].
-            for targets in &rest[i..group_end] {
-                let last_slot = self.last_slot;
-                out.push(self.code_under(policy, |enc, q| {
-                    enc.prepare_pframe(targets, true, true, last_slot, q)
-                })?);
-            }
-            // 3. Display the alt-ref; it becomes LAST, the old LAST slot
-            // is freed for the next group's alt-ref.
-            out.push(self.show_existing_packet(alt_slot)?);
-            let old_last = self.last_slot;
-            self.last_slot = alt_slot;
-            self.alt_slot = old_last;
-            i = group_end + 1;
+        }
+        let mut out = Vec::with_capacity(seq.len());
+        for pk in seq {
+            let t = &frame_targets[pk.frame];
+            let frame = pk.frame;
+            let bytes = match pk.kind {
+                PacketKind::Key => {
+                    self.code_under(policy, frame, |enc, q| enc.prepare_keyframe(t, q))?
+                }
+                PacketKind::HiddenAltref => {
+                    let alt_slot = self.alt_slot;
+                    if self.structure.intra_only_altref {
+                        self.code_under(policy, frame, |enc, q| {
+                            enc.prepare_intra_only_arf(t, alt_slot, q)
+                        })?
+                    } else {
+                        self.code_under(policy, frame, |enc, q| {
+                            enc.prepare_pframe(t, false, false, alt_slot, q)
+                        })?
+                    }
+                }
+                PacketKind::Shown { use_alt } => {
+                    let last_slot = self.last_slot;
+                    self.code_under(policy, frame, |enc, q| {
+                        enc.prepare_pframe(t, true, use_alt, last_slot, q)
+                    })?
+                }
+                PacketKind::ShowExisting => {
+                    // Display the alt-ref; it becomes LAST, the old LAST
+                    // slot is freed for the next group's alt-ref.
+                    let alt_slot = self.alt_slot;
+                    let bytes = self.show_existing_packet(alt_slot, frame)?;
+                    let old_last = self.last_slot;
+                    self.last_slot = alt_slot;
+                    self.alt_slot = old_last;
+                    bytes
+                }
+            };
+            out.push(bytes);
         }
         Ok(out)
     }
+}
+
+/// The GOP layout of a structured encode (round 458): which display
+/// frames are keyframes and how long each alt-ref group is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GopPlan {
+    /// Display frames coded as keyframes (`0` always; ascending).
+    pub keyframes: Vec<usize>,
+    /// Alt-ref group lengths in display frames, consecutive over the
+    /// non-keyframe frames (a group never spans a keyframe; a length-1
+    /// group is a lone shown P-frame).
+    pub groups: Vec<usize>,
+}
+
+impl GopPlan {
+    /// The structure's default: a keyframe at frame 0, then groups of
+    /// `altref_interval` (the tail group shorter).
+    pub fn default_for(n: usize, altref_interval: usize) -> Self {
+        Self::with_keyframes(n, vec![0], |_, _| altref_interval)
+    }
+
+    /// Keyframes at `keyframes` (frame 0 is added if absent), each
+    /// segment split into groups by `len_at( first frame of the group,
+    /// frames left in the segment )` (clamped to `1..=left`).
+    pub fn with_keyframes(
+        n: usize,
+        mut keyframes: Vec<usize>,
+        mut len_at: impl FnMut(usize, usize) -> usize,
+    ) -> Self {
+        keyframes.retain(|&k| k < n);
+        keyframes.sort_unstable();
+        keyframes.dedup();
+        if keyframes.first() != Some(&0) {
+            keyframes.insert(0, 0);
+        }
+        let mut groups = Vec::new();
+        for (s, &k) in keyframes.iter().enumerate() {
+            let seg_end = keyframes.get(s + 1).copied().unwrap_or(n);
+            let mut i = k + 1;
+            while i < seg_end {
+                let left = seg_end - i;
+                let len = len_at(i, left).clamp(1, left);
+                groups.push(len);
+                i += len;
+            }
+        }
+        Self { keyframes, groups }
+    }
+
+    /// The decode-order packet sequence: per segment a keyframe, then
+    /// per group either a lone shown P-frame (length 1) or a hidden
+    /// alt-ref of the group's last frame, the earlier frames shown over
+    /// the three-slot set, and the `show_existing_frame` packet.
+    pub fn packets(&self, n: usize, _intra_only_altref: bool) -> Vec<PlannedPacket> {
+        let mut out = Vec::new();
+        let mut groups = self.groups.iter();
+        for (s, &k) in self.keyframes.iter().enumerate() {
+            let seg_end = self.keyframes.get(s + 1).copied().unwrap_or(n);
+            out.push(PlannedPacket {
+                kind: PacketKind::Key,
+                frame: k,
+            });
+            let mut i = k + 1;
+            while i < seg_end {
+                let len = *groups.next().expect("groups cover every segment");
+                let group_end = i + len - 1;
+                if len == 1 {
+                    out.push(PlannedPacket {
+                        kind: PacketKind::Shown { use_alt: false },
+                        frame: i,
+                    });
+                } else {
+                    out.push(PlannedPacket {
+                        kind: PacketKind::HiddenAltref,
+                        frame: group_end,
+                    });
+                    for f in i..group_end {
+                        out.push(PlannedPacket {
+                            kind: PacketKind::Shown { use_alt: true },
+                            frame: f,
+                        });
+                    }
+                    out.push(PlannedPacket {
+                        kind: PacketKind::ShowExisting,
+                        frame: group_end,
+                    });
+                }
+                i = group_end + 1;
+            }
+        }
+        out
+    }
+}
+
+/// One packet of a [`GopPlan`] sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlannedPacket {
+    pub kind: PacketKind,
+    /// The display frame coded (the alt-ref frame for
+    /// `ShowExisting`).
+    pub frame: usize,
+}
+
+/// What a planned packet codes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PacketKind {
+    /// A keyframe (every slot refreshed, roles restarted).
+    Key,
+    /// The group's hidden alt-ref (a P-frame, or intra-only per
+    /// [`GopStructure::intra_only_altref`]).
+    HiddenAltref,
+    /// A shown P-frame; `use_alt` admits the group's alt-ref slot.
+    Shown { use_alt: bool },
+    /// The `show_existing_frame` packet presenting the alt-ref.
+    ShowExisting,
 }
 
 /// One prepared-but-uncommitted frame of the [`StructuredGopEncoder`]
@@ -7568,6 +7719,14 @@ pub(crate) struct PacketStat {
     /// The packet presents a display frame (`show_frame = 1`, or a
     /// `show_existing_frame` packet) — the VBV refill points.
     pub shown: bool,
+    /// The display frame the packet codes (a `show_existing_frame`
+    /// packet: the alt-ref frame it presents).
+    pub frame: usize,
+    /// The packet is a keyframe.
+    pub keyframe: bool,
+    /// The packet is `FrameIsIntra` (a keyframe or a hidden intra-only
+    /// alt-ref) — its size is an intra cost, not an inter one.
+    pub intra: bool,
 }
 
 /// The quantizer policy's verdict for one packet ([`QPolicy`]).
@@ -7665,6 +7824,115 @@ pub(crate) struct TwoPassPacket {
     pub base_q_idx: u8,
     /// The one-byte `show_existing_frame` packet.
     pub show_existing: bool,
+    /// The packet is a keyframe (frame 0, or a placed scene cut).
+    pub keyframe: bool,
+    /// The display frame the packet codes.
+    pub frame: usize,
+}
+
+/// Round-458 scene-cut rule, part one: a display frame is a cut
+/// candidate when its first-pass inter cost exceeds this multiple of
+/// the median inter cost of the sequence's P-coded frames, or reaches
+/// [`SCENE_CUT_KEY_RATIO`] of the first keyframe's intra cost (the one
+/// intra cost the first pass measured for free) — either way the
+/// intra probe below decides.
+pub(crate) const SCENE_CUT_SPIKE: usize = 2;
+
+/// Round-458 scene-cut rule, part one (`(num, den)`): the keyframe-cost
+/// fraction that also makes a frame a cut candidate.
+pub(crate) const SCENE_CUT_KEY_RATIO: (usize, usize) = (2, 3);
+
+/// Round-458 scene-cut rule, part two (`(num, den)`): a candidate is a
+/// cut when its inter cost is at least `num / den` of its intra cost
+/// (the probe keyframe encode at the first-pass quantizer) — inter
+/// prediction bought nothing worth its syntax, so a keyframe there is
+/// as cheap and resets the prediction chain for the frames after it.
+pub(crate) const SCENE_CUT_INTRA_RATIO: (usize, usize) = (3, 4);
+
+/// Round-458 adaptive group length: an alt-ref group whose frames'
+/// mean first-pass motion activity (eighth-pel `|mv|`, see
+/// [`motion_activity`]) exceeds this is halved until it fits or is a
+/// lone P-frame — a distant alt-ref predicts fast motion poorly, and
+/// its hidden bytes are then better spent on the shown frames.
+pub(crate) const HIGH_MOTION_ACTIVITY: u32 = 48;
+
+/// First-pass statistics of one display frame, from the packet that
+/// coded it.
+#[derive(Clone, Copy, Debug, Default)]
+struct FrameStat {
+    bytes: usize,
+    motion: u32,
+    /// Coded intra in the first pass (a hidden intra-only alt-ref):
+    /// no inter cost was measured, so it is never a cut candidate.
+    intra: bool,
+}
+
+/// Plan the second pass from the first (round 458): the [`GopPlan`]
+/// (keyframes at detected scene cuts, motion-adapted group lengths)
+/// and the per-display-frame first-pass cost with the intra probe
+/// substituted on every placed keyframe.
+fn plan_second_pass(
+    frame_targets: &[[Plane; 3]],
+    width: u32,
+    height: u32,
+    fmt: LossyFormat,
+    structure: GopStructure,
+    probe_q: u8,
+    first: &[FrameStat],
+) -> Result<(GopPlan, Vec<usize>), Error> {
+    let n = frame_targets.len();
+    let mut cost: Vec<usize> = first.iter().map(|f| f.bytes).collect();
+    let mut keyframes = vec![0usize];
+    let inter: Vec<usize> = first[1..]
+        .iter()
+        .filter(|f| !f.intra)
+        .map(|f| f.bytes)
+        .collect();
+    if structure.scene_cut_keyframes && n > 2 && !inter.is_empty() {
+        let mut sorted = inter.clone();
+        sorted.sort_unstable();
+        let median = sorted[sorted.len() / 2].max(1);
+        let probe = StructuredGopEncoder::new(width, height, probe_q, fmt, structure)?;
+        let kf_cost = first[0].bytes;
+        for j in 1..n {
+            if first[j].intra {
+                continue;
+            }
+            let spike = first[j].bytes > SCENE_CUT_SPIKE * median;
+            let near_key =
+                first[j].bytes * SCENE_CUT_KEY_RATIO.1 >= kf_cost * SCENE_CUT_KEY_RATIO.0;
+            if !spike && !near_key {
+                continue;
+            }
+            let intra = probe
+                .prepare_keyframe(&frame_targets[j], probe_q)?
+                .bytes
+                .len();
+            if first[j].bytes * SCENE_CUT_INTRA_RATIO.1 >= intra * SCENE_CUT_INTRA_RATIO.0 {
+                keyframes.push(j);
+                cost[j] = intra;
+            }
+        }
+    }
+    let interval = structure.altref_interval;
+    // Intra-only alt-refs are refresh points, not prediction aids —
+    // a group's length is then the refresh period, and motion does
+    // not shorten it.
+    let adaptive = structure.adaptive_group_length && !structure.intra_only_altref;
+    let plan = GopPlan::with_keyframes(n, keyframes, |i, left| {
+        let mut len = interval.min(left).max(1);
+        if adaptive {
+            let mean = |len: usize| -> u32 {
+                let span = &first[i..i + len];
+                (span.iter().map(|f| u64::from(f.motion)).sum::<u64>() / len as u64) as u32
+            };
+            while len > 1 && mean(len) > HIGH_MOTION_ACTIVITY {
+                len /= 2;
+            }
+        }
+        len
+    });
+    Ok((plan, cost))
 }
 
 /// The two-pass allocation + VBV policy over a first pass's per-packet
@@ -7753,15 +8021,20 @@ fn two_pass_policy(
 /// [`encode_sequence_lossy_rc_two_pass_420`]:
 ///
 /// *First pass*: the GOP is coded once at `probe_q` through
-/// [`StructuredGopEncoder::encode`], recording each packet's size and
-/// motion activity ([`StructuredGopEncoder::stats`]).
+/// [`StructuredGopEncoder::encode`] (the structure's default plan),
+/// recording each packet's size and motion activity
+/// ([`StructuredGopEncoder::stats`]).
 ///
-/// *Second pass*: a fresh encoder codes the identical packet sequence
+/// *Planning* ([`plan_second_pass`]): scene-cut keyframes and
+/// motion-adapted group lengths from those statistics.
+///
+/// *Second pass*: a fresh encoder codes the planned packet sequence
 /// under [`two_pass_policy`] — each decoded packet bisected to its
 /// budget through the probe / commit split ([`FrameQ::Budget`]), the
 /// hidden alt-refs included (a hidden alt-ref is the group's most
 /// referenced frame, and its first-pass size draws its share of the
-/// pool like any other packet).
+/// pool like any other packet); a placed keyframe draws its probe
+/// intra cost.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_sequence_lossy_structured_two_pass_planes(
     frame_targets: &[[Plane; 3]],
@@ -7776,23 +8049,68 @@ pub(crate) fn encode_sequence_lossy_structured_two_pass_planes(
     if frame_targets.is_empty() || target_bytes_per_frame == 0 {
         return Err(Error::Unsupported);
     }
+    let n = frame_targets.len();
     // First pass.
     let mut probe = StructuredGopEncoder::new(width, height, probe_q, fmt, structure)?;
     probe.encode(frame_targets)?;
-    let stats = probe.stats.clone();
+    let mut first = vec![FrameStat::default(); n];
+    for st in probe.stats.iter().filter(|s| !s.show_existing) {
+        first[st.frame] = FrameStat {
+            bytes: st.bytes,
+            motion: st.motion_activity,
+            intra: st.intra,
+        };
+    }
     drop(probe);
+
+    // Plan.
+    let (plan, cost) = plan_second_pass(
+        frame_targets,
+        width,
+        height,
+        fmt,
+        structure,
+        probe_q,
+        &first,
+    )?;
+    let seq = plan.packets(n, structure.intra_only_altref);
+    let se_bytes = {
+        let mut hdr = lossless_pframe_header_fmt(width, height, fmt);
+        hdr.show_existing_frame = true;
+        hdr.frame_to_show_map_idx = Some(0);
+        crate::header_writer::write_uncompressed_header(&hdr)?.len()
+    };
+    let planned: Vec<PacketStat> = seq
+        .iter()
+        .map(|p| PacketStat {
+            bytes: if p.kind == PacketKind::ShowExisting {
+                se_bytes
+            } else {
+                cost[p.frame]
+            },
+            motion_activity: first[p.frame].motion,
+            base_q_idx: 0,
+            budget: None,
+            show_existing: p.kind == PacketKind::ShowExisting,
+            shown: p.kind != PacketKind::HiddenAltref,
+            frame: p.frame,
+            keyframe: p.kind == PacketKind::Key,
+            intra: p.kind == PacketKind::Key
+                || (p.kind == PacketKind::HiddenAltref && structure.intra_only_altref),
+        })
+        .collect();
 
     // Second pass.
     let (_, mut policy) = two_pass_policy(
-        &stats,
-        frame_targets.len(),
+        &planned,
+        n,
         target_bytes_per_frame,
         vbv_bytes,
         structure.altref_interval,
     );
     let mut enc = StructuredGopEncoder::new(width, height, probe_q, fmt, structure)?;
-    let packets = enc.encode_with(frame_targets, &mut policy)?;
-    let report = stats
+    let packets = enc.encode_packets(frame_targets, &seq, &mut policy)?;
+    let report = planned
         .iter()
         .zip(&enc.stats)
         .map(|(fp, sp)| TwoPassPacket {
@@ -7804,6 +8122,8 @@ pub(crate) fn encode_sequence_lossy_structured_two_pass_planes(
             coded_bytes: sp.bytes,
             base_q_idx: sp.base_q_idx,
             show_existing: sp.show_existing,
+            keyframe: sp.keyframe,
+            frame: sp.frame,
         })
         .collect();
     Ok((packets, report))
@@ -8739,6 +9059,8 @@ mod tests {
             intra_only_altref: false,
             entropy_adaptation: true,
             switchable_interp: true,
+            scene_cut_keyframes: true,
+            adaptive_group_length: true,
         };
         let (packets, headers, decoded, _) =
             assert_structured_gop_mirror(&src, w, h, 100, structure);
@@ -8938,6 +9260,8 @@ mod tests {
             intra_only_altref: true,
             entropy_adaptation: true,
             switchable_interp: true,
+            scene_cut_keyframes: true,
+            adaptive_group_length: true,
         };
         let (packets, headers, decoded, _) =
             assert_structured_gop_mirror(&src, w, h, 100, structure);
@@ -8988,6 +9312,8 @@ mod tests {
             intra_only_altref: false,
             entropy_adaptation: true,
             switchable_interp: true,
+            scene_cut_keyframes: true,
+            adaptive_group_length: true,
         };
         let (packets, headers, decoded, _) =
             assert_structured_gop_mirror(&src, w, h, 140, structure);
@@ -9025,6 +9351,8 @@ mod tests {
             intra_only_altref: false,
             entropy_adaptation: true,
             switchable_interp: true,
+            scene_cut_keyframes: true,
+            adaptive_group_length: true,
         };
         let (pk2, hs2, dec2, _) = assert_structured_gop_mirror(&src2, w2, h2, 120, rows);
         for hd in hs2.iter().filter(|hd| !hd.show_existing_frame) {
@@ -9085,6 +9413,8 @@ mod tests {
             intra_only_altref: false,
             entropy_adaptation: true,
             switchable_interp: true,
+            scene_cut_keyframes: true,
+            adaptive_group_length: true,
         };
         let (packets, headers, decoded, seg_maps) =
             assert_structured_gop_mirror(&src, w, h, 100, full);
@@ -9198,6 +9528,8 @@ mod tests {
                 intra_only_altref: false,
                 entropy_adaptation: true,
                 switchable_interp: true,
+                scene_cut_keyframes: true,
+                adaptive_group_length: true,
             };
             let (pk, hs, dec, _) = assert_structured_gop_mirror(&src[..4], w, h, 120, st);
             assert!(hs
@@ -14092,6 +14424,8 @@ mod entropy_mirror_tests {
                 intra_only_altref: intra_only,
                 entropy_adaptation: true,
                 switchable_interp: true,
+                scene_cut_keyframes: true,
+                adaptive_group_length: true,
             };
             let src: Vec<Vec<u8>> = (0..7).map(|k| scene(w as usize, h as usize, k)).collect();
             let targets: Vec<[Plane; 3]> = src

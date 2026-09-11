@@ -1267,6 +1267,16 @@ pub struct Vp9TwoPassFrame {
     /// `first_pass_bytes == coded_bytes` (one byte; two on profile 3),
     /// `budget == 0`, `base_q_idx == 0`.
     pub show_existing: bool,
+    /// The packet is a keyframe — the first packet, or a scene-cut
+    /// keyframe the structured two-pass planner placed
+    /// ([`Vp9GopConfig::scene_cut_keyframes`]); `first_pass_bytes` is
+    /// then the probe intra cost.
+    pub keyframe: bool,
+    /// The display frame the packet codes (the plain chain: the
+    /// packet index; structured GOPs: a hidden alt-ref codes its
+    /// group's last frame, the `show_existing_frame` packet presents
+    /// it).
+    pub frame: usize,
 }
 
 /// **Two-pass rate-controlled** lossy sequence encode (round 455).
@@ -1308,13 +1318,16 @@ pub fn encode_vp9_lossy_sequence_rc_two_pass(
     )?;
     let report = report
         .into_iter()
-        .map(|f| Vp9TwoPassFrame {
+        .enumerate()
+        .map(|(i, f)| Vp9TwoPassFrame {
             first_pass_bytes: f.first_pass.bytes,
             motion_activity: f.first_pass.motion_activity,
             budget: f.budget,
             coded_bytes: f.coded_bytes,
             base_q_idx: f.base_q_idx,
             show_existing: false,
+            keyframe: i == 0,
+            frame: i,
         })
         .collect();
     Ok((packets, report))
@@ -1530,6 +1543,8 @@ fn two_pass_report(report: Vec<pixel_encoder::TwoPassPacket>) -> Vec<Vp9TwoPassF
             coded_bytes: f.coded_bytes,
             base_q_idx: f.base_q_idx,
             show_existing: f.show_existing,
+            keyframe: f.keyframe,
+            frame: f.frame,
         })
         .collect()
 }
@@ -1708,6 +1723,26 @@ pub struct Vp9GopConfig {
     /// prediction SSE, coded per block as §6.4.16 `interp_filter`.
     /// `false` codes frame-level `EIGHTTAP` (the round-452 filter).
     pub switchable_interp_filter: bool,
+    /// **Scene-cut keyframes** (round 458, on by default; two-pass
+    /// entries only — the fixed-quantizer entries have no first pass
+    /// to plan from): the second pass places a keyframe on every
+    /// display frame whose first-pass inter cost exceeds twice the
+    /// median inter cost of the sequence AND is at least three
+    /// quarters of its intra cost (a probe keyframe encode at the
+    /// first-pass quantizer): inter prediction bought nothing worth its
+    /// syntax there, so the keyframe is as cheap and resets the
+    /// prediction chain for the frames after it. The keyframe starts a
+    /// new alt-ref segment (every slot refreshed, roles restarted).
+    pub scene_cut_keyframes: bool,
+    /// **Adaptive group length** (round 458, on by default; two-pass
+    /// entries only): an alt-ref group whose frames' mean first-pass
+    /// motion activity exceeds 48 eighth-pel is halved until it fits
+    /// (or is a lone P-frame) — a distant alt-ref predicts fast motion
+    /// poorly, and its hidden bytes are better spent on the shown
+    /// frames; static content keeps `altref_interval`. Not applied
+    /// under `intra_only_altref` (a refresh period is a structural
+    /// choice, not a prediction aid).
+    pub adaptive_group_length: bool,
 }
 
 impl Vp9GopConfig {
@@ -1723,6 +1758,8 @@ impl Vp9GopConfig {
             intra_only_altref: false,
             entropy_adaptation: true,
             switchable_interp_filter: true,
+            scene_cut_keyframes: true,
+            adaptive_group_length: true,
         }
     }
 }
@@ -1846,6 +1883,8 @@ fn gop_structure_of(cfg: &Vp9GopConfig) -> pixel_encoder::GopStructure {
         intra_only_altref: cfg.intra_only_altref,
         entropy_adaptation: cfg.entropy_adaptation,
         switchable_interp: cfg.switchable_interp_filter,
+        scene_cut_keyframes: cfg.scene_cut_keyframes,
+        adaptive_group_length: cfg.adaptive_group_length,
     }
 }
 

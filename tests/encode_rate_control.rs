@@ -544,9 +544,35 @@ fn two_pass_structured_gop_across_shapes_and_formats() {
                 "{name}: format"
             );
         }
-        // Hidden alt-refs exist whenever a group forms.
-        let se = report.iter().filter(|f| f.show_existing).count();
-        assert!(se >= 1, "{name}: at least one show_existing_frame packet");
+        // Planning A/B (round 458): the same target with scene-cut
+        // keyframes and adaptive group lengths off — the unplanned
+        // stream keeps every group of the configured interval (hidden
+        // alt-refs exist whenever a group forms), the planned one is
+        // never more than 0.3 dB below it and the report flags every
+        // keyframe it placed.
+        let mut unplanned_cfg = cfg;
+        unplanned_cfg.scene_cut_keyframes = false;
+        unplanned_cfg.adaptive_group_length = false;
+        let (unplanned, ureport) = encode(&unplanned_cfg).expect(name);
+        assert!(
+            ureport.iter().filter(|f| f.show_existing).count() >= 1,
+            "{name}: unplanned stream forms alt-ref groups"
+        );
+        assert_eq!(ureport.iter().filter(|f| f.keyframe).count(), 1);
+        assert!(report[0].keyframe && report[0].frame == 0);
+        let placed: Vec<usize> = report
+            .iter()
+            .filter(|f| f.keyframe && f.frame > 0)
+            .map(|f| f.frame)
+            .collect();
+        if name == "seg-full-scene-cut" {
+            assert_eq!(placed, vec![3], "{name}: keyframe at the cut");
+        } else {
+            assert!(
+                placed.is_empty(),
+                "{name}: no keyframe placed on continuous content"
+            );
+        }
         let vbv = (cfg.altref_interval as usize + 1).max(2) * target;
         let accuracy = check_two_pass(name, &packets, &report, n, target, vbv);
         dump_when_requested(name, &packets, &decoded, w as u32, h as u32, 8, ssx, ssy);
@@ -559,7 +585,14 @@ fn two_pass_structured_gop_across_shapes_and_formats() {
         let p = psnr16(&decoded, &sources, 8);
         assert!(p > 25.0, "{name}: PSNR {p:.2} dB");
         let total: usize = packets.iter().map(Vec::len).sum();
-        if ssx && ssy {
+        let udecoded = decode_vp9_sequence(&refs(&unplanned)).expect("decodes");
+        let pu = psnr16(&udecoded, &sources, 8);
+        assert!(
+            p + 0.3 >= pu,
+            "{name}: planned {p:.2} dB vs unplanned {pu:.2} dB"
+        );
+        let utotal: usize = unplanned.iter().map(Vec::len).sum();
+        let chain_note = if ssx && ssy {
             let (chain, _) = encode_vp9_lossy_sequence_rc_two_pass(
                 &refs(&frames),
                 w as u32,
@@ -569,22 +602,25 @@ fn two_pass_structured_gop_across_shapes_and_formats() {
             )
             .expect("chain");
             let chain_total: usize = chain.iter().map(Vec::len).sum();
-            let pc = psnr(&chain, &frames);
-            eprintln!(
-                "{name}: pool {} B; structured two-pass {total} B ({accuracy:.1}%) @ {p:.2} dB in {} packets; chain two-pass {chain_total} B ({:.1}%) @ {pc:.2} dB; q = {:?}",
-                target * n,
-                packets.len(),
-                100.0 * chain_total as f64 / (target * n) as f64,
-                report.iter().map(|f| f.base_q_idx).collect::<Vec<_>>(),
-            );
+            format!(
+                "; chain two-pass {chain_total} B @ {:.2} dB",
+                psnr(&chain, &frames)
+            )
         } else {
-            eprintln!(
-                "{name}: pool {} B; structured two-pass {total} B ({accuracy:.1}%) @ {p:.2} dB in {} packets; q = {:?}",
-                target * n,
-                packets.len(),
-                report.iter().map(|f| f.base_q_idx).collect::<Vec<_>>(),
-            );
-        }
+            String::new()
+        };
+        eprintln!(
+            "{name}: pool {} B; planned two-pass {total} B ({accuracy:.1}%) @ {p:.2} dB in {} packets (keyframes {:?}); unplanned {utotal} B @ {pu:.2} dB in {} packets{chain_note}; q = {:?}",
+            target * n,
+            packets.len(),
+            report
+                .iter()
+                .filter(|f| f.keyframe)
+                .map(|f| f.frame)
+                .collect::<Vec<_>>(),
+            unplanned.len(),
+            report.iter().map(|f| f.base_q_idx).collect::<Vec<_>>(),
+        );
     }
 }
 
@@ -774,4 +810,44 @@ fn two_pass_structured_gop_contract() {
         600,
         0,
     ));
+}
+
+/// The planner leaves continuous, static content alone: no keyframe
+/// is placed, every group keeps the configured interval (the packet
+/// sequence equals the unplanned one), and the two streams are
+/// byte-identical — planning only acts on measured statistics.
+#[test]
+fn two_pass_planner_keeps_static_gop_intact() {
+    let frames: Vec<Vec<u8>> = (0..7).map(|_| scene(64, 48, 0, 1)).collect();
+    let mut cfg = Vp9GopConfig::new(110);
+    cfg.altref_interval = 3;
+    let (planned, report) =
+        encode_vp9_lossy_sequence_rc_two_pass_with(&refs(&frames), 64, 48, &cfg, 500, 0).unwrap();
+    let mut off = cfg;
+    off.scene_cut_keyframes = false;
+    off.adaptive_group_length = false;
+    let (unplanned, ureport) =
+        encode_vp9_lossy_sequence_rc_two_pass_with(&refs(&frames), 64, 48, &off, 500, 0).unwrap();
+    assert_eq!(planned, unplanned, "static content: planning is a no-op");
+    assert_eq!(report, ureport);
+    assert_eq!(report.iter().filter(|f| f.keyframe).count(), 1);
+    assert_eq!(report.iter().filter(|f| f.show_existing).count(), 2);
+    assert!(report.iter().all(|f| f.motion_activity == 0));
+    // Display-frame bookkeeping: every display frame is coded exactly
+    // once, the show_existing packets present their group's alt-ref.
+    let mut coded: Vec<usize> = report
+        .iter()
+        .filter(|f| !f.show_existing)
+        .map(|f| f.frame)
+        .collect();
+    coded.sort_unstable();
+    assert_eq!(coded, (0..7).collect::<Vec<_>>());
+    assert_eq!(
+        report
+            .iter()
+            .filter(|f| f.show_existing)
+            .map(|f| f.frame)
+            .collect::<Vec<_>>(),
+        vec![3, 6]
+    );
 }

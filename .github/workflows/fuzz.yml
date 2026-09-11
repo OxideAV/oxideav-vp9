@@ -31,6 +31,14 @@ name: Fuzz
 #     (first-pass statistics, VBV allocation): the emitted packets
 #     must decode to exactly the source frame count, every two-pass
 #     frame within its reported budget (or at the q == 255 floor).
+#   * encode_two_pass_structured — oracle-carrying round-trip over the
+#     round-458 structured two-pass entries (every Vp9GopConfig axis
+#     incl. scene-cut keyframe placement, adaptive group length and
+#     the coefficient election, at 4:2:0 / 4:4:4 / 4:2:2 / 4:4:0 /
+#     10-bit): one report entry per packet, the first a keyframe,
+#     every display frame coded exactly once, every decoded packet
+#     within its budget (or at the q == 255 floor), the stream decoding
+#     to exactly the source frame count at the declared format.
 #
 # Seed corpus entries (corpus/*/seed-*) are derived from the crate's
 # synthetic test vectors and tracked in git; fuzz-grown corpus persists

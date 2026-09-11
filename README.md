@@ -925,7 +925,7 @@ the pre-455 default-bank framing) reproduce the earlier bytes.
 
 ## Testing
 
-The crate carries 1290+ tests (lib unit tests plus integration suites
+The crate carries 1320+ tests (lib unit tests plus integration suites
 in `tests/`, including the keyframe **and inter** encoder writers, each
 round-tripped back through the in-crate decoder; `encode_keyframe`
 exercising the public `encode_vp9` → decode **byte-exact lossless**
@@ -963,6 +963,11 @@ oracle-carrying round-trip over all seven public-entry §7.2 formats
 (fuzz-derived format / geometry / quantizer / bit-depth-masked
 content through the matching matrix keyframe entry; a 28-case
 deterministic smoke also runs in standard CI);
+the `encode_gop_structures` / `encode_adaptive_chain` /
+`encode_two_pass_structured` oracle-carrying round-trips over the
+structured-GOP, adaptive-chain and structured two-pass write paths
+(round 458: scene-cut planning, adaptive groups and the coefficient
+election live on every trial quantisation);
 the `decode_robustness` integration suite pins the same
 garbage-in-no-panic contract in standard CI, including a fuzz-found
 OOM regression (headers claiming huge frame geometries are rejected

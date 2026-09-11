@@ -95,3 +95,10 @@ path = "fuzz_targets/encode_adaptive_chain.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "encode_two_pass_structured"
+path = "fuzz_targets/encode_two_pass_structured.rs"
+test = false
+doc = false
+bench = false

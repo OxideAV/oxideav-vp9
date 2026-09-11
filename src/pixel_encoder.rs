@@ -2520,27 +2520,34 @@ fn search_block_mv_wh(
     bh: i32,
     range: i32,
 ) -> ((i32, i32), u64, u64) {
-    let sad_at = |dy: i32, dx: i32| -> u64 {
+    // Round 458: the row loop bails out as soon as the partial SAD
+    // reaches `bound` — a candidate must be *strictly* below the
+    // running best to win, so an aborted candidate could never have
+    // been elected and the returned vector is byte-identical.
+    let sad_at = |dy: i32, dx: i32, bound: u64| -> u64 {
         let mut sad = 0u64;
         for i in 0..bh {
+            let ry = (by + i + dy).clamp(0, vis_h - 1) as usize;
+            let ref_row = &ref_samples[ry * ref_stride..];
             for j in 0..bw {
-                let ry = (by + i + dy).clamp(0, vis_h - 1) as usize;
                 let rx = (bx + j + dx).clamp(0, vis_w - 1) as usize;
                 let t = target.get((bx + j) as usize, (by + i) as usize);
-                let p = ref_samples[ry * ref_stride + rx];
-                sad += (t - p).unsigned_abs() as u64;
+                sad += (t - ref_row[rx]).unsigned_abs() as u64;
+            }
+            if sad >= bound {
+                return sad;
             }
         }
         sad
     };
-    let zero_sad = sad_at(0, 0);
+    let zero_sad = sad_at(0, 0, u64::MAX);
     let mut best = ((0i32, 0i32), zero_sad);
     for dy in -range..=range {
         for dx in -range..=range {
             if dy == 0 && dx == 0 {
                 continue;
             }
-            let sad = sad_at(dy, dx);
+            let sad = sad_at(dy, dx, best.1);
             if sad < best.1 {
                 best = ((dy, dx), sad);
             }
@@ -2651,6 +2658,21 @@ fn refine_leaf_mv_subpel(
         sad
     };
 
+    // Round 458: the descent revisits candidates — every move keeps up
+    // to six of the previous neighbourhood, every finer step re-probes
+    // coarser positions — and each probe is a full §8.5.2 prediction;
+    // the SAD of a vector is a pure function of it, so memoising is
+    // byte-identical and skips the repeats.
+    let mut memo = std::collections::HashMap::<[i32; 2], u64>::new();
+    let mut raw_sad_of = sad_of;
+    let mut sad_of = |mv: [i32; 2]| -> u64 {
+        if let Some(&s) = memo.get(&mv) {
+            return s;
+        }
+        let s = raw_sad_of(mv);
+        memo.insert(mv, s);
+        s
+    };
     let mut best = (start_mv, sad_of(start_mv));
     // Coarse-to-fine: half-pel, quarter-pel, then eighth-pel under hp.
     for &step in &[4i32, 2, 1] {

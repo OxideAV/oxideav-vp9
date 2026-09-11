@@ -969,6 +969,17 @@ OOM regression (headers claiming huge frame geometries are rejected
 against the largest per-level `Max luma picture size` — 35 651 584
 samples — before any frame-sized allocation).
 
+## Benchmarks
+
+`cargo bench --bench encode` (Criterion) times the default structured
+GOP entry and the plain adaptive chain on a 96x64 six-frame moving
+scene and a 256x160 lossy keyframe. Round 458's byte-identical
+speedups (tabled forward-DCT cosines, early-exit integer search,
+row-slice eight-tap horizontal pass, memoised sub-pel descent) took the
+chain from 31.3 to 43.3 fps and the keyframe from 20.4 to 33.9 fps on
+the development machine; the sub-pel refinement's §8.5.2 prediction
+remains the dominant cost.
+
 ## Provenance
 
 Single source of truth: the VP9 Bitstream & Decoding Process

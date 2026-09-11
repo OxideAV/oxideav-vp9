@@ -195,6 +195,10 @@ fn clip1(x: i32, bit_depth: u32) -> i32 {
 // sampling inputs the §8.5.2.1-3 steps produce; the positional list
 // mirrors the spec rather than bundling into a struct.
 #[allow(clippy::too_many_arguments)]
+// The generic reference form: the §8.5.2 driver runs the plane form
+// below (round 458); this one stays as the oracle the equivalence
+// test and the cross-check tests read from.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn block_inter_predict<F>(
     ref_sample: F,
     x: i32,
@@ -262,9 +266,121 @@ where
     pred
 }
 
+/// [`block_inter_predict`] over a row-major sample plane (round 458):
+/// the same §8.5.2.4 arithmetic — the horizontal pass reads the
+/// reference through `Clip3( 0, lastX, · )` / `Clip3( 0, lastY, · )`
+/// exactly as the generic form does — but a column whose eight-tap
+/// window lies entirely inside `[ 0, lastX ]` reads its taps straight
+/// from the clipped row's slice (no per-tap clip, no per-sample call),
+/// which is every interior column. Bit-identical to the generic form
+/// (the tap products are accumulated in the same order).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn block_inter_predict_plane(
+    samples: &[i32],
+    stride: usize,
+    x: i32,
+    y: i32,
+    x_step: i32,
+    y_step: i32,
+    w: usize,
+    h: usize,
+    interp_filter: usize,
+    last_x: i32,
+    last_y: i32,
+    bit_depth: u32,
+) -> Vec<i32> {
+    debug_assert!(interp_filter < 4, "interp_filter must be 0..3");
+    debug_assert!(w > 0 && h > 0, "block dimensions must be non-zero");
+
+    let filter = &SUBPEL_FILTERS[interp_filter];
+    let intermediate_height = ((((h as i32 - 1) * y_step + 15) >> 4) + 8) as usize;
+
+    let mut intermediate = vec![0i32; intermediate_height * w];
+    for r in 0..intermediate_height {
+        let ref_row = clip3(0, last_y, (y >> 4) + r as i32 - 3) as usize;
+        let row = &samples[ref_row * stride..ref_row * stride + (last_x as usize + 1)];
+        let out = &mut intermediate[r * w..(r + 1) * w];
+        for (c, slot) in out.iter_mut().enumerate() {
+            let p = x + x_step * c as i32;
+            let phase = (p & SUBPEL_MASK) as usize;
+            let taps = &filter[phase];
+            let base = (p >> 4) - 3;
+            let mut s = 0i32;
+            if base >= 0 && base + 7 <= last_x {
+                let win = &row[base as usize..base as usize + 8];
+                for (&tap, &v) in taps.iter().zip(win) {
+                    s += tap * v;
+                }
+            } else {
+                for (t, &tap) in taps.iter().enumerate() {
+                    let ref_col = clip3(0, last_x, base + t as i32);
+                    s += tap * row[ref_col as usize];
+                }
+            }
+            *slot = clip1(round2(s, 7), bit_depth);
+        }
+    }
+
+    let mut pred = vec![0i32; h * w];
+    for r in 0..h {
+        let p = (y & SUBPEL_MASK) + y_step * r as i32;
+        let phase = (p & SUBPEL_MASK) as usize;
+        let taps = &filter[phase];
+        let base_row = (p >> 4) as usize;
+        for c in 0..w {
+            let mut s = 0i32;
+            for (t, &tap) in taps.iter().enumerate() {
+                s += tap * intermediate[(base_row + t) * w + c];
+            }
+            pred[r * w + c] = clip1(round2(s, 7), bit_depth);
+        }
+    }
+    pred
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The plane form equals the generic form sample for sample across
+    /// every kernel, scaled and unscaled steps, and blocks straddling
+    /// every plane edge (the clipped-window fallback) — a hash-texture
+    /// reference, every phase exercised.
+    #[test]
+    fn plane_form_matches_generic_form_everywhere() {
+        let (pw, ph) = (40usize, 28usize);
+        let samples: Vec<i32> = (0..pw * ph)
+            .map(|i| ((i as u64).wrapping_mul(2_654_435_761) >> 20) as i32 & 0xff)
+            .collect();
+        let (last_x, last_y) = (pw as i32 - 1, ph as i32 - 1);
+        for filt in 0..4usize {
+            for (xs, ys) in [(16, 16), (32, 16), (16, 24), (20, 20)] {
+                for (w, h) in [(4usize, 4usize), (8, 4), (16, 16)] {
+                    for x in [-70, -13, 0, 5, 200, 500, 640] {
+                        for y in [-40, -9, 0, 7, 150, 300, 430] {
+                            let a = block_inter_predict(
+                                |r, c| samples[r as usize * pw + c as usize],
+                                x,
+                                y,
+                                xs,
+                                ys,
+                                w,
+                                h,
+                                filt,
+                                last_x,
+                                last_y,
+                                8,
+                            );
+                            let b = block_inter_predict_plane(
+                                &samples, pw, x, y, xs, ys, w, h, filt, last_x, last_y, 8,
+                            );
+                            assert_eq!(a, b, "filter {filt} step ({xs},{ys}) {w}x{h} at ({x},{y})");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /// Every §8.5.2.4 sub-pixel kernel sums to `1 << 7 = 128`, the
     /// normalisation that `Round2( s, 7 )` divides out.

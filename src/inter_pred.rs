@@ -56,7 +56,6 @@
 // §8.5.2.1-4 primitive modules).
 #![allow(dead_code)]
 
-use crate::block_inter_pred::block_inter_predict;
 use crate::inter_mv::{clamp_mv, scale_mv, select_mv, BlockGrid, ScaleGeom};
 use crate::intra::Plane;
 
@@ -212,8 +211,9 @@ pub(crate) fn predict_inter(
         let last_y = ((ref_plane.ref_frame_height + sub_y as i32) >> sub_y) - 1;
 
         // §8.5.2 step 5 — §8.5.2.4 block inter prediction.
-        *pred_slot = block_inter_predict(
-            |row, col| ref_plane.sample(row, col),
+        *pred_slot = crate::block_inter_pred::block_inter_predict_plane(
+            ref_plane.samples,
+            ref_plane.stride,
             scaled.start_x,
             scaled.start_y,
             scaled.step_x,

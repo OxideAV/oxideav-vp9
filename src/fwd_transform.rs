@@ -108,20 +108,46 @@ pub(crate) fn forward_dct_2d(block: &mut [i64], n: u32) {
 /// `X[k] = (k==0 ? 1/√2 : 1) · (2/N) · Σ_i x[i] cos((2i+1)kπ / 2N)`.
 fn fwd_dct_1d(src: &[f64], dst: &mut [f64]) {
     let nf = src.len() as f64;
+    let table = dct_cos_table(src.len());
     for (k, slot) in dst.iter_mut().enumerate() {
         let scale = if k == 0 {
             std::f64::consts::FRAC_1_SQRT_2
         } else {
             1.0
         };
-        let sum: f64 = src
-            .iter()
-            .enumerate()
-            .map(|(i, &x)| {
-                x * ((2 * i + 1) as f64 * k as f64 * std::f64::consts::PI / (2.0 * nf)).cos()
-            })
-            .sum();
+        let row = &table[k * src.len()..(k + 1) * src.len()];
+        let sum: f64 = src.iter().zip(row).map(|(&x, &c)| x * c).sum();
         *slot = scale * (2.0 / nf) * sum;
+    }
+}
+
+/// `cos( (2i+1)kπ / 2N )` for `N ∈ {4, 8, 16, 32}`, row-major
+/// `[k][i]`, evaluated once (round 458: the per-coefficient cosine
+/// call was the forward transform's whole cost). The entries are the
+/// exact doubles the inline expression produced, so every coefficient
+/// — and every coded byte — is unchanged.
+fn dct_cos_table(n: usize) -> &'static [f64] {
+    static TABLES: std::sync::OnceLock<[Vec<f64>; 4]> = std::sync::OnceLock::new();
+    let t = TABLES.get_or_init(|| {
+        let build = |n: usize| -> Vec<f64> {
+            let nf = n as f64;
+            let mut v = vec![0.0f64; n * n];
+            for k in 0..n {
+                for i in 0..n {
+                    v[k * n + i] =
+                        ((2 * i + 1) as f64 * k as f64 * std::f64::consts::PI / (2.0 * nf)).cos();
+                }
+            }
+            v
+        };
+        [build(4), build(8), build(16), build(32)]
+    });
+    match n {
+        4 => &t[0],
+        8 => &t[1],
+        16 => &t[2],
+        32 => &t[3],
+        _ => unreachable!("transform sizes are 4, 8, 16, 32"),
     }
 }
 

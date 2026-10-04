@@ -373,9 +373,9 @@ impl std::fmt::Debug for Vp9Encoder {
 }
 
 impl Vp9Encoder {
-    /// Build an encoder from stream parameters: `width` / `height` /
-    /// `pixel_format` are required; `options` carries
-    /// [`Vp9EncoderOptions`].
+    /// Build an encoder from stream parameters: `width` / `height` are
+    /// required, `pixel_format` defaults to `Yuv420P`; `options`
+    /// carries [`Vp9EncoderOptions`].
     pub fn new(params: &CodecParameters) -> CoreResult<Self> {
         let width = params
             .width
@@ -383,9 +383,9 @@ impl Vp9Encoder {
         let height = params
             .height
             .ok_or_else(|| CoreError::invalid("vp9 encoder: height is required"))?;
-        let fmt = params
-            .pixel_format
-            .ok_or_else(|| CoreError::invalid("vp9 encoder: pixel_format is required"))?;
+        // No declared layout: 8-bit 4:2:0 (profile 0), the format every
+        // VP9 decoder supports.
+        let fmt = params.pixel_format.unwrap_or(PixelFormat::Yuv420P);
         let opts: Vp9EncoderOptions = parse_options(&params.options)?;
 
         let Some((bit_depth, ssx, ssy)) = format_triple(fmt) else {
@@ -542,7 +542,8 @@ pub fn make_decoder(_params: &CodecParameters) -> CoreResult<Box<dyn Decoder>> {
 }
 
 /// Direct encoder factory (the registry's `EncoderFactory`): build a
-/// [`Vp9Encoder`] from `width` / `height` / `pixel_format` +
+/// [`Vp9Encoder`] from `width` / `height` / `pixel_format` (default
+/// `Yuv420P`) +
 /// [`Vp9EncoderOptions`].
 pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
     Ok(Box::new(Vp9Encoder::new(params)?))

@@ -59,8 +59,12 @@
 //! extents lines 5944-5948; §7.2.6 `compute_image_size( )` lines
 //! 1760-1761).
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
+
 use crate::superblock_loop_filter::{
-    SuperblockFilterFrame, SuperblockFilterPlane, superblock_loop_filter,
+    PlaneWindow, SuperblockFilterFrame, SuperblockFilterPlane, superblock_loop_filter,
+    superblock_loop_filter_window,
 };
 
 /// The 3-plane `CurrFrame` array of reconstructed samples — the §8.8
@@ -109,6 +113,29 @@ pub struct CurrFrame<'a> {
 /// * Whenever the inner §8.8.2 driver panics (inconsistent plane
 ///   view, short per-MI arrays, or invalid per-MI decode state).
 pub fn frame_loop_filter(curr: &mut CurrFrame, frame: &SuperblockFilterFrame) {
+    check_extents(curr, frame);
+
+    // §8.8 lines 5451-5455: the four-deep superblock raster.
+    for row in (0..frame.mi_rows).step_by(8) {
+        for col in (0..frame.mi_cols).step_by(8) {
+            for plane in 0..3u8 {
+                for pass in 0..2u8 {
+                    superblock_loop_filter(
+                        &mut curr.planes[plane as usize],
+                        frame,
+                        plane,
+                        pass,
+                        row,
+                        col,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The §7.2.6 / §8.10 plane-extent checks shared by both drivers.
+fn check_extents(curr: &CurrFrame, frame: &SuperblockFilterFrame) {
     // §7.2.6 lines 1760-1761: MiCols = (FrameWidth + 7) >> 3,
     // MiRows = (FrameHeight + 7) >> 3 — tie the luma plane extent to
     // the MiRows x MiCols grid the raster (and the per-MI arrays) use.
@@ -129,21 +156,299 @@ pub fn frame_loop_filter(curr: &mut CurrFrame, frame: &SuperblockFilterFrame) {
             "§8.8: chroma plane extent inconsistent with subsampling (§8.10)"
         );
     }
+}
 
-    // §8.8 lines 5451-5455: the four-deep superblock raster.
-    for row in (0..frame.mi_rows).step_by(8) {
-        for col in (0..frame.mi_cols).step_by(8) {
-            for plane in 0..3u8 {
-                for pass in 0..2u8 {
-                    superblock_loop_filter(
-                        &mut curr.planes[plane as usize],
-                        frame,
-                        plane,
-                        pass,
-                        row,
-                        col,
-                    );
+/// The rows above a superblock row that its §8.8.2 calls read and
+/// write: the top edge's `p7..p0` side (the widest §8.8.5 stencil
+/// reaches eight samples to each side of the edge).
+const HALO_ROWS: usize = 8;
+
+/// Per-row progress of the row-parallel driver: `done[ r ]` counts the
+/// halo slots superblock row `r` has published.
+struct RowProgress {
+    done: Mutex<Vec<usize>>,
+    changed: Condvar,
+    abort: AtomicBool,
+}
+
+impl RowProgress {
+    /// Record that row `r` has published `n` slots.
+    fn publish(&self, r: usize, n: usize) {
+        let mut done = self.done.lock().unwrap_or_else(|e| e.into_inner());
+        done[r] = n;
+        self.changed.notify_all();
+    }
+
+    /// Block until row `r` has published more than `c` slots. `false`
+    /// when another worker failed and the walk is being abandoned.
+    fn wait_for(&self, r: usize, c: usize) -> bool {
+        let mut done = self.done.lock().unwrap_or_else(|e| e.into_inner());
+        while done[r] <= c {
+            if self.abort.load(Ordering::Acquire) {
+                return false;
+            }
+            done = self.changed.wait(done).unwrap_or_else(|e| e.into_inner());
+        }
+        true
+    }
+
+    /// Release every waiter (a worker panicked).
+    fn fail(&self) {
+        self.abort.store(true, Ordering::Release);
+        let _guard = self.done.lock().unwrap_or_else(|e| e.into_inner());
+        self.changed.notify_all();
+    }
+}
+
+/// [`frame_loop_filter`] with the superblock rows on up to `workers`
+/// threads. The bytes equal the serial raster for any worker count;
+/// `workers <= 1` (or a single superblock row) runs the serial raster.
+///
+/// # Why the rows can overlap
+///
+/// The §8.8.2 call for superblock `(row, col)` reads and writes only
+/// the samples of its own superblock plus the [`HALO_ROWS`] rows above
+/// it (its top edge, horizontal pass) and the seven columns left of it
+/// (its left edge, vertical pass). In the raster the samples it needs
+/// from the superblock row above are final once that row has finished
+/// superblock `col + 1` — the last call of the row above that writes
+/// them (the left edge of `col + 1` reaches seven columns into `col`).
+/// No call of the row above after that point touches them, and no call
+/// of this row touches anything the row above still has to read. So
+/// each superblock row runs in a wavefront two superblocks behind the
+/// row above and every call sees exactly the samples the serial raster
+/// shows it.
+///
+/// # Data flow
+///
+/// Nothing is shared mutably between workers. Each superblock row owns
+/// its rows of every plane and filters them in a private window that
+/// also holds the [`HALO_ROWS`] rows above. When the row finishes
+/// superblock `col`, it publishes the bottom [`HALO_ROWS`] rows of
+/// superblock `col - 1` (now final as far as it is concerned) into a
+/// per-superblock slot; the row below copies the slot into its window
+/// before filtering superblock `col - 1`. When a row is done, it writes
+/// its own rows back and hands over its halo rows — which it has
+/// filtered last, so they are final — and those are copied into the
+/// row above once every worker has joined.
+pub(crate) fn frame_loop_filter_rows(
+    curr: &mut CurrFrame,
+    frame: &SuperblockFilterFrame,
+    workers: usize,
+) {
+    let sb_rows = frame.mi_rows.div_ceil(8) as usize;
+    let sb_cols = frame.mi_cols.div_ceil(8) as usize;
+    let workers = workers.min(sb_rows);
+    if workers <= 1 {
+        frame_loop_filter(curr, frame);
+        return;
+    }
+    // The extent checks of the serial driver (shared panics).
+    check_extents(curr, frame);
+
+    // Per plane: (width, stride, rows per superblock row, columns per
+    // superblock, plane height).
+    let geom: [(usize, usize, usize, usize, usize); 3] = std::array::from_fn(|p| {
+        let v = &curr.planes[p];
+        let (sx, sy) = if p == 0 {
+            (0, 0)
+        } else {
+            (frame.subsampling_x as usize, frame.subsampling_y as usize)
+        };
+        (v.width, v.stride, 64 >> sy, 64 >> sx, v.height)
+    });
+    let own_rows = |p: usize, r: usize| -> (usize, usize) {
+        let (_, _, sb_h, _, h) = geom[p];
+        ((r * sb_h).min(h), ((r + 1) * sb_h).min(h))
+    };
+
+    // Split every plane into the disjoint per-row chunks the workers own.
+    let mut chunks: Vec<Option<[&mut [i32]; 3]>> = (0..sb_rows).map(|_| None).collect();
+    {
+        let [y, u, v] = &mut curr.planes;
+        let mut rest: [&mut [i32]; 3] = [&mut *y.data, &mut *u.data, &mut *v.data];
+        for (r, chunk) in chunks.iter_mut().enumerate() {
+            let parts: [&mut [i32]; 3] = std::array::from_fn(|p| {
+                let (y0, y1) = own_rows(p, r);
+                let stride = geom[p].1;
+                let len = if r + 1 == sb_rows {
+                    rest[p].len()
+                } else {
+                    (y1 - y0) * stride
+                };
+                let (a, b) = std::mem::take(&mut rest[p]).split_at_mut(len);
+                rest[p] = b;
+                a
+            });
+            *chunk = Some(parts);
+        }
+    }
+    let chunks = Mutex::new(chunks);
+
+    // slots[ r * sb_cols + c ]: the bottom HALO_ROWS rows of superblock
+    // (r, c), per plane, as row r leaves them.
+    let slots: Vec<OnceLock<[Vec<i32>; 3]>> =
+        (0..sb_rows * sb_cols).map(|_| OnceLock::new()).collect();
+    // tops[ r ]: row r's final values of the HALO_ROWS rows above it.
+    let tops: Vec<OnceLock<[Vec<i32>; 3]>> = (0..sb_rows).map(|_| OnceLock::new()).collect();
+    let progress = RowProgress {
+        done: Mutex::new(vec![0; sb_rows]),
+        changed: Condvar::new(),
+        abort: AtomicBool::new(false),
+    };
+    let next_row = AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let (chunks, slots, tops, progress, next_row, geom) =
+                (&chunks, &slots, &tops, &progress, &next_row, &geom);
+            scope.spawn(move || {
+                // A panicking worker must release the rows waiting on it
+                // (the scope re-raises the panic).
+                struct Unblock<'p>(&'p RowProgress);
+                impl Drop for Unblock<'_> {
+                    fn drop(&mut self) {
+                        if std::thread::panicking() {
+                            self.0.fail();
+                        }
+                    }
                 }
+                let _unblock = Unblock(progress);
+                loop {
+                    let r = next_row.fetch_add(1, Ordering::AcqRel);
+                    if r >= sb_rows || progress.abort.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let chunk = chunks.lock().unwrap_or_else(|e| e.into_inner())[r]
+                        .take()
+                        .expect("row chunk taken once");
+                    // The row's window per plane: halo rows, then its own.
+                    let halo: [usize; 3] = std::array::from_fn(|p| {
+                        if r == 0 {
+                            0
+                        } else {
+                            HALO_ROWS.min(own_rows(p, r).0)
+                        }
+                    });
+                    let mut windows: [Vec<i32>; 3] = std::array::from_fn(|p| {
+                        let (w, stride, ..) = geom[p];
+                        let (y0, y1) = own_rows(p, r);
+                        let mut buf = vec![0; (halo[p] + y1 - y0) * w];
+                        for (dst, src) in buf[halo[p] * w..]
+                            .chunks_exact_mut(w)
+                            .zip(chunk[p].chunks(stride))
+                        {
+                            dst.copy_from_slice(&src[..w]);
+                        }
+                        buf
+                    });
+                    let publish_slot = |windows: &[Vec<i32>; 3], c: usize| {
+                        let cells: [Vec<i32>; 3] = std::array::from_fn(|p| {
+                            let (w, _, _, sb_w, _) = geom[p];
+                            let (x0, x1) = ((c * sb_w).min(w), ((c + 1) * sb_w).min(w));
+                            let rows = windows[p].len() / w;
+                            let keep = HALO_ROWS.min(rows);
+                            let mut cell = Vec::with_capacity(keep * (x1 - x0));
+                            for line in windows[p][(rows - keep) * w..].chunks_exact(w) {
+                                cell.extend_from_slice(&line[x0..x1]);
+                            }
+                            cell
+                        });
+                        let _ = slots[r * sb_cols + c].set(cells);
+                    };
+                    for c in 0..sb_cols {
+                        if r > 0 {
+                            if !progress.wait_for(r - 1, c) {
+                                return;
+                            }
+                            let cells = slots[(r - 1) * sb_cols + c]
+                                .get()
+                                .expect("published before progress");
+                            for p in 0..3 {
+                                let (w, _, _, sb_w, _) = geom[p];
+                                let (x0, x1) = ((c * sb_w).min(w), ((c + 1) * sb_w).min(w));
+                                if x1 == x0 || halo[p] == 0 {
+                                    continue;
+                                }
+                                // The slot holds the last HALO_ROWS rows
+                                // of the row above; the window wants the
+                                // last `halo[p]` of them.
+                                let slot_rows = cells[p].len() / (x1 - x0);
+                                let skip = slot_rows - halo[p];
+                                for (k, src) in
+                                    cells[p].chunks_exact(x1 - x0).skip(skip).enumerate()
+                                {
+                                    windows[p][k * w + x0..k * w + x1].copy_from_slice(src);
+                                }
+                            }
+                        }
+                        for (p, buf) in windows.iter_mut().enumerate() {
+                            let (w, ..) = geom[p];
+                            let (y0, _) = own_rows(p, r);
+                            let rows = buf.len() / w;
+                            if rows == 0 {
+                                continue;
+                            }
+                            let mut window = PlaneWindow {
+                                data: buf,
+                                stride: w,
+                                width: w,
+                                height: rows,
+                                y_origin: y0 - halo[p],
+                            };
+                            for pass in 0..2u8 {
+                                superblock_loop_filter_window(
+                                    &mut window,
+                                    frame,
+                                    p as u8,
+                                    pass,
+                                    (r * 8) as u32,
+                                    (c * 8) as u32,
+                                );
+                            }
+                        }
+                        if c > 0 && r + 1 < sb_rows {
+                            publish_slot(&windows, c - 1);
+                            progress.publish(r, c);
+                        }
+                    }
+                    if r + 1 < sb_rows {
+                        publish_slot(&windows, sb_cols - 1);
+                    }
+                    progress.publish(r, sb_cols);
+                    // Own rows back to the chunk; the halo rows are final.
+                    for p in 0..3 {
+                        let (w, stride, ..) = geom[p];
+                        for (src, dst) in windows[p][halo[p] * w..]
+                            .chunks_exact(w)
+                            .zip(chunk[p].chunks_mut(stride))
+                        {
+                            dst[..w].copy_from_slice(src);
+                        }
+                    }
+                    if r > 0 {
+                        let top: [Vec<i32>; 3] = std::array::from_fn(|p| {
+                            let w = geom[p].0;
+                            windows[p][..halo[p] * w].to_vec()
+                        });
+                        let _ = tops[r].set(top);
+                    }
+                }
+            });
+        }
+    });
+
+    // The halo rows each row filtered last, into the rows above it.
+    for (r, top) in tops.into_iter().enumerate().skip(1) {
+        let Some(top) = top.into_inner() else {
+            continue;
+        };
+        for (p, rows) in top.iter().enumerate() {
+            let (w, stride, ..) = geom[p];
+            let y0 = own_rows(p, r).0 - rows.len() / w.max(1);
+            for (k, src) in rows.chunks_exact(w).enumerate() {
+                let at = (y0 + k) * stride;
+                curr.planes[p].data[at..at + w].copy_from_slice(src);
             }
         }
     }
@@ -510,5 +815,90 @@ mod tests {
             PlaneBuf::filled(64, 64, 100),
         ];
         run_frame(&mut planes, &fix);
+    }
+
+    /// A grid mixing every edge kind the §8.8.3 filter sizes cover: per
+    /// superblock, either 64x64 / 32x32-transform blocks (the 16-wide
+    /// filter on the 32-sample edges), 16x16 / 8x8-transform blocks or
+    /// 8x8 / 4x4-transform blocks, with some skipped inter blocks
+    /// (internal edges off) and two loop-filter levels via segments.
+    fn mixed(mi_cols: u32, mi_rows: u32, sub_x: u8, sub_y: u8) -> Fixture {
+        use crate::filter_size::{TX_16X16, TX_32X32, TX_8X8};
+        use crate::residual::{BLOCK_16X16, BLOCK_64X64};
+        let mut fix = Fixture::uniform(mi_cols, mi_rows, sub_x, sub_y, 40);
+        let mut seg = seg_disabled();
+        seg.enabled = true;
+        seg.feature_enabled[1][crate::loop_filter::SEG_LVL_ALT_L] = true;
+        seg.feature_data[1][crate::loop_filter::SEG_LVL_ALT_L] = 12;
+        fix.lookup = loop_filter_frame_init(&lf(40), &seg, [0; 4], [0; 2]);
+        for r in 0..mi_rows as usize {
+            for c in 0..mi_cols as usize {
+                let i = r * mi_cols as usize + c;
+                let kind = ((r / 8) * 7 + (c / 8) * 3) % 3;
+                let (bs, tx) = match kind {
+                    0 => (BLOCK_64X64, TX_32X32),
+                    1 => (BLOCK_16X16, TX_8X8),
+                    _ => (BLOCK_8X8, TX_4X4),
+                };
+                fix.mi_sizes[i] = bs;
+                fix.tx_sizes[i] = if (r + c) % 5 == 0 {
+                    TX_16X16.min(tx)
+                } else {
+                    tx
+                };
+                fix.skips[i] = (r * 3 + c) % 4 == 0;
+                fix.refs[i] = if fix.skips[i] { 1 } else { 0 };
+                fix.seg_ids[i] = ((r + 2 * c) % 3 == 0) as u8;
+            }
+        }
+        fix
+    }
+
+    #[test]
+    fn row_parallel_matches_serial_raster() {
+        // Heights that end mid-superblock (and mid-8x8 for chroma),
+        // every subsampling, worker counts below / at / above the row
+        // count.
+        for &(mi_cols, mi_rows) in &[(24u32, 17u32), (17, 40), (9, 9), (32, 33), (8, 16)] {
+            for &(sx, sy) in &[(1u8, 1u8), (1, 0), (0, 0)] {
+                let fix = mixed(mi_cols, mi_rows, sx, sy);
+                let frame = fix.frame();
+                // Near-flat blocks (noise of 0..=1) with small steps
+                // between 8x8 cells: the flat / flat2 masks hold often,
+                // so the 8- and 16-wide filters fire across every edge
+                // kind, alongside the 4-wide filter.
+                let mut base = noise_planes(&fix, mi_cols * 131 + mi_rows, 1);
+                for pb in base.iter_mut() {
+                    for y in 0..pb.h {
+                        for x in 0..pb.w {
+                            pb.data[y * pb.w + x] +=
+                                100 + (((x / 8) * 5 + (y / 8) * 3) % 4) as i32 * 2;
+                        }
+                    }
+                }
+                let mut want = base.clone();
+                reference_raster(&mut want, &fix);
+                assert!(
+                    want[0].data != base[0].data,
+                    "the fixture filters something"
+                );
+                for workers in [1usize, 2, 3, 8] {
+                    let mut got = base.clone();
+                    {
+                        let [a, b, c] = &mut got;
+                        let mut curr = CurrFrame {
+                            planes: [a.view(), b.view(), c.view()],
+                        };
+                        frame_loop_filter_rows(&mut curr, &frame, workers);
+                    }
+                    for p in 0..3 {
+                        assert!(
+                            got[p].data == want[p].data,
+                            "plane {p} differs: {mi_cols}x{mi_rows} sub=({sx},{sy}) workers={workers}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

@@ -225,6 +225,7 @@ fn abs_diff(a: i32, b: i32) -> i32 {
 ///     flatMask2 = (mask == 0)
 /// }
 /// ```
+#[inline]
 pub fn filter_mask(
     samples: &FilterMaskSamples,
     limit: u8,

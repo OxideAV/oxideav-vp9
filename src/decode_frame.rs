@@ -51,7 +51,7 @@ use crate::compressed::{
 };
 use crate::decode_block::{DecodedBlockResult, Vp9FrameState, decode_block_apply};
 use crate::dequant::{get_ac_quant, get_dc_quant, seg_feature_active};
-use crate::frame_loop_filter::{CurrFrame, frame_loop_filter};
+use crate::frame_loop_filter::{CurrFrame, frame_loop_filter_rows};
 use crate::header::{
     ColorConfig, FrameType, MAX_SEGMENTS, QuantizationParams, RefFrameState, SEG_LVL_MAX,
     SegmentationParams, Vp9FrameHeader, parse_uncompressed_header,
@@ -1865,7 +1865,13 @@ fn decode_single_frame(
                 },
             ],
         };
-        frame_loop_filter(&mut curr, &filter_frame);
+        // Superblock rows run in a wavefront on the ExecutionContext budget
+        // (one worker = the plain §8.8 raster); the bytes are the same.
+        frame_loop_filter_rows(
+            &mut curr,
+            &filter_frame,
+            exec.effective_workers(sb64_rows as usize),
+        );
     }
 
     // §8.10 output: crop the working planes to the visible extents.

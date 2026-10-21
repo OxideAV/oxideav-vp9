@@ -389,7 +389,7 @@ mod tests {
                     o.oq4, o.oq5, o.oq6,
                 ];
                 let want = spec_outputs(&v, log2_size);
-                let first = (7 - (want.len() / 2)) as usize; // op(n-1) is slot 0 of got for n == 7
+                let first = 7 - (want.len() / 2); // op(n-1) is slot 0 of got for n == 7
                 assert_eq!(
                     &got[first..first + want.len()],
                     &want[..],

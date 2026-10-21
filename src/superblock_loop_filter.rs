@@ -57,7 +57,7 @@
 //! stencil addressing lines 5703-5727; §6.4.22 `get_uv_tx_size( )`
 //! lines 2871-2876).
 
-use crate::adaptive_filter_strength::adaptive_filter_strength;
+use crate::adaptive_filter_strength::{FilterStrength, adaptive_filter_strength};
 use crate::filter_size::{PASS_VERTICAL, filter_size};
 use crate::loop_filter::LvlLookup;
 use crate::residual::get_uv_tx_size;
@@ -297,6 +297,10 @@ pub fn superblock_loop_filter(
 
     // §8.8.2 lines 5524-5525: edge ∈ 0..(16 >> sub) - 1, i ∈ 0..edgeLen - 1.
     for edge in 0..(16u32 >> geom.sub) {
+        // Steps 2-16 depend on (x, y) only through the mode-info cell
+        // (x >> 3, y >> 3): consecutive samples of an edge in the same
+        // cell share the decision, made once for the cell.
+        let mut cached: Option<((u32, u32), Option<(u8, FilterStrength)>)> = None;
         for i in 0..geom.edge_len {
             // Step 1 (lines 5527-5531): x / y in luma coordinates.
             let (x, y) = if pass == PASS_VERTICAL {
@@ -313,87 +317,101 @@ pub fn superblock_loop_filter(
                 continue;
             }
 
-            // Steps 2-3 (lines 5532-5533): loopCol / loopRow.
-            let loop_col = ((x >> 3) >> sub_x) << sub_x;
-            let loop_row = ((y >> 3) >> sub_y) << sub_y;
-            let idx = loop_row as usize * frame.mi_cols as usize + loop_col as usize;
+            let cell = (x >> 3, y >> 3);
+            let decision = match cached {
+                Some((c, d)) if c == cell => d,
+                _ => {
+                    let d = 'decide: {
+                        // Steps 2-3 (lines 5532-5533): loopCol / loopRow.
+                        let loop_col = ((x >> 3) >> sub_x) << sub_x;
+                        let loop_row = ((y >> 3) >> sub_y) << sub_y;
+                        let idx = loop_row as usize * frame.mi_cols as usize + loop_col as usize;
 
-            // Steps 4-5 (lines 5534-5535): MiSize / tx_size.
-            let mi_size = frame.mi_sizes[idx];
-            let tx_size = frame.tx_sizes[idx];
+                        // Steps 4-5 (lines 5534-5535): MiSize / tx_size.
+                        let mi_size = frame.mi_sizes[idx];
+                        let tx_size = frame.tx_sizes[idx];
 
-            // Step 6 (line 5537): txSz = (plane > 0) ? get_uv_tx_size( )
-            // : tx_size, with §6.4.22 reading the MiSize / tx_size at
-            // (loopRow, loopCol) and the frame subsampling.
-            let tx_sz = if plane > 0 {
-                get_uv_tx_size(
-                    u32::from(tx_size),
-                    mi_size,
-                    frame.subsampling_x == 1,
-                    frame.subsampling_y == 1,
-                ) as u8
-            } else {
-                tx_size
+                        // Step 6 (line 5537): txSz = (plane > 0) ? get_uv_tx_size( )
+                        // : tx_size, with §6.4.22 reading the MiSize / tx_size at
+                        // (loopRow, loopCol) and the frame subsampling.
+                        let tx_sz = if plane > 0 {
+                            get_uv_tx_size(
+                                u32::from(tx_size),
+                                mi_size,
+                                frame.subsampling_x == 1,
+                                frame.subsampling_y == 1,
+                            ) as u8
+                        } else {
+                            tx_size
+                        };
+
+                        // Steps 7-14 (lines 5538-5578): the round-274 predicate
+                        // bundle (isBlockEdge / isTxEdge / is32Edge / onScreen /
+                        // applyFilter).
+                        let mi = SuperblockFilterMi {
+                            mi_size,
+                            tx_sz,
+                            skip: frame.skips[idx],
+                            ref_frame_0: frame.ref_frames_0[idx],
+                        };
+                        let e = superblock_filter_edge(
+                            pass,
+                            row,
+                            col,
+                            edge,
+                            i,
+                            sub_x,
+                            sub_y,
+                            frame.mi_cols,
+                            frame.mi_rows,
+                            &mi,
+                        );
+                        if !e.apply_filter {
+                            // Step 17's applyFilter == 1 gate: steps 15-16 are
+                            // pure derivations with no other consumer, so the
+                            // whole tail is skipped.
+                            break 'decide None;
+                        }
+
+                        // Step 15 (lines 5579-5581): filterSize via §8.8.3.
+                        let f_size = filter_size(
+                            tx_sz,
+                            e.is_32_edge,
+                            pass,
+                            e.x,
+                            e.y,
+                            sub_x as u8,
+                            sub_y as u8,
+                            frame.mi_cols,
+                            frame.mi_rows,
+                        );
+
+                        // Step 16 (lines 5582-5583): lvl / limit / blimit / thresh
+                        // via §8.8.4 at (loopRow, loopCol).
+                        let strength = adaptive_filter_strength(
+                            frame.lvl_lookup,
+                            frame.segment_ids[idx] as usize,
+                            frame.ref_frames_0[idx],
+                            frame.y_modes[idx],
+                            frame.loop_filter_sharpness,
+                        )
+                        .expect("§8.8.4: segment_id must be < 8 and ref_frame in 0..=3");
+                        Some((f_size, strength))
+                    };
+                    cached = Some((cell, d));
+                    d
+                }
             };
-
-            // Steps 7-14 (lines 5538-5578): the round-274 predicate
-            // bundle (isBlockEdge / isTxEdge / is32Edge / onScreen /
-            // applyFilter).
-            let mi = SuperblockFilterMi {
-                mi_size,
-                tx_sz,
-                skip: frame.skips[idx],
-                ref_frame_0: frame.ref_frames_0[idx],
-            };
-            let e = superblock_filter_edge(
-                pass,
-                row,
-                col,
-                edge,
-                i,
-                sub_x,
-                sub_y,
-                frame.mi_cols,
-                frame.mi_rows,
-                &mi,
-            );
-            if !e.apply_filter {
-                // Step 17's applyFilter == 1 gate: steps 15-16 are
-                // pure derivations with no other consumer, so the
-                // whole tail is skipped.
+            let Some((f_size, strength)) = decision else {
                 continue;
-            }
-
-            // Step 15 (lines 5579-5581): filterSize via §8.8.3.
-            let f_size = filter_size(
-                tx_sz,
-                e.is_32_edge,
-                pass,
-                e.x,
-                e.y,
-                sub_x as u8,
-                sub_y as u8,
-                frame.mi_cols,
-                frame.mi_rows,
-            );
-
-            // Step 16 (lines 5582-5583): lvl / limit / blimit / thresh
-            // via §8.8.4 at (loopRow, loopCol).
-            let strength = adaptive_filter_strength(
-                frame.lvl_lookup,
-                frame.segment_ids[idx] as usize,
-                frame.ref_frames_0[idx],
-                frame.y_modes[idx],
-                frame.loop_filter_sharpness,
-            )
-            .expect("§8.8.4: segment_id must be < 8 and ref_frame in 0..=3");
+            };
 
             // Step 17 (lines 5584-5586): if applyFilter == 1 and
             // lvl > 0, run §8.8.5 at (x >> subX, y >> subY) along
             // (dx, dy).
             if strength.lvl > 0 {
-                let px = i64::from(e.x >> sub_x);
-                let py = i64::from(e.y >> sub_y);
+                let px = i64::from(x >> sub_x);
+                let py = i64::from(y >> sub_y);
                 let (dx, dy) = (i64::from(geom.dx), i64::from(geom.dy));
                 let stencil = gather_stencil(plane_buf, px, py, dx, dy);
                 let out = sample_filtering(

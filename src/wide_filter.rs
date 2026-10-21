@@ -205,49 +205,6 @@ fn round2(x: i32, n: u32) -> i32 {
     (x + (1 << (n - 1))) >> n
 }
 
-/// Index helper — return the sample at position index `k` per the
-/// `vp9-spec.txt` §8.8.5.3 line 5869 mapping
-/// `CurrFrame[ plane ][ y+k*dy ][ x+k*dx ]`:
-///
-/// * `k == 0` → `q0`
-/// * `k > 0` → `q[k-1+1] = q[k]` — wait, no:
-///
-/// Per the §8.8.5.1 stencil at lines 5703-5727: `q1` lives at offset
-/// `+1` (i.e. `y+dy, x+dx`), so position index `k > 0` maps to
-/// `q[k - 1]`'s field — actually, re-reading: `q1 = CurrFrame[ ][
-/// y+dy ][ x+dx ]` means `q1` is at the position with `k = 1` in the
-/// wide-filter indexing. So position `k = j` for `j >= 1` is the
-/// `q{j}` sample. Position `k = 0` is `q0`.
-///
-/// And `p0 = CurrFrame[ ][ y-dy ][ x-dx ]` so position `k = -1` is
-/// `p0`. `p1` at `y-dy*2` → position `k = -2`. So position `k = -j`
-/// for `j >= 1` is `p{j-1}`.
-#[inline]
-fn sample_at(s: &WideFilterSamples, k: i32) -> i32 {
-    match k {
-        // §8.8.5.1 line 5703: q0 at offset (y, x) i.e. k = 0.
-        0 => s.q0,
-        // §8.8.5.1 lines 5713-5719: q{k} at offset k for k = 1..=7.
-        1 => s.q1,
-        2 => s.q2,
-        3 => s.q3,
-        4 => s.q4,
-        5 => s.q5,
-        6 => s.q6,
-        7 => s.q7,
-        // §8.8.5.1 lines 5720-5727: p{|k|-1} at offset k for k = -1..-8.
-        -1 => s.p0,
-        -2 => s.p1,
-        -3 => s.p2,
-        -4 => s.p3,
-        -5 => s.p4,
-        -6 => s.p5,
-        -7 => s.p6,
-        -8 => s.p7,
-        _ => unreachable!("wide_filter position index out of [-8, 7]"),
-    }
-}
-
 /// Run §8.8.5.3 `wide filter process` for one edge per
 /// `vp9-spec.txt` lines 5855-5888.
 ///
@@ -317,34 +274,23 @@ pub fn wide_filter(
     // 7). For log2_size == 3 only positions [-3, 2] are filled.
     let mut f = [0_i32; 14];
 
+    // The samples by position (`k` at index `k + 8`: p7 ..= q7).
+    let s = [
+        samples.p7, samples.p6, samples.p5, samples.p4, samples.p3, samples.p2, samples.p1,
+        samples.p0, samples.q0, samples.q1, samples.q2, samples.q3, samples.q4, samples.q5,
+        samples.q6, samples.q7,
+    ];
+    let at = |k: i32| s[(clip3(-(n + 1), n, k) + 8) as usize];
+
+    // §8.8.5.3 lines 5868-5881: `F[i] = Round2(t, log2Size)` with
+    // `t = sample(i) + sum_{j=-n..=n} sample(Clip3(-(n+1), n, i+j))`.
+    // The clamped window sum slides by one position per `i`: it drops
+    // `Clip3(.., i-n)` and gains `Clip3(.., i+n+1)`, so each `F[i]` costs
+    // O(1) instead of O(n). Integer arithmetic, so the result is exact.
+    let mut window: i32 = (-n..=n).map(|j| at(-n + j)).sum();
     for i in -n..n {
-        // §8.8.5.3 line 5869 — `t = CurrFrame[ plane ][ y+i*dy ][
-        // x+i*dx ]`. Index `i` into the §8.8.5.1 sample mapping at
-        // lines 5703-5727 (position `0` is `q0`, position `-1` is
-        // `p0`, etc.).
-        let mut t = sample_at(samples, i);
-
-        // §8.8.5.3 lines 5878-5881 — accumulate `2n+1` clamped
-        // samples. Together with the initial `t` that's `2n+2` total
-        // samples, matching `Round2( t, log2Size )` = `(t + (1 <<
-        // (log2Size-1))) >> log2Size` to renormalise into a
-        // unity-gain low-pass.
-        for j in -n..=n {
-            // §8.8.5.3 line 5879 — `p = Clip3( -(n+1), n, i+j )`.
-            // The clamp extends `p` by one sample beyond the
-            // outermost mutated position so the kernel can pull in
-            // edge-replicated samples (`p{n}` and `q{n}` are
-            // duplicated when `i+j` would exceed the range).
-            let p = clip3(-(n + 1), n, i + j);
-            t += sample_at(samples, p);
-        }
-
-        // §8.8.5.3 line 5882 — `F[ i ] = Round2( t, log2Size )`.
-        // Renormalises the `2n+2` summed samples down to a single
-        // output. The index translation `i - (-n) == i + n` lands
-        // the value at slot `0` for `i == -n`, slot `2n-1` for `i
-        // == n-1`.
-        f[(i + n) as usize] = round2(t, log2_size);
+        f[(i + n) as usize] = round2(at(i) + window, log2_size);
+        window += at(i + n + 1) - at(i - n);
     }
 
     // Pack the §8.8.5.3 outputs into a position-keyed struct.
@@ -396,6 +342,62 @@ pub fn wide_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The §8.8.5.3 sums evaluated literally, for every `F[i]`.
+    fn spec_outputs(v: &[i32; 16], log2_size: u32) -> Vec<i32> {
+        let n: i32 = (1 << (log2_size - 1)) - 1;
+        let at = |k: i32| v[(k + 8) as usize];
+        (-n..n)
+            .map(|i| {
+                let t = at(i) + (-n..=n).map(|j| at(clip3(-(n + 1), n, i + j))).sum::<i32>();
+                round2(t, log2_size)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn running_sum_equals_the_spec_sums() {
+        let mut x: u32 = 0x1234_5678;
+        for _ in 0..2000 {
+            let mut v = [0_i32; 16];
+            for s in v.iter_mut() {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *s = (x >> 20) as i32; // 0..4096: up to 12-bit samples
+            }
+            let samples = WideFilterSamples {
+                p7: v[0],
+                p6: v[1],
+                p5: v[2],
+                p4: v[3],
+                p3: v[4],
+                p2: v[5],
+                p1: v[6],
+                p0: v[7],
+                q0: v[8],
+                q1: v[9],
+                q2: v[10],
+                q3: v[11],
+                q4: v[12],
+                q5: v[13],
+                q6: v[14],
+                q7: v[15],
+            };
+            for log2_size in [3, 4] {
+                let o = wide_filter(&samples, log2_size, 12);
+                let got = [
+                    o.op6, o.op5, o.op4, o.op3, o.op2, o.op1, o.op0, o.oq0, o.oq1, o.oq2, o.oq3,
+                    o.oq4, o.oq5, o.oq6,
+                ];
+                let want = spec_outputs(&v, log2_size);
+                let first = (7 - (want.len() / 2)) as usize; // op(n-1) is slot 0 of got for n == 7
+                assert_eq!(
+                    &got[first..first + want.len()],
+                    &want[..],
+                    "log2_size {log2_size}"
+                );
+            }
+        }
+    }
 
     /// Build a stencil where every sample equals `v`. The low-pass
     /// kernel is unity-gain so every output equals `v` too, regardless

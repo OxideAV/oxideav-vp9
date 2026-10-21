@@ -295,14 +295,27 @@ pub(crate) fn block_inter_predict_plane(
     let filter = &SUBPEL_FILTERS[interp_filter];
     let intermediate_height = ((((h as i32 - 1) * y_step + 15) >> 4) + 8) as usize;
 
+    // Phase 0 is the `{ 0, 0, 0, 128, 0, 0, 0, 0 }` kernel: the filtered
+    // value is the centre sample itself (`Clip1(Round2(128 * v, 7)) == v`
+    // for a sample of the plane). Without scaling, a whole-sample vertical
+    // position reads only intermediate rows 3 ..= h + 2.
+    let rows = if y_step == 16 && (y & SUBPEL_MASK) == 0 {
+        3..h + 3
+    } else {
+        0..intermediate_height
+    };
     let mut intermediate = vec![0i32; intermediate_height * w];
-    for r in 0..intermediate_height {
+    for r in rows {
         let ref_row = clip3(0, last_y, (y >> 4) + r as i32 - 3) as usize;
         let row = &samples[ref_row * stride..ref_row * stride + (last_x as usize + 1)];
         let out = &mut intermediate[r * w..(r + 1) * w];
         for (c, slot) in out.iter_mut().enumerate() {
             let p = x + x_step * c as i32;
             let phase = (p & SUBPEL_MASK) as usize;
+            if phase == 0 {
+                *slot = row[clip3(0, last_x, p >> 4) as usize];
+                continue;
+            }
             let taps = &filter[phase];
             let base = (p >> 4) - 3;
             let mut s = 0i32;
@@ -327,6 +340,11 @@ pub(crate) fn block_inter_predict_plane(
         let phase = (p & SUBPEL_MASK) as usize;
         let taps = &filter[phase];
         let base_row = (p >> 4) as usize;
+        if phase == 0 {
+            let src = (base_row + 3) * w;
+            pred[r * w..(r + 1) * w].copy_from_slice(&intermediate[src..src + w]);
+            continue;
+        }
         for c in 0..w {
             let mut s = 0i32;
             for (t, &tap) in taps.iter().enumerate() {

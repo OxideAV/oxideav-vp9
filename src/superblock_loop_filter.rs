@@ -272,6 +272,10 @@ fn scatter_stencil(
     }
 }
 
+/// One mode-info cell's edge decision: the cell `(x >> 3, y >> 3)` and,
+/// when the edge is filtered there, its filter size and strength.
+type CellDecision = ((u32, u32), Option<(u8, FilterStrength)>);
+
 /// Run the §8.8.2 `superblock loop filter process` per `vp9-spec.txt`
 /// lines 5491-5586, modifying `plane_buf` in place.
 ///
@@ -344,7 +348,7 @@ pub fn superblock_loop_filter(
         // Steps 2-16 depend on (x, y) only through the mode-info cell
         // (x >> 3, y >> 3): consecutive samples of an edge in the same
         // cell share the decision, made once for the cell.
-        let mut cached: Option<((u32, u32), Option<(u8, FilterStrength)>)> = None;
+        let mut cached: Option<CellDecision> = None;
         for i in 0..geom.edge_len {
             // Step 1 (lines 5527-5531): x / y in luma coordinates.
             let (x, y) = if pass == PASS_VERTICAL {

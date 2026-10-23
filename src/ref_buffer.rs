@@ -82,6 +82,22 @@ pub(crate) struct RefSlot {
 }
 
 impl RefSlot {
+    /// The slot as a displayable frame — the §8.9
+    /// `show_existing_frame` output of `FrameStore[ i ]`.
+    pub fn to_decoded_frame(&self) -> crate::Vp9DecodedFrame {
+        let to_u16 = |p: &[i32]| p.iter().map(|&v| v as u16).collect();
+        crate::Vp9DecodedFrame {
+            width: self.frame_width,
+            height: self.frame_height,
+            bit_depth: self.bit_depth,
+            subsampling_x: self.subsampling_x,
+            subsampling_y: self.subsampling_y,
+            y: to_u16(&self.y),
+            u: to_u16(&self.u),
+            v: to_u16(&self.v),
+        }
+    }
+
     /// Chroma plane width (`(FrameWidth + subsampling_x) >>
     /// subsampling_x`) per §8.10.
     pub fn chroma_width(&self) -> usize {
@@ -166,15 +182,16 @@ impl RefBuffers {
         let lw = curr.frame_width as usize;
         let lh = curr.frame_height as usize;
 
-        // Crop the working planes to the visible extents once; the
-        // refreshed slots all receive the same cropped copy.
-        let crop = |src: &[i32], stride: usize, w: usize, h: usize| -> Vec<i32> {
-            let mut out = Vec::with_capacity(w * h);
-            for row in 0..h {
-                let base = row * stride;
-                out.extend_from_slice(&src[base..base + w]);
+        // Crop the working planes to the visible extents. The slot's
+        // own buffer is refilled in place, so a steady-state stream
+        // reuses its allocations instead of faulting in fresh pages
+        // every frame.
+        let crop = |dst: &mut Vec<i32>, src: &[i32], stride: usize, w: usize, h: usize| {
+            dst.clear();
+            dst.reserve(w * h);
+            for row in src.chunks(stride).take(h) {
+                dst.extend_from_slice(&row[..w]);
             }
-            out
         };
 
         for i in 0..NUM_REF_FRAMES {
@@ -187,9 +204,9 @@ impl RefBuffers {
             slot.subsampling_x = curr.subsampling_x;
             slot.subsampling_y = curr.subsampling_y;
             slot.bit_depth = curr.bit_depth;
-            slot.y = crop(curr.y, curr.y_stride, lw, lh);
-            slot.u = crop(curr.u, curr.uv_stride, cw, ch);
-            slot.v = crop(curr.v, curr.uv_stride, cw, ch);
+            crop(&mut slot.y, curr.y, curr.y_stride, lw, lh);
+            crop(&mut slot.u, curr.u, curr.uv_stride, cw, ch);
+            crop(&mut slot.v, curr.v, curr.uv_stride, cw, ch);
         }
     }
 }

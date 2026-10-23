@@ -605,7 +605,13 @@ pub use header::{
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use loop_filter::{LvlLookup, MAX_LOOP_FILTER, MAX_MODE_LF_DELTAS, loop_filter_frame_init};
-// internal — exposed for hardware decoders, which take each segment's quantizers
+// Stable: the §8.6.1 quantizer lookups (`dc_q` / `ac_q` tables, the
+// §6.4.9 segment-aware `get_qindex`, and the per-plane `get_dc_quant` /
+// `get_ac_quant` with the header deltas applied). A hardware front end
+// (VA-API / VideoToolbox-style) that decodes the compressed data in
+// silicon still has to hand the driver each segment's luma / chroma DC
+// and AC quantizers; it derives them here instead of carrying its own
+// copy of the tables and the segment logic.
 pub use dequant::{ac_q, dc_q, get_ac_quant, get_dc_quant, get_qindex};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]

@@ -8,7 +8,7 @@
 //! returned [`WideFilterOutput`] samples against the §8.8.5.3 listing
 //! verbatim.
 
-use oxideav_vp9::{wide_filter, WideFilterOutput, WideFilterSamples};
+use oxideav_vp9::{WideFilterOutput, WideFilterSamples, wide_filter};
 
 /// Build a stencil with every sample equal to `v`. The §8.8.5.3
 /// kernel is a normalised low-pass so every output equals `v`.

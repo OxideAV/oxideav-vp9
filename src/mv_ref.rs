@@ -1448,8 +1448,8 @@ mod tests {
         let mut cell = Cell::inter(LAST_FRAME, [0, 0], NEARESTMV);
         cell.sub_mv[0] = [[1, 1], [22, 22], [3, 3], [44, 44]];
         src.set(8, 7, cell); // left neighbour {0,-1}, deltaCol -1.
-                             // block == 1: idx_n_column_to_subblock[1][deltaCol==0? :] -> [1,3];
-                             // deltaCol != 0 -> column 0 -> sub index 1 -> [22,22].
+        // block == 1: idx_n_column_to_subblock[1][deltaCol==0? :] -> [1,3];
+        // deltaCol != 0 -> column 0 -> sub index 1 -> [22,22].
         let block_mvs = [[100, 100], [0, 0], [0, 0], [0, 0]];
         let out = g.append_sub8x8_mvs(&src, 1, LAST_FRAME, &block_mvs, &NO_BIAS, false);
         // slot 0 from BlockMvs[0]; slot 1 from RefListMv[0] == [22,22].

@@ -96,10 +96,10 @@
 
 #![allow(dead_code)] // surfaces land in the next round's §6.4.3 driver
 
+use crate::Error;
 use crate::bool_coder::BoolCoder;
 use crate::mode_info::tree_decode;
 use crate::residual::{BLOCK_8X8, BLOCK_SIZES};
-use crate::Error;
 
 // ----- §3 partition enumeration -----
 
@@ -672,7 +672,7 @@ pub(crate) struct LeafBlock {
 pub(crate) trait LeafSink {
     /// Handle one §6.4.4 `decode_block( r, c, subsize )` call site.
     fn leaf(&mut self, coder: &mut BoolCoder<'_>, r: u32, c: u32, subsize: u8)
-        -> Result<(), Error>;
+    -> Result<(), Error>;
 
     /// §9.3.4 counting hook: one `partition` syntax element was parsed
     /// with context `ctx` and value `partition` (`counts_partition[ ctx ]
@@ -773,11 +773,11 @@ pub(crate) fn write_back_partition_context(
 /// `BLOCK_16X16` / `BLOCK_32X32` / `BLOCK_64X64`); the recursion
 /// produces only the `subsize_lookup` children of those.
 #[allow(clippy::too_many_arguments)] // the §6.4.3 signature has 8 positional
-                                     // inputs by spec design (r / c / bsize +
-                                     // frame extents + context state + probs +
-                                     // leaf-log sink); each is independent and
-                                     // bundling them would obscure the spec
-                                     // mapping.
+// inputs by spec design (r / c / bsize +
+// frame extents + context state + probs +
+// leaf-log sink); each is independent and
+// bundling them would obscure the spec
+// mapping.
 pub(crate) fn decode_partition(
     coder: &mut BoolCoder<'_>,
     r: u32,
@@ -1008,11 +1008,11 @@ pub(crate) fn tile_col_bounds(mi_cols: u32, tile_cols_log2: u32, mi_c: u32) -> (
 /// caller never produces a backwards range — this assertion documents
 /// the precondition).
 #[allow(clippy::too_many_arguments)] // mirrors the §6.4 + §6.4.2 spec
-                                     // composition (four tile-offset
-                                     // inputs + two frame extents + ctx
-                                     // state + probs + leaf sink); each
-                                     // is independent and bundling them
-                                     // would obscure the spec mapping.
+// composition (four tile-offset
+// inputs + two frame extents + ctx
+// state + probs + leaf sink); each
+// is independent and bundling them
+// would obscure the spec mapping.
 pub(crate) fn decode_tile(
     coder: &mut BoolCoder<'_>,
     mi_row_start: u32,
@@ -1294,10 +1294,10 @@ pub(crate) struct DecodedTile {
 ///   exit-padding) or [`decode_partition`] / [`decode_tile`] surfaces
 ///   an inner bitstream violation.
 #[allow(clippy::too_many_arguments)] // mirrors the §6.4 spec
-                                     // composition (data + running sz
-                                     // + two tile-grid sizes + two
-                                     // frame extents + ctx state +
-                                     // probs).
+// composition (data + running sz
+// + two tile-grid sizes + two
+// frame extents + ctx state +
+// probs).
 pub(crate) fn decode_tiles(
     data: &[u8],
     sz: u32,
@@ -2710,7 +2710,7 @@ mod tests {
         let mut coder = BoolCoder::init_bool(bytes, 4).unwrap();
         let mut state = PartitionContextState::new(8, 8);
         state.above[0] = 7; // sentinel, must survive (clear_left does
-                            // NOT touch above)
+        // NOT touch above)
         let mut leaves: Vec<LeafBlock> = Vec::new();
         decode_tile(
             &mut coder,

@@ -26,11 +26,9 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_vp9::{
-    decode_vp9_sequence, encode_vp9_lossy_sequence_rc_two_pass_with,
-    encode_vp9_lossy_sequence_rc_two_pass_with_422,
-    encode_vp9_lossy_sequence_rc_two_pass_with_440,
-    encode_vp9_lossy_sequence_rc_two_pass_with_444,
-    encode_vp9_lossy_sequence_rc_two_pass_with_hbd, Vp9GopConfig, Vp9Segmentation,
+    Vp9GopConfig, Vp9Segmentation, decode_vp9_sequence, encode_vp9_lossy_sequence_rc_two_pass_with,
+    encode_vp9_lossy_sequence_rc_two_pass_with_422, encode_vp9_lossy_sequence_rc_two_pass_with_440,
+    encode_vp9_lossy_sequence_rc_two_pass_with_444, encode_vp9_lossy_sequence_rc_two_pass_with_hbd,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -129,7 +127,10 @@ fuzz_target!(|data: &[u8]| {
     .expect("structured two-pass encodes");
 
     assert_eq!(report.len(), packets.len(), "one report entry per packet");
-    assert!(report[0].keyframe && report[0].frame == 0, "first packet is the keyframe");
+    assert!(
+        report[0].keyframe && report[0].frame == 0,
+        "first packet is the keyframe"
+    );
     let mut coded = vec![0u8; n_frames];
     for (p, r) in packets.iter().zip(&report) {
         assert_eq!(p.len(), r.coded_bytes);
@@ -139,10 +140,16 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!((r.budget, r.base_q_idx), (0, 0));
         } else {
             coded[r.frame] += 1;
-            assert!(r.coded_bytes <= r.budget || r.base_q_idx == 255, "budget respected");
+            assert!(
+                r.coded_bytes <= r.budget || r.base_q_idx == 255,
+                "budget respected"
+            );
         }
     }
-    assert!(coded.iter().all(|&c| c == 1), "every display frame coded once: {coded:?}");
+    assert!(
+        coded.iter().all(|&c| c == 1),
+        "every display frame coded once: {coded:?}"
+    );
     let prefs: Vec<&[u8]> = packets.iter().map(Vec::as_slice).collect();
     let decoded = decode_vp9_sequence(&prefs).expect("structured two-pass stream must decode");
     assert_eq!(decoded.len(), n_frames, "shown frame count");

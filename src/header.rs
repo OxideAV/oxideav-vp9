@@ -22,8 +22,8 @@
 //! The §6.3 compressed header lives in `compressed.rs` (the §9.2
 //! Boolean range coder).
 
-use crate::bitreader::BitReader;
 use crate::Error;
+use crate::bitreader::BitReader;
 
 /// `MAX_SEGMENTS` from §3 (Table of constants): segmentation supports
 /// up to 8 distinct segments per frame.
@@ -736,11 +736,7 @@ fn read_frame_sync_code(br: &mut BitReader<'_>) -> Result<(), Error> {
 fn read_color_config(br: &mut BitReader<'_>, profile: u8) -> Result<ColorConfig, Error> {
     let bit_depth = if profile >= 2 {
         let ten_or_twelve_bit = br.read_bits(1)?;
-        if ten_or_twelve_bit == 1 {
-            12
-        } else {
-            10
-        }
+        if ten_or_twelve_bit == 1 { 12 } else { 10 }
     } else {
         8
     };

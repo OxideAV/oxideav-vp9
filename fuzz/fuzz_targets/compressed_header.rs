@@ -16,8 +16,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_vp9::{
-    parse_compressed_header, parse_compressed_header_inter, RefFrameSignBias,
-    Vp9CompressedHeaderInterInputs,
+    RefFrameSignBias, Vp9CompressedHeaderInterInputs, parse_compressed_header,
+    parse_compressed_header_inter,
 };
 
 fuzz_target!(|data: &[u8]| {

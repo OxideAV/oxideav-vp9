@@ -57,10 +57,10 @@
 //! primitives landed in earlier rounds; this round only composes
 //! them per the §8.8.5 dispatch table.
 
-use crate::filter_mask::{filter_mask, FilterMaskSamples};
+use crate::filter_mask::{FilterMaskSamples, filter_mask};
 use crate::filter_size::{TX_4X4, TX_8X8};
-use crate::narrow_filter::{narrow_filter, NarrowFilterSamples};
-use crate::wide_filter::{wide_filter, WideFilterSamples};
+use crate::narrow_filter::{NarrowFilterSamples, narrow_filter};
+use crate::wide_filter::{WideFilterSamples, wide_filter};
 
 /// §8.8.5 input — the 16-sample stencil straddling the boundary.
 ///

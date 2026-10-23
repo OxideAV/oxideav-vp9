@@ -21,8 +21,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_vp9::{
-    decode_vp9_sequence, encode_vp9_lossy_sequence_resized, encode_vp9_lossy_sequence_with,
-    Vp9GopConfig, Vp9Segmentation,
+    Vp9GopConfig, Vp9Segmentation, decode_vp9_sequence, encode_vp9_lossy_sequence_resized,
+    encode_vp9_lossy_sequence_with,
 };
 
 fuzz_target!(|data: &[u8]| {

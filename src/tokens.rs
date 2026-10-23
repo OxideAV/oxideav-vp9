@@ -46,9 +46,9 @@
 // dead-code warnings module-wide rather than annotating each item.
 #![allow(dead_code)]
 
+use crate::Error;
 use crate::bool_coder::BoolCoder;
 use crate::idct::{ADST_DCT, DCT_ADST};
-use crate::Error;
 
 /// `ZERO_TOKEN` per §7.4.16. Indicates the next coefficient at scan
 /// position `pos` is 0 (and `checkEob` clears).

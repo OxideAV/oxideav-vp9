@@ -37,12 +37,12 @@
 //! (`docs/video/vp9/vp9-spec.txt`) §6.4.24 / §8.6.2 / §8.7 / §9.3.
 
 use crate::coef_probs::CoefProbs;
-use crate::idct::{inverse_transform_2d, DCT_DCT};
+use crate::idct::{DCT_DCT, inverse_transform_2d};
 use crate::scan::get_scan;
 use crate::token_writer::token_for_magnitude;
 use crate::tokens::{
-    build_token_probs, coef_band, token_cache_neighbours, CAT_PROBS, DCT_VAL_CATEGORY6,
-    ENERGY_CLASS, EXTRA_BITS, TOKEN_TREE, ZERO_TOKEN,
+    CAT_PROBS, DCT_VAL_CATEGORY6, ENERGY_CLASS, EXTRA_BITS, TOKEN_TREE, ZERO_TOKEN,
+    build_token_probs, coef_band, token_cache_neighbours,
 };
 
 /// Lagrange multiplier as a fraction of the squared pixel-domain

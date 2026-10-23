@@ -53,7 +53,13 @@ fuzz_target!(|data: &[u8]| {
             for y in 0..ch {
                 for x in 0..cw {
                     let i = (y * cw + x + plane * 7 + k) % content.len().max(1);
-                    px.push(content.get(i).copied().unwrap_or(0).wrapping_add((x + y) as u8));
+                    px.push(
+                        content
+                            .get(i)
+                            .copied()
+                            .unwrap_or(0)
+                            .wrapping_add((x + y) as u8),
+                    );
                 }
             }
         }
@@ -81,7 +87,10 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(report.len(), n_frames);
         for (p, r) in packets.iter().zip(&report) {
             assert_eq!(p.len(), r.coded_bytes);
-            assert!(r.coded_bytes <= r.budget || r.base_q_idx == 255, "budget respected");
+            assert!(
+                r.coded_bytes <= r.budget || r.base_q_idx == 255,
+                "budget respected"
+            );
         }
         let prefs: Vec<&[u8]> = packets.iter().map(Vec::as_slice).collect();
         let decoded = decode_vp9_sequence(&prefs).expect("two-pass stream must decode");

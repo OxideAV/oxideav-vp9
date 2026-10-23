@@ -28,12 +28,12 @@
 //! (`docs/video/vp9/vp9-spec.txt`) §6.2; the field order mirrors the
 //! in-crate parser exactly.
 
-use crate::header::{
-    ColorConfig, ColorSpace, FrameType, LoopFilterParams, QuantizationParams, SegmentationParams,
-    TileInfo, Vp9FrameHeader, MAX_SEGMENTS, SEGMENTATION_FEATURE_BITS, SEGMENTATION_FEATURE_SIGNED,
-    SEG_LVL_MAX,
-};
 use crate::Error;
+use crate::header::{
+    ColorConfig, ColorSpace, FrameType, LoopFilterParams, MAX_SEGMENTS, QuantizationParams,
+    SEG_LVL_MAX, SEGMENTATION_FEATURE_BITS, SEGMENTATION_FEATURE_SIGNED, SegmentationParams,
+    TileInfo, Vp9FrameHeader,
+};
 
 /// MSB-first bit writer producing a byte buffer. The `f(n)` / `s(n)`
 /// primitives mirror the `BitReader` parsing process bit-for-bit.
@@ -527,7 +527,7 @@ pub(crate) fn write_uncompressed_header(hdr: &Vp9FrameHeader) -> Result<Vec<u8>,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::header::{parse_uncompressed_header, ColorSpace};
+    use crate::header::{ColorSpace, parse_uncompressed_header};
 
     #[test]
     fn bitwriter_roundtrips_through_bit_layout() {
@@ -788,7 +788,7 @@ mod tests {
     /// writer codes the explicit-frame-size path, so `ref_dims` is unused,
     /// but the parser still requires a `ref_state` to be present.
     fn assert_inter_roundtrips(h: &Vp9FrameHeader) {
-        use crate::header::{parse_uncompressed_header_with_refs, RefFrameState};
+        use crate::header::{RefFrameState, parse_uncompressed_header_with_refs};
         let bytes = write_uncompressed_header(h).expect("write inter");
         let dims = [(h.frame_width, h.frame_height); 8];
         let state = RefFrameState {
@@ -939,7 +939,7 @@ mod tests {
     /// `intra_only = 0` flag and then the normal inter tail.
     #[test]
     fn hidden_inter_frame_roundtrips() {
-        use crate::header::{parse_uncompressed_header_with_refs, RefFrameState};
+        use crate::header::{RefFrameState, parse_uncompressed_header_with_refs};
         let mut h = minimal_inter_header();
         h.show_frame = false;
         let bytes = write_uncompressed_header(&h).expect("write hidden inter");

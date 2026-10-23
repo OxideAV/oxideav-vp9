@@ -11,9 +11,8 @@
 //! [`narrow_filter`] and §8.8.5.3 [`wide_filter`] primitives.
 
 use oxideav_vp9::{
-    filter_mask, narrow_filter, sample_filtering, wide_filter, FilterMaskSamples,
-    NarrowFilterSamples, SampleFilterOutput, SampleFilterSamples, WideFilterSamples, TX_16X16,
-    TX_4X4, TX_8X8,
+    FilterMaskSamples, NarrowFilterSamples, SampleFilterOutput, SampleFilterSamples, TX_4X4,
+    TX_8X8, TX_16X16, WideFilterSamples, filter_mask, narrow_filter, sample_filtering, wide_filter,
 };
 
 /// Build a flat stencil at `v`.

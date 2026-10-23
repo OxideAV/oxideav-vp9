@@ -42,47 +42,47 @@
 
 use oxideav_core::ExecutionContext;
 
+use crate::Error;
 use crate::bool_coder::BoolCoder;
 use crate::compressed::{
-    parse_compressed_header, parse_compressed_header_inter_with_ctx,
-    parse_compressed_header_with_ctx, CompoundReferenceConfig, FrameContext, RefFrameSignBias,
-    Vp9CompressedHeader, Vp9CompressedHeaderInter, Vp9CompressedHeaderInterInputs,
+    CompoundReferenceConfig, FrameContext, RefFrameSignBias, Vp9CompressedHeader,
+    Vp9CompressedHeaderInter, Vp9CompressedHeaderInterInputs, parse_compressed_header,
+    parse_compressed_header_inter_with_ctx, parse_compressed_header_with_ctx,
 };
-use crate::decode_block::{decode_block_apply, DecodedBlockResult, Vp9FrameState};
+use crate::decode_block::{DecodedBlockResult, Vp9FrameState, decode_block_apply};
 use crate::dequant::{get_ac_quant, get_dc_quant, seg_feature_active};
-use crate::frame_loop_filter::{frame_loop_filter, CurrFrame};
+use crate::frame_loop_filter::{CurrFrame, frame_loop_filter};
 use crate::header::{
-    parse_uncompressed_header, parse_uncompressed_header_with_refs, ColorConfig, FrameType,
-    QuantizationParams, RefFrameState, SegmentationParams, Vp9FrameHeader, MAX_SEGMENTS,
-    SEG_LVL_MAX,
+    ColorConfig, FrameType, MAX_SEGMENTS, QuantizationParams, RefFrameState, SEG_LVL_MAX,
+    SegmentationParams, Vp9FrameHeader, parse_uncompressed_header,
+    parse_uncompressed_header_with_refs,
 };
-use crate::inter_decode::{build_ref_planes, FrameStateMvSource, PrevFrameMvs};
+use crate::inter_decode::{FrameStateMvSource, PrevFrameMvs, build_ref_planes};
 use crate::inter_mv::{BlockGrid, ScaleGeom};
-use crate::inter_pred::{predict_inter, InterPredArgs};
-use crate::intra::{predict_intra, Plane, PredMode};
+use crate::inter_pred::{InterPredArgs, predict_inter};
+use crate::intra::{Plane, PredMode, predict_intra};
 use crate::loop_filter::loop_filter_frame_init;
 use crate::mode_info::{
-    inter_frame_mode_info, intra_frame_mode_info, intra_segment_id, InterFrameModeArgs,
-    InterRefFrameArgs, InterSegmentIdArgs, InterpFilterNeighbours, IntraFrameNeighbours,
-    IsInterNeighbours, NeighbourSkips, NeighbourTxSizes, PrevSegmentIds, RefFrameNeighbours,
-    SegFeatureTables, SegPredContextState, Vp9InterFrameBlock, Vp9IntraMiBlock, ALTREF_FRAME,
-    DC_PRED, GOLDEN_FRAME, INTRA_FRAME, LAST_FRAME, NONE_REF_FRAME, SEG_LVL_SKIP,
+    ALTREF_FRAME, DC_PRED, GOLDEN_FRAME, INTRA_FRAME, InterFrameModeArgs, InterRefFrameArgs,
+    InterSegmentIdArgs, InterpFilterNeighbours, IntraFrameNeighbours, IsInterNeighbours,
+    LAST_FRAME, NONE_REF_FRAME, NeighbourSkips, NeighbourTxSizes, PrevSegmentIds,
+    RefFrameNeighbours, SEG_LVL_SKIP, SegFeatureTables, SegPredContextState, Vp9InterFrameBlock,
+    Vp9IntraMiBlock, inter_frame_mode_info, intra_frame_mode_info, intra_segment_id,
 };
 use crate::mv_ref::MvRefGeometry;
 use crate::partition::{
-    decode_partition, get_tile_offset, tile_payload_sizes, LeafSink, PartitionContextState,
-    PartitionProbsKind,
+    LeafSink, PartitionContextState, PartitionProbsKind, decode_partition, get_tile_offset,
+    tile_payload_sizes,
 };
 use crate::reconstruct::{reconstruct_block, tx_type_for_intra};
-use crate::ref_buffer::{CurrFramePlanes, RefBuffers, REFS_PER_FRAME};
+use crate::ref_buffer::{CurrFramePlanes, REFS_PER_FRAME, RefBuffers};
 use crate::residual::{
-    get_plane_block_size, get_uv_tx_size, BLOCK_64X64, BLOCK_8X8, BLOCK_INVALID,
-    NUM_4X4_BLOCKS_HIGH_LOOKUP, NUM_4X4_BLOCKS_WIDE_LOOKUP,
+    BLOCK_8X8, BLOCK_64X64, BLOCK_INVALID, NUM_4X4_BLOCKS_HIGH_LOOKUP, NUM_4X4_BLOCKS_WIDE_LOOKUP,
+    get_plane_block_size, get_uv_tx_size,
 };
 use crate::scan::get_scan;
 use crate::superblock_loop_filter::{SuperblockFilterFrame, SuperblockFilterPlane};
-use crate::tokens::{tokens, NonzeroContext, TokenBlockCtx};
-use crate::Error;
+use crate::tokens::{NonzeroContext, TokenBlockCtx, tokens};
 
 /// One decoded VP9 frame, cropped to the §8.10 output extents.
 ///
@@ -1797,7 +1797,13 @@ fn decode_single_frame(
         loop_filter_frame_init(&hdr.loop_filter, &hdr.segmentation, ref_deltas, mode_deltas);
 
     let skips_bool: Vec<bool> = state.skips.iter().map(|&s| s != 0).collect();
-    let ref_frames_0: Vec<i32> = state.ref_frames.chunks_exact(2).map(|p| p[0]).collect();
+    let ref_frames_0: Vec<i32> = state
+        .ref_frames
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|p| p[0])
+        .collect();
     let filter_frame = SuperblockFilterFrame {
         mi_sizes: &state.mi_sizes,
         tx_sizes: &state.tx_sizes,
@@ -2608,10 +2614,10 @@ pub(crate) fn decode_inter_blocks_for_test(
     blocks: Vec<(u32, u32, u8)>,
 ) -> Result<Vec<RecoveredInterBlock>, Error> {
     use crate::residual::{
-        get_plane_block_size, get_uv_tx_size, BLOCK_8X8, BLOCK_INVALID, NUM_4X4_BLOCKS_HIGH_LOOKUP,
-        NUM_4X4_BLOCKS_WIDE_LOOKUP,
+        BLOCK_8X8, BLOCK_INVALID, NUM_4X4_BLOCKS_HIGH_LOOKUP, NUM_4X4_BLOCKS_WIDE_LOOKUP,
+        get_plane_block_size, get_uv_tx_size,
     };
-    use crate::tokens::{tokens, TokenBlockCtx};
+    use crate::tokens::{TokenBlockCtx, tokens};
 
     let chdr_inter = build_inter_chdr_for_test(ctx, tx_mode, reference_mode, comp_config);
     let mut state = Vp9FrameState::new(mi_rows, mi_cols);

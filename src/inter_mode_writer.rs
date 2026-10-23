@@ -27,19 +27,19 @@
 // exercised now by the round-trip tests below.
 #![allow(dead_code)]
 
+use crate::Error;
 use crate::bool_encoder::BoolEncoder;
 use crate::compressed::{CompoundReferenceConfig, ReferenceMode};
 use crate::mode_info::{
+    ALTREF_FRAME, BINARY_TREE, COMP_MODE_CONTEXTS, CompModeNeighbours, GOLDEN_FRAME,
+    INTER_MODE_CONTEXTS, INTER_MODE_TREE, INTER_MODES, INTERP_FILTER_CONTEXTS, INTERP_FILTER_TREE,
+    IS_INTER_CONTEXTS, InterpFilterNeighbours, IsInterNeighbours, LAST_FRAME, NEARESTMV,
+    NONE_REF_FRAME, REF_CONTEXTS, RefFrameNeighbours, SWITCHABLE, SWITCHABLE_FILTERS,
     comp_mode_context, comp_ref_context, interp_filter_context, is_inter_context,
-    single_ref_p1_context, single_ref_p2_context, CompModeNeighbours, InterpFilterNeighbours,
-    IsInterNeighbours, RefFrameNeighbours, ALTREF_FRAME, BINARY_TREE, COMP_MODE_CONTEXTS,
-    GOLDEN_FRAME, INTERP_FILTER_CONTEXTS, INTERP_FILTER_TREE, INTER_MODES, INTER_MODE_CONTEXTS,
-    INTER_MODE_TREE, IS_INTER_CONTEXTS, LAST_FRAME, NEARESTMV, NONE_REF_FRAME, REF_CONTEXTS,
-    SWITCHABLE, SWITCHABLE_FILTERS,
+    single_ref_p1_context, single_ref_p2_context,
 };
 use crate::mode_writer::tree_encode;
 use crate::prob_adapt::CountsNonCoef;
-use crate::Error;
 
 /// §6.4.13 `read_is_inter( )` inverse.
 ///
@@ -253,7 +253,7 @@ mod tests {
     use super::*;
     use crate::bool_coder::BoolCoder;
     use crate::compressed::FrameContext;
-    use crate::mode_info::{read_is_inter, read_ref_frames, tree_decode, DEFAULT_IS_INTER_PROB};
+    use crate::mode_info::{DEFAULT_IS_INTER_PROB, read_is_inter, read_ref_frames, tree_decode};
 
     fn enc_to_dec(enc: BoolEncoder) -> BoolCoder<'static> {
         let buf = enc.finish();

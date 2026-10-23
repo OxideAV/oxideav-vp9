@@ -243,7 +243,7 @@ pub fn adaptive_filter_strength(
 mod tests {
     use super::*;
     use crate::loop_filter::loop_filter_frame_init;
-    use crate::{LoopFilterParams, SegmentationParams, MAX_SEGMENTS, SEG_LVL_MAX};
+    use crate::{LoopFilterParams, MAX_SEGMENTS, SEG_LVL_MAX, SegmentationParams};
 
     /// §8.8.4 step 1 mode→modeType mapping per `vp9-spec.txt` lines
     /// 5637-5638.

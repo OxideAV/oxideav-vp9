@@ -31,21 +31,21 @@
 //! (`setup_past_independence` / `reset_frame_context`), §6.3.3–§6.3.6,
 //! §6.3.17, §7.1.2, §8.4; the §9.3.4 counting table.
 
+use crate::Error;
 use crate::bool_encoder::BoolEncoder;
 use crate::coef_probs::CoefProbs;
 use crate::compressed::{
-    inv_remap_prob, tx_mode_to_biggest_tx_size, FrameContext, ReferenceMode, TxMode,
+    FrameContext, ReferenceMode, TxMode, inv_remap_prob, tx_mode_to_biggest_tx_size,
 };
 use crate::header::{FrameType, Vp9FrameHeader};
 use crate::mode_info::{
-    BLOCK_SIZE_GROUPS, COMP_MODE_CONTEXTS, INTERP_FILTER_CONTEXTS, INTERP_FILTER_TREE,
-    INTER_MODE_CONTEXTS, INTER_MODE_TREE, INTRA_MODES, INTRA_MODE_TREE, IS_INTER_CONTEXTS,
-    REF_CONTEXTS, SWITCHABLE, TX_SIZE_16_TREE, TX_SIZE_32_TREE, TX_SIZE_8_TREE,
+    BLOCK_SIZE_GROUPS, COMP_MODE_CONTEXTS, INTER_MODE_CONTEXTS, INTER_MODE_TREE,
+    INTERP_FILTER_CONTEXTS, INTERP_FILTER_TREE, INTRA_MODE_TREE, INTRA_MODES, IS_INTER_CONTEXTS,
+    REF_CONTEXTS, SWITCHABLE, TX_SIZE_8_TREE, TX_SIZE_16_TREE, TX_SIZE_32_TREE,
 };
 use crate::mv::{MV_CLASS_TREE, MV_FR_TREE, MV_JOINT_TREE};
 use crate::partition::{PARTITION_CONTEXTS, PARTITION_TREE};
-use crate::prob_adapt::{adapt_coef_probs, adapt_noncoef_probs, FrameCounts};
-use crate::Error;
+use crate::prob_adapt::{FrameCounts, adapt_coef_probs, adapt_noncoef_probs};
 
 // ----- bit-cost arithmetic -----
 

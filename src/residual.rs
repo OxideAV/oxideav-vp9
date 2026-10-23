@@ -60,7 +60,7 @@
 // per-block mode-info decode is the missing piece).
 #![allow(dead_code)]
 
-use crate::intra::{predict_intra, Plane, PredMode};
+use crate::intra::{Plane, PredMode, predict_intra};
 use crate::reconstruct::reconstruct_block;
 use crate::tokens::NonzeroContext;
 
@@ -531,7 +531,7 @@ pub(crate) fn residual_intra(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::idct::{inverse_transform_2d, DCT_DCT};
+    use crate::idct::{DCT_DCT, inverse_transform_2d};
     use crate::intra::PredMode;
 
     // ----- Static tables -----

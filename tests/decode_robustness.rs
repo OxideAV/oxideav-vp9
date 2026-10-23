@@ -143,11 +143,11 @@ fn pseudo_random_input_never_panics() {
     for iter in 0..2000u32 {
         let len = (next() % 512) as usize;
         let mut buf: Vec<u8> = Vec::with_capacity(len + 32);
-        if let Some(seed) = &seed {
-            if next() & 1 == 0 {
-                let take = (next() as usize) % (seed.len() + 1);
-                buf.extend_from_slice(&seed[..take]);
-            }
+        if let Some(seed) = &seed
+            && next() & 1 == 0
+        {
+            let take = (next() as usize) % (seed.len() + 1);
+            buf.extend_from_slice(&seed[..take]);
         }
         while buf.len() < len {
             buf.push((next() & 0xFF) as u8);

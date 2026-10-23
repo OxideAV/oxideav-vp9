@@ -25,8 +25,8 @@
 //! (`docs/video/vp9/vp9-spec.txt`) §6.3 lines 1957-1975.
 
 use oxideav_vp9::{
-    parse_compressed_header, parse_compressed_header_inter, parse_uncompressed_header, FrameType,
-    MvProbs, RefFrameSignBias, ReferenceMode, TxMode, Vp9CompressedHeaderInterInputs,
+    FrameType, MvProbs, RefFrameSignBias, ReferenceMode, TxMode, Vp9CompressedHeaderInterInputs,
+    parse_compressed_header, parse_compressed_header_inter, parse_uncompressed_header,
 };
 
 /// Minimal MSB-first bit builder mirroring §9.1 read order.

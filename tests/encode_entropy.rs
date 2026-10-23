@@ -8,10 +8,10 @@
 //! crate's encode corpus, with the corpus-wide totals printed.
 
 use oxideav_vp9::{
-    decode_vp9_sequence, encode_vp9_lossy_sequence, encode_vp9_lossy_sequence_444,
-    encode_vp9_lossy_sequence_hbd, encode_vp9_lossy_sequence_rc, encode_vp9_lossy_sequence_resized,
-    encode_vp9_lossy_sequence_resized_with, encode_vp9_lossy_sequence_with, Vp9GopConfig,
-    Vp9Segmentation,
+    Vp9GopConfig, Vp9Segmentation, decode_vp9_sequence, encode_vp9_lossy_sequence,
+    encode_vp9_lossy_sequence_444, encode_vp9_lossy_sequence_hbd, encode_vp9_lossy_sequence_rc,
+    encode_vp9_lossy_sequence_resized, encode_vp9_lossy_sequence_resized_with,
+    encode_vp9_lossy_sequence_with,
 };
 
 /// Source frame `k` of a translating textured scene (luma ramp + moving
@@ -25,7 +25,7 @@ fn scene(w: usize, h: usize, cw: usize, ch: usize, k: usize, seed: usize) -> Vec
             if (8..24).contains(&px_x) && (8..24).contains(&y) {
                 v = (px_x as usize * 37 + y * 53 + seed) % 255;
             }
-            if (x * 7 + y * 11 + k) % 29 == 0 {
+            if (x * 7 + y * 11 + k).is_multiple_of(29) {
                 v = (v + 40) % 256;
             }
             px.push(v as u8);
@@ -356,7 +356,10 @@ fn coefficient_election_lands_on_or_above_the_plain_rd_curve() {
         let saving = 100.0 * (plain_bytes_at_psnr - b_r) / plain_bytes_at_psnr;
         eprintln!(
             "{name}: rdoq {b_r} B @ {p_r:.2} dB; plain curve {:?}; plain @ same bytes {plain_psnr_at_bytes:.2} dB ({:+.2} dB); bytes at equal PSNR {plain_bytes_at_psnr:.0} B ({saving:+.1}%)",
-            curve.iter().map(|(b, p)| format!("{b:.0}B/{p:.2}dB")).collect::<Vec<_>>(),
+            curve
+                .iter()
+                .map(|(b, p)| format!("{b:.0}B/{p:.2}dB"))
+                .collect::<Vec<_>>(),
             p_r - plain_psnr_at_bytes,
         );
         assert!(

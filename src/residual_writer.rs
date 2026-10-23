@@ -33,16 +33,16 @@
 // module is exercised from the round-trip tests below.
 #![allow(dead_code)]
 
+use crate::Error;
 use crate::bool_encoder::BoolEncoder;
 use crate::idct::DCT_DCT;
 use crate::reconstruct::tx_type_for_intra;
 use crate::residual::{
-    get_plane_block_size, get_uv_tx_size, BLOCK_8X8, BLOCK_INVALID, NUM_4X4_BLOCKS_HIGH_LOOKUP,
-    NUM_4X4_BLOCKS_WIDE_LOOKUP,
+    BLOCK_8X8, BLOCK_INVALID, NUM_4X4_BLOCKS_HIGH_LOOKUP, NUM_4X4_BLOCKS_WIDE_LOOKUP,
+    get_plane_block_size, get_uv_tx_size,
 };
 use crate::scan::get_scan;
 use crate::tokens::{NonzeroContext, TokenBlockCtx};
-use crate::Error;
 use crate::{intra::PredMode, mode_info::Vp9IntraMiBlock};
 
 /// Per-frame geometry the residual writer needs, mirroring the

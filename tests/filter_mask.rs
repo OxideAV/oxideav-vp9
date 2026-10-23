@@ -7,7 +7,7 @@
 //! the four returned [`FilterMask`] booleans against the §8.8.5.1
 //! listing verbatim.
 
-use oxideav_vp9::{filter_mask, FilterMask, FilterMaskSamples, TX_16X16, TX_4X4, TX_8X8};
+use oxideav_vp9::{FilterMask, FilterMaskSamples, TX_4X4, TX_8X8, TX_16X16, filter_mask};
 
 /// Build a stencil with every sample equal to `v`. With a flat
 /// stencil every §8.8.5.1 abs-diff is `0`, every `> ...Bd` test is

@@ -205,11 +205,7 @@ pub struct SuperblockFilterMi {
 /// §5.1 `Max(x, y)` for the §8.8.2 step 7 `Max(BLOCK_16X16, MiSize)`.
 #[inline]
 fn max_u8(x: u8, y: u8) -> u8 {
-    if x > y {
-        x
-    } else {
-        y
-    }
+    if x > y { x } else { y }
 }
 
 /// Run §8.8.2 steps 1-14 per `vp9-spec.txt` lines 5526-5580.
@@ -299,11 +295,11 @@ pub fn superblock_filter_edge(
     {
         false
     } else {
-        edge % (1u32 << mi.tx_sz) == 0
+        edge.is_multiple_of(1u32 << mi.tx_sz)
     };
 
     // Step 12: is32Edge (lines 5561-5564).
-    let is_32_edge = edge % 8 == 0;
+    let is_32_edge = edge.is_multiple_of(8);
 
     // Step 13: onScreen (lines 5565-5572) — true unless any of the
     // four exclusion conditions holds (off the right / bottom of the
@@ -335,7 +331,7 @@ pub fn superblock_filter_edge(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::residual::{BLOCK_4X4, BLOCK_64X64, BLOCK_8X8};
+    use crate::residual::{BLOCK_4X4, BLOCK_8X8, BLOCK_64X64};
 
     const TX_4X4: u8 = 0;
     const TX_8X8: u8 = 1;

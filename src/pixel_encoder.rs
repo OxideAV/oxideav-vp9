@@ -36,8 +36,9 @@
 //! walk order, availability rules and reconstruction state mirror the
 //! in-crate decoder exactly.
 
+use crate::Error;
 use crate::dequant::{get_ac_quant, get_dc_quant};
-use crate::frame_writer::{assemble_keyframe, BlockPlan, FrameCoefSource, KeyframePlan};
+use crate::frame_writer::{BlockPlan, FrameCoefSource, KeyframePlan, assemble_keyframe};
 use crate::fwd_transform::forward_wht_2d;
 use crate::header::{
     ColorConfig, ColorSpace, FrameType, LoopFilterParams, QuantizationParams, SegmentationParams,
@@ -45,13 +46,12 @@ use crate::header::{
 };
 use crate::idct::DCT_DCT;
 use crate::inter_mv::{BlockGrid, ScaleGeom};
-use crate::inter_pred::{predict_inter, InterPredArgs, RefPlane, RefPlanes};
-use crate::intra::{predict_intra, Plane, PredMode};
+use crate::inter_pred::{InterPredArgs, RefPlane, RefPlanes, predict_inter};
+use crate::intra::{Plane, PredMode, predict_intra};
 use crate::reconstruct::reconstruct_block;
 use crate::residual::{
-    get_plane_block_size, BLOCK_8X8, NUM_4X4_BLOCKS_HIGH_LOOKUP, NUM_4X4_BLOCKS_WIDE_LOOKUP,
+    BLOCK_8X8, NUM_4X4_BLOCKS_HIGH_LOOKUP, NUM_4X4_BLOCKS_WIDE_LOOKUP, get_plane_block_size,
 };
-use crate::Error;
 
 /// Build a padded target [`Plane`] from a row-major 8-bit source
 /// rectangle: the visible `vis_w × vis_h` samples are copied through and
@@ -1427,7 +1427,7 @@ fn select_leaf_modes(
     ssy: bool,
     bit_depth: u32,
 ) -> (u8, u8) {
-    use crate::residual::{get_uv_tx_size, NUM_4X4_BLOCKS_HIGH_LOOKUP, NUM_4X4_BLOCKS_WIDE_LOOKUP};
+    use crate::residual::{NUM_4X4_BLOCKS_HIGH_LOOKUP, NUM_4X4_BLOCKS_WIDE_LOOKUP, get_uv_tx_size};
 
     // Trial-predict one transform block on `scratch`, SAD it against the
     // target, restore the region.
@@ -4600,11 +4600,12 @@ pub(crate) fn encode_pframe_lossy_tree_motion_opts(
                     };
                 }
                 let mut best_score = l_zero;
-                if let Some((mv, sad)) = l_new {
-                    if search_range > 0 && sad + NEWMV_SAD_MARGIN < best_score {
-                        best_score = sad + NEWMV_SAD_MARGIN;
-                        choice = ([LAST_FRAME, NONE_REF_FRAME], NEWMV, [mv, [0, 0]]);
-                    }
+                if let Some((mv, sad)) = l_new
+                    && search_range > 0
+                    && sad + NEWMV_SAD_MARGIN < best_score
+                {
+                    best_score = sad + NEWMV_SAD_MARGIN;
+                    choice = ([LAST_FRAME, NONE_REF_FRAME], NEWMV, [mv, [0, 0]]);
                 }
                 let mut g_new_mv: Option<[i32; 2]> = None;
                 if let Some(gplanes) = golden {
@@ -6821,10 +6822,10 @@ fn finish_frame_lossy(
     if level == 0 {
         // The frame's coded table (update_data as planned by the
         // caller) is what the decoder persists.
-        if let Some(sp) = seg_persist {
-            if hdr.segmentation.enabled {
-                *sp = Some(SegTablePersist::of(&hdr.segmentation));
-            }
+        if let Some(sp) = seg_persist
+            && hdr.segmentation.enabled
+        {
+            *sp = Some(SegTablePersist::of(&hdr.segmentation));
         }
         return Ok((bytes0, recon0, *hdr));
     }
@@ -6904,14 +6905,14 @@ fn finish_frame_lossy(
             }
         }
     }
-    if let Some(sp) = seg_persist {
-        if hdr2.segmentation.enabled {
-            // §7.2.10: code the table only when it moved off the
-            // decoder's persisted copy.
-            let table = SegTablePersist::of(&hdr2.segmentation);
-            hdr2.segmentation.update_data = *sp != Some(table);
-            *sp = Some(table);
-        }
+    if let Some(sp) = seg_persist
+        && hdr2.segmentation.enabled
+    {
+        // §7.2.10: code the table only when it moved off the
+        // decoder's persisted copy.
+        let table = SegTablePersist::of(&hdr2.segmentation);
+        hdr2.segmentation.update_data = *sp != Some(table);
+        *sp = Some(table);
     }
 
     let (bytes, mut recon, state) = re_encode(&hdr2)?;
@@ -9627,10 +9628,11 @@ mod tests {
                 coefficient_rdo: true,
             };
             let (pk, hs, dec, _) = assert_structured_gop_mirror(&src[..4], w, h, 120, st);
-            assert!(hs
-                .iter()
-                .filter(|hd| !hd.show_existing_frame)
-                .all(|hd| hd.segmentation.enabled));
+            assert!(
+                hs.iter()
+                    .filter(|hd| !hd.show_existing_frame)
+                    .all(|hd| hd.segmentation.enabled)
+            );
             assert_eq!(
                 hs[0].segmentation.feature_enabled[STATIC_SKIP_SEGMENT][SEG_LVL_SKIP],
                 mode == SegMode::StaticSkip
@@ -10065,10 +10067,11 @@ mod tests {
         let t = padded_targets_420(&px, w, h);
         let plan = plan_keyframe_tree(&t, 8, 8, true, true, 8, 60);
         assert_eq!(plan.leaves.len(), 4, "quadrant content: four 32x32 leaves");
-        assert!(plan
-            .leaves
-            .values()
-            .all(|l| l.mi_size == crate::residual::BLOCK_32X32));
+        assert!(
+            plan.leaves
+                .values()
+                .all(|l| l.mi_size == crate::residual::BLOCK_32X32)
+        );
     }
 
     /// The planner's split threshold scales with the quantizer: content
@@ -10340,7 +10343,7 @@ mod tests {
     fn rc_sequence_rides_chain_framing() {
         use crate::decode_frame::decode_vp9_sequence;
         use crate::header::{
-            parse_uncompressed_header, parse_uncompressed_header_with_refs, RefFrameState,
+            RefFrameState, parse_uncompressed_header, parse_uncompressed_header_with_refs,
         };
         let (w, h) = (64u32, 48u32);
         let n = (w * h) as usize + 2 * 32 * 24;
@@ -14422,7 +14425,7 @@ mod entropy_mirror_tests {
                 if (8..24).contains(&px_x) && (8..24).contains(&y) {
                     v = (px_x as usize * 37 + y * 53) % 255;
                 }
-                if (x * 7 + y * 11 + k) % 29 == 0 {
+                if (x * 7 + y * 11 + k).is_multiple_of(29) {
                     v = (v + 40) % 256;
                 }
                 px.push(v as u8);

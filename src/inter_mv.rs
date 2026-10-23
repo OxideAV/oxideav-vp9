@@ -310,7 +310,7 @@ pub(crate) fn scale_mv(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::residual::{BLOCK_16X16, BLOCK_4X4};
+    use crate::residual::{BLOCK_4X4, BLOCK_16X16};
 
     // ---- §8.5.2.1 round_mv_comp helpers ---------------------------------
 

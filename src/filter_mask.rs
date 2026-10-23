@@ -55,7 +55,7 @@
 //! (`docs/video/vp9/vp9-spec.txt` §8.8.5.1 lines 5685-5792). `Abs`
 //! is the §3 absolute-value primitive.
 
-use crate::filter_size::{TX_16X16, TX_8X8};
+use crate::filter_size::{TX_8X8, TX_16X16};
 
 /// §8.8.5.1 input — the 16-sample stencil straddling the boundary.
 ///

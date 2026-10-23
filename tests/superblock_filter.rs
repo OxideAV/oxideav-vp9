@@ -10,8 +10,8 @@
 //! gating the §8.8.2 steps 15-17 hand-off matches the listing.
 
 use oxideav_vp9::{
-    superblock_filter_edge, superblock_filter_geometry, SuperblockFilterGeometry,
-    SuperblockFilterMi,
+    SuperblockFilterGeometry, SuperblockFilterMi, superblock_filter_edge,
+    superblock_filter_geometry,
 };
 
 const TX_4X4: u8 = 0;
@@ -47,7 +47,7 @@ fn geometry_drives_loop_bounds() {
         }
     );
     assert_eq!(16u32 >> g.sub, 16); // edge count
-                                    // 4:2:0 chroma vertical: 8 edges, 32-sample boundary.
+    // 4:2:0 chroma vertical: 8 edges, 32-sample boundary.
     let gc = superblock_filter_geometry(0, 1, 1);
     assert_eq!(16u32 >> gc.sub, 8);
     assert_eq!(gc.edge_len, 32);
@@ -86,7 +86,7 @@ fn interior_block_edges_filter_regardless_of_skip() {
     let block = mi(BLOCK_8X8, TX_4X4, true, INTRA_FRAME);
     for edge in 1..(16u32 >> g.sub) {
         let e = superblock_filter_edge(0, 0, 0, edge, 0, 0, 0, 64, 64, &block);
-        if e.x % 8 == 0 {
+        if e.x.is_multiple_of(8) {
             assert!(e.is_block_edge, "edge {edge} x {}", e.x);
             assert!(e.apply_filter);
         }

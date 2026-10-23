@@ -83,10 +83,10 @@
 //! [`crate::mode_info::NONE_REF_FRAME`] constant.
 
 #![allow(dead_code)] // surfaces are pub(crate); the inter-only fields
-                     // (Mvs / SubMvs / InterpFilters accessors) have
-                     // no production reader until the inter-frame
-                     // rounds land — the intra path is wired via the
-                     // round-284 decode_frame module.
+// (Mvs / SubMvs / InterpFilters accessors) have
+// no production reader until the inter-frame
+// rounds land — the intra path is wired via the
+// round-284 decode_frame module.
 
 use crate::mode_info::NONE_REF_FRAME;
 use crate::partition::{NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP};
@@ -530,7 +530,7 @@ pub(crate) fn decode_block_apply(
 mod tests {
     use super::*;
     use crate::mode_info::{ALTREF_FRAME, DC_PRED, GOLDEN_FRAME, INTRA_FRAME, LAST_FRAME, V_PRED};
-    use crate::residual::{BLOCK_16X16, BLOCK_4X4, BLOCK_64X64, BLOCK_8X8};
+    use crate::residual::{BLOCK_4X4, BLOCK_8X8, BLOCK_16X16, BLOCK_64X64};
 
     /// §6.4.4 line 2410: a default-initialised result on an intra block
     /// writes zero into `Skips[ r ][ c ]`. The base case.

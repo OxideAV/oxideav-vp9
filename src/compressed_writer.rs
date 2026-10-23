@@ -18,9 +18,9 @@
 //! (`docs/video/vp9/vp9-spec.txt`) §6.3; the field order mirrors the
 //! in-crate parser exactly.
 
-use crate::bool_encoder::BoolEncoder;
-use crate::compressed::{tx_mode_to_biggest_tx_size, ReferenceMode, TxMode};
 use crate::Error;
+use crate::bool_encoder::BoolEncoder;
+use crate::compressed::{ReferenceMode, TxMode, tx_mode_to_biggest_tx_size};
 
 use crate::compressed::FrameContext;
 use crate::entropy_model::{write_diff_update_prob, write_update_mv_prob};
@@ -402,7 +402,7 @@ pub(crate) fn write_compressed_header_inter_ctx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compressed::{parse_compressed_header, DEFAULT_SKIP_PROB, DEFAULT_TX_PROBS};
+    use crate::compressed::{DEFAULT_SKIP_PROB, DEFAULT_TX_PROBS, parse_compressed_header};
 
     fn assert_intra_header_roundtrips(tx_mode: TxMode, lossless: bool) {
         let bytes = write_compressed_header_intra(tx_mode, lossless).expect("write chdr");
@@ -466,8 +466,8 @@ mod tests {
     // ----- §6.3 inter compressed header -----
 
     use crate::compressed::{
-        parse_compressed_header_inter, FrameContext, RefFrameSignBias,
-        Vp9CompressedHeaderInterInputs,
+        FrameContext, RefFrameSignBias, Vp9CompressedHeaderInterInputs,
+        parse_compressed_header_inter,
     };
 
     /// Round-trip the written inter header through `parse_compressed_header_inter`

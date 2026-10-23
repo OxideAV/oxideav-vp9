@@ -1,6 +1,6 @@
 //! Round-trip fuzz for the round-441 **lossy format matrix** keyframe
-//! entries — `encode_vp9_lossy_444` / `encode_vp9_lossy_422` (profile
-//! 1) and `encode_vp9_lossy_hbd` / `encode_vp9_lossy_hbd_422`
+//! entries — `encode_vp9_lossy_444` / `encode_vp9_lossy_422`
+//! (profile 1) and `encode_vp9_lossy_hbd` / `encode_vp9_lossy_hbd_422`
 //! (profiles 2/3) — the paths that generalise the lossy pipeline over
 //! the §7.2.2 `(BitDepth, subsampling_x, subsampling_y)` triple.
 //!

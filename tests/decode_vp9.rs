@@ -22,7 +22,7 @@
 //! intra-leading fixture in the corpus when the docs tree is present
 //! (workspace checkouts), comparing the leading keyframe byte-exactly.
 
-use oxideav_vp9::{decode_intra_frame, decode_vp9, Error};
+use oxideav_vp9::{Error, decode_intra_frame, decode_vp9};
 
 fn from_hex_lines(lines: &[&str]) -> Vec<u8> {
     let mut out = Vec::new();

@@ -51,8 +51,8 @@
 // exclusively from `#[cfg(test)]`.
 #![allow(dead_code)]
 
-use crate::idct::{inverse_transform_2d, ADST_ADST, ADST_DCT, DCT_ADST, DCT_DCT};
-use crate::intra::{predict_intra, Plane, PredMode};
+use crate::idct::{ADST_ADST, ADST_DCT, DCT_ADST, DCT_DCT, inverse_transform_2d};
+use crate::intra::{Plane, PredMode, predict_intra};
 
 /// `mode2txfm_map[ MB_MODE_COUNT ]` from §10.5 — the intra prefix of the
 /// table, mapping each of the 10 §7.4.5 intra prediction modes

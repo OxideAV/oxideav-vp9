@@ -261,7 +261,7 @@ pub(crate) fn get_ac_quant(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::header::{QuantizationParams, SegmentationParams, MAX_SEGMENTS, SEG_LVL_MAX};
+    use crate::header::{MAX_SEGMENTS, QuantizationParams, SEG_LVL_MAX, SegmentationParams};
 
     fn quant(base: u8, ydc: i8, uvdc: i8, uvac: i8) -> QuantizationParams {
         QuantizationParams {

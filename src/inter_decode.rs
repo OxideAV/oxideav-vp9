@@ -35,7 +35,7 @@ use crate::decode_block::Vp9FrameState;
 use crate::inter_pred::{RefPlane, RefPlanes};
 use crate::mode_info::LAST_FRAME;
 use crate::mv_ref::MvCandidateSource;
-use crate::ref_buffer::{resolve_ref_idx, RefBuffers, REFS_PER_FRAME};
+use crate::ref_buffer::{REFS_PER_FRAME, RefBuffers, resolve_ref_idx};
 
 /// Optional previous-frame motion-field snapshot the §6.5.10 candidate
 /// scan reads when `UsePrevFrameMvs` is set.

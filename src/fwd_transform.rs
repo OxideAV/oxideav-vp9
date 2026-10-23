@@ -67,7 +67,7 @@ pub(crate) fn forward_wht_2d(block: &mut [i64]) {
     // Then undo the row pass. The decoder's row pass consumed
     // `Dequant >> 2` with `Dequant == 4 * Tokens`, so the row-domain
     // values recovered here *are* the tokens.
-    for row in block.chunks_exact_mut(4) {
+    for row in block.as_chunks_mut::<4>().0 {
         t.copy_from_slice(row);
         inverse_wht(&mut t, 0);
         row.copy_from_slice(&t);
@@ -399,7 +399,7 @@ pub(crate) fn quantize_block_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::idct::{inverse_transform_2d, DCT_DCT};
+    use crate::idct::{DCT_DCT, inverse_transform_2d};
 
     /// Simulate the decoder's lossless reconstruction of a token block:
     /// §8.6.1 dequant (lossless quantizer = 4 for DC and AC) then the

@@ -81,16 +81,16 @@
 // lands.
 #![allow(dead_code)]
 
+use crate::Error;
 use crate::bool_coder::BoolCoder;
 use crate::compressed::{
-    tx_mode_to_biggest_tx_size, CompoundReferenceConfig, ReferenceMode, TxMode,
+    CompoundReferenceConfig, ReferenceMode, TxMode, tx_mode_to_biggest_tx_size,
 };
 use crate::partition::{NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP};
 use crate::residual::{
     BLOCK_8X8, BLOCK_SIZES, MAX_TXSIZE_LOOKUP, NUM_4X4_BLOCKS_HIGH_LOOKUP,
     NUM_4X4_BLOCKS_WIDE_LOOKUP,
 };
-use crate::Error;
 
 // ----- §9.3.1 tree listings (verbatim transcription) -----
 
@@ -2172,11 +2172,7 @@ pub(crate) fn comp_ref_context(
     };
     // §6.4.11 `vrf` selection: AboveSingle/LeftSingle ? RefFrame[0] : RefFrame[VarRefIdx].
     let pick_var = |single: bool, rf0: i32, rf1: i32| {
-        if single || var_ref_idx == 0 {
-            rf0
-        } else {
-            rf1
-        }
+        if single || var_ref_idx == 0 { rf0 } else { rf1 }
     };
 
     match (nb.above, nb.left) {
@@ -2858,7 +2854,7 @@ pub(crate) fn inter_block_mode_info<S: crate::mv_ref::MvCandidateSource>(
     seg_feature_skip_active: bool,
     counts: &mut crate::prob_adapt::CountsNonCoef,
 ) -> Result<Vp9InterBlockModeInfo, Error> {
-    use crate::mv::{assign_mv, MvPredictors};
+    use crate::mv::{MvPredictors, assign_mv};
 
     let mi_size = geom.mi_size as u8;
 
@@ -3348,7 +3344,7 @@ pub(crate) fn inter_frame_mode_info<S: crate::mv_ref::MvCandidateSource>(
 mod tests {
     use super::*;
     use crate::residual::{
-        BLOCK_16X16, BLOCK_32X32, BLOCK_4X4, BLOCK_4X8, BLOCK_64X64, BLOCK_8X4, BLOCK_8X8,
+        BLOCK_4X4, BLOCK_4X8, BLOCK_8X4, BLOCK_8X8, BLOCK_16X16, BLOCK_32X32, BLOCK_64X64,
     };
 
     // ----- Tree-listing anchors -----
@@ -4155,7 +4151,9 @@ mod tests {
         // post-loop returns -n which gives 0 again).
         assert_eq!(
             INTRA_MODE_TREE,
-            [0, 2, -9, 4, -1, 6, 8, 12, -2, 10, -4, -5, -3, 14, -8, 16, -6, -7]
+            [
+                0, 2, -9, 4, -1, 6, 8, 12, -2, 10, -4, -5, -3, 14, -8, 16, -6, -7
+            ]
         );
     }
 
@@ -4332,7 +4330,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(value, 0); // DC_PRED via tree[0]=0.
-                              // Only one read since every bit=0 routes straight to a leaf.
+        // Only one read since every bit=0 routes straight to a leaf.
         assert_eq!(calls.borrow().len(), 1);
         assert_eq!(calls.borrow()[0].0, 0);
         // The selected row's node-0 prob is the [V_PRED][H_PRED][0]
@@ -5303,7 +5301,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(id, 2); // = predicted.
-                           // BLOCK_16X16 → bw=bh=2; ctx flag=1 written across (0..2).
+        // BLOCK_16X16 → bw=bh=2; ctx flag=1 written across (0..2).
         assert_eq!(ctx.above(0), 1);
         assert_eq!(ctx.above(1), 1);
         assert_eq!(ctx.left(0), 1);

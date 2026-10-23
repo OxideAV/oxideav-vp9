@@ -8,9 +8,9 @@
 //! returned [`FilterStrength`] tuple against the §8.8.4 formulas.
 
 use oxideav_vp9::{
-    adaptive_filter_strength, loop_filter_frame_init, mode_to_mode_type, FilterStrength,
-    LoopFilterParams, LvlLookup, SegmentationParams, MAX_LOOP_FILTER, MAX_SEGMENTS, NEARESTMV,
-    NEARMV, NEWMV, SEG_LVL_MAX, ZEROMV,
+    FilterStrength, LoopFilterParams, LvlLookup, MAX_LOOP_FILTER, MAX_SEGMENTS, NEARESTMV, NEARMV,
+    NEWMV, SEG_LVL_MAX, SegmentationParams, ZEROMV, adaptive_filter_strength,
+    loop_filter_frame_init, mode_to_mode_type,
 };
 
 fn lf_with(level: u8, sharpness: u8) -> LoopFilterParams {

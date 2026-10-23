@@ -37,20 +37,20 @@
 // subsystem); exercised now by the round-trip tests below.
 #![allow(dead_code)]
 
+use crate::Error;
 use crate::bool_encoder::BoolEncoder;
 use crate::compressed::TxMode;
-use crate::decode_block::{decode_block_apply, DecodedBlockResult, Vp9FrameState};
+use crate::decode_block::{DecodedBlockResult, Vp9FrameState, decode_block_apply};
 use crate::mode_info::{
-    tx_size_context, IntraFrameNeighbours, NeighbourSkips, NeighbourTxSizes, Vp9IntraMiBlock,
-    DC_PRED, SIZE_GROUP_LOOKUP,
+    DC_PRED, IntraFrameNeighbours, NeighbourSkips, NeighbourTxSizes, SIZE_GROUP_LOOKUP,
+    Vp9IntraMiBlock, tx_size_context,
 };
 use crate::mode_writer::{
     tx_size_is_coded, write_default_intra_mode, write_default_uv_mode, write_segment_id,
     write_skip, write_tx_size,
 };
 use crate::residual::{BLOCK_8X8, MAX_TXSIZE_LOOKUP};
-use crate::residual_writer::{write_residual_intra, CoefSource, ResidualWriteCtx};
-use crate::Error;
+use crate::residual_writer::{CoefSource, ResidualWriteCtx, write_residual_intra};
 
 const INTRA_FRAME: i32 = 0;
 const NONE_REF_FRAME: i32 = -1;

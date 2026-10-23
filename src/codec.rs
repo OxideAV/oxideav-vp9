@@ -28,15 +28,15 @@ use std::collections::VecDeque;
 
 use oxideav_core::registry::{CodecInfo, Decoder, Encoder};
 use oxideav_core::{
-    parse_options, CodecCapabilities, CodecId, CodecOptionsStruct, CodecParameters, CodecTag,
-    Error as CoreError, ExecutionContext, Frame, OptionField, OptionKind, OptionValue, Packet,
-    PixelFormat, Result as CoreResult, RuntimeContext, TimeBase, VideoFrame, VideoPlane,
+    CodecCapabilities, CodecId, CodecOptionsStruct, CodecParameters, CodecTag, Error as CoreError,
+    ExecutionContext, Frame, OptionField, OptionKind, OptionValue, Packet, PixelFormat,
+    Result as CoreResult, RuntimeContext, TimeBase, VideoFrame, VideoPlane, parse_options,
 };
 
 use crate::decode_frame::{Vp9DecodedFrame, Vp9SequenceDecoder};
 use crate::pixel_encoder::{
-    padded_targets_from_u16, padded_targets_from_u8, ChainModel, LosslessGopEncoder420,
-    LossyFormat, LossyGopEncoder,
+    ChainModel, LosslessGopEncoder420, LossyFormat, LossyGopEncoder, padded_targets_from_u8,
+    padded_targets_from_u16,
 };
 use crate::superframe::split_superframe;
 
@@ -493,7 +493,9 @@ impl Encoder for Vp9Encoder {
                     // §8.10 output convention: little-endian pairs per
                     // sample — reassemble the native u16 planes.
                     let samples: Vec<u16> = planar
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .map(|c| u16::from_le_bytes([c[0], c[1]]))
                         .collect();
                     let max = (1u16 << self.bit_depth) - 1;

@@ -28,16 +28,16 @@
 // exercised now by the round-trip tests below.
 #![allow(dead_code)]
 
+use crate::Error;
 use crate::adaptive_filter_strength::{NEARESTMV, NEARMV, NEWMV};
 use crate::bool_encoder::BoolEncoder;
 use crate::compressed::MvProbs;
 use crate::mode_writer::tree_encode;
 use crate::mv::{
-    use_mv_hp, MvPredictors, MV_CLASS_0, MV_CLASS_TREE, MV_FR_TREE, MV_JOINT_HNZVNZ,
-    MV_JOINT_HNZVZ, MV_JOINT_HZVNZ, MV_JOINT_TREE, MV_JOINT_ZERO,
+    MV_CLASS_0, MV_CLASS_TREE, MV_FR_TREE, MV_JOINT_HNZVNZ, MV_JOINT_HNZVZ, MV_JOINT_HZVNZ,
+    MV_JOINT_TREE, MV_JOINT_ZERO, MvPredictors, use_mv_hp,
 };
 use crate::prob_adapt::CountsNonCoef;
-use crate::Error;
 
 /// `CLASS0_SIZE == 1 << 1` per §3 — the class-0 integer-part shift, mirror
 /// of the constant `read_mv_component` decomposes against.

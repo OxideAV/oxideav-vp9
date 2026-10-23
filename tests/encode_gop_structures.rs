@@ -10,9 +10,9 @@
 //! byte-determinism, and rejections.
 
 use oxideav_vp9::{
-    decode_vp9_sequence, encode_vp9_lossy_sequence, encode_vp9_lossy_sequence_altref,
-    encode_vp9_lossy_sequence_resized, encode_vp9_lossy_sequence_resized_with,
-    encode_vp9_lossy_sequence_with, Error, Vp9GopConfig, Vp9Segmentation,
+    Error, Vp9GopConfig, Vp9Segmentation, decode_vp9_sequence, encode_vp9_lossy_sequence,
+    encode_vp9_lossy_sequence_altref, encode_vp9_lossy_sequence_resized,
+    encode_vp9_lossy_sequence_resized_with, encode_vp9_lossy_sequence_with,
 };
 
 /// Source frame `k` of a translating 4:2:0 scene (a ramp plus a sharp

@@ -84,11 +84,7 @@ pub const PASS_HORIZONTAL: u8 = 1;
 /// §5.1 `Min(x, y)` — the smaller of two `u8` operands.
 #[inline]
 fn min_u8(x: u8, y: u8) -> u8 {
-    if x < y {
-        x
-    } else {
-        y
-    }
+    if x < y { x } else { y }
 }
 
 /// Run §8.8.3 `filter_size( )` per `vp9-spec.txt` lines 5587-5625.

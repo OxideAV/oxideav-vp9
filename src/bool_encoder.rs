@@ -173,10 +173,10 @@ impl BoolEncoder {
         for _ in 0..32 {
             self.write_bool(0, 128);
         }
-        if let Some(&last) = self.out.last() {
-            if (last & 0xe0) == 0xc0 {
-                self.out.push(0x00);
-            }
+        if let Some(&last) = self.out.last()
+            && (last & 0xe0) == 0xc0
+        {
+            self.out.push(0x00);
         }
         if self.out.is_empty() {
             self.out.push(0x00);

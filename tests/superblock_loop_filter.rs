@@ -4,9 +4,9 @@
 //! (`docs/video/vp9/vp9-spec.txt` §8.8.2 lines 5491-5586).
 
 use oxideav_vp9::{
+    LoopFilterParams, LvlLookup, MAX_SEGMENTS, PASS_HORIZONTAL, PASS_VERTICAL, SEG_LVL_MAX,
+    SampleFilterSamples, SegmentationParams, SuperblockFilterFrame, SuperblockFilterPlane, TX_4X4,
     adaptive_filter_strength, loop_filter_frame_init, sample_filtering, superblock_loop_filter,
-    LoopFilterParams, LvlLookup, SampleFilterSamples, SegmentationParams, SuperblockFilterFrame,
-    SuperblockFilterPlane, MAX_SEGMENTS, PASS_HORIZONTAL, PASS_VERTICAL, SEG_LVL_MAX, TX_4X4,
 };
 
 /// `BLOCK_8X8 = 3` per §3 — the block-size enumeration index the

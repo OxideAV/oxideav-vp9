@@ -31,22 +31,22 @@
 //! (`docs/video/vp9/vp9-spec.txt`) §6.1 / §6.2 / §6.3 / §6.4; the byte
 //! layout mirrors the in-crate `decode_intra_frame` exactly.
 
-use crate::block_writer::{write_keyframe_intra_block, BlockWriteFrameCtx, IntraBlockSpec};
+use crate::Error;
+use crate::block_writer::{BlockWriteFrameCtx, IntraBlockSpec, write_keyframe_intra_block};
 use crate::bool_encoder::BoolEncoder;
 use crate::coef_probs::DEFAULT_COEF_PROBS;
-use crate::compressed::{TxMode, DEFAULT_SKIP_PROB, DEFAULT_TX_PROBS};
+use crate::compressed::{DEFAULT_SKIP_PROB, DEFAULT_TX_PROBS, TxMode};
 use crate::compressed_writer::write_compressed_header_intra;
 use crate::decode_block::Vp9FrameState;
 use crate::header::{FrameType, Vp9FrameHeader};
 use crate::header_writer::write_uncompressed_header;
 use crate::mode_writer::{inferred_tx_size, tx_size_is_coded};
 use crate::partition::{
-    PartitionContextState, PartitionProbsKind, PARTITION_NONE, PARTITION_SPLIT,
+    PARTITION_NONE, PARTITION_SPLIT, PartitionContextState, PartitionProbsKind,
 };
 use crate::partition_writer::{write_partition_8x8, write_partition_tree};
-use crate::residual::{BLOCK_64X64, BLOCK_8X8, MAX_TXSIZE_LOOKUP};
+use crate::residual::{BLOCK_8X8, BLOCK_64X64, MAX_TXSIZE_LOOKUP};
 use crate::tokens::NonzeroContext;
-use crate::Error;
 use std::collections::HashMap;
 
 /// Per-8x8-block plan: the mode / skip / segment a leaf block codes.
@@ -1160,10 +1160,10 @@ pub(crate) fn assemble_inter_frame_tree_ctx(
     coeffs: &mut FrameCoefSource<'_>,
     entropy: Option<&FrameEntropy<'_>>,
 ) -> Result<(Vec<u8>, Vp9FrameState, Box<crate::prob_adapt::FrameCounts>), Error> {
-    use crate::compressed::{setup_compound_reference_mode, RefFrameSignBias, ReferenceMode};
+    use crate::compressed::{RefFrameSignBias, ReferenceMode, setup_compound_reference_mode};
     use crate::compressed_writer::write_compressed_header_inter_ctx;
     use crate::inter_block_writer::{
-        write_inter_block, InterBlockFrameCtx, InterBlockProbs, InterBlockSpec,
+        InterBlockFrameCtx, InterBlockProbs, InterBlockSpec, write_inter_block,
     };
     use crate::mode_info::ZEROMV;
 
@@ -1640,7 +1640,7 @@ mod tests {
     #[test]
     fn non_skip_dc_residual_reconstructs_top_left_block() {
         use crate::dequant::get_dc_quant;
-        use crate::idct::{inverse_transform_2d, DCT_DCT};
+        use crate::idct::{DCT_DCT, inverse_transform_2d};
 
         let hdr = keyframe_header(64, 64);
         let n = 8 * 8usize;
@@ -1702,7 +1702,7 @@ mod tests {
         seg.pred_prob = Some([255; 3]);
         seg.update_data = true;
         seg.abs_or_delta_update = false; // delta update.
-                                         // SEG_LVL_ALT_Q (feature 0) on segment 1: a -16 quantizer delta.
+        // SEG_LVL_ALT_Q (feature 0) on segment 1: a -16 quantizer delta.
         seg.feature_enabled[1][0] = true;
         seg.feature_data[1][0] = -16;
         hdr.segmentation = seg;
@@ -1765,7 +1765,7 @@ mod tests {
     #[test]
     fn non_skip_ac_residual_reconstructs_top_left_block() {
         use crate::dequant::{get_ac_quant, get_dc_quant};
-        use crate::idct::{inverse_transform_2d, DCT_DCT};
+        use crate::idct::{DCT_DCT, inverse_transform_2d};
 
         let hdr = keyframe_header(64, 64);
         // DC_PRED everywhere so mode2txfm_map -> DCT_DCT (matches probe).
@@ -1873,7 +1873,7 @@ mod tests {
     #[test]
     fn tree_64x64_tx32_dc_residual_reconstructs() {
         use crate::dequant::get_dc_quant;
-        use crate::idct::{inverse_transform_2d, DCT_DCT};
+        use crate::idct::{DCT_DCT, inverse_transform_2d};
 
         let hdr = keyframe_header(64, 64);
         let mut plan = uniform_tree_plan(8, 8, BLOCK_64X64, 3, false);
@@ -1912,7 +1912,7 @@ mod tests {
     #[test]
     fn tree_16x16_tx16_dc_residual_reconstructs() {
         use crate::dequant::get_dc_quant;
-        use crate::idct::{inverse_transform_2d, DCT_DCT};
+        use crate::idct::{DCT_DCT, inverse_transform_2d};
 
         let hdr = keyframe_header(64, 64);
         let plan = uniform_tree_plan(8, 8, BLOCK_16X16, 2, false);
@@ -2229,11 +2229,7 @@ mod tests {
         let mut coeffs: Box<FrameCoefSource> =
             Box::new(
                 |_r, _c, p, _sx, _sy, _b| {
-                    if p == 0 {
-                        vec![2i64]
-                    } else {
-                        Vec::new()
-                    }
+                    if p == 0 { vec![2i64] } else { Vec::new() }
                 },
             );
         let pf = assemble_inter_frame_planned(
@@ -2383,11 +2379,7 @@ mod tests {
         let mut coeffs: Box<FrameCoefSource> =
             Box::new(
                 |_r, _c, p, _sx, _sy, _b| {
-                    if p == 0 {
-                        vec![40i64]
-                    } else {
-                        Vec::new()
-                    }
+                    if p == 0 { vec![40i64] } else { Vec::new() }
                 },
             );
         let pf = assemble_inter_frame_tree(&p_hdr, &tree_plan, &mut *planner, &mut *coeffs)
@@ -2455,11 +2447,7 @@ mod tests {
         let mut coeffs: Box<FrameCoefSource> =
             Box::new(
                 |_r, _c, p, _sx, _sy, _b| {
-                    if p == 0 {
-                        vec![24i64]
-                    } else {
-                        Vec::new()
-                    }
+                    if p == 0 { vec![24i64] } else { Vec::new() }
                 },
             );
         let pf = assemble_inter_frame_tree(&p_hdr, &tree_plan, &mut *planner, &mut *coeffs)
@@ -3174,11 +3162,7 @@ mod tests {
         }
         let mut coeffs: Box<FrameCoefSource> = Box::new(
             |_r, _c, p, _sx, _sy, _b| {
-                if p == 0 {
-                    vec![3]
-                } else {
-                    Vec::new()
-                }
+                if p == 0 { vec![3] } else { Vec::new() }
             },
         );
         let (_bytes, st) =

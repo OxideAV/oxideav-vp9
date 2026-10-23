@@ -3,9 +3,9 @@
 //! lossy keyframe — the profiling targets of the encoder's
 //! byte-identical speedups. Run with `cargo bench --bench encode`.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use oxideav_vp9::{
-    encode_vp9_lossy, encode_vp9_lossy_sequence, encode_vp9_lossy_sequence_with, Vp9GopConfig,
+    Vp9GopConfig, encode_vp9_lossy, encode_vp9_lossy_sequence, encode_vp9_lossy_sequence_with,
 };
 
 /// Translating textured 4:2:0 content (the rate-control tests' scene).
@@ -20,7 +20,7 @@ fn scene(w: usize, h: usize, k: usize) -> Vec<u8> {
             if (8..24).contains(&px_x) && (8..24).contains(&y) {
                 v = (px_x as usize * 37 + y * 53) % 255;
             }
-            if (x * 7 + y * 11 + k) % 29 == 0 {
+            if (x * 7 + y * 11 + k).is_multiple_of(29) {
                 v = (v + 40) % 256;
             }
             px.push(v as u8);

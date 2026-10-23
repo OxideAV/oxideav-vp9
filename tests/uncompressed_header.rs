@@ -5,7 +5,7 @@
 //! No external fixtures are involved — every input is constructed bit
 //! by bit from the §6.2 syntax tree.
 
-use oxideav_vp9::{parse_uncompressed_header, ColorSpace, Error, FrameType};
+use oxideav_vp9::{ColorSpace, Error, FrameType, parse_uncompressed_header};
 
 /// Minimal MSB-first bit builder for assembling test buffers. Pushes
 /// the lowest `n` bits of `value` MSB-first into an internal byte
@@ -197,7 +197,7 @@ fn profile0_keyframe_yuv420_studio_swing() {
     assert_eq!(h.reset_frame_context, 0);
     assert!(!h.refresh_frame_context); // we wrote 0
     assert!(!h.frame_parallel_decoding_mode); // we wrote 0
-                                              // FrameIsIntra=1 forces frame_context_idx to 0.
+    // FrameIsIntra=1 forces frame_context_idx to 0.
     assert_eq!(h.frame_context_idx, 0);
     assert_eq!(h.loop_filter.level, 0);
     assert!(!h.loop_filter.delta_enabled);
@@ -244,13 +244,13 @@ fn profile2_keyframe_10bit_with_render_override_and_quant_deltas() {
     b.push_bits(2, 3); // sharpness
     b.push_bits(1, 1); // delta_enabled
     b.push_bits(0, 1); // delta_update = 0
-                       // quantization with nonzero base_q_idx and a Y DC delta.
+    // quantization with nonzero base_q_idx and a Y DC delta.
     b.push_bits(64, 8); // base_q_idx
     b.push_bits(1, 1); // delta_coded for y_dc
     b.push_signed(-3, 4); // delta_q_y_dc = -3
     b.push_bits(0, 1); // delta_coded for uv_dc = 0
     b.push_bits(0, 1); // delta_coded for uv_ac = 0
-                       // segmentation_enabled = 0.
+    // segmentation_enabled = 0.
     b.push_bits(0, 1);
     // tile_info for 3840-wide frame: max_log2 = 3, min_log2 = 0.
     // Emit "increment, increment, increment" then bit for rows.
@@ -260,10 +260,10 @@ fn profile2_keyframe_10bit_with_render_override_and_quant_deltas() {
     // To keep this terse choose min_log2 (write three 0-bits to break
     // immediately at the first iteration).
     b.push_bits(0, 1); // increment = 0 -> break at tile_cols_log2 = 0
-                       // tile_rows_log2: first bit = 1, then increment bit.
+    // tile_rows_log2: first bit = 1, then increment bit.
     b.push_bits(1, 1);
     b.push_bits(1, 1); // -> tile_rows_log2 = 2
-                       // header_size_in_bytes = 17 (arbitrary nonzero).
+    // header_size_in_bytes = 17 (arbitrary nonzero).
     b.push_bits(17, 16);
     b.align_to_byte();
 
@@ -415,21 +415,21 @@ fn loop_filter_with_full_delta_update() {
     b.push_bits(255, 16); // 256 width
     b.push_bits(255, 16); // 256 height
     b.push_bits(0, 1); // render_and_frame_size_different
-                       // tail (error-resilient): frame_context_idx = 0
+    // tail (error-resilient): frame_context_idx = 0
     b.push_bits(0, 2);
     // loop_filter_params:
     b.push_bits(35, 6); // level
     b.push_bits(5, 3); // sharpness
     b.push_bits(1, 1); // delta_enabled
     b.push_bits(1, 1); // delta_update
-                       // ref_deltas: update [Y, N, Y, N], values [+10, _, -7, _].
+    // ref_deltas: update [Y, N, Y, N], values [+10, _, -7, _].
     b.push_bits(1, 1); // update_ref_delta[0]
     b.push_signed(10, 6);
     b.push_bits(0, 1); // update_ref_delta[1]
     b.push_bits(1, 1); // update_ref_delta[2]
     b.push_signed(-7, 6);
     b.push_bits(0, 1); // update_ref_delta[3]
-                       // mode_deltas: update [N, Y], value -1.
+    // mode_deltas: update [N, Y], value -1.
     b.push_bits(0, 1); // update_mode_delta[0]
     b.push_bits(1, 1); // update_mode_delta[1]
     b.push_signed(-1, 6);
@@ -443,7 +443,7 @@ fn loop_filter_with_full_delta_update() {
     // tile_info: 256-wide -> Sb64Cols = 4, min_log2 = 0, max_log2 = 0
     // (4 >> 1 = 2 < 4 so loop runs once, returning maxLog2 - 1 = 0).
     b.push_bits(0, 1); // tile_rows_log2 first bit
-                       // header_size = 0.
+    // header_size = 0.
     b.push_bits(0, 16);
     b.align_to_byte();
 
@@ -483,7 +483,7 @@ fn segmentation_enabled_with_update_map_and_data() {
     b.push_bits(255, 16); // 256 height
     b.push_bits(0, 1); // render_and_frame_size_different
     b.push_bits(0, 2); // frame_context_idx
-                       // loop_filter (disabled).
+    // loop_filter (disabled).
     b.push_bits(0, 6);
     b.push_bits(0, 3);
     b.push_bits(0, 1);
@@ -553,7 +553,7 @@ fn segmentation_enabled_with_update_map_and_data() {
 
     // tile_info: 256-wide.
     b.push_bits(0, 1); // tile_rows_log2 first bit
-                       // header_size = 5.
+    // header_size = 5.
     b.push_bits(5, 16);
     b.align_to_byte();
 
@@ -578,7 +578,7 @@ fn segmentation_enabled_with_update_map_and_data() {
     assert_eq!(h.segmentation.feature_data[2][2], 3);
     assert!(h.segmentation.feature_enabled[3][3]);
     assert_eq!(h.segmentation.feature_data[3][3], 0); // skip flag, value irrelevant
-                                                      // Everything else stays disabled.
+    // Everything else stays disabled.
     assert!(!h.segmentation.feature_enabled[4][0]);
     assert!(!h.segmentation.feature_enabled[0][1]);
 
@@ -603,9 +603,9 @@ fn tile_info_picks_up_increments_for_4k_frame() {
     b.push_bits(3839, 16); // 3840 width
     b.push_bits(2159, 16); // 2160 height
     b.push_bits(0, 1); // render_and_frame_size_different
-                       // tail
+    // tail
     b.push_bits(0, 2); // frame_context_idx
-                       // loop_filter disabled
+    // loop_filter disabled
     b.push_bits(0, 6);
     b.push_bits(0, 3);
     b.push_bits(0, 1);
@@ -622,7 +622,7 @@ fn tile_info_picks_up_increments_for_4k_frame() {
     b.push_bits(1, 1);
     b.push_bits(0, 1);
     b.push_bits(0, 1); // tile_rows_log2 first bit = 0
-                       // header_size = 0
+    // header_size = 0
     b.push_bits(0, 16);
     b.align_to_byte();
 
@@ -660,9 +660,9 @@ fn nonzero_trailing_bit_is_rejected() {
     b.push_bits(0, 1);
     b.push_bits(0, 1); // tile rows first bit
     b.push_bits(0, 16); // header_size
-                        // Don't align — set a stray 1 in the pad region.
-                        // Currently bit_pos isn't byte aligned. Push a 1 at the next
-                        // position to violate trailing_bits.
+    // Don't align — set a stray 1 in the pad region.
+    // Currently bit_pos isn't byte aligned. Push a 1 at the next
+    // position to violate trailing_bits.
     let pos = b.bit_pos;
     if pos & 7 != 0 {
         b.push_bits(1, 1);

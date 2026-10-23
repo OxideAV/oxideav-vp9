@@ -20,16 +20,16 @@
 //! (`docs/video/vp9/vp9-spec.txt`) §6.4.3 / §9.3.1 / §9.3.2 / §10.2; the
 //! recursion order + context handling mirror the in-crate decoder.
 
+use crate::Error;
 use crate::bool_encoder::BoolEncoder;
 use crate::mode_writer::tree_encode;
 use crate::partition::{
-    partition_plane_context, write_back_partition_context, PartitionContextState,
-    PartitionProbsKind, COLS_PARTITION_TREE, NUM_8X8_BLOCKS_WIDE_LOOKUP, PARTITION_CONTEXTS,
-    PARTITION_HORZ, PARTITION_NONE, PARTITION_SPLIT, PARTITION_TREE, PARTITION_TYPES,
-    PARTITION_VERT, ROWS_PARTITION_TREE, SUBSIZE_LOOKUP,
+    COLS_PARTITION_TREE, NUM_8X8_BLOCKS_WIDE_LOOKUP, PARTITION_CONTEXTS, PARTITION_HORZ,
+    PARTITION_NONE, PARTITION_SPLIT, PARTITION_TREE, PARTITION_TYPES, PARTITION_VERT,
+    PartitionContextState, PartitionProbsKind, ROWS_PARTITION_TREE, SUBSIZE_LOOKUP,
+    partition_plane_context, write_back_partition_context,
 };
 use crate::residual::{BLOCK_8X8, BLOCK_SIZES};
-use crate::Error;
 
 /// §6.4.4 per-leaf callback signature: invoked at every block call site
 /// the §6.4.3 traversal reaches, with the live encoder positioned at the
@@ -425,7 +425,7 @@ pub(crate) fn write_partition_tree(
 mod tests {
     use super::*;
     use crate::bool_coder::BoolCoder;
-    use crate::partition::{decode_partition, LeafBlock};
+    use crate::partition::{LeafBlock, decode_partition};
     use crate::residual::BLOCK_64X64;
 
     /// Encode an all-8x8 partition for a `mi_rows × mi_cols` frame, then

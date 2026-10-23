@@ -35,12 +35,12 @@
 //! `UseHp == 0` the bit is not present in the bitstream and the decoded
 //! value is fixed to `1` (§9.3.3 listing, `vp9-spec.txt` lines 6214-6216).
 
+use crate::Error;
 use crate::adaptive_filter_strength::{NEARESTMV, NEARMV, NEWMV};
 use crate::bool_coder::BoolCoder;
 use crate::compressed::MvProbs;
-use crate::mode_info::{tree_decode, BINARY_TREE};
+use crate::mode_info::{BINARY_TREE, tree_decode};
 use crate::prob_adapt::CountsNonCoef;
-use crate::Error;
 
 /// `MV_JOINT_ZERO = 0` per §7.4.13 (`vp9-spec.txt` line 4014). Neither
 /// motion-vector difference component is non-zero.

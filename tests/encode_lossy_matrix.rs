@@ -10,8 +10,8 @@
 //! the encode is byte-deterministic, and bad arguments are rejected.
 
 use oxideav_vp9::{
-    decode_intra_frame, encode_vp9_lossy_422, encode_vp9_lossy_440, encode_vp9_lossy_444,
-    encode_vp9_lossy_hbd, encode_vp9_lossy_hbd_422, encode_vp9_lossy_hbd_440, Error,
+    Error, decode_intra_frame, encode_vp9_lossy_422, encode_vp9_lossy_440, encode_vp9_lossy_444,
+    encode_vp9_lossy_hbd, encode_vp9_lossy_hbd_422, encode_vp9_lossy_hbd_440,
 };
 
 /// Deterministic 8-bit planar content at the given chroma dims.

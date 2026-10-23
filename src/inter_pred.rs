@@ -56,7 +56,7 @@
 // §8.5.2.1-4 primitive modules).
 #![allow(dead_code)]
 
-use crate::inter_mv::{clamp_mv, scale_mv, select_mv, BlockGrid, ScaleGeom};
+use crate::inter_mv::{BlockGrid, ScaleGeom, clamp_mv, scale_mv, select_mv};
 use crate::intra::Plane;
 
 /// `Round2( x, n )` per spec §3 (`vp9-spec.txt` line 636). The §8.5.2
@@ -258,7 +258,7 @@ pub(crate) fn predict_inter(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::residual::{BLOCK_64X64, BLOCK_8X8};
+    use crate::residual::{BLOCK_8X8, BLOCK_64X64};
 
     /// Build a `w×h` reference plane with a value that stays inside the
     /// 8-bit `Clip1` range (`0..=255`) yet is unique within the small

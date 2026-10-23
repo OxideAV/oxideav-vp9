@@ -4,13 +4,13 @@
 //! mid-sequence scene cut — with the one-pass chain kept intact.
 
 use oxideav_vp9::{
-    decode_vp9_sequence, encode_vp9_lossy_sequence_rc, encode_vp9_lossy_sequence_rc_two_pass,
+    Error, Vp9DecodedFrame, Vp9GopConfig, Vp9Segmentation, Vp9TwoPassFrame, decode_vp9_sequence,
+    encode_vp9_lossy_sequence_rc, encode_vp9_lossy_sequence_rc_two_pass,
     encode_vp9_lossy_sequence_rc_two_pass_with, encode_vp9_lossy_sequence_rc_two_pass_with_422,
     encode_vp9_lossy_sequence_rc_two_pass_with_440, encode_vp9_lossy_sequence_rc_two_pass_with_444,
     encode_vp9_lossy_sequence_rc_two_pass_with_hbd,
     encode_vp9_lossy_sequence_rc_two_pass_with_hbd_422,
-    encode_vp9_lossy_sequence_rc_two_pass_with_hbd_440, Error, Vp9DecodedFrame, Vp9GopConfig,
-    Vp9Segmentation, Vp9TwoPassFrame,
+    encode_vp9_lossy_sequence_rc_two_pass_with_hbd_440,
 };
 
 fn scene(w: usize, h: usize, k: usize, seed: usize) -> Vec<u8> {
@@ -24,7 +24,7 @@ fn scene(w: usize, h: usize, k: usize, seed: usize) -> Vec<u8> {
             if (8..24).contains(&px_x) && (8..24).contains(&y) {
                 v = (px_x as usize * 37 + y * 53 + seed) % 255;
             }
-            if (x * 7 + y * 11 + k) % 29 == 0 {
+            if (x * 7 + y * 11 + k).is_multiple_of(29) {
                 v = (v + 40) % 256;
             }
             px.push(v as u8);
@@ -154,10 +154,12 @@ fn two_pass_rate_accuracy_across_gop_shapes() {
             over <= usize::from(name == "scene-cut"),
             "{name}: {over} frames above the keyframe"
         );
-        assert!(report
-            .iter()
-            .filter(|f| f.first_pass_bytes <= kf.first_pass_bytes)
-            .all(|f| f.budget <= kf.budget));
+        assert!(
+            report
+                .iter()
+                .filter(|f| f.first_pass_bytes <= kf.first_pass_bytes)
+                .all(|f| f.budget <= kf.budget)
+        );
         assert_eq!(kf.motion_activity, 0);
         // One-pass comparison at the same per-frame target.
         let one = encode_vp9_lossy_sequence_rc(&refs(&frames), w, h, target).expect("1p");

@@ -2,8 +2,8 @@
 //! API surface — `vp9-spec.txt` lines 5465-5488.
 
 use oxideav_vp9::{
-    loop_filter_frame_init, LoopFilterParams, LvlLookup, SegmentationParams, MAX_LOOP_FILTER,
-    MAX_MODE_LF_DELTAS, MAX_SEGMENTS, SEG_LVL_MAX,
+    LoopFilterParams, LvlLookup, MAX_LOOP_FILTER, MAX_MODE_LF_DELTAS, MAX_SEGMENTS, SEG_LVL_MAX,
+    SegmentationParams, loop_filter_frame_init,
 };
 
 /// `SEG_LVL_ALT_L = 1` per §3 (`vp9-spec.txt` line 476) — duplicated

@@ -17,14 +17,14 @@
 //! (`docs/video/vp9/vp9-spec.txt`) §6.4.6-§6.4.10 / §9.3.1 / §9.3.2; the
 //! bit order mirrors the in-crate decoder exactly.
 
+use crate::Error;
 use crate::bool_encoder::BoolEncoder;
-use crate::compressed::{tx_mode_to_biggest_tx_size, TxMode};
+use crate::compressed::{TxMode, tx_mode_to_biggest_tx_size};
 use crate::mode_info::{
-    BINARY_TREE, INTRA_MODE_TREE, KF_UV_MODE_PROBS, KF_Y_MODE_PROBS, SEGMENT_TREE, TX_SIZE_16_TREE,
-    TX_SIZE_32_TREE, TX_SIZE_8_TREE,
+    BINARY_TREE, INTRA_MODE_TREE, KF_UV_MODE_PROBS, KF_Y_MODE_PROBS, SEGMENT_TREE, TX_SIZE_8_TREE,
+    TX_SIZE_16_TREE, TX_SIZE_32_TREE,
 };
 use crate::prob_adapt::CountsNonCoef;
-use crate::Error;
 
 /// Resolve the §9.3.1 tree bit path that `tree_decode` walks to reach the
 /// leaf `value`. The decoder walks `n = tree[ n + bit ]` from `n = 0`,
@@ -210,10 +210,10 @@ mod tests {
     use super::*;
     use crate::bool_coder::BoolCoder;
     use crate::mode_info::{
-        default_intra_mode, default_uv_mode, read_segment_id, read_skip, read_tx_size,
-        NeighbourSkips, NeighbourTxSizes,
+        NeighbourSkips, NeighbourTxSizes, default_intra_mode, default_uv_mode, read_segment_id,
+        read_skip, read_tx_size,
     };
-    use crate::residual::{BLOCK_16X16, BLOCK_64X64, BLOCK_8X8};
+    use crate::residual::{BLOCK_8X8, BLOCK_16X16, BLOCK_64X64};
 
     #[test]
     fn skip_roundtrips_both_values_all_contexts() {
@@ -264,14 +264,16 @@ mod tests {
         // Only the marker + flush — decoding read_skip with
         // seg_feature_active short-circuits to 1 reading nothing.
         let mut dec = BoolCoder::init_bool(&buf, buf.len()).unwrap();
-        assert!(read_skip(
-            &mut dec,
-            true,
-            &skip_prob,
-            NeighbourSkips::default(),
-            &mut Default::default()
-        )
-        .unwrap());
+        assert!(
+            read_skip(
+                &mut dec,
+                true,
+                &skip_prob,
+                NeighbourSkips::default(),
+                &mut Default::default()
+            )
+            .unwrap()
+        );
     }
 
     #[test]

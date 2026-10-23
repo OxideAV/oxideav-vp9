@@ -4,6 +4,10 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95
+
 ### Added
 
 - encode_two_pass_structured fuzz target (round 458) - eleventh harness: oracle-carrying round-trip over the structured two-pass entries (every Vp9GopConfig axis incl. scene-cut keyframe placement, adaptive group length and the coefficient election, at 4:2:0 / 4:4:4 / 4:2:2 / 4:4:0 / 10-bit 4:2:0) across fuzz-derived geometry / budget / VBV / content with an optional mid-sequence scene cut: one report entry per packet, the first a keyframe, every display frame coded exactly once, every decoded packet within its budget (or at the q == 255 floor), show_existing_frame packets at most two bytes, the stream decoding to exactly the source frame count at the declared format; 1345 runs / 300 s clean locally, encode_gop_structures 2603 runs / 150 s and encode_adaptive_chain 818 runs / 150 s clean on the round-458 defaults (coefficient election + sub-8x8 / scaled-leaf filter election live); two tracked seeds; fuzz workflow roster refreshed

@@ -557,12 +557,12 @@ mod wide_filter;
 // Stable entry points: single-frame + multi-frame decode and the
 // decoded-frame type in their visible signatures.
 pub use codec::{
-    make_decoder, make_encoder, pixel_format_for_triple, Vp9Decoder, Vp9Encoder, Vp9EncoderOptions,
+    Vp9Decoder, Vp9Encoder, Vp9EncoderOptions, make_decoder, make_encoder, pixel_format_for_triple,
 };
 
 pub use decode_frame::{
-    decode_intra_frame, decode_vp9_sequence, decode_vp9_sequence_with, Vp9DecodedFrame,
-    Vp9SequenceDecoder,
+    Vp9DecodedFrame, Vp9SequenceDecoder, decode_intra_frame, decode_vp9_sequence,
+    decode_vp9_sequence_with,
 };
 // Stable container utility: the Annex B superframe split that a caller
 // runs before feeding frames to `decode_vp9_sequence`.
@@ -571,7 +571,7 @@ pub use superframe::split_superframe;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use adaptive_filter_strength::{
-    adaptive_filter_strength, mode_to_mode_type, FilterStrength, NEARESTMV, NEARMV, NEWMV, ZEROMV,
+    FilterStrength, NEARESTMV, NEARMV, NEWMV, ZEROMV, adaptive_filter_strength, mode_to_mode_type,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
@@ -579,55 +579,55 @@ pub use coef_probs::CoefProbs;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use compressed::{
-    parse_compressed_header, parse_compressed_header_inter, CompoundReferenceConfig, MvProbs,
-    RefFrameSignBias, ReferenceMode, TxMode, Vp9CompressedHeader, Vp9CompressedHeaderInter,
-    Vp9CompressedHeaderInterInputs,
+    CompoundReferenceConfig, MvProbs, RefFrameSignBias, ReferenceMode, TxMode, Vp9CompressedHeader,
+    Vp9CompressedHeaderInter, Vp9CompressedHeaderInterInputs, parse_compressed_header,
+    parse_compressed_header_inter,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub use filter_mask::{filter_mask, FilterMask, FilterMaskSamples};
+pub use filter_mask::{FilterMask, FilterMaskSamples, filter_mask};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use filter_size::{
-    filter_size, PASS_HORIZONTAL, PASS_VERTICAL, TX_16X16, TX_32X32, TX_4X4, TX_8X8,
+    PASS_HORIZONTAL, PASS_VERTICAL, TX_4X4, TX_8X8, TX_16X16, TX_32X32, filter_size,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub use frame_loop_filter::{frame_loop_filter, CurrFrame};
+pub use frame_loop_filter::{CurrFrame, frame_loop_filter};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use header::{
-    parse_uncompressed_header, parse_uncompressed_header_with_refs, ColorConfig, ColorSpace,
-    FrameType, LoopFilterParams, QuantizationParams, RefFrameState, SegmentationParams, TileInfo,
-    Vp9FrameHeader, MAX_SEGMENTS, SEGMENTATION_FEATURE_BITS, SEGMENTATION_FEATURE_SIGNED,
-    SEG_LVL_MAX,
+    ColorConfig, ColorSpace, FrameType, LoopFilterParams, MAX_SEGMENTS, QuantizationParams,
+    RefFrameState, SEG_LVL_MAX, SEGMENTATION_FEATURE_BITS, SEGMENTATION_FEATURE_SIGNED,
+    SegmentationParams, TileInfo, Vp9FrameHeader, parse_uncompressed_header,
+    parse_uncompressed_header_with_refs,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub use loop_filter::{loop_filter_frame_init, LvlLookup, MAX_LOOP_FILTER, MAX_MODE_LF_DELTAS};
+pub use loop_filter::{LvlLookup, MAX_LOOP_FILTER, MAX_MODE_LF_DELTAS, loop_filter_frame_init};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub use narrow_filter::{narrow_filter, NarrowFilterOutput, NarrowFilterSamples};
+pub use narrow_filter::{NarrowFilterOutput, NarrowFilterSamples, narrow_filter};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use partition::tile_payload_sizes;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub use sample_filtering::{sample_filtering, SampleFilterOutput, SampleFilterSamples};
+pub use sample_filtering::{SampleFilterOutput, SampleFilterSamples, sample_filtering};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use superblock_filter::{
-    superblock_filter_edge, superblock_filter_geometry, SuperblockFilterEdge,
-    SuperblockFilterGeometry, SuperblockFilterMi,
+    SuperblockFilterEdge, SuperblockFilterGeometry, SuperblockFilterMi, superblock_filter_edge,
+    superblock_filter_geometry,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use superblock_loop_filter::{
-    superblock_loop_filter, SuperblockFilterFrame, SuperblockFilterPlane,
+    SuperblockFilterFrame, SuperblockFilterPlane, superblock_loop_filter,
 };
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub use wide_filter::{wide_filter, WideFilterOutput, WideFilterSamples};
+pub use wide_filter::{WideFilterOutput, WideFilterSamples, wide_filter};
 
 /// Crate-local error type.
 ///
@@ -2256,8 +2256,8 @@ mod encode_roundtrip_tests {
     fn build_scaled_reference_stream() -> Vec<Vec<u8>> {
         use crate::compressed::TxMode;
         use crate::frame_writer::{
-            assemble_inter_frame_all_skip_zeromv, assemble_inter_frame_planned,
-            inter_pframe_header, FrameCoefSource, InterBlockPlanner,
+            FrameCoefSource, InterBlockPlanner, assemble_inter_frame_all_skip_zeromv,
+            assemble_inter_frame_planned, inter_pframe_header,
         };
 
         // Keyframe: a deterministic high-detail pattern (diagonal
@@ -2678,8 +2678,8 @@ mod encode_roundtrip_tests {
     ///   copy of F2's (post-filter) reconstruction.
     fn build_seg_features_stream() -> Vec<Vec<u8>> {
         use crate::frame_writer::{
-            assemble_inter_frame_all_skip_zeromv, assemble_inter_frame_tree, inter_pframe_header,
             FrameCoefSource, InterFrameTreePlan, InterTreeLeaf, InterTreePlanner,
+            assemble_inter_frame_all_skip_zeromv, assemble_inter_frame_tree, inter_pframe_header,
         };
         use crate::header::SegmentationParams;
         use crate::mode_info::{
@@ -2913,7 +2913,7 @@ mod encode_roundtrip_tests {
     /// No black-box encoder wrapper exposes per-sub-block motion
     /// planning, so this axis is only mintable by the in-crate writers.
     fn build_sub8x8_inter_stream() -> Vec<Vec<u8>> {
-        use crate::frame_writer::{assemble_inter_frame_all_skip_zeromv, InterTreeLeaf};
+        use crate::frame_writer::{InterTreeLeaf, assemble_inter_frame_all_skip_zeromv};
         use crate::inter_block_writer::InterSubBlockSpec;
         use crate::mode_info::{LAST_FRAME, NEARESTMV, NEARMV, NEWMV, NONE_REF_FRAME, ZEROMV};
         use crate::partition::{PARTITION_HORZ, PARTITION_SPLIT, PARTITION_VERT};
@@ -3345,8 +3345,8 @@ mod encode_roundtrip_tests {
         prev: Option<Vec<u8>>,
     ) -> Vec<u8> {
         use crate::frame_writer::{
-            assemble_inter_frame_tree, FrameCoefSource, InterFrameTreePlan, InterTreeLeaf,
-            InterTreePlanner,
+            FrameCoefSource, InterFrameTreePlan, InterTreeLeaf, InterTreePlanner,
+            assemble_inter_frame_tree,
         };
         use crate::mode_info::{GOLDEN_FRAME, LAST_FRAME, NONE_REF_FRAME, ZEROMV};
 
@@ -3615,7 +3615,7 @@ mod encode_roundtrip_tests {
         use crate::header::QuantizationParams;
         use crate::intra::Plane;
         use crate::pixel_encoder::{
-            encode_pframe_lossy_tree_motion, lossless_pframe_header, PFRAME_SEARCH_RANGE,
+            PFRAME_SEARCH_RANGE, encode_pframe_lossy_tree_motion, lossless_pframe_header,
         };
 
         // F0: lossless keyframe of the texture.
@@ -3802,8 +3802,8 @@ mod encode_roundtrip_tests {
         use crate::header_writer::write_uncompressed_header;
         use crate::intra::Plane;
         use crate::pixel_encoder::{
-            encode_keyframe_lossy_420_with_recon, encode_pframe_lossy_tree_motion,
-            lossless_pframe_header, padded_plane_from_bytes, ReconState, PFRAME_SEARCH_RANGE,
+            PFRAME_SEARCH_RANGE, ReconState, encode_keyframe_lossy_420_with_recon,
+            encode_pframe_lossy_tree_motion, lossless_pframe_header, padded_plane_from_bytes,
         };
 
         let fa = compound_noise_frame(0x1111_2222_3333_4444);

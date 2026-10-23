@@ -7,7 +7,7 @@
 //! returned [`NarrowFilterOutput`] samples against the §8.8.5.2
 //! listing verbatim.
 
-use oxideav_vp9::{narrow_filter, NarrowFilterOutput, NarrowFilterSamples};
+use oxideav_vp9::{NarrowFilterOutput, NarrowFilterSamples, narrow_filter};
 
 /// Build a flat stencil with every sample equal to `v`. With a flat
 /// stencil every §8.8.5.2 working-coord difference is `0`, so

@@ -6,13 +6,13 @@
 //! at the declared format, byte-deterministic, distortion bounded.
 
 use oxideav_vp9::{
-    decode_vp9_sequence, encode_vp9_lossy_sequence_resized_422,
+    Vp9DecodedFrame, Vp9GopConfig, decode_vp9_sequence, encode_vp9_lossy_sequence_resized_422,
     encode_vp9_lossy_sequence_resized_440, encode_vp9_lossy_sequence_resized_444,
     encode_vp9_lossy_sequence_resized_hbd, encode_vp9_lossy_sequence_resized_hbd_422,
     encode_vp9_lossy_sequence_resized_hbd_440, encode_vp9_lossy_sequence_with_422,
     encode_vp9_lossy_sequence_with_440, encode_vp9_lossy_sequence_with_444,
     encode_vp9_lossy_sequence_with_hbd, encode_vp9_lossy_sequence_with_hbd_422,
-    encode_vp9_lossy_sequence_with_hbd_440, Vp9DecodedFrame, Vp9GopConfig,
+    encode_vp9_lossy_sequence_with_hbd_440,
 };
 
 /// Chroma dims for a subsampling pair.
@@ -274,15 +274,17 @@ fn format_matrix_wrappers_are_deterministic_and_reject_bad_depths() {
     assert!(encode_vp9_lossy_sequence_resized_hbd(&refs, &[(32, 32)], 8, true, 100).is_err());
     // Out-of-range samples for the declared depth reject.
     let hot = vec![4095u16; src.len()];
-    assert!(encode_vp9_lossy_sequence_with_hbd(
-        &[hot.as_slice()],
-        32,
-        32,
-        10,
-        true,
-        &Vp9GopConfig::new(100)
-    )
-    .is_err());
+    assert!(
+        encode_vp9_lossy_sequence_with_hbd(
+            &[hot.as_slice()],
+            32,
+            32,
+            10,
+            true,
+            &Vp9GopConfig::new(100)
+        )
+        .is_err()
+    );
 }
 
 fn ivf_wrap(packets: &[Vec<u8>], w: u16, h: u16) -> Vec<u8> {

@@ -2,7 +2,7 @@
 //! — `vp9-spec.txt` lines 5587-5625.
 
 use oxideav_vp9::{
-    filter_size, PASS_HORIZONTAL, PASS_VERTICAL, TX_16X16, TX_32X32, TX_4X4, TX_8X8,
+    PASS_HORIZONTAL, PASS_VERTICAL, TX_4X4, TX_8X8, TX_16X16, TX_32X32, filter_size,
 };
 
 /// §8.8.3 line 5611 `baseSize = Min(TX_16X16, txSz)` via the public

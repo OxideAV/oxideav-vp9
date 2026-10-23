@@ -72,7 +72,7 @@
 //! `Clip3` is the §5.1 primitive.
 
 use crate::dequant::seg_feature_active;
-use crate::header::{LoopFilterParams, SegmentationParams, MAX_SEGMENTS};
+use crate::header::{LoopFilterParams, MAX_SEGMENTS, SegmentationParams};
 use crate::mode_info::{ALTREF_FRAME, GOLDEN_FRAME, INTRA_FRAME, LAST_FRAME};
 
 /// `SEG_LVL_ALT_L = 1` per §3 (`vp9-spec.txt` line 476) — the

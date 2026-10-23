@@ -13,9 +13,9 @@
 //! (`docs/video/vp9/vp9-spec.txt`) §6.4.24 / §6.4.26 / §9.3.3; the bit
 //! order mirrors the in-crate decoder exactly.
 
+use crate::Error;
 use crate::bool_encoder::BoolEncoder;
 use crate::tokens::{CAT_PROBS, DCT_VAL_CATEGORY6, EXTRA_BITS, ONE_TOKEN, TOKEN_TREE, ZERO_TOKEN};
-use crate::Error;
 
 /// Write one `more_coefs` bit (§6.4.24): `B(prob)` with value 1 when more
 /// coefficients follow, 0 at end-of-block.
@@ -234,7 +234,7 @@ pub(crate) fn write_tokens(
     counts: &mut crate::prob_adapt::FrameCounts,
 ) -> Result<bool, Error> {
     use crate::tokens::{
-        build_token_probs, coef_band, token_cache_neighbours, ENERGY_CLASS, ZERO_TOKEN,
+        ENERGY_CLASS, ZERO_TOKEN, build_token_probs, coef_band, token_cache_neighbours,
     };
 
     let seg_eob = 16usize << (tx_sz << 1);
@@ -348,7 +348,7 @@ pub(crate) fn write_tokens(
 mod tests {
     use super::*;
     use crate::bool_coder::BoolCoder;
-    use crate::tokens::{read_coef_token, CoefStep};
+    use crate::tokens::{CoefStep, read_coef_token};
 
     /// A representative 10-node token-probability array (mid-range so the
     /// arithmetic actually fires); the exact values only need to match
@@ -470,8 +470,8 @@ mod tests {
 
     use crate::coef_probs::DEFAULT_COEF_PROBS;
     use crate::idct::{ADST_ADST, DCT_DCT};
-    use crate::scan::{DEFAULT_SCAN_16X16, DEFAULT_SCAN_4X4, DEFAULT_SCAN_8X8};
-    use crate::tokens::{tokens, NonzeroContext, TokenBlockCtx};
+    use crate::scan::{DEFAULT_SCAN_4X4, DEFAULT_SCAN_8X8, DEFAULT_SCAN_16X16};
+    use crate::tokens::{NonzeroContext, TokenBlockCtx, tokens};
 
     /// Encode `coeffs` (raster order, length `segEob`) with [`write_tokens`]
     /// then decode it back with the real [`tokens`] driver and assert the

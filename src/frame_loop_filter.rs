@@ -60,7 +60,7 @@
 //! 1760-1761).
 
 use crate::superblock_loop_filter::{
-    superblock_loop_filter, SuperblockFilterFrame, SuperblockFilterPlane,
+    SuperblockFilterFrame, SuperblockFilterPlane, superblock_loop_filter,
 };
 
 /// The 3-plane `CurrFrame` array of reconstructed samples — the §8.8
@@ -153,9 +153,9 @@ pub fn frame_loop_filter(curr: &mut CurrFrame, frame: &SuperblockFilterFrame) {
 mod tests {
     use super::*;
     use crate::filter_size::TX_4X4;
-    use crate::loop_filter::{loop_filter_frame_init, LvlLookup};
+    use crate::loop_filter::{LvlLookup, loop_filter_frame_init};
     use crate::residual::BLOCK_8X8;
-    use crate::{LoopFilterParams, SegmentationParams, MAX_SEGMENTS, SEG_LVL_MAX};
+    use crate::{LoopFilterParams, MAX_SEGMENTS, SEG_LVL_MAX, SegmentationParams};
 
     fn lf(level: u8) -> LoopFilterParams {
         LoopFilterParams {

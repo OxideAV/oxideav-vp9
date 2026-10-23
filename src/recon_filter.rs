@@ -44,10 +44,10 @@
 //! `loop_filter_params( )` fixed-width `filter_level` field.
 
 use crate::decode_block::Vp9FrameState;
-use crate::frame_loop_filter::{frame_loop_filter, CurrFrame};
+use crate::frame_loop_filter::{CurrFrame, frame_loop_filter};
 use crate::header::Vp9FrameHeader;
 use crate::intra::Plane;
-use crate::loop_filter::{loop_filter_frame_init, resolve_lf_deltas, MAX_LOOP_FILTER};
+use crate::loop_filter::{MAX_LOOP_FILTER, loop_filter_frame_init, resolve_lf_deltas};
 use crate::pixel_encoder::ReconState;
 use crate::superblock_loop_filter::{SuperblockFilterFrame, SuperblockFilterPlane};
 
@@ -63,7 +63,13 @@ impl FilterMiArrays {
     fn from_state(state: &Vp9FrameState) -> Self {
         Self {
             skips: state.skips.iter().map(|&s| s != 0).collect(),
-            ref_frames_0: state.ref_frames.chunks_exact(2).map(|p| p[0]).collect(),
+            ref_frames_0: state
+                .ref_frames
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|p| p[0])
+                .collect(),
         }
     }
 }
@@ -459,9 +465,9 @@ mod tests {
     use crate::decode_frame::decode_vp9_sequence;
     use crate::header::QuantizationParams;
     use crate::pixel_encoder::{
-        encode_keyframe_lossy_tree_with_state, encode_pframe_lossy_tree_motion_with_state,
-        lossless_pframe_header, lossy_keyframe_header_420, padded_plane_from_bytes,
-        plan_keyframe_tree, PFRAME_SEARCH_RANGE,
+        PFRAME_SEARCH_RANGE, encode_keyframe_lossy_tree_with_state,
+        encode_pframe_lossy_tree_motion_with_state, lossless_pframe_header,
+        lossy_keyframe_header_420, padded_plane_from_bytes, plan_keyframe_tree,
     };
 
     /// Deterministic textured 4:2:0 planar frame — enough spatial

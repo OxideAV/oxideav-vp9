@@ -58,12 +58,12 @@
 //! lines 2871-2876).
 
 use crate::adaptive_filter_strength::adaptive_filter_strength;
-use crate::filter_size::{filter_size, PASS_VERTICAL};
+use crate::filter_size::{PASS_VERTICAL, filter_size};
 use crate::loop_filter::LvlLookup;
 use crate::residual::get_uv_tx_size;
-use crate::sample_filtering::{sample_filtering, SampleFilterOutput, SampleFilterSamples};
+use crate::sample_filtering::{SampleFilterOutput, SampleFilterSamples, sample_filtering};
 use crate::superblock_filter::{
-    superblock_filter_edge, superblock_filter_geometry, SuperblockFilterMi,
+    SuperblockFilterMi, superblock_filter_edge, superblock_filter_geometry,
 };
 
 /// A mutable view of one `CurrFrame[ plane ]` sample plane for the
@@ -414,9 +414,9 @@ pub fn superblock_loop_filter(
 mod tests {
     use super::*;
     use crate::filter_size::{PASS_HORIZONTAL, TX_4X4};
-    use crate::loop_filter::{loop_filter_frame_init, SEG_LVL_ALT_L};
-    use crate::residual::{BLOCK_64X64, BLOCK_8X8};
-    use crate::{LoopFilterParams, SegmentationParams, MAX_SEGMENTS, SEG_LVL_MAX};
+    use crate::loop_filter::{SEG_LVL_ALT_L, loop_filter_frame_init};
+    use crate::residual::{BLOCK_8X8, BLOCK_64X64};
+    use crate::{LoopFilterParams, MAX_SEGMENTS, SEG_LVL_MAX, SegmentationParams};
 
     fn lf(level: u8) -> LoopFilterParams {
         LoopFilterParams {

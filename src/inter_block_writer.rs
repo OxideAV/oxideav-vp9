@@ -49,17 +49,18 @@
 // exercised now by the round-trip tests below.
 #![allow(dead_code)]
 
+use crate::Error;
 use crate::bool_encoder::BoolEncoder;
 use crate::compressed::{CompoundReferenceConfig, MvProbs, ReferenceMode, TxMode};
-use crate::decode_block::{decode_block_apply, DecodedBlockResult, Vp9FrameState};
+use crate::decode_block::{DecodedBlockResult, Vp9FrameState, decode_block_apply};
 use crate::inter_decode::FrameStateMvSource;
 use crate::inter_mode_writer::{
-    write_inter_mode, write_interp_filter, write_is_inter, write_ref_frames, RefFramesWriteArgs,
+    RefFramesWriteArgs, write_inter_mode, write_interp_filter, write_is_inter, write_ref_frames,
 };
 use crate::mode_info::{
-    tx_size_context, InterpFilterNeighbours, IsInterNeighbours, NeighbourSkips, NeighbourTxSizes,
-    RefFrameNeighbours, INTERP_FILTER_CONTEXTS, INTER_MODES, INTER_MODE_CONTEXTS, INTRA_FRAME,
-    IS_INTER_CONTEXTS, NONE_REF_FRAME, SWITCHABLE, SWITCHABLE_FILTERS,
+    INTER_MODE_CONTEXTS, INTER_MODES, INTERP_FILTER_CONTEXTS, INTRA_FRAME, IS_INTER_CONTEXTS,
+    InterpFilterNeighbours, IsInterNeighbours, NONE_REF_FRAME, NeighbourSkips, NeighbourTxSizes,
+    RefFrameNeighbours, SWITCHABLE, SWITCHABLE_FILTERS, tx_size_context,
 };
 use crate::mode_writer::{tx_size_is_coded, write_skip, write_tx_size};
 use crate::mv::MvPredictors;
@@ -68,8 +69,7 @@ use crate::mv_writer::write_assign_mv;
 use crate::residual::{
     BLOCK_8X8, MAX_TXSIZE_LOOKUP, NUM_4X4_BLOCKS_HIGH_LOOKUP, NUM_4X4_BLOCKS_WIDE_LOOKUP,
 };
-use crate::residual_writer::{write_residual_inter, CoefSource, ResidualWriteCtx};
-use crate::Error;
+use crate::residual_writer::{CoefSource, ResidualWriteCtx, write_residual_inter};
 
 /// Per-sub-block spec for a `MiSize < BLOCK_8X8` inter block — the
 /// §6.4.16 `(idy, idx)` walk's per-cell `inter_mode` and §6.4.18 motion

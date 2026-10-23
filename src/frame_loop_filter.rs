@@ -823,7 +823,7 @@ mod tests {
     /// 8x8 / 4x4-transform blocks, with some skipped inter blocks
     /// (internal edges off) and two loop-filter levels via segments.
     fn mixed(mi_cols: u32, mi_rows: u32, sub_x: u8, sub_y: u8) -> Fixture {
-        use crate::filter_size::{TX_16X16, TX_32X32, TX_8X8};
+        use crate::filter_size::{TX_8X8, TX_16X16, TX_32X32};
         use crate::residual::{BLOCK_16X16, BLOCK_64X64};
         let mut fix = Fixture::uniform(mi_cols, mi_rows, sub_x, sub_y, 40);
         let mut seg = seg_disabled();
@@ -860,7 +860,7 @@ mod tests {
         // every subsampling, worker counts below / at / above the row
         // count.
         for &(mi_cols, mi_rows) in &[(24u32, 17u32), (17, 40), (9, 9), (32, 33), (8, 16)] {
-            for &(sx, sy) in &[(1u8, 1u8), (1, 0), (0, 0)] {
+            for &(sx, sy) in &[(1u8, 1u8), (1, 0), (0, 1), (0, 0)] {
                 let fix = mixed(mi_cols, mi_rows, sx, sy);
                 let frame = fix.frame();
                 // Near-flat blocks (noise of 0..=1) with small steps

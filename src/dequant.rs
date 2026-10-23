@@ -177,13 +177,13 @@ fn qlookup_row(bit_depth: u8) -> usize {
 
 /// `dc_q( b )` (§8.6.1) — `dc_qlookup[ (BitDepth-8) >> 1 ][ Clip3(0,
 /// 255, b) ]`.
-pub(crate) fn dc_q(bit_depth: u8, b: i32) -> i32 {
+pub fn dc_q(bit_depth: u8, b: i32) -> i32 {
     DC_QLOOKUP[qlookup_row(bit_depth)][clip3(0, 255, b) as usize]
 }
 
 /// `ac_q( b )` (§8.6.1) — `ac_qlookup[ (BitDepth-8) >> 1 ][ Clip3(0,
 /// 255, b) ]`.
-pub(crate) fn ac_q(bit_depth: u8, b: i32) -> i32 {
+pub fn ac_q(bit_depth: u8, b: i32) -> i32 {
     AC_QLOOKUP[qlookup_row(bit_depth)][clip3(0, 255, b) as usize]
 }
 
@@ -205,11 +205,7 @@ pub(crate) fn seg_feature_active(
 /// `segmentation_abs_or_delta_update == 1`) or offsets (when 0)
 /// `base_q_idx`, then the result is clipped into `[0, 255]`. Otherwise
 /// `base_q_idx` is returned directly.
-pub(crate) fn get_qindex(
-    seg: &SegmentationParams,
-    quant: &QuantizationParams,
-    segment_id: usize,
-) -> i32 {
+pub fn get_qindex(seg: &SegmentationParams, quant: &QuantizationParams, segment_id: usize) -> i32 {
     if seg_feature_active(seg, segment_id, SEG_LVL_ALT_Q) {
         let mut data = seg.feature_data[segment_id][SEG_LVL_ALT_Q] as i32;
         if !seg.abs_or_delta_update {
@@ -225,7 +221,7 @@ pub(crate) fn get_qindex(
 /// `plane` (0 = luma, 1/2 = chroma). Adds the plane-appropriate header
 /// delta (`delta_q_y_dc` for luma, `delta_q_uv_dc` for chroma) to
 /// `get_qindex()` before [`dc_q`].
-pub(crate) fn get_dc_quant(
+pub fn get_dc_quant(
     plane: usize,
     seg: &SegmentationParams,
     quant: &QuantizationParams,
@@ -243,7 +239,7 @@ pub(crate) fn get_dc_quant(
 /// `get_ac_quant( plane )` (§8.6.1) — the AC-coefficient quantizer for
 /// `plane`. Luma uses `get_qindex()` directly (there is no
 /// `delta_q_y_ac` in VP9); chroma adds `delta_q_uv_ac`.
-pub(crate) fn get_ac_quant(
+pub fn get_ac_quant(
     plane: usize,
     seg: &SegmentationParams,
     quant: &QuantizationParams,

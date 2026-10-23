@@ -605,6 +605,8 @@ pub use header::{
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use loop_filter::{LvlLookup, MAX_LOOP_FILTER, MAX_MODE_LF_DELTAS, loop_filter_frame_init};
+// internal — exposed for hardware decoders, which take each segment's quantizers
+pub use dequant::{ac_q, dc_q, get_ac_quant, get_dc_quant, get_qindex};
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use narrow_filter::{NarrowFilterOutput, NarrowFilterSamples, narrow_filter};

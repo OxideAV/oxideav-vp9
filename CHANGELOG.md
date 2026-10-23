@@ -8,6 +8,7 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 - edition 2024, MSRV 1.95
 - wide_filter (§8.8.5.3): the clamped window sum slides by one position per output instead of being re-summed (O(1) per `F[i]`; integer arithmetic, output identical, pinned against the literal spec sums on 2000 random 12-bit stencils at both sizes) — 1080p single-thread decode 17.6 -> 21.9 fps on the maintainer's 4-tile-column 120-frame libvpx fixture, MD5-identical to ffmpeg's decode (#16, ropoctl)
+- block_inter_pred (§8.5.2.4): a whole-sample (phase 0) column copies its centre sample and a whole-sample row copies its intermediate row instead of running the `{0,0,0,128,0,0,0,0}` kernel (`Clip1(Round2(128·v, 7)) == v`); without scaling a whole-sample vertical position also skips the seven intermediate rows the vertical pass never reads — 1080p single-thread decode 21.9 -> 22.6 fps (P-only) / 22.2 -> 27.1 fps (alt-ref) on top of #16, MD5-identical to ffmpeg's decode (#17, ropoctl)
 
 ### Added
 

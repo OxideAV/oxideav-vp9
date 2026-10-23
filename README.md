@@ -202,7 +202,8 @@ might carry hidden alt-ref frames.
 `oxideav_core::ExecutionContext` — the single threading authority —
 and decode a multi-tile-column frame's tile columns concurrently
 (`effective_workers( tileCols )` workers, the §9.2.4 multi-coder
-model; serial stays the default). Tile columns are independent by
+model; serial stays the default), and run the §8.8 loop filter's
+superblock rows as a wavefront on the same budget (#21). Tile columns are independent by
 construction (§6.4.4 `AvailL = MiCol > MiColStart`, SB64-aligned tile
 boundaries bounding every §8.5.1 edge read, §6.5 candidate scans
 clamped to the tile window), so each worker decodes its columns into
@@ -768,7 +769,13 @@ the pre-455 default-bank framing) reproduce the earlier bytes.
   4-thread parity sweep, and a registry parity sweep. Measured on
   1080p 4-tile-column streams (release): 3.10x at 4 threads / 1.78x
   at 2 on coefficient-heavy content; 1.31x at 4 threads on easy
-  low-rate content (the §8.8 loop filter stays serial).
+  low-rate content. Since #21 (ropoctl) the §8.8 loop filter rides the
+  same budget: superblock rows run as a wavefront on
+  `effective_workers( superblock rows )` threads (each row two
+  superblocks behind the row above; private row windows, no shared
+  mutable state), byte-identical to the serial raster — so single-tile
+  streams scale too (1080p: 41 -> 58 fps at 1 -> 8 threads; 4-tile
+  P-only 34 -> 65 fps).
 * Encoder depth beyond the planner-driven baseline. Keyframes **and
   P-frames** plan partitions `BLOCK_4X4`..`BLOCK_64X64` with
   transforms `TX_4X4`..`TX_32X32` (P-frames select per-block inter tx

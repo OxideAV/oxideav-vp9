@@ -7,6 +7,7 @@ All notable changes to `oxideav-vp9` are recorded here.
 ### Changed
 
 - edition 2024, MSRV 1.95
+- wide_filter (§8.8.5.3): the clamped window sum slides by one position per output instead of being re-summed (O(1) per `F[i]`; integer arithmetic, output identical, pinned against the literal spec sums on 2000 random 12-bit stencils at both sizes) — 1080p single-thread decode 17.6 -> 21.9 fps on the maintainer's 4-tile-column 120-frame libvpx fixture, MD5-identical to ffmpeg's decode (#16, ropoctl)
 
 ### Added
 

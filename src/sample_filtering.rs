@@ -253,6 +253,7 @@ impl SampleFilterOutput {
 /// `filterSize == TX_4X4` short-circuit, and the `flatMask2 == 0`
 /// test sits behind a `filterSize == TX_8X8` short-circuit. So the
 /// §8.8.5.1 `None` returns for those masks are never dereferenced.
+#[inline]
 pub fn sample_filtering(
     samples: &SampleFilterSamples,
     limit: u8,

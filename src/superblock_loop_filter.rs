@@ -88,40 +88,65 @@ pub struct SuperblockFilterPlane<'a> {
     pub height: usize,
 }
 
-impl SuperblockFilterPlane<'_> {
+/// The row window of one `CurrFrame[ plane ]` the §8.8.2 driver
+/// filters in place: `data[ (y - y_origin) * stride + x ]` is
+/// `CurrFrame[ plane ][ y ][ x ]` for `x < width` and
+/// `y_origin <= y < y_origin + height`.
+///
+/// A whole-plane [`SuperblockFilterPlane`] is the window with
+/// `y_origin == 0`. The row-parallel driver in
+/// [`crate::frame_loop_filter`] hands each superblock row a window
+/// holding just the rows that row reads and writes: the eight rows
+/// above it (the `p7..p0` side of its top edge) and its own rows.
+/// Every stencil position the §8.8.5 filters consume for that row lies
+/// inside the window, so the clamped / dropped handling below only ever
+/// meets the echoed tail positions, exactly as at the frame edges.
+#[derive(Debug)]
+pub(crate) struct PlaneWindow<'a> {
+    pub(crate) data: &'a mut [i32],
+    pub(crate) stride: usize,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) y_origin: usize,
+}
+
+impl PlaneWindow<'_> {
     /// The index of position `-8` and the index step between positions
     /// when all sixteen positions `(x + k*dx, y + k*dy)`, `k` in
-    /// `-8..=7`, lie inside the plane (`dx`, `dy` are 0 or 1).
+    /// `-8..=7`, lie inside the window (`dx`, `dy` are 0 or 1).
     #[inline]
     fn interior(&self, x: i64, y: i64, dx: i64, dy: i64) -> Option<(usize, usize)> {
         let (x0, y0, x1, y1) = (x - 8 * dx, y - 8 * dy, x + 7 * dx, y + 7 * dy);
-        if x0 < 0 || y0 < 0 || x1 >= self.width as i64 || y1 >= self.height as i64 {
+        let top = self.y_origin as i64;
+        if x0 < 0 || y0 < top || x1 >= self.width as i64 || y1 >= top + self.height as i64 {
             return None;
         }
         Some((
-            y0 as usize * self.stride + x0 as usize,
+            (y0 - top) as usize * self.stride + x0 as usize,
             dy as usize * self.stride + dx as usize,
         ))
     }
 
     /// Read the sample at `(x, y)` with the coordinates clamped into
-    /// the plane (edge replication). Only ever feeds stencil
+    /// the window (edge replication). Only ever feeds stencil
     /// positions whose output is echoed unmutated — see the module
     /// docs.
     #[inline]
     fn get_clamped(&self, x: i64, y: i64) -> i32 {
+        let top = self.y_origin as i64;
         let cx = x.clamp(0, self.width as i64 - 1) as usize;
-        let cy = y.clamp(0, self.height as i64 - 1) as usize;
+        let cy = (y.clamp(top, top + self.height as i64 - 1) - top) as usize;
         self.data[cy * self.stride + cx]
     }
 
     /// Write `value` at `(x, y)` if the true coordinate lies inside
-    /// the plane; out-of-plane positions are dropped (they were read
+    /// the window; positions outside are dropped (they were read
     /// clamped and echoed — writing them anywhere would corrupt).
     #[inline]
     fn set_in_bounds(&mut self, x: i64, y: i64, value: i32) {
-        if x >= 0 && y >= 0 && (x as usize) < self.width && (y as usize) < self.height {
-            self.data[y as usize * self.stride + x as usize] = value;
+        let top = self.y_origin as i64;
+        if x >= 0 && y >= top && (x as usize) < self.width && y < top + self.height as i64 {
+            self.data[(y - top) as usize * self.stride + x as usize] = value;
         }
     }
 }
@@ -181,13 +206,7 @@ pub struct SuperblockFilterFrame<'a> {
 /// Gather the §8.8.5.1 16-sample stencil at plane position `(x, y)`
 /// along the `(dx, dy)` filter direction per `vp9-spec.txt` lines
 /// 5703-5727 (`q_k` at `+k`, `p_k` at `-(k + 1)`).
-fn gather_stencil(
-    plane: &SuperblockFilterPlane,
-    x: i64,
-    y: i64,
-    dx: i64,
-    dy: i64,
-) -> SampleFilterSamples {
+fn gather_stencil(plane: &PlaneWindow, x: i64, y: i64, dx: i64, dy: i64) -> SampleFilterSamples {
     if let Some((base, step)) = plane.interior(x, y, dx, dy) {
         // Every position inside the plane: no clamping needed.
         let d = &plane.data;
@@ -236,7 +255,7 @@ fn gather_stencil(
 /// at the true (unclamped) sample positions; positions outside the
 /// plane are dropped (their values are clamped-read echoes).
 fn scatter_stencil(
-    plane: &mut SuperblockFilterPlane,
+    plane: &mut PlaneWindow,
     x: i64,
     y: i64,
     dx: i64,
@@ -318,6 +337,30 @@ pub fn superblock_loop_filter(
         plane_buf.stride >= plane_buf.width
             && plane_buf.data.len() >= plane_buf.stride * plane_buf.height,
         "§8.8.2: inconsistent CurrFrame plane view"
+    );
+    let mut window = PlaneWindow {
+        data: &mut *plane_buf.data,
+        stride: plane_buf.stride,
+        width: plane_buf.width,
+        height: plane_buf.height,
+        y_origin: 0,
+    };
+    superblock_loop_filter_window(&mut window, frame, plane, pass, row, col);
+}
+
+/// [`superblock_loop_filter`] over a [`PlaneWindow`]: the rows of
+/// superblock row `row` that the window holds are filtered in place.
+pub(crate) fn superblock_loop_filter_window(
+    plane_buf: &mut PlaneWindow,
+    frame: &SuperblockFilterFrame,
+    plane: u8,
+    pass: u8,
+    row: u32,
+    col: u32,
+) {
+    debug_assert!(
+        plane_buf.stride >= plane_buf.width
+            && plane_buf.data.len() >= plane_buf.stride * plane_buf.height
     );
     let mi_cells = (frame.mi_rows as usize) * (frame.mi_cols as usize);
     assert!(

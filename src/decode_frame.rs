@@ -51,7 +51,7 @@ use crate::compressed::{
 };
 use crate::decode_block::{DecodedBlockResult, Vp9FrameState, decode_block_apply};
 use crate::dequant::{get_ac_quant, get_dc_quant, seg_feature_active};
-use crate::frame_loop_filter::{CurrFrame, frame_loop_filter};
+use crate::frame_loop_filter::{CurrFrame, frame_loop_filter_rows};
 use crate::header::{
     ColorConfig, FrameType, MAX_SEGMENTS, QuantizationParams, RefFrameState, SEG_LVL_MAX,
     SegmentationParams, Vp9FrameHeader, parse_uncompressed_header,
@@ -1865,16 +1865,20 @@ fn decode_single_frame(
                 },
             ],
         };
-        frame_loop_filter(&mut curr, &filter_frame);
+        // Superblock rows run in a wavefront on the ExecutionContext budget
+        // (one worker = the plain §8.8 raster); the bytes are the same.
+        frame_loop_filter_rows(
+            &mut curr,
+            &filter_frame,
+            exec.effective_workers(sb64_rows as usize),
+        );
     }
 
     // §8.10 output: crop the working planes to the visible extents.
     let crop = |plane: &Plane, w: usize, h: usize| -> Vec<u16> {
         let mut out = Vec::with_capacity(w * h);
-        for yy in 0..h {
-            for xx in 0..w {
-                out.push(plane.get(xx, yy) as u16);
-            }
+        for row in plane.samples().chunks_exact(plane.width()).take(h) {
+            out.extend(row[..w].iter().map(|&v| v as u16));
         }
         out
     };
@@ -1982,15 +1986,6 @@ pub struct Vp9SequenceDecoder {
     // The previous decoded frame's §6.4.4 state + show/size for the §6.5
     // prev-MV scan + §7.2.6 UsePrevFrameMvs derivation.
     prev_state: Option<(Vp9FrameState, u32, u32, bool)>,
-    // §8.10 `FrameStore[ ]`: the eight reference slots as displayable
-    // frames, for a later §8.9 `show_existing_frame` output. Per §8.10
-    // step 1, EVERY decoded frame writes the slots `refresh_frame_flags`
-    // names — including hidden (`show_frame == 0`) alt-ref frames — and a
-    // `show_existing_frame` packet re-displays `FrameStore[ idx ]` with
-    // that stored frame's own §8.9 dimensions / bit depth. `RefBuffers`
-    // already tracks the sample planes; this parallel array keeps the
-    // crop + packing metadata needed to re-emit the frame verbatim.
-    frame_store: [Option<Vp9DecodedFrame>; 8],
     // §6.1.2 / §7.2 `FrameContext[ 4 ]` — the persistent entropy
     // probability banks `load_probs( )` / `save_probs( )` thread across
     // frames. Initialised to the §10.5 defaults; a key / intra-only /
@@ -2066,7 +2061,6 @@ impl Vp9SequenceDecoder {
             bufs: RefBuffers::new(),
             last_color: None,
             prev_state: None,
-            frame_store: Default::default(),
             frame_contexts: Default::default(),
             last_frame_type_was_key: false,
             persist_feature_enabled: [[false; SEG_LVL_MAX]; MAX_SEGMENTS],
@@ -2119,7 +2113,6 @@ impl Vp9SequenceDecoder {
             bufs,
             last_color,
             prev_state,
-            frame_store,
             frame_contexts,
             last_frame_type_was_key,
             persist_feature_enabled,
@@ -2145,14 +2138,16 @@ impl Vp9SequenceDecoder {
 
         if hdr.show_existing_frame {
             // §8.9: output `FrameStore[ frame_to_show_map_idx ]` verbatim.
-            // The slot may have been written by a hidden alt-ref frame, so
-            // it is sourced from `frame_store` (updated for every decoded
-            // frame) rather than only the shown ones.
+            // Per §8.10 step 1 every decoded frame — hidden alt-ref
+            // frames included — writes the slots `refresh_frame_flags`
+            // names, and the slot keeps that frame's own visible planes,
+            // dimensions, subsampling and bit depth, so the displayable
+            // frame is rebuilt from it.
             let idx = hdr.frame_to_show_map_idx.ok_or(Error::InvalidBitstream)? as usize;
-            let f = frame_store
-                .get(idx)
-                .and_then(|s| s.clone())
-                .ok_or(Error::InvalidBitstream)?;
+            if idx >= crate::ref_buffer::NUM_REF_FRAMES || !bufs.is_initialised(idx) {
+                return Err(Error::InvalidBitstream);
+            }
+            let f = bufs.slot(idx).to_decoded_frame();
             // §7.2.6 NOTE: compute_image_size is not invoked for a
             // show_existing_frame packet, so it leaves `prev_state` (the
             // §7.2.6 "previous invocation" record) untouched.
@@ -2442,17 +2437,6 @@ impl Vp9SequenceDecoder {
         let shown = hdr.show_frame;
         *last_counts = Some(products.counts);
         *prev_state = Some((products.state, hdr.frame_width, hdr.frame_height, shown));
-
-        // §8.10 step 1: store the decoded frame into the `FrameStore[ ]`
-        // slots `refresh_frame_flags` names. This happens for every decoded
-        // frame, including hidden (`show_frame == 0`) alt-ref frames, so a
-        // later `show_existing_frame` can re-display whatever a hidden ARF
-        // wrote into a slot.
-        for (i, slot) in frame_store.iter_mut().enumerate() {
-            if (hdr.refresh_frame_flags >> i) & 1 == 1 {
-                *slot = Some(products.out.clone());
-            }
-        }
 
         // §8.9: a hidden (`show_frame == 0`) frame is decoded as a reference
         // but not emitted; only shown frames are output here.

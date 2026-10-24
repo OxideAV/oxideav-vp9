@@ -89,6 +89,21 @@ pub struct SuperblockFilterPlane<'a> {
 }
 
 impl SuperblockFilterPlane<'_> {
+    /// The index of position `-8` and the index step between positions
+    /// when all sixteen positions `(x + k*dx, y + k*dy)`, `k` in
+    /// `-8..=7`, lie inside the plane (`dx`, `dy` are 0 or 1).
+    #[inline]
+    fn interior(&self, x: i64, y: i64, dx: i64, dy: i64) -> Option<(usize, usize)> {
+        let (x0, y0, x1, y1) = (x - 8 * dx, y - 8 * dy, x + 7 * dx, y + 7 * dy);
+        if x0 < 0 || y0 < 0 || x1 >= self.width as i64 || y1 >= self.height as i64 {
+            return None;
+        }
+        Some((
+            y0 as usize * self.stride + x0 as usize,
+            dy as usize * self.stride + dx as usize,
+        ))
+    }
+
     /// Read the sample at `(x, y)` with the coordinates clamped into
     /// the plane (edge replication). Only ever feeds stencil
     /// positions whose output is echoed unmutated — see the module
@@ -173,6 +188,29 @@ fn gather_stencil(
     dx: i64,
     dy: i64,
 ) -> SampleFilterSamples {
+    if let Some((base, step)) = plane.interior(x, y, dx, dy) {
+        // Every position inside the plane: no clamping needed.
+        let d = &plane.data;
+        let s = |k: usize| d[base + k * step];
+        return SampleFilterSamples {
+            p7: s(0),
+            p6: s(1),
+            p5: s(2),
+            p4: s(3),
+            p3: s(4),
+            p2: s(5),
+            p1: s(6),
+            p0: s(7),
+            q0: s(8),
+            q1: s(9),
+            q2: s(10),
+            q3: s(11),
+            q4: s(12),
+            q5: s(13),
+            q6: s(14),
+            q7: s(15),
+        };
+    }
     let s = |k: i64| plane.get_clamped(x + dx * k, y + dy * k);
     SampleFilterSamples {
         p7: s(-8),
@@ -223,6 +261,12 @@ fn scatter_stencil(
         (6, out.q6),
         (7, out.q7),
     ];
+    if let Some((base, step)) = plane.interior(x, y, dx, dy) {
+        for (k, v) in positions {
+            plane.data[base + (k + 8) as usize * step] = v;
+        }
+        return;
+    }
     for (k, v) in positions {
         plane.set_in_bounds(x + dx * k, y + dy * k, v);
     }

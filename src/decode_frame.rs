@@ -1401,7 +1401,7 @@ struct FrameDecodeProducts {
     counts: Box<crate::prob_adapt::FrameCounts>,
 }
 
-/// The §6.3 compressed-header product threaded into [`decode_single_frame`]:
+/// The §6.3 compressed-header product threaded into [`launch_single_frame`]:
 /// either the intra-only header or the full inter header.
 enum ChdrKind {
     Intra(Box<Vp9CompressedHeader>),

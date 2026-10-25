@@ -2605,15 +2605,21 @@ fn launch_frame(
         height: job.geom[p].1,
         band_shift: job.geom[p].2,
     });
-    let frame = Arc::new(FrameBuf::new(
-        fgeom,
-        job.hdr.frame_width,
-        job.hdr.frame_height,
-        job.ssx,
-        job.ssy,
-        job.hdr.color_config.bit_depth,
-        job.mi_rows,
-    ));
+    let frame = Arc::new(
+        FrameBuf::new(
+            fgeom,
+            job.hdr.frame_width,
+            job.hdr.frame_height,
+            job.ssx,
+            job.ssy,
+            job.hdr.color_config.bit_depth,
+            job.mi_rows,
+        )
+        .with_color(
+            job.hdr.color_config.color_space,
+            job.hdr.color_config.color_range_full,
+        ),
+    );
     // Band storage: a recycled frame's when the geometry matches (every
     // own row is overwritten by the tile columns and every halo row the
     // loop filter reads is first filled from a slot, so stale contents

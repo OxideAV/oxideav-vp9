@@ -134,6 +134,11 @@ pub(crate) struct FrameBuf {
     pub(crate) subsampling_x: bool,
     pub(crate) subsampling_y: bool,
     pub(crate) bit_depth: u8,
+    /// §7.2.2 `color_space` / `color_range` of the frame that decoded
+    /// into this buffer (a §8.9 re-display shows the stored frame with
+    /// the colour description it was coded with).
+    pub(crate) color_space: crate::header::ColorSpace,
+    pub(crate) color_range_full: bool,
     /// Per band: the band's buffer, final above its tail (see [`TAIL`]).
     bands: Vec<OnceLock<Band>>,
     /// Per band: its last `TAIL` rows (fewer in a shorter band), which
@@ -168,6 +173,8 @@ impl FrameBuf {
             subsampling_x,
             subsampling_y,
             bit_depth,
+            color_space: crate::header::ColorSpace::Unknown,
+            color_range_full: false,
             bands: (0..n_bands).map(|_| OnceLock::new()).collect(),
             tails: (0..n_bands).map(|_| OnceLock::new()).collect(),
             mi: (0..n_mi).map(|_| OnceLock::new()).collect(),
@@ -175,6 +182,14 @@ impl FrameBuf {
             changed: Condvar::new(),
             zero_row: vec![0; geom[0].stride.max(geom[1].stride)],
         }
+    }
+
+    /// The same frame, labelled with the §7.2.2 colour description its
+    /// header coded.
+    pub(crate) fn with_color(mut self, color_space: crate::header::ColorSpace, full: bool) -> Self {
+        self.color_space = color_space;
+        self.color_range_full = full;
+        self
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, FrameSync> {

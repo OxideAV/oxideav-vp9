@@ -502,6 +502,16 @@ fn registry_decoder_matches_batch_decode_on_the_corpus() {
             last.subsampling_y,
         )
         .expect("every §7.2.2 triple has a framework label");
+        // A §7.2.2 CS_RGB stream (always 4:4:4) emits its planes as
+        // G, B, R: the framework's planar Gbrp family at that depth.
+        let rgb = oxideav_vp9::parse_uncompressed_header(split[0])
+            .is_ok_and(|h| h.color_config.color_space == oxideav_vp9::ColorSpace::Rgb);
+        let label = match (rgb, label) {
+            (true, PixelFormat::Yuv444P) => PixelFormat::Gbrp8,
+            (true, PixelFormat::Yuv444P10Le) => PixelFormat::Gbrp10Le,
+            (true, PixelFormat::Yuv444P12Le) => PixelFormat::Gbrp12Le,
+            (_, l) => l,
+        };
         assert_eq!(dec.pixel_format(), Some(label), "{name}: decoder label");
         if !last.subsampling_x && last.subsampling_y {
             assert!(

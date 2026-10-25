@@ -4,6 +4,28 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- `Vp9Decoder` implements `Decoder::output_params` /
+  `output_params_generation` (oxideav-core 0.1.42) and forwards
+  `output_pixel_format` to it: emitted width / height (§7.2.5
+  `FrameWidth` / `FrameHeight`), pixel format and the §7.2.2 colour
+  signal (`color_range` + `color_space` as an H.273 matrix: BT.601 →
+  5, BT.709 → 1, SMPTE 170 → 6, SMPTE 240 → 7, BT.2020 → 9, RGB → 0),
+  answered from the first keyframe header before the first frame. The
+  generation bumps exactly when `receive_frame` returns the first frame
+  of a new shape — identical at 1 and 8 threads. Black-box fixtures
+  (`tests/fixtures/output_params/`, `generate.sh`) pin the answers
+  against ffprobe across 8/10/12-bit, 4:2:0/4:2:2/4:4:0/4:4:4, RGB,
+  odd sizes and signalled colour spaces.
+
+### Changed
+
+- A `CS_RGB` stream is labelled `Gbrp8` / `Gbrp10Le` / `Gbrp12Le`
+  (planes G, B, R) instead of the `Yuv444P*` family;
+  `Vp9Decoder::pixel_format( )` now describes the frame most recently
+  returned (before the first: the first keyframe submitted).
+
 ### Performance
 
 - Decoder hot paths (byte-identical output): the §8.8 loop filter runs a

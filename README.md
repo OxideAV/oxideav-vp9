@@ -557,8 +557,17 @@ the dual-API convention:
   streams come back as `Yuv440P` / `Yuv440P10Le` / `Yuv440P12Le`
   with full-width, half-height chroma planes (the label's own
   `plane_dimensions( )` rule, §8.10 `ceil` on the row axis) — and
-  `Vp9Decoder::pixel_format( )` reports the label of the most
-  recently decoded frame. Since round 448 [`Vp9Decoder`]
+  `Vp9Decoder::pixel_format( )` reports the label of the frame most
+  recently returned (a `CS_RGB` stream is labelled with the planar
+  `Gbrp8` / `Gbrp10Le` / `Gbrp12Le` family — its planes are G, B, R).
+  `Decoder::output_params( )` describes the emitted frames — §7.2.5
+  frame size (not the `render_size( )` hint), pixel format and the
+  §7.2.2 colour signal (range + matrix) — from the first keyframe
+  header on, before the first frame; `output_params_generation( )`
+  moves exactly at the first returned frame of a new shape (keyframe
+  or intra-only resize, reference-scaled inter frame, a §8.9
+  re-display of a differently-sized slot, the first frame after a
+  `reset( )`), identically at every thread budget. Since round 448 [`Vp9Decoder`]
   honors the framework `set_execution_context` hook: multi-tile
   streams decode tile-parallel under the granted budget,
   frame-identical to the serial decode, with the budget preserved

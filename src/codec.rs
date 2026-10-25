@@ -28,10 +28,13 @@ use std::collections::VecDeque;
 
 use oxideav_core::registry::{CodecInfo, Decoder, Encoder};
 use oxideav_core::{
-    CodecCapabilities, CodecId, CodecOptionsStruct, CodecParameters, CodecTag, Error as CoreError,
-    ExecutionContext, Frame, OptionField, OptionKind, OptionValue, Packet, PixelFormat,
-    Result as CoreResult, RuntimeContext, TimeBase, VideoFrame, VideoPlane, parse_options,
+    CodecCapabilities, CodecId, CodecOptionsStruct, CodecParameters, CodecTag, ColorPrimaries,
+    ColorRange, ColorSignal, Error as CoreError, ExecutionContext, Frame, MatrixCoefficients,
+    OptionField, OptionKind, OptionValue, Packet, PixelFormat, Result as CoreResult,
+    RuntimeContext, TimeBase, TransferCharacteristics, VideoFrame, VideoPlane, parse_options,
 };
+
+use crate::header::{ColorSpace, FrameType, parse_uncompressed_header};
 
 use crate::decode_frame::Vp9SequenceDecoder;
 use crate::frame_buf::FrameBuf;
@@ -103,6 +106,122 @@ pub fn pixel_format_for_triple(bit_depth: u8, ssx: bool, ssy: bool) -> Option<Pi
     })
 }
 
+/// The framework pixel format a decoded frame is emitted with: the
+/// [`pixel_format_for_triple`] label, except that a §7.2.2 `CS_RGB`
+/// frame (always 4:4:4, §6.2.2) carries its three planes as G, B, R —
+/// the framework's planar `Gbrp*` family at the same depth and storage.
+fn emitted_pixel_format(
+    bit_depth: u8,
+    ssx: bool,
+    ssy: bool,
+    color_space: ColorSpace,
+) -> Option<PixelFormat> {
+    if color_space == ColorSpace::Rgb && !ssx && !ssy {
+        return match bit_depth {
+            8 => Some(PixelFormat::Gbrp8),
+            10 => Some(PixelFormat::Gbrp10Le),
+            12 => Some(PixelFormat::Gbrp12Le),
+            _ => None,
+        };
+    }
+    pixel_format_for_triple(bit_depth, ssx, ssy)
+}
+
+/// The colour signal a §7.2.2 `color_config( )` states: the range bit
+/// (`color_range`; forced full for `CS_RGB`) and the matrix the
+/// `color_space` names, as an H.273 matrix-coefficients code point.
+/// VP9 signals neither primaries nor transfer characteristics, so those
+/// stay unspecified; `CS_UNKNOWN` / `CS_RESERVED` leave the matrix
+/// unspecified too.
+fn color_signal_for(color_space: ColorSpace, full: bool) -> ColorSignal {
+    let matrix = match color_space {
+        ColorSpace::Bt601 => MatrixCoefficients::BT470_SYSTEM_BG,
+        ColorSpace::Bt709 => MatrixCoefficients::BT709,
+        ColorSpace::Smpte170 => MatrixCoefficients::BT601_525,
+        ColorSpace::Smpte240 => MatrixCoefficients::SMPTE_ST240,
+        ColorSpace::Bt2020 => MatrixCoefficients::BT2020_NCL,
+        ColorSpace::Rgb => MatrixCoefficients::IDENTITY,
+        ColorSpace::Unknown | ColorSpace::Reserved => MatrixCoefficients::UNSPECIFIED,
+    };
+    ColorSignal::new(
+        ColorRange::from_full_range_flag(full),
+        ColorPrimaries::UNSPECIFIED,
+        TransferCharacteristics::UNSPECIFIED,
+        matrix,
+    )
+}
+
+/// The stream-level description of a shown frame — what
+/// [`Decoder::output_params`] reports: the §7.2.5 `FrameWidth` /
+/// `FrameHeight` the planes are emitted at, the framework pixel format
+/// and the §7.2.2 colour signal. (VP9 codes no frame rate.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OutputShape {
+    width: u32,
+    height: u32,
+    format: PixelFormat,
+    color: ColorSignal,
+}
+
+impl OutputShape {
+    fn new(
+        width: u32,
+        height: u32,
+        bit_depth: u8,
+        ssx: bool,
+        ssy: bool,
+        color_space: ColorSpace,
+        full: bool,
+    ) -> Option<Self> {
+        Some(Self {
+            width,
+            height,
+            format: emitted_pixel_format(bit_depth, ssx, ssy, color_space)?,
+            color: color_signal_for(color_space, full),
+        })
+    }
+
+    fn of_buf(f: &FrameBuf) -> Option<Self> {
+        Self::new(
+            f.frame_width,
+            f.frame_height,
+            f.bit_depth,
+            f.subsampling_x,
+            f.subsampling_y,
+            f.color_space,
+            f.color_range_full,
+        )
+    }
+
+    /// The shape a §6.2 keyframe header announces (a keyframe's header
+    /// is self-contained: frame size and colour config are both coded).
+    fn of_keyframe(payload: &[u8]) -> Option<Self> {
+        let hdr = parse_uncompressed_header(payload).ok()?;
+        if hdr.show_existing_frame || hdr.frame_type != FrameType::KeyFrame {
+            return None;
+        }
+        let cc = hdr.color_config;
+        Self::new(
+            hdr.frame_width,
+            hdr.frame_height,
+            cc.bit_depth,
+            cc.subsampling_x,
+            cc.subsampling_y,
+            cc.color_space,
+            cc.color_range_full,
+        )
+    }
+
+    fn to_params(self, id: &CodecId) -> CodecParameters {
+        let mut p = CodecParameters::video(id.clone());
+        p.width = Some(self.width);
+        p.height = Some(self.height);
+        p.pixel_format = Some(self.format);
+        p.color_signal = self.color;
+        p
+    }
+}
+
 /// Chroma plane extent per §8.10: `ceil` division on each subsampled
 /// axis.
 fn chroma_dims(width: u32, height: u32, ssx: bool, ssy: bool) -> (usize, usize) {
@@ -118,13 +237,14 @@ fn chroma_dims(width: u32, height: u32, ssx: bool, ssy: bool) -> (usize, usize) 
 /// on each subsampled axis — for 4:4:0, full-width, half-height
 /// chroma); samples pack one byte each at 8-bit, §8.10 little-endian
 /// pairs at 10/12.
-fn buf_to_frame(f: &FrameBuf, pts: Option<i64>) -> CoreResult<(PixelFormat, Frame)> {
-    let Some(fmt) = pixel_format_for_triple(f.bit_depth, f.subsampling_x, f.subsampling_y) else {
+fn buf_to_frame(f: &FrameBuf, pts: Option<i64>) -> CoreResult<(OutputShape, Frame)> {
+    let Some(shape) = OutputShape::of_buf(f) else {
         return Err(CoreError::unsupported(format!(
             "vp9: no framework pixel-format label for bit depth {} (§7.2.2 allows 8/10/12)",
             f.bit_depth
         )));
     };
+    let fmt = shape.format;
     if !f.wait_complete() {
         return Err(CoreError::invalid("vp9: frame decode failed"));
     }
@@ -161,7 +281,7 @@ fn buf_to_frame(f: &FrameBuf, pts: Option<i64>) -> CoreResult<(PixelFormat, Fram
         }
     };
     Ok((
-        fmt,
+        shape,
         Frame::Video(VideoFrame {
             pts,
             planes: vec![pack(0, w, h), pack(1, cw, ch), pack(2, cw, ch)],
@@ -183,12 +303,21 @@ fn buf_to_frame(f: &FrameBuf, pts: Option<i64>) -> CoreResult<(PixelFormat, Fram
 pub struct Vp9Decoder {
     id: CodecId,
     seq: Vp9SequenceDecoder,
-    pending: VecDeque<Frame>,
+    /// Shown frames ready for [`Decoder::receive_frame`], each with the
+    /// output description it carries.
+    pending: VecDeque<(Frame, OutputShape)>,
     flushed: bool,
-    /// The framework label of the most recently decoded frame's §7.2.2
-    /// format triple (`None` before the first decoded frame or after
-    /// [`Decoder::reset`]).
-    format: Option<PixelFormat>,
+    /// The description of the frame `receive_frame` returned last
+    /// (`None` before the first one). Kept across [`Decoder::reset`]:
+    /// the change signal compares the first frame after a seek against
+    /// it.
+    current: Option<OutputShape>,
+    /// Before the first returned frame: what the first keyframe header
+    /// submitted announces (cleared by [`Decoder::reset`]).
+    announced: Option<OutputShape>,
+    /// [`Decoder::output_params_generation`]: bumped (wrapping) when a
+    /// returned frame's description differs from the previous one's.
+    generation: u64,
     /// The caller-granted threading budget (framework contract: serial
     /// until `set_execution_context` says otherwise); forwarded to the
     /// sequence decoder's §6.4 tile-column fan-out and preserved across
@@ -209,9 +338,8 @@ impl Vp9Decoder {
     fn collect_ready(&mut self) -> CoreResult<()> {
         while let Some((buf, tag)) = self.seq.pop_ready() {
             let pts = (tag != NO_PTS).then_some(tag);
-            let (fmt, frame) = buf_to_frame(&buf, pts)?;
-            self.format = Some(fmt);
-            self.pending.push_back(frame);
+            let (shape, frame) = buf_to_frame(&buf, pts)?;
+            self.pending.push_back((frame, shape));
         }
         Ok(())
     }
@@ -223,19 +351,28 @@ impl Vp9Decoder {
             seq: Vp9SequenceDecoder::new(),
             pending: VecDeque::new(),
             flushed: false,
-            format: None,
+            current: None,
+            announced: None,
+            generation: 0,
             exec: ExecutionContext::serial(),
         }
     }
 
     /// The framework pixel format the decoded stream is labelled with —
     /// the §7.2.2 `(BitDepth, subsampling_x, subsampling_y)` triple of
-    /// the most recently decoded frame mapped onto the framework's
-    /// planar YUV families (4:2:0 / 4:2:2 / 4:4:4 / 4:4:0 at 8, 10 and
-    /// 12 bits). `None` until a frame has been decoded, and again after
-    /// [`Decoder::reset`].
+    /// the frame most recently returned by [`Decoder::receive_frame`]
+    /// (before the first one: of the first keyframe submitted) mapped
+    /// onto the framework's planar YUV families (4:2:0 / 4:2:2 / 4:4:4
+    /// / 4:4:0 at 8, 10 and 12 bits), or the planar `Gbrp*` family for
+    /// a `CS_RGB` stream. `None` until a keyframe has been submitted.
+    /// The same answer as [`Decoder::output_pixel_format`].
     pub fn pixel_format(&self) -> Option<PixelFormat> {
-        self.format
+        self.shape().map(|s| s.format)
+    }
+
+    /// The output description [`Decoder::output_params`] reports.
+    fn shape(&self) -> Option<OutputShape> {
+        self.current.or(self.announced)
     }
 }
 
@@ -271,6 +408,11 @@ impl Decoder for Vp9Decoder {
         let tag = packet.pts.unwrap_or(NO_PTS);
         let frames = split_superframe(&packet.data);
         for payload in frames {
+            // Answer output_params before the first frame: the first
+            // keyframe's header states the size and colour config.
+            if self.current.is_none() && self.announced.is_none() {
+                self.announced = OutputShape::of_keyframe(payload);
+            }
             self.seq.submit(payload, tag, in_flight).map_err(map_err)?;
             self.collect_ready()?;
         }
@@ -279,7 +421,16 @@ impl Decoder for Vp9Decoder {
 
     fn receive_frame(&mut self) -> CoreResult<Frame> {
         loop {
-            if let Some(f) = self.pending.pop_front() {
+            if let Some((f, shape)) = self.pending.pop_front() {
+                // The change signal moves with the first frame of a new
+                // shape (a key / intra-only frame at a new size or
+                // format, a reference-scaled inter frame, a §8.9
+                // re-display of a differently-sized slot) — in output
+                // order, so identically at every thread budget.
+                if self.current.is_some_and(|c| c != shape) {
+                    self.generation = self.generation.wrapping_add(1);
+                }
+                self.current = Some(shape);
                 return Ok(f);
             }
             if !self.flushed {
@@ -312,8 +463,22 @@ impl Decoder for Vp9Decoder {
         self.seq.set_execution_context(&self.exec);
         self.pending.clear();
         self.flushed = false;
-        self.format = None;
+        // `current` stays: the first frame after the seek is compared
+        // against the last one returned before it.
+        self.announced = None;
         Ok(())
+    }
+
+    fn output_params(&self) -> Option<CodecParameters> {
+        self.shape().map(|s| s.to_params(&self.id))
+    }
+
+    fn output_params_generation(&self) -> u64 {
+        self.generation
+    }
+
+    fn output_pixel_format(&self) -> Option<PixelFormat> {
+        self.output_params().and_then(|p| p.pixel_format)
     }
 }
 

@@ -611,28 +611,38 @@ fn unscaled_kernel<R: SampleRows>(
         return;
     }
 
+    let taps = &filter[fy];
+    if fx == 0 {
+        // Vertical only: filter the reference rows directly (no
+        // intermediate copy).
+        for r in 0..h {
+            let src: [&[R::Px]; 8] =
+                std::array::from_fn(|k| &rows_of.row(iy + r + k - 3)[ix..ix + w]);
+            let d = dst_row(out, r);
+            for (c, o) in out[d].iter_mut().enumerate() {
+                let mut s = 0i32;
+                for k in 0..8 {
+                    s += taps[k] * src[k][c].get();
+                }
+                *o = ((s + 64) >> 7).clamp(0, max);
+            }
+        }
+        return;
+    }
+
     // Intermediate rows iy - 3 .. iy + h + 4 (h + 7 rows).
     let rows = h + 7;
     let inter = &mut scratch[..rows * w];
-    if fx == 0 {
-        for (r, dst) in inter.chunks_exact_mut(w).enumerate() {
-            for (o, &v) in dst.iter_mut().zip(&rows_of.row(iy + r - 3)[ix..ix + w]) {
-                *o = v.get();
-            }
-        }
-    } else {
-        for (r, dst) in inter.chunks_exact_mut(w).enumerate() {
-            hfilt(&rows_of.row(iy + r - 3)[ix - 3..ix + w + 4], dst);
-        }
+    for (r, dst) in inter.chunks_exact_mut(w).enumerate() {
+        hfilt(&rows_of.row(iy + r - 3)[ix - 3..ix + w + 4], dst);
     }
-    let taps = &filter[fy];
     for r in 0..h {
-        let src = &inter[r * w..(r + 8) * w];
+        let src: [&[i32]; 8] = std::array::from_fn(|k| &inter[(r + k) * w..(r + k + 1) * w]);
         let d = dst_row(out, r);
         for (c, o) in out[d].iter_mut().enumerate() {
             let mut s = 0i32;
             for k in 0..8 {
-                s += taps[k] * src[k * w + c];
+                s += taps[k] * src[k][c];
             }
             *o = ((s + 64) >> 7).clamp(0, max);
         }

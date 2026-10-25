@@ -88,6 +88,10 @@ All notable changes to `oxideav-vp9` are recorded here.
 - Loop-filter kernel: up to 16 positions per call, horizontal and
   vertical edges as separate instantiations with fixed tap ranges (the
   vertical edges' transposing gather / scatter got ~40% cheaper).
+- Inter prediction: a vertical-only sub-pixel filter reads the reference
+  rows directly (no intermediate copy), and the vertical pass indexes
+  eight row slices — 4x4 to 64x64 blocks with a vertical phase run 15–60%
+  faster in isolation.
 - `examples/decode_ivf.rs`: time an IVF stream through `Vp9Decoder` at a
   given thread budget (optionally dumping the planar output).
 - `tests/corpus_threads.rs`: every staged fixture decodes identically at

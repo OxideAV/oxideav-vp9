@@ -200,7 +200,7 @@ fn reconstruct_n<const SQ: usize>(
     for (i, res) in dequant.chunks_exact(n0).take(rows).enumerate() {
         let out = &mut data[(y + i) * pw + x..][..cols];
         for (o, &r) in out.iter_mut().zip(res) {
-            *o = (*o as i64 + r).clamp(0, max) as i32;
+            *o = (i64::from(*o) + r).clamp(0, max) as u16;
         }
     }
 }

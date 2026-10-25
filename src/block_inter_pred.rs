@@ -443,7 +443,7 @@ pub(crate) fn block_inter_predict_plane<R: SampleRows>(
 /// references, footprints crossing the plane edge) takes the general
 /// path.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn block_inter_predict_into<R: SampleRows>(
+pub(crate) fn block_inter_predict_into<R: SampleRows, O: Px>(
     rows_of: &R,
     x: i32,
     y: i32,
@@ -455,7 +455,7 @@ pub(crate) fn block_inter_predict_into<R: SampleRows>(
     last_x: i32,
     last_y: i32,
     bit_depth: u32,
-    out: &mut [i32],
+    out: &mut [O],
     out_stride: usize,
     scratch: &mut [i32; 64 * 71],
 ) {
@@ -512,7 +512,9 @@ pub(crate) fn block_inter_predict_into<R: SampleRows>(
             bit_depth,
         );
         for (r, src) in pred.chunks_exact(w).enumerate() {
-            out[r * out_stride..r * out_stride + w].copy_from_slice(src);
+            for (o, &v) in out[r * out_stride..r * out_stride + w].iter_mut().zip(src) {
+                *o = O::put(v);
+            }
         }
         return;
     }
@@ -557,7 +559,7 @@ impl<P: crate::frame_buf::Px> SampleRows for Window<'_, P> {
 /// The unscaled, in-plane §8.5.2.4 filter of
 /// [`block_inter_predict_into`].
 #[inline(always)]
-fn unscaled_kernel<R: SampleRows>(
+fn unscaled_kernel<R: SampleRows, O: Px>(
     rows_of: &R,
     (ix, iy, fx, fy, w, h, interp_filter, bit_depth): (
         usize,
@@ -569,13 +571,13 @@ fn unscaled_kernel<R: SampleRows>(
         usize,
         u32,
     ),
-    out: &mut [i32],
+    out: &mut [O],
     out_stride: usize,
     scratch: &mut [i32; 64 * 71],
 ) {
     let max = (1i32 << bit_depth) - 1;
     let filter = &SUBPEL_FILTERS[interp_filter];
-    let dst_row = |out: &mut [i32], r: usize| -> std::ops::Range<usize> {
+    let dst_row = |out: &mut [O], r: usize| -> std::ops::Range<usize> {
         let _ = out;
         r * out_stride..r * out_stride + w
     };
@@ -584,29 +586,30 @@ fn unscaled_kernel<R: SampleRows>(
         for r in 0..h {
             let d = dst_row(out, r);
             for (o, &v) in out[d].iter_mut().zip(&rows_of.row(iy + r)[ix..ix + w]) {
-                *o = v.get();
+                *o = O::put(v.get());
             }
         }
         return;
     }
 
-    let hfilt = |row: &[R::Px], dst: &mut [i32]| {
+    let hfilt = |row: &[R::Px], c: usize| -> i32 {
         let taps = &filter[fx];
-        for (c, d) in dst.iter_mut().enumerate() {
-            let win = &row[c..c + 8];
-            let mut s = 0i32;
-            for k in 0..8 {
-                s += taps[k] * win[k].get();
-            }
-            *d = ((s + 64) >> 7).clamp(0, max);
+        let win = &row[c..c + 8];
+        let mut s = 0i32;
+        for k in 0..8 {
+            s += taps[k] * win[k].get();
         }
+        ((s + 64) >> 7).clamp(0, max)
     };
 
     if fy == 0 {
         // Horizontal only: the rows the vertical pass would copy.
         for r in 0..h {
             let d = dst_row(out, r);
-            hfilt(&rows_of.row(iy + r)[ix - 3..ix + w + 4], &mut out[d]);
+            let row = &rows_of.row(iy + r)[ix - 3..ix + w + 4];
+            for (c, o) in out[d].iter_mut().enumerate() {
+                *o = O::put(hfilt(row, c));
+            }
         }
         return;
     }
@@ -624,7 +627,7 @@ fn unscaled_kernel<R: SampleRows>(
                 for k in 0..8 {
                     s += taps[k] * src[k][c].get();
                 }
-                *o = ((s + 64) >> 7).clamp(0, max);
+                *o = O::put(((s + 64) >> 7).clamp(0, max));
             }
         }
         return;
@@ -634,7 +637,10 @@ fn unscaled_kernel<R: SampleRows>(
     let rows = h + 7;
     let inter = &mut scratch[..rows * w];
     for (r, dst) in inter.chunks_exact_mut(w).enumerate() {
-        hfilt(&rows_of.row(iy + r - 3)[ix - 3..ix + w + 4], dst);
+        let row = &rows_of.row(iy + r - 3)[ix - 3..ix + w + 4];
+        for (c, d) in dst.iter_mut().enumerate() {
+            *d = hfilt(row, c);
+        }
     }
     for r in 0..h {
         let src: [&[i32]; 8] = std::array::from_fn(|k| &inter[(r + k) * w..(r + k + 1) * w]);
@@ -644,7 +650,7 @@ fn unscaled_kernel<R: SampleRows>(
             for k in 0..8 {
                 s += taps[k] * src[k][c];
             }
-            *o = ((s + 64) >> 7).clamp(0, max);
+            *o = O::put(((s + 64) >> 7).clamp(0, max));
         }
     }
 }

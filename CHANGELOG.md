@@ -95,6 +95,10 @@ All notable changes to `oxideav-vp9` are recorded here.
 - Loop-filter decisions: each mode-info cell carries its §8.8.2 block-edge
   masks, and an edge's fixed coordinate settles its off-screen / frame-
   border cases once per edge instead of per position.
+- The working planes (`Plane`) store `u16` samples (every writer clips
+  to `0..1 << BitDepth`), halving the reconstruction's write traffic and
+  making the band publish a plain copy; logged inter operations live out
+  of line in the row log instead of one heap box each.
 - `examples/decode_ivf.rs`: time an IVF stream through `Vp9Decoder` at a
   given thread budget (optionally dumping the planar output).
 - `tests/corpus_threads.rs`: every staged fixture decodes identically at

@@ -1065,7 +1065,10 @@ impl BlockDecoder<'_> {
             block_mvs: *block_mvs,
         };
         match &mut self.sink {
-            Sink::Log(log) => log.ops.push(PixelOp::Inter(Box::new(op))),
+            Sink::Log(log) => {
+                log.ops.push(PixelOp::Inter(log.inters.len() as u32));
+                log.inters.push(op);
+            }
             Sink::Now { y, u, v, pred } => {
                 let inter = self.inter.as_ref().expect("inter ctx");
                 let ctx = PixelCtx {
@@ -1220,7 +1223,8 @@ struct InterOp {
 enum PixelOp {
     Intra(IntraOp),
     Recon(ReconOp),
-    Inter(Box<InterOp>),
+    /// Index into [`ReconLog::inters`].
+    Inter(u32),
 }
 
 /// One superblock row's logged pixel work.
@@ -1228,12 +1232,15 @@ enum PixelOp {
 pub(crate) struct ReconLog {
     ops: Vec<PixelOp>,
     coefs: Vec<(u16, i32)>,
+    /// The (large) inter operations, out of line.
+    inters: Vec<InterOp>,
 }
 
 impl ReconLog {
     fn clear(&mut self) {
         self.ops.clear();
         self.coefs.clear();
+        self.inters.clear();
     }
 }
 
@@ -1341,7 +1348,8 @@ fn replay(
                 };
                 intra_op(dst, op, ctx.bit_depth);
             }
-            PixelOp::Inter(op) => {
+            PixelOp::Inter(idx) => {
+                let op = &log.inters[*idx as usize];
                 let dst: &mut Plane = match op.plane {
                     0 => &mut *y,
                     1 => &mut *u,
@@ -2187,12 +2195,8 @@ fn publish_tile_pixels(
             let src = plane.samples();
             for k in 0..rows {
                 let at = (y0 + k) * w;
-                for (d, &v) in band[p][(HALO + k) * w + x0..(HALO + k) * w + x1]
-                    .iter_mut()
-                    .zip(&src[at + x0..at + x1])
-                {
-                    *d = v as u16;
-                }
+                band[p][(HALO + k) * w + x0..(HALO + k) * w + x1]
+                    .copy_from_slice(&src[at + x0..at + x1]);
             }
         }
     }

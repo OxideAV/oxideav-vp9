@@ -304,13 +304,8 @@ pub(crate) fn predict_inter_with(
         let last_y = ((ref_plane.ref_frame_height + sub_y as i32) >> sub_y) - 1;
 
         // §8.5.2 step 5 — §8.5.2.4 block inter prediction.
-        let (out, out_stride): (&mut [i32], usize) = if inside && ref_list == 0 {
-            (&mut dst.samples_mut()[py * pw + px..], pw)
-        } else {
-            (&mut preds[ref_list][..], w)
-        };
         macro_rules! run {
-            ($rows:expr) => {
+            ($rows:expr, $out:expr, $stride:expr) => {
                 crate::block_inter_pred::block_inter_predict_into(
                     $rows,
                     scaled.start_x,
@@ -323,18 +318,28 @@ pub(crate) fn predict_inter_with(
                     last_x,
                     last_y,
                     args.bit_depth,
-                    out,
-                    out_stride,
+                    $out,
+                    $stride,
                     inter,
                 )
             };
         }
-        match ref_plane.bands {
-            Some((f, p)) => run!(&FrameRows(f, p)),
-            None => run!(&crate::block_inter_pred::FlatRows {
-                samples: ref_plane.samples,
-                stride: ref_plane.stride,
-            }),
+        let flat = crate::block_inter_pred::FlatRows {
+            samples: ref_plane.samples,
+            stride: ref_plane.stride,
+        };
+        if inside && ref_list == 0 {
+            let out = &mut dst.samples_mut()[py * pw + px..];
+            match ref_plane.bands {
+                Some((f, p)) => run!(&FrameRows(f, p), out, pw),
+                None => run!(&flat, out, pw),
+            }
+        } else {
+            let out = &mut preds[ref_list][..];
+            match ref_plane.bands {
+                Some((f, p)) => run!(&FrameRows(f, p), out, w),
+                None => run!(&flat, out, w),
+            }
         }
     }
 
@@ -346,7 +351,7 @@ pub(crate) fn predict_inter_with(
             for i in 0..h {
                 let o = &mut data[(py + i) * pw + px..][..w];
                 for (o, &b) in o.iter_mut().zip(&preds[1][i * w..(i + 1) * w]) {
-                    *o = round2(*o + b, 1);
+                    *o = round2(i32::from(*o) + b, 1) as u16;
                 }
             }
         }
@@ -364,10 +369,12 @@ pub(crate) fn predict_inter_with(
         if args.is_compound {
             let p1 = &preds[1][i * w..i * w + cols];
             for ((o, &a), &b) in out.iter_mut().zip(p0).zip(p1) {
-                *o = round2(a + b, 1);
+                *o = round2(a + b, 1) as u16;
             }
         } else {
-            out.copy_from_slice(p0);
+            for (o, &a) in out.iter_mut().zip(p0) {
+                *o = a as u16;
+            }
         }
     }
 }

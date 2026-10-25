@@ -95,16 +95,16 @@ impl PredMode {
 
 /// A minimal row-major plane buffer standing in for `CurrFrame[ plane ]`.
 ///
-/// Samples are stored as `i32` so the high-bit-depth (10/12-bit) paths
-/// fit without separate buffer types; values are conceptually in
-/// `0..(1 << BitDepth)`. The §8.5.1 process reads neighbour samples
+/// Samples are stored as `u16` — every §7.2.2 bit depth fits, and the
+/// values are always in `0..(1 << BitDepth)` (every writer clips) — and
+/// read / written as `i32`. The §8.5.1 process reads neighbour samples
 /// from rows / columns adjacent to the transform block and writes the
 /// prediction back into the block region.
 #[derive(Debug, Clone)]
 pub struct Plane {
     width: usize,
     height: usize,
-    samples: Vec<i32>,
+    samples: Vec<u16>,
 }
 
 impl Plane {
@@ -134,25 +134,26 @@ impl Plane {
     /// `Min(maxY, .)` before reading, so a panic indicates a caller
     /// supplied an out-of-range `(maxX, maxY)` relative to the buffer.
     pub fn get(&self, x: usize, y: usize) -> i32 {
-        self.samples[y * self.width + x]
+        i32::from(self.samples[y * self.width + x])
     }
 
     /// Writes `value` at row `y`, column `x`.
     pub fn set(&mut self, x: usize, y: usize, value: i32) {
-        self.samples[y * self.width + x] = value;
+        debug_assert!((0..=0xffff).contains(&value), "sample {value} out of range");
+        self.samples[y * self.width + x] = value as u16;
     }
 
     /// Row-major sample slice (stride = `width`). Used by the §8.8
     /// loop-filter driver, which operates on the same `CurrFrame`
     /// storage through its own plane view.
-    pub(crate) fn samples_mut(&mut self) -> &mut [i32] {
+    pub(crate) fn samples_mut(&mut self) -> &mut [u16] {
         &mut self.samples
     }
 
     /// Row-major immutable sample slice (stride = `width`). Used by the
     /// §8.10 reference-buffer update, which copies the reconstructed +
     /// loop-filtered working plane into a `FrameStore[ ]` slot.
-    pub(crate) fn samples(&self) -> &[i32] {
+    pub(crate) fn samples(&self) -> &[u16] {
         &self.samples
     }
 

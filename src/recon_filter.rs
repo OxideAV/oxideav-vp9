@@ -103,29 +103,39 @@ fn run_filter(
         bit_depth: hdr.color_config.bit_depth,
         lvl_lookup,
     };
-    let mut curr = CurrFrame {
-        planes: [
-            SuperblockFilterPlane {
-                data: y.samples_mut(),
-                stride: y_w,
-                width: y_w,
-                height: y_h,
-            },
-            SuperblockFilterPlane {
-                data: u.samples_mut(),
-                stride: u_w,
-                width: u_w,
-                height: u_h,
-            },
-            SuperblockFilterPlane {
-                data: v.samples_mut(),
-                stride: v_w,
-                width: v_w,
-                height: v_h,
-            },
-        ],
-    };
-    frame_loop_filter(&mut curr, &filter_frame);
+    // The public §8.8 driver works on `i32` sample views.
+    let widen = |p: &Plane| -> Vec<i32> { p.samples().iter().map(|&s| i32::from(s)).collect() };
+    let (mut yd, mut ud, mut vd) = (widen(y), widen(u), widen(v));
+    {
+        let mut curr = CurrFrame {
+            planes: [
+                SuperblockFilterPlane {
+                    data: &mut yd,
+                    stride: y_w,
+                    width: y_w,
+                    height: y_h,
+                },
+                SuperblockFilterPlane {
+                    data: &mut ud,
+                    stride: u_w,
+                    width: u_w,
+                    height: u_h,
+                },
+                SuperblockFilterPlane {
+                    data: &mut vd,
+                    stride: v_w,
+                    width: v_w,
+                    height: v_h,
+                },
+            ],
+        };
+        frame_loop_filter(&mut curr, &filter_frame);
+    }
+    for (p, d) in [(y, yd), (u, ud), (v, vd)] {
+        for (o, s) in p.samples_mut().iter_mut().zip(d) {
+            *o = s as u16;
+        }
+    }
 }
 
 /// Apply the decode path's §8.1 step 2 / §8.8 loop filter to the
@@ -546,7 +556,7 @@ mod tests {
         let (w, h) = (48u32, 32u32);
         let px = textured_planar(w as usize, h as usize, 3);
         let (_, mut recon, state) = encode_kf(&px, w, h, 80, 0);
-        let before: Vec<Vec<i32>> = recon.planes.iter().map(|p| p.samples().to_vec()).collect();
+        let before: Vec<Vec<u16>> = recon.planes.iter().map(|p| p.samples().to_vec()).collect();
         let hdr = lossy_keyframe_header_420(w, h, 80);
         filter_reconstruction(&mut recon, &state, &hdr);
         for (p, b) in recon.planes.iter().zip(&before) {
@@ -790,7 +800,7 @@ mod tests {
     fn keyframe_filtered_recon_mirrors_decoder_at_nonzero_sharpness() {
         let (w, h) = (48u32, 40u32);
         let px = gentle_planar(w as usize, h as usize);
-        let mut outputs: Vec<Vec<i32>> = Vec::new();
+        let mut outputs: Vec<Vec<u16>> = Vec::new();
         for sharpness in [0u8, 3, 7] {
             let (bytes, mut recon, state) = encode_kf_sharp(&px, w, h, 140, 32, sharpness);
             let mut hdr = lossy_keyframe_header_420(w, h, 140);

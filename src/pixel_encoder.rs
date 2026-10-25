@@ -2139,6 +2139,7 @@ fn predict_inter_leaf2_scaled(
                     stride,
                     ref_frame_width: ref_w as i32,
                     ref_frame_height: ref_h as i32,
+                    bands: None,
                 }),
                 second.map(|sp| {
                     let (s2, stride2) = sp[plane];
@@ -2147,6 +2148,7 @@ fn predict_inter_leaf2_scaled(
                         stride: stride2,
                         ref_frame_width: ref_w as i32,
                         ref_frame_height: ref_h as i32,
+                        bands: None,
                     }
                 }),
             ],
@@ -2228,6 +2230,7 @@ fn predict_inter_leaf_sub8x8(
                     stride,
                     ref_frame_width: vis_w as i32,
                     ref_frame_height: vis_h as i32,
+                    bands: None,
                 }),
                 second.map(|sp| {
                     let (s2, stride2) = sp[plane];
@@ -2236,6 +2239,7 @@ fn predict_inter_leaf_sub8x8(
                         stride: stride2,
                         ref_frame_width: vis_w as i32,
                         ref_frame_height: vis_h as i32,
+                        bands: None,
                     }
                 }),
             ],
@@ -2612,6 +2616,7 @@ fn refine_leaf_mv_subpel(
                     stride,
                     ref_frame_width: vis_w as i32,
                     ref_frame_height: vis_h as i32,
+                    bands: None,
                 }),
                 None,
             ],

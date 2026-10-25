@@ -507,6 +507,7 @@ mod dequant;
 mod entropy_model;
 mod filter_mask;
 mod filter_size;
+mod frame_buf;
 mod frame_loop_filter;
 mod frame_writer;
 mod fwd_transform;
@@ -553,6 +554,7 @@ mod superframe;
 mod token_writer;
 mod tokens;
 mod wide_filter;
+mod worker_pool;
 
 // Stable entry points: single-frame + multi-frame decode and the
 // decoded-frame type in their visible signatures.

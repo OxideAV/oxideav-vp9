@@ -137,6 +137,27 @@ pub(crate) const SUBPEL_FILTERS: [[[i32; 8]; 16]; 4] = [
 ];
 
 /// `Clip3( low, high, x )` per spec §3 (`vp9-spec.txt` line 624).
+/// Row access to a reference plane: `row( y )` is the plane's row `y`
+/// (at least `lastX + 1` samples).
+pub(crate) trait SampleRows {
+    fn row(&self, y: usize) -> &[i32];
+}
+
+/// A flat row-major plane of `stride` samples per row.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FlatRows<'a> {
+    pub samples: &'a [i32],
+    pub stride: usize,
+}
+
+impl SampleRows for FlatRows<'_> {
+    #[inline]
+    fn row(&self, y: usize) -> &[i32] {
+        let s = &self.samples[y * self.stride..];
+        &s[..self.stride.min(s.len())]
+    }
+}
+
 #[inline]
 fn clip3(low: i32, high: i32, x: i32) -> i32 {
     if x < low {
@@ -275,9 +296,8 @@ where
 /// which is every interior column. Bit-identical to the generic form
 /// (the tap products are accumulated in the same order).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn block_inter_predict_plane(
-    samples: &[i32],
-    stride: usize,
+pub(crate) fn block_inter_predict_plane<R: SampleRows>(
+    rows_of: &R,
     x: i32,
     y: i32,
     x_step: i32,
@@ -307,7 +327,7 @@ pub(crate) fn block_inter_predict_plane(
     let mut intermediate = vec![0i32; intermediate_height * w];
     for r in rows {
         let ref_row = clip3(0, last_y, (y >> 4) + r as i32 - 3) as usize;
-        let row = &samples[ref_row * stride..ref_row * stride + (last_x as usize + 1)];
+        let row = &rows_of.row(ref_row)[..last_x as usize + 1];
         let out = &mut intermediate[r * w..(r + 1) * w];
         for (c, slot) in out.iter_mut().enumerate() {
             let p = x + x_step * c as i32;
@@ -368,9 +388,8 @@ pub(crate) fn block_inter_predict_plane(
 /// references, footprints crossing the plane edge) takes the general
 /// path.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn block_inter_predict_into(
-    samples: &[i32],
-    stride: usize,
+pub(crate) fn block_inter_predict_into<R: SampleRows>(
+    rows_of: &R,
     x: i32,
     y: i32,
     x_step: i32,
@@ -395,8 +414,7 @@ pub(crate) fn block_inter_predict_into(
         && h <= 64;
     if !unscaled_inside {
         let pred = block_inter_predict_plane(
-            samples,
-            stride,
+            rows_of,
             x,
             y,
             x_step,
@@ -420,8 +438,7 @@ pub(crate) fn block_inter_predict_into(
 
     if fx == 0 && fy == 0 {
         for (r, dst) in out.chunks_exact_mut(w).enumerate() {
-            let at = (iy + r) * stride + ix;
-            dst.copy_from_slice(&samples[at..at + w]);
+            dst.copy_from_slice(&rows_of.row(iy + r)[ix..ix + w]);
         }
         return;
     }
@@ -441,8 +458,7 @@ pub(crate) fn block_inter_predict_into(
     if fy == 0 {
         // Horizontal only: the rows the vertical pass would copy.
         for (r, dst) in out.chunks_exact_mut(w).enumerate() {
-            let at = (iy + r) * stride + ix - 3;
-            hfilt(&samples[at..at + w + 7], dst);
+            hfilt(&rows_of.row(iy + r)[ix - 3..ix + w + 4], dst);
         }
         return;
     }
@@ -452,13 +468,11 @@ pub(crate) fn block_inter_predict_into(
     let inter = &mut scratch[..rows * w];
     if fx == 0 {
         for (r, dst) in inter.chunks_exact_mut(w).enumerate() {
-            let at = (iy + r - 3) * stride + ix;
-            dst.copy_from_slice(&samples[at..at + w]);
+            dst.copy_from_slice(&rows_of.row(iy + r - 3)[ix..ix + w]);
         }
     } else {
         for (r, dst) in inter.chunks_exact_mut(w).enumerate() {
-            let at = (iy + r - 3) * stride + ix - 3;
-            hfilt(&samples[at..at + w + 7], dst);
+            hfilt(&rows_of.row(iy + r - 3)[ix - 3..ix + w + 4], dst);
         }
     }
     let taps = &filter[fy];
@@ -492,8 +506,8 @@ mod tests {
         for filt in 0..4usize {
             for (xs, ys) in [(16, 16), (32, 16), (16, 24), (20, 20)] {
                 for (w, h) in [(4usize, 4usize), (8, 4), (16, 16)] {
-                    for x in [-70, -13, 0, 5, 200, 500, 640] {
-                        for y in [-40, -9, 0, 7, 150, 300, 430] {
+                    for x in [-70, -13, 0, 5, 51, 77, 200, 333, 500, 640] {
+                        for y in [-40, -9, 0, 7, 51, 98, 150, 300, 430] {
                             let a = block_inter_predict(
                                 |r, c| samples[r as usize * pw + c as usize],
                                 x,
@@ -507,10 +521,32 @@ mod tests {
                                 last_y,
                                 8,
                             );
+                            let rows = FlatRows {
+                                samples: &samples,
+                                stride: pw,
+                            };
                             let b = block_inter_predict_plane(
-                                &samples, pw, x, y, xs, ys, w, h, filt, last_x, last_y, 8,
+                                &rows, x, y, xs, ys, w, h, filt, last_x, last_y, 8,
                             );
                             assert_eq!(a, b, "filter {filt} step ({xs},{ys}) {w}x{h} at ({x},{y})");
+                            let mut c = vec![0i32; w * h];
+                            let mut scratch = Box::new([0i32; 64 * 71]);
+                            block_inter_predict_into(
+                                &rows,
+                                x,
+                                y,
+                                xs,
+                                ys,
+                                w,
+                                h,
+                                filt,
+                                last_x,
+                                last_y,
+                                8,
+                                &mut c,
+                                &mut scratch,
+                            );
+                            assert_eq!(a, c, "into: filter {filt} ({xs},{ys}) {w}x{h} ({x},{y})");
                         }
                     }
                 }

@@ -273,6 +273,20 @@ impl Vp9FrameState {
     /// Exhaustively destructures both sides so a future field cannot be
     /// silently dropped from the merge. Panics on a geometry mismatch
     /// or an out-of-bounds range.
+    /// Reset every array to zero (the [`Self::new`] state) in place.
+    pub(crate) fn clear(&mut self) {
+        self.skips.fill(0);
+        self.tx_sizes.fill(0);
+        self.mi_sizes.fill(0);
+        self.y_modes.fill(0);
+        self.segment_ids.fill(0);
+        self.ref_frames.fill(0);
+        self.interp_filters.fill(0);
+        self.mvs.fill((0, 0));
+        self.sub_mvs.fill((0, 0));
+        self.sub_modes.fill(0);
+    }
+
     pub(crate) fn merge_cols_from(&mut self, src: &Self, c0: u32, c1: u32) {
         // Per-MI slot multiplicity: 1 for the scalar arrays, 2 for the
         // per-refList pairs, 2 * 4 for SubMvs, 4 for SubModes.

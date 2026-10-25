@@ -87,18 +87,21 @@ pub(crate) struct RefPlane<'a> {
     /// `RefFrameHeight[ refIdx ]` — reference frame height in luma
     /// samples.
     pub ref_frame_height: i32,
+    /// The decoder's banded frame storage; when set it supplies the rows
+    /// and `samples` / `stride` are unused.
+    pub bands: Option<&'a crate::frame_buf::BandPlane>,
 }
 
-impl RefPlane<'_> {
-    /// Edge-clamped reference read `ref[ row ][ col ]`. The §8.5.2.4
-    /// process clamps `row` / `col` with `Clip3( 0, lastY/lastX, … )`
-    /// before reaching this accessor, so the index is always in range;
-    /// the `min` is a defensive guard mirroring that clamp.
+impl crate::block_inter_pred::SampleRows for RefPlane<'_> {
     #[inline]
-    fn sample(&self, row: i32, col: i32) -> i32 {
-        let r = row.max(0) as usize;
-        let c = col.max(0) as usize;
-        self.samples[r * self.stride + c]
+    fn row(&self, y: usize) -> &[i32] {
+        match self.bands {
+            Some(b) => b.row(y),
+            None => {
+                let s = &self.samples[y * self.stride..];
+                &s[..self.stride.min(s.len())]
+            }
+        }
     }
 }
 
@@ -256,8 +259,7 @@ fn predict_inter_with(
 
         // §8.5.2 step 5 — §8.5.2.4 block inter prediction.
         crate::block_inter_pred::block_inter_predict_into(
-            ref_plane.samples,
-            ref_plane.stride,
+            &ref_plane,
             scaled.start_x,
             scaled.start_y,
             scaled.step_x,
@@ -372,6 +374,7 @@ mod tests {
                     stride: rw,
                     ref_frame_width: 64,
                     ref_frame_height: 64,
+                    bands: None,
                 }),
                 None,
             ],
@@ -435,6 +438,7 @@ mod tests {
                     stride: rw,
                     ref_frame_width: 64,
                     ref_frame_height: 64,
+                    bands: None,
                 }),
                 None,
             ],
@@ -495,12 +499,14 @@ mod tests {
                     stride: rw,
                     ref_frame_width: 32,
                     ref_frame_height: 32,
+                    bands: None,
                 }),
                 Some(RefPlane {
                     samples: &refp1,
                     stride: rw,
                     ref_frame_width: 32,
                     ref_frame_height: 32,
+                    bands: None,
                 }),
             ],
         };
@@ -562,6 +568,7 @@ mod tests {
                     stride: rw,
                     ref_frame_width: 64,
                     ref_frame_height: 64,
+                    bands: None,
                 }),
                 None,
             ],
@@ -622,6 +629,7 @@ mod tests {
                     stride: rw,
                     ref_frame_width: 64,
                     ref_frame_height: 64,
+                    bands: None,
                 }),
                 None,
             ],
@@ -769,6 +777,7 @@ mod tests {
                     stride: rw,
                     ref_frame_width: 32,
                     ref_frame_height: 32,
+                    bands: None,
                 }),
                 None,
             ],
@@ -869,12 +878,14 @@ mod tests {
                     stride: rw0,
                     ref_frame_width: 32,
                     ref_frame_height: 32,
+                    bands: None,
                 }),
                 Some(RefPlane {
                     samples: &refp1,
                     stride: rw1,
                     ref_frame_width: 64,
                     ref_frame_height: 64,
+                    bands: None,
                 }),
             ],
         };

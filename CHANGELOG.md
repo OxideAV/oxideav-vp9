@@ -22,6 +22,19 @@ All notable changes to `oxideav-vp9` are recorded here.
   buffer zero between blocks instead of refilling it, and skips the
   `TokenCache[ ]` reset (every context neighbour precedes its position
   in the scan — pinned by a unit test).
+- Threading: a persistent worker pool lives as long as the
+  `Vp9SequenceDecoder` (no per-frame thread spawn), sized by the
+  `ExecutionContext` budget capped at the frame's useful parallelism
+  (tile columns + superblock rows). Each frame runs as one batch: a job
+  per tile column decodes into reusable private planes and publishes
+  every finished superblock row into that row's band; a job per
+  superblock row runs the §8.8 loop filter as soon as all columns have
+  published it, two superblocks behind the row above — filtering
+  overlaps decoding instead of waiting on a frame-wide join. Decoded
+  frames are banded, immutable and shared by the §8.10 reference slots
+  (no per-slot copies); a frame no slot holds any more lends its storage
+  to the next. 1080p reference clip: 8 threads 3.56 s → 0.77 s, auto
+  4.26 s → 0.78 s; output identical at every budget.
 - `examples/decode_ivf.rs`: time an IVF stream through `Vp9Decoder` at a
   given thread budget (optionally dumping the planar output).
 - `tests/corpus_threads.rs`: every staged fixture decodes identically at

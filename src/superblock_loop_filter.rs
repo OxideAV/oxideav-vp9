@@ -354,11 +354,29 @@ pub(crate) fn superblock_loop_filter_window(
     row: u32,
     col: u32,
 ) {
+    superblock_loop_filter_window_at(plane_buf, frame, 0, plane, pass, row, col);
+}
+
+/// [`superblock_loop_filter_window`] over per-MI arrays that start at MI
+/// row `mi_row_base` (`frame.mi_sizes[ ( r - mi_row_base ) * MiCols + c ]`
+/// is the entry of `( r, c )`), so a superblock row can be filtered from
+/// just its own rows of mode info. The §8.8.2 steps read mode info only
+/// inside the superblock being filtered.
+pub(crate) fn superblock_loop_filter_window_at(
+    plane_buf: &mut PlaneWindow,
+    frame: &SuperblockFilterFrame,
+    mi_row_base: u32,
+    plane: u8,
+    pass: u8,
+    row: u32,
+    col: u32,
+) {
     debug_assert!(
         plane_buf.stride >= plane_buf.width
             && plane_buf.data.len() >= plane_buf.stride * plane_buf.height
     );
-    let mi_cells = (frame.mi_rows as usize) * (frame.mi_cols as usize);
+    let mi_cells = ((row + 8).min(frame.mi_rows).saturating_sub(mi_row_base) as usize)
+        * (frame.mi_cols as usize);
     assert!(
         frame.mi_sizes.len() >= mi_cells
             && frame.tx_sizes.len() >= mi_cells
@@ -418,7 +436,8 @@ pub(crate) fn superblock_loop_filter_window(
                     // Steps 2-3 (lines 5532-5533): loopCol / loopRow.
                     let loop_col = ((x >> 3) >> sub_x) << sub_x;
                     let loop_row = ((y >> 3) >> sub_y) << sub_y;
-                    let idx = loop_row as usize * frame.mi_cols as usize + loop_col as usize;
+                    let idx = (loop_row - mi_row_base) as usize * frame.mi_cols as usize
+                        + loop_col as usize;
 
                     // Steps 4-5 (lines 5534-5535): MiSize / tx_size.
                     let mi_size = frame.mi_sizes[idx];

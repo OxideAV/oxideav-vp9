@@ -162,16 +162,18 @@ pub(crate) fn build_ref_planes<'a>(
         }
         let ref_idx = resolve_ref_idx(rf, ref_frame_idx);
         let s = bufs.slot(ref_idx);
-        let (samples, stride) = match plane {
-            0 => (s.y.as_slice(), s.frame_width as usize),
-            1 => (s.u.as_slice(), s.chroma_width()),
-            _ => (s.v.as_slice(), s.chroma_width()),
+        let Some(frame) = s.frame.as_deref() else {
+            // An unwritten slot has no samples; the §8.5.2 driver is never
+            // reached for it on a conformant stream.
+            continue;
         };
+        let p = &frame.planes[plane.min(2)];
         *slot = Some(RefPlane {
-            samples,
-            stride,
-            ref_frame_width: s.frame_width as i32,
-            ref_frame_height: s.frame_height as i32,
+            samples: &[],
+            stride: p.stride,
+            ref_frame_width: frame.frame_width as i32,
+            ref_frame_height: frame.frame_height as i32,
+            bands: Some(p),
         });
     }
     RefPlanes { list }
@@ -180,6 +182,7 @@ pub(crate) fn build_ref_planes<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block_inter_pred::SampleRows;
     use crate::mode_info::{ALTREF_FRAME, GOLDEN_FRAME, INTRA_FRAME, LAST_FRAME, NONE_REF_FRAME};
     use crate::ref_buffer::CurrFramePlanes;
 
@@ -251,7 +254,7 @@ mod tests {
         let y = vec![10i32; 64 * 64];
         let u = vec![20i32; 32 * 32];
         let v = vec![30i32; 32 * 32];
-        bufs.update(
+        bufs.update_planes(
             0x01,
             &CurrFramePlanes {
                 y: &y,
@@ -269,7 +272,7 @@ mod tests {
         let y1 = vec![40i32; 64 * 64];
         let u1 = vec![41i32; 32 * 32];
         let v1 = vec![42i32; 32 * 32];
-        bufs.update(
+        bufs.update_planes(
             0x02,
             &CurrFramePlanes {
                 y: &y1,
@@ -294,7 +297,7 @@ mod tests {
         let map = [0u8, 1, 2];
         let refs = build_ref_planes(&bufs, [LAST_FRAME, NONE_REF_FRAME], &map, 0);
         let p0 = refs.list[0].expect("luma ref plane");
-        assert_eq!(p0.samples[0], 10);
+        assert_eq!(p0.row(0)[0], 10);
         assert_eq!(p0.stride, 64);
         assert_eq!(p0.ref_frame_width, 64);
         assert_eq!(p0.ref_frame_height, 64);
@@ -307,10 +310,10 @@ mod tests {
         let map = [0u8, 1, 2];
         let refs_u = build_ref_planes(&bufs, [LAST_FRAME, NONE_REF_FRAME], &map, 1);
         let p = refs_u.list[0].expect("U ref plane");
-        assert_eq!(p.samples[0], 20);
+        assert_eq!(p.row(0)[0], 20);
         assert_eq!(p.stride, 32);
         let refs_v = build_ref_planes(&bufs, [LAST_FRAME, NONE_REF_FRAME], &map, 2);
-        assert_eq!(refs_v.list[0].expect("V ref plane").samples[0], 30);
+        assert_eq!(refs_v.list[0].expect("V ref plane").row(0)[0], 30);
     }
 
     #[test]
@@ -319,8 +322,8 @@ mod tests {
         let map = [0u8, 1, 2];
         // Compound: LAST (slot 0, luma 10) + GOLDEN (slot 1, luma 40).
         let refs = build_ref_planes(&bufs, [LAST_FRAME, GOLDEN_FRAME], &map, 0);
-        assert_eq!(refs.list[0].expect("list0").samples[0], 10);
-        assert_eq!(refs.list[1].expect("list1").samples[0], 40);
+        assert_eq!(refs.list[0].expect("list0").row(0)[0], 10);
+        assert_eq!(refs.list[1].expect("list1").row(0)[0], 40);
     }
 
     #[test]

@@ -17,9 +17,10 @@
 //!
 //! * [`RefBuffers`] — the eight `FrameStore` slots plus their geometry.
 //! * [`RefBuffers::update`] — the §8.10 reference frame update process:
-//!   for each slot whose `refresh_frame_flags` bit is set, copy the
-//!   current frame's planes + record `FrameWidth` / `FrameHeight` /
-//!   sub-sampling / bit-depth into that slot.
+//!   for each slot whose `refresh_frame_flags` bit is set, store the
+//!   current frame (its planes + `FrameWidth` / `FrameHeight` /
+//!   sub-sampling / bit-depth) into that slot. A decoded frame is
+//!   immutable, so the slots share it (`Arc`) instead of copying it.
 //! * [`resolve_ref_idx`] — the §8.5.2.3 / §8.5.2.4
 //!   `ref_frame_idx[ ref_frame[ refList ] - LAST_FRAME ]` slot
 //!   resolution.
@@ -38,92 +39,76 @@
 // `dead_code` lint is silenced module-wide.
 #![allow(dead_code)]
 
+use std::sync::Arc;
+
+use crate::frame_buf::{BandPlane, FrameBuf};
 use crate::mode_info::LAST_FRAME;
 
-/// `NUM_REF_FRAMES = 8` per §3 (`vp9-spec.txt` line 472). The number of
-/// reference-frame slots a VP9 decoder maintains; `refresh_frame_flags`
-/// is an 8-bit mask over these slots.
+/// `NUM_REF_FRAMES` from §3: the number of `FrameStore` slots.
 pub(crate) const NUM_REF_FRAMES: usize = 8;
 
-/// `REFS_PER_FRAME = 3` per §3 (`vp9-spec.txt` line 474). The number of
-/// reference frames an inter frame may use (the `LAST` / `GOLDEN` /
-/// `ALTREF` lists), sizing `ref_frame_idx[ ]`.
+/// `REFS_PER_FRAME` from §3: the number of reference lists an inter
+/// frame names (`LAST`, `GOLDEN`, `ALTREF`).
 pub(crate) const REFS_PER_FRAME: usize = 3;
 
-/// One reference-frame slot's stored planes + geometry.
-///
-/// `planes[ 0 ]` is luma (`width × height`), `planes[ 1 ]` / `planes[ 2 ]`
-/// are the sub-sampled chroma planes. The geometry mirrors the §8.10
-/// per-slot records (`RefFrameWidth` / `RefFrameHeight` /
-/// `RefSubsamplingX` / `RefSubsamplingY` / `RefBitDepth`). A freshly
-/// allocated slot is empty (`width == 0`); a valid stream never samples
-/// an uninitialised slot (§7.4 conformance: `ref_frame_idx` must name a
-/// slot a prior frame refreshed).
+/// One §8.10 `FrameStore[ i ]` slot: the stored frame (planes + the
+/// `RefFrameWidth` / `RefFrameHeight` / `RefSubsamplingX` /
+/// `RefSubsamplingY` / `RefBitDepth` geometry), `None` until a frame
+/// refreshes it.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RefSlot {
-    /// `RefFrameWidth[ i ]` — slot frame width in luma samples.
-    pub frame_width: u32,
-    /// `RefFrameHeight[ i ]` — slot frame height in luma samples.
-    pub frame_height: u32,
-    /// `RefSubsamplingX[ i ]`.
-    pub subsampling_x: bool,
-    /// `RefSubsamplingY[ i ]`.
-    pub subsampling_y: bool,
-    /// `RefBitDepth[ i ]`.
-    pub bit_depth: u8,
-    /// `FrameStore[ i ][ 0 ]` luma plane, row-major, stride = luma
-    /// width.
-    pub y: Vec<i32>,
-    /// `FrameStore[ i ][ 1 ]` U chroma plane, row-major, stride = chroma
-    /// width.
-    pub u: Vec<i32>,
-    /// `FrameStore[ i ][ 2 ]` V chroma plane, row-major.
-    pub v: Vec<i32>,
+    pub frame: Option<Arc<FrameBuf>>,
 }
 
 impl RefSlot {
-    /// The slot as a displayable frame — the §8.9
-    /// `show_existing_frame` output of `FrameStore[ i ]`.
+    /// `RefFrameWidth[ i ]` (0 for an empty slot).
+    pub fn frame_width(&self) -> u32 {
+        self.frame.as_ref().map_or(0, |f| f.frame_width)
+    }
+
+    /// `RefFrameHeight[ i ]` (0 for an empty slot).
+    pub fn frame_height(&self) -> u32 {
+        self.frame.as_ref().map_or(0, |f| f.frame_height)
+    }
+
+    /// The stored plane `p` (`0` = Y). Panics on an empty slot.
+    pub fn plane(&self, p: usize) -> &BandPlane {
+        &self.frame.as_ref().expect("initialised slot").planes[p]
+    }
+
+    /// Sample `(x, y)` of plane `p` (tests).
+    pub fn sample(&self, p: usize, x: usize, y: usize) -> i32 {
+        self.plane(p).row(y)[x]
+    }
+
+    /// The stored frame cropped to its §8.10 visible extents.
     pub fn to_decoded_frame(&self) -> crate::Vp9DecodedFrame {
-        let to_u16 = |p: &[i32]| p.iter().map(|&v| v as u16).collect();
-        crate::Vp9DecodedFrame {
-            width: self.frame_width,
-            height: self.frame_height,
-            bit_depth: self.bit_depth,
-            subsampling_x: self.subsampling_x,
-            subsampling_y: self.subsampling_y,
-            y: to_u16(&self.y),
-            u: to_u16(&self.u),
-            v: to_u16(&self.v),
-        }
+        self.frame
+            .as_ref()
+            .expect("initialised slot")
+            .to_decoded_frame()
     }
 
-    /// Chroma plane width (`(FrameWidth + subsampling_x) >>
-    /// subsampling_x`) per §8.10.
+    /// Visible chroma width per §8.10.
     pub fn chroma_width(&self) -> usize {
-        ((self.frame_width + u32::from(self.subsampling_x)) >> u32::from(self.subsampling_x))
-            as usize
+        self.frame.as_ref().map_or(0, |f| f.chroma_dims().0)
     }
 
-    /// Chroma plane height (`(FrameHeight + subsampling_y) >>
-    /// subsampling_y`) per §8.10.
+    /// Visible chroma height per §8.10.
     pub fn chroma_height(&self) -> usize {
-        ((self.frame_height + u32::from(self.subsampling_y)) >> u32::from(self.subsampling_y))
-            as usize
+        self.frame.as_ref().map_or(0, |f| f.chroma_dims().1)
     }
 }
 
-/// The eight §8.10 `FrameStore[ ]` reference slots.
+/// The eight §8.10 `FrameStore[ ]` slots.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RefBuffers {
     slots: [RefSlot; NUM_REF_FRAMES],
 }
 
-/// The current-frame planes the §8.10 update copies into the refreshed
-/// slots. Each plane is row-major; `y_stride` / `uv_stride` are the
-/// working strides (the working planes may be MI-aligned wider than the
-/// visible extent, so the update copies the visible `FrameWidth` /
-/// chroma extents out of the working buffer).
+/// A flat view of a just-decoded frame's working planes (tests and
+/// encoder-mirror helpers; the decoder stores its [`FrameBuf`]
+/// directly through [`RefBuffers::update`]).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CurrFramePlanes<'a> {
     pub y: &'a [i32],
@@ -139,87 +124,60 @@ pub(crate) struct CurrFramePlanes<'a> {
 }
 
 impl RefBuffers {
-    /// Allocate an empty reference-buffer set (all eight slots empty).
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Borrow slot `idx` (`0..NUM_REF_FRAMES`).
     pub fn slot(&self, idx: usize) -> &RefSlot {
         &self.slots[idx]
     }
 
-    /// `RefFrameWidth[ idx ]` per §8.10 / §6.2.5.
     pub fn ref_frame_width(&self, idx: usize) -> u32 {
-        self.slots[idx].frame_width
+        self.slots[idx].frame_width()
     }
 
-    /// `RefFrameHeight[ idx ]` per §8.10 / §6.2.5.
     pub fn ref_frame_height(&self, idx: usize) -> u32 {
-        self.slots[idx].frame_height
+        self.slots[idx].frame_height()
     }
 
-    /// `true` if slot `idx` has been refreshed by a prior frame (i.e.
-    /// is samplable). §7.4 conformance requires every `ref_frame_idx`
-    /// to name such a slot.
+    /// Whether slot `idx` has ever been written.
     pub fn is_initialised(&self, idx: usize) -> bool {
-        self.slots[idx].frame_width != 0
+        self.slots[idx].frame.is_some()
     }
 
-    /// §8.10 reference frame update process (`vp9-spec.txt` lines
-    /// 5938-5949).
-    ///
-    /// For each slot `i` whose `refresh_frame_flags` bit is set, copy the
-    /// current frame's visible planes into `FrameStore[ i ]` and record
-    /// `RefFrameWidth[ i ]` / `RefFrameHeight[ i ]` / the sub-sampling /
-    /// bit-depth. Slots whose bit is clear are left untouched (they keep
-    /// the frame a previous update stored).
-    pub fn update(&mut self, refresh_frame_flags: u8, curr: &CurrFramePlanes<'_>) {
-        let cw = ((curr.frame_width + u32::from(curr.subsampling_x))
-            >> u32::from(curr.subsampling_x)) as usize;
-        let ch = ((curr.frame_height + u32::from(curr.subsampling_y))
-            >> u32::from(curr.subsampling_y)) as usize;
-        let lw = curr.frame_width as usize;
-        let lh = curr.frame_height as usize;
-
-        // Crop the working planes to the visible extents. The slot's
-        // own buffer is refilled in place, so a steady-state stream
-        // reuses its allocations instead of faulting in fresh pages
-        // every frame.
-        let crop = |dst: &mut Vec<i32>, src: &[i32], stride: usize, w: usize, h: usize| {
-            dst.clear();
-            dst.reserve(w * h);
-            for row in src.chunks(stride).take(h) {
-                dst.extend_from_slice(&row[..w]);
+    /// §8.10 reference frame update: every slot whose
+    /// `refresh_frame_flags` bit is set now holds `frame`.
+    pub fn update(&mut self, refresh_frame_flags: u8, frame: &Arc<FrameBuf>) {
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if (refresh_frame_flags >> i) & 1 != 0 {
+                slot.frame = Some(Arc::clone(frame));
             }
-        };
-
-        for i in 0..NUM_REF_FRAMES {
-            if (refresh_frame_flags >> i) & 1 == 0 {
-                continue;
-            }
-            let slot = &mut self.slots[i];
-            slot.frame_width = curr.frame_width;
-            slot.frame_height = curr.frame_height;
-            slot.subsampling_x = curr.subsampling_x;
-            slot.subsampling_y = curr.subsampling_y;
-            slot.bit_depth = curr.bit_depth;
-            crop(&mut slot.y, curr.y, curr.y_stride, lw, lh);
-            crop(&mut slot.u, curr.u, curr.uv_stride, cw, ch);
-            crop(&mut slot.v, curr.v, curr.uv_stride, cw, ch);
         }
+    }
+
+    /// [`Self::update`] from flat planes (copied into a [`FrameBuf`]).
+    pub fn update_planes(&mut self, refresh_frame_flags: u8, curr: &CurrFramePlanes<'_>) {
+        let ssy = u32::from(curr.subsampling_y);
+        let lh = curr.y.len() / curr.y_stride;
+        let ch = curr.u.len() / curr.uv_stride;
+        let frame = Arc::new(FrameBuf {
+            planes: [
+                BandPlane::from_flat(curr.y, curr.y_stride, lh, 6),
+                BandPlane::from_flat(curr.u, curr.uv_stride, ch, 6 - ssy),
+                BandPlane::from_flat(curr.v, curr.uv_stride, ch, 6 - ssy),
+            ],
+            frame_width: curr.frame_width,
+            frame_height: curr.frame_height,
+            subsampling_x: curr.subsampling_x,
+            subsampling_y: curr.subsampling_y,
+            bit_depth: curr.bit_depth,
+        });
+        self.update(refresh_frame_flags, &frame);
     }
 }
 
-/// §8.5.2.3 / §8.5.2.4 `refIdx = ref_frame_idx[ ref_frame[ refList ] -
-/// LAST_FRAME ]` (`vp9-spec.txt` lines 4635 / 4692).
-///
-/// `ref_frame` is the per-block `ref_frame[ refList ]` value (one of
-/// `LAST_FRAME = 1` / `GOLDEN_FRAME = 2` / `ALTREF_FRAME = 3`);
-/// `ref_frame_idx` is the frame's three-entry slot map from §6.2.
-/// Returns the `FrameStore` slot index. Panics on an out-of-range
-/// `ref_frame` (the caller only invokes this for inter `refList`s whose
-/// `ref_frame` is `>= LAST_FRAME`).
+/// §8.5.2.3 / §8.5.2.4 slot resolution: `refIdx = ref_frame_idx[
+/// ref_frame[ refList ] - LAST_FRAME ]`.
 #[inline]
 pub(crate) fn resolve_ref_idx(ref_frame: i32, ref_frame_idx: &[u8; REFS_PER_FRAME]) -> usize {
     let i = (ref_frame - LAST_FRAME) as usize;
@@ -269,16 +227,16 @@ mod tests {
             subsampling_y: true,
             bit_depth: 8,
         };
-        bufs.update(0xFF, &curr);
+        bufs.update_planes(0xFF, &curr);
         for i in 0..NUM_REF_FRAMES {
             assert!(bufs.is_initialised(i));
             assert_eq!(bufs.ref_frame_width(i), 64);
             assert_eq!(bufs.ref_frame_height(i), 64);
             let slot = bufs.slot(i);
-            assert_eq!(slot.y.len(), 64 * 64);
-            assert_eq!(slot.y[0], 42);
-            assert_eq!(slot.u[0], 7);
-            assert_eq!(slot.v[0], 8);
+            assert_eq!(slot.sample(0, 0, 0), 42);
+            assert_eq!(slot.sample(0, 63, 63), 42);
+            assert_eq!(slot.sample(1, 0, 0), 7);
+            assert_eq!(slot.sample(2, 0, 0), 8);
             assert_eq!(slot.chroma_width(), 32);
             assert_eq!(slot.chroma_height(), 32);
         }
@@ -292,7 +250,7 @@ mod tests {
         let mut bufs = RefBuffers::new();
         // Keyframe fills all slots with luma 10.
         let (y0, u0, v0) = make_curr(64, 64, 10, 1);
-        bufs.update(
+        bufs.update_planes(
             0xFF,
             &CurrFramePlanes {
                 y: &y0,
@@ -309,7 +267,7 @@ mod tests {
         );
         // P-frame refreshes only slot 0 with luma 99.
         let (y1, u1, v1) = make_curr(64, 64, 99, 2);
-        bufs.update(
+        bufs.update_planes(
             0x01,
             &CurrFramePlanes {
                 y: &y1,
@@ -324,16 +282,20 @@ mod tests {
                 bit_depth: 8,
             },
         );
-        assert_eq!(bufs.slot(0).y[0], 99); // refreshed
+        assert_eq!(bufs.slot(0).sample(0, 0, 0), 99); // refreshed
         for i in 1..NUM_REF_FRAMES {
-            assert_eq!(bufs.slot(i).y[0], 10, "slot {i} should be untouched");
+            assert_eq!(
+                bufs.slot(i).sample(0, 0, 0),
+                10,
+                "slot {i} should be untouched"
+            );
         }
     }
 
-    /// §8.10: the update crops an MI-aligned working plane (stride wider
-    /// than FrameWidth) down to the visible extent.
+    /// §8.10: the stored frame keeps the MI-aligned working plane and
+    /// its visible extent; the output crop drops the stride tail.
     #[test]
-    fn update_crops_mi_aligned_working_plane() {
+    fn update_keeps_mi_aligned_plane_and_visible_crop() {
         let mut bufs = RefBuffers::new();
         // Working luma is 16-wide stride but the frame is only 10 wide.
         let stride = 16usize;
@@ -349,7 +311,7 @@ mod tests {
         let ch = ((lh + 1) >> 1) as usize;
         let u = vec![5i32; 8 * ch]; // chroma stride 8
         let v = vec![6i32; 8 * ch];
-        bufs.update(
+        bufs.update_planes(
             0x02,
             &CurrFramePlanes {
                 y: &y,
@@ -365,14 +327,17 @@ mod tests {
             },
         );
         let slot = bufs.slot(1);
-        assert_eq!(slot.y.len(), (lw * lh) as usize);
+        assert_eq!(slot.sample(0, 15, 1), 115);
+        let out = slot.to_decoded_frame();
+        assert_eq!(out.y.len(), (lw * lh) as usize);
         // Row 0 of the cropped plane is cols 0..9 of the working plane.
         for col in 0..lw as usize {
-            assert_eq!(slot.y[col], col as i32);
+            assert_eq!(out.y[col], col as u16);
         }
         // Row 1, col 0 is working (1,0) = 100, not the stride-tail of row 0.
-        assert_eq!(slot.y[lw as usize], 100);
-        assert_eq!(slot.u.len(), cw * ch);
+        assert_eq!(out.y[lw as usize], 100);
+        assert_eq!(out.u.len(), cw * ch);
+        assert_eq!(slot.chroma_width(), cw);
     }
 
     /// §8.5.2.3 / §8.5.2.4: `resolve_ref_idx` maps a per-block

@@ -76,6 +76,15 @@ All notable changes to `oxideav-vp9` are recorded here.
   band one superblock row sooner. Inter prediction reads a footprint
   spanning band tops / tails as up to four contiguous pieces. The §9.3.2
   token contexts come from per-(size, type) neighbour tables.
+- Each tile column now runs as two jobs: its entropy decode
+  (partition, mode info, motion vectors, tokens) logs every superblock
+  row's pixel work — intra / inter predictions and reconstructions with
+  their coefficients, in order — and publishes the row's mode info; its
+  reconstruction replays the log into the column's planes and publishes
+  the pixels. The same §8.5 / §8.6 operations run in the same order, so
+  the bytes are unchanged, but decode runs ahead of reconstruction and a
+  frame's entropy decode only waits on the previous frame's mode info.
+  1080p reference clip, auto threads: 0.31 s → 0.26 s.
 - `examples/decode_ivf.rs`: time an IVF stream through `Vp9Decoder` at a
   given thread budget (optionally dumping the planar output).
 - `tests/corpus_threads.rs`: every staged fixture decodes identically at

@@ -142,14 +142,12 @@ struct BlockDecoder<'a> {
     bit_depth: u32,
     lossless: bool,
     state: &'a mut Vp9FrameState,
-    y: &'a mut Plane,
-    u: &'a mut Plane,
-    v: &'a mut Plane,
+    /// The pixel work (predictions, reconstructions): done now or
+    /// logged for replay.
+    sink: Sink<'a>,
     nz: &'a mut [NonzeroContext; 3],
     token_cache: &'a mut [u8; 1024],
     tok_buf: &'a mut [i64; 1024],
-    /// §8.5.2 prediction working storage.
-    pred: &'a mut crate::inter_pred::PredScratch,
     /// §9.3.4 per-frame syntax-element count bank (cleared per frame by
     /// §8.3 `clear_counts( )`; consumed by §6.1.2 `refresh_probs( )`).
     counts: &'a mut crate::prob_adapt::FrameCounts,
@@ -433,27 +431,21 @@ impl BlockDecoder<'_> {
                         };
                         let mode = PredMode::from_raw(mode_raw).ok_or(Error::InvalidBitstream)?;
 
-                        let plane_buf: &mut Plane = match plane {
-                            0 => self.y,
-                            1 => self.u,
-                            _ => self.v,
-                        };
                         // §6.4.21: predict_intra( plane, startX, startY,
                         //   AvailL || x > 0, AvailU || y > 0,
                         //   x + step < num4x4w, txSz, blockIdx ).
-                        predict_intra(
-                            plane_buf,
-                            start_x as usize,
-                            start_y as usize,
-                            avail_l || x > 0,
-                            avail_u || y > 0,
-                            x + step < num4x4w,
-                            tx_sz,
+                        self.px_intra(IntraOp {
+                            plane: plane as u8,
+                            x: start_x as u16,
+                            y: start_y as u16,
+                            have_left: avail_l || x > 0,
+                            have_above: avail_u || y > 0,
+                            not_on_right: x + step < num4x4w,
+                            tx_sz: tx_sz as u8,
                             mode,
-                            (maxx - 1) as usize,
-                            (maxy - 1) as usize,
-                            self.bit_depth,
-                        );
+                            max_x: (maxx - 1) as u16,
+                            max_y: (maxy - 1) as u16,
+                        });
 
                         if !mi.skip {
                             // §6.4.25 TxType selection (intra blocks:
@@ -508,22 +500,20 @@ impl BlockDecoder<'_> {
                             // txSz ) — a no-op on an all-zero residual
                             // (the transform of zeros is zero).
                             if nonzero {
-                                reconstruct_block(
-                                    plane_buf,
-                                    start_x as usize,
-                                    start_y as usize,
-                                    tx_sz,
-                                    &self.tok_buf[..seg_eob],
-                                    dc_quant,
-                                    ac_quant,
-                                    tx_type,
-                                    self.lossless,
-                                    self.bit_depth,
+                                self.px_recon(
+                                    ReconOp {
+                                        plane: plane as u8,
+                                        x: start_x as u16,
+                                        y: start_y as u16,
+                                        tx_sz: tx_sz as u8,
+                                        tx_type,
+                                        dc_quant,
+                                        ac_quant,
+                                        coefs: (0, 0),
+                                    },
+                                    scan,
+                                    eob,
                                 );
-                                // Keep Tokens[ ] all-zero between blocks.
-                                for &p in &scan[..eob] {
-                                    self.tok_buf[p as usize] = 0;
-                                }
                             }
                         }
                     }
@@ -924,12 +914,6 @@ impl BlockDecoder<'_> {
                     let mut nonzero = false;
 
                     if start_x < maxx && start_y < maxy {
-                        let plane_buf: &mut Plane = match plane {
-                            0 => self.y,
-                            1 => self.u,
-                            _ => self.v,
-                        };
-
                         if !is_inter {
                             let mode_raw = if plane > 0 {
                                 uv_mode
@@ -940,19 +924,18 @@ impl BlockDecoder<'_> {
                             };
                             let mode =
                                 PredMode::from_raw(mode_raw).ok_or(Error::InvalidBitstream)?;
-                            predict_intra(
-                                plane_buf,
-                                start_x as usize,
-                                start_y as usize,
-                                avail_l || x > 0,
-                                avail_u || y > 0,
-                                x + step < num4x4w,
-                                tx_sz,
+                            self.px_intra(IntraOp {
+                                plane: plane as u8,
+                                x: start_x as u16,
+                                y: start_y as u16,
+                                have_left: avail_l || x > 0,
+                                have_above: avail_u || y > 0,
+                                not_on_right: x + step < num4x4w,
+                                tx_sz: tx_sz as u8,
                                 mode,
-                                (maxx - 1) as usize,
-                                (maxy - 1) as usize,
-                                self.bit_depth,
-                            );
+                                max_x: (maxx - 1) as u16,
+                                max_y: (maxy - 1) as u16,
+                            });
                         }
 
                         if !skip {
@@ -1008,22 +991,20 @@ impl BlockDecoder<'_> {
                             // of zeros is zero and Clip1 of an in-range
                             // sample is the sample.
                             if nonzero {
-                                reconstruct_block(
-                                    plane_buf,
-                                    start_x as usize,
-                                    start_y as usize,
-                                    tx_sz,
-                                    &self.tok_buf[..seg_eob],
-                                    dc_quant,
-                                    ac_quant,
-                                    tx_type,
-                                    self.lossless,
-                                    self.bit_depth,
+                                self.px_recon(
+                                    ReconOp {
+                                        plane: plane as u8,
+                                        x: start_x as u16,
+                                        y: start_y as u16,
+                                        tx_sz: tx_sz as u8,
+                                        tx_type,
+                                        dc_quant,
+                                        ac_quant,
+                                        coefs: (0, 0),
+                                    },
+                                    scan,
+                                    eob,
                                 );
-                                // Keep Tokens[ ] all-zero between blocks.
-                                for &p in &scan[..eob] {
-                                    self.tok_buf[p as usize] = 0;
-                                }
                             }
                         }
                     }
@@ -1050,8 +1031,7 @@ impl BlockDecoder<'_> {
     }
 
     /// §8.5.2 `predict_inter( plane, x, y, w, h, blockIdx )` for one
-    /// region — resolves the §8.10 reference planes and runs the
-    /// [`predict_inter`] driver, writing into the working plane.
+    /// region — run now or logged (see [`Sink`]).
     #[allow(clippy::too_many_arguments)]
     fn predict_inter_region(
         &mut self,
@@ -1069,53 +1049,335 @@ impl BlockDecoder<'_> {
         is_compound: bool,
         block_mvs: &[[[i32; 2]; 4]; 2],
     ) {
-        let inter = self.inter.as_ref().expect("inter ctx");
-        let refs = build_ref_planes(inter.refs, ref_frame, &inter.ref_frame_idx, plane);
+        let op = InterOp {
+            plane: plane as u8,
+            x: x as u16,
+            y: y as u16,
+            w: w as u8,
+            h: h as u8,
+            block_idx: block_idx as u8,
+            r,
+            c,
+            mi_size,
+            ref_frame: [ref_frame[0] as i8, ref_frame[1] as i8],
+            interp_filter,
+            is_compound,
+            block_mvs: *block_mvs,
+        };
+        match &mut self.sink {
+            Sink::Log(log) => log.ops.push(PixelOp::Inter(Box::new(op))),
+            Sink::Now { y, u, v, pred } => {
+                let inter = self.inter.as_ref().expect("inter ctx");
+                let ctx = PixelCtx {
+                    refs: Some(inter.refs),
+                    ref_frame_idx: inter.ref_frame_idx,
+                    frame_width: inter.frame_width,
+                    frame_height: inter.frame_height,
+                    mi_rows: self.mi_rows,
+                    mi_cols: self.mi_cols,
+                    subsampling_x: self.subsampling_x,
+                    subsampling_y: self.subsampling_y,
+                    bit_depth: self.bit_depth,
+                    lossless: self.lossless,
+                };
+                let dst: &mut Plane = match plane {
+                    0 => y,
+                    1 => u,
+                    _ => v,
+                };
+                ctx.inter(dst, pred, &op);
+            }
+        }
+    }
+
+    /// §8.5.1 `predict_intra( )` for one transform block — run now or
+    /// logged.
+    fn px_intra(&mut self, op: IntraOp) {
+        match &mut self.sink {
+            Sink::Log(log) => log.ops.push(PixelOp::Intra(op)),
+            Sink::Now { y, u, v, .. } => {
+                let dst: &mut Plane = match op.plane {
+                    0 => y,
+                    1 => u,
+                    _ => v,
+                };
+                intra_op(dst, &op, self.bit_depth);
+            }
+        }
+    }
+
+    /// §8.6.2 `reconstruct( )` of one transform block whose `Tokens[ ]`
+    /// (the first `eob` positions of `scan`) are in `tok_buf` — run now
+    /// or logged with its coefficients; either way `tok_buf` is left
+    /// all-zero.
+    fn px_recon(&mut self, mut op: ReconOp, scan: &[u16], eob: usize) {
+        let n0 = 1usize << (op.tx_sz + 2);
+        match &mut self.sink {
+            Sink::Log(log) => {
+                let start = log.coefs.len();
+                for &p in &scan[..eob] {
+                    let v = self.tok_buf[p as usize];
+                    if v != 0 {
+                        log.coefs.push((p, v as i32));
+                        self.tok_buf[p as usize] = 0;
+                    }
+                }
+                op.coefs = (start as u32, (log.coefs.len() - start) as u32);
+                log.ops.push(PixelOp::Recon(op));
+            }
+            Sink::Now { y, u, v, .. } => {
+                let dst: &mut Plane = match op.plane {
+                    0 => y,
+                    1 => u,
+                    _ => v,
+                };
+                reconstruct_block(
+                    dst,
+                    usize::from(op.x),
+                    usize::from(op.y),
+                    u32::from(op.tx_sz),
+                    &self.tok_buf[..n0 * n0],
+                    op.dc_quant,
+                    op.ac_quant,
+                    op.tx_type,
+                    self.lossless,
+                    self.bit_depth,
+                );
+                // Keep Tokens[ ] all-zero between blocks.
+                for &p in &scan[..eob] {
+                    self.tok_buf[p as usize] = 0;
+                }
+            }
+        }
+    }
+}
+
+/// Where a [`BlockDecoder`]'s pixel work goes: straight into the working
+/// planes, or into a [`ReconLog`] replayed later (in the same order, by
+/// [`replay`]) — which lets a tile's entropy decode run ahead of its
+/// reconstruction. Either way the same §8.5 / §8.6 operations run in the
+/// same order on the same inputs.
+enum Sink<'a> {
+    /// Straight into the planes (the block-level test helpers).
+    #[cfg_attr(not(test), allow(dead_code))]
+    Now {
+        y: &'a mut Plane,
+        u: &'a mut Plane,
+        v: &'a mut Plane,
+        pred: &'a mut crate::inter_pred::PredScratch,
+    },
+    Log(&'a mut ReconLog),
+}
+
+/// §8.5.1 intra prediction of one transform block.
+#[derive(Clone, Copy, Debug)]
+struct IntraOp {
+    plane: u8,
+    x: u16,
+    y: u16,
+    have_left: bool,
+    have_above: bool,
+    not_on_right: bool,
+    tx_sz: u8,
+    mode: PredMode,
+    max_x: u16,
+    max_y: u16,
+}
+
+/// §8.6.2 reconstruction of one transform block with non-zero tokens
+/// (`coefs`: its `(position, token)` pairs in the log's arena).
+#[derive(Clone, Copy, Debug)]
+struct ReconOp {
+    plane: u8,
+    x: u16,
+    y: u16,
+    tx_sz: u8,
+    tx_type: u8,
+    dc_quant: i32,
+    ac_quant: i32,
+    coefs: (u32, u32),
+}
+
+/// §8.5.2 inter prediction of one region.
+#[derive(Clone, Copy, Debug)]
+struct InterOp {
+    plane: u8,
+    x: u16,
+    y: u16,
+    w: u8,
+    h: u8,
+    block_idx: u8,
+    r: u32,
+    c: u32,
+    mi_size: u8,
+    ref_frame: [i8; 2],
+    interp_filter: u8,
+    is_compound: bool,
+    block_mvs: [[[i32; 2]; 4]; 2],
+}
+
+#[derive(Debug)]
+enum PixelOp {
+    Intra(IntraOp),
+    Recon(ReconOp),
+    Inter(Box<InterOp>),
+}
+
+/// One superblock row's logged pixel work.
+#[derive(Debug, Default)]
+pub(crate) struct ReconLog {
+    ops: Vec<PixelOp>,
+    coefs: Vec<(u16, i32)>,
+}
+
+impl ReconLog {
+    fn clear(&mut self) {
+        self.ops.clear();
+        self.coefs.clear();
+    }
+}
+
+/// The frame-level inputs the pixel operations read.
+struct PixelCtx<'a> {
+    refs: Option<&'a RefBuffers>,
+    ref_frame_idx: [u8; REFS_PER_FRAME],
+    frame_width: u32,
+    frame_height: u32,
+    mi_rows: u32,
+    mi_cols: u32,
+    subsampling_x: bool,
+    subsampling_y: bool,
+    bit_depth: u32,
+    lossless: bool,
+}
+
+fn intra_op(dst: &mut Plane, op: &IntraOp, bit_depth: u32) {
+    predict_intra(
+        dst,
+        usize::from(op.x),
+        usize::from(op.y),
+        op.have_left,
+        op.have_above,
+        op.not_on_right,
+        u32::from(op.tx_sz),
+        op.mode,
+        usize::from(op.max_x),
+        usize::from(op.max_y),
+        bit_depth,
+    );
+}
+
+impl PixelCtx<'_> {
+    /// §8.5.2 `predict_inter( )` of `op` into `dst`.
+    fn inter(&self, dst: &mut Plane, pred: &mut crate::inter_pred::PredScratch, op: &InterOp) {
+        let plane = usize::from(op.plane);
+        let ref_frame = [i32::from(op.ref_frame[0]), i32::from(op.ref_frame[1])];
+        let refs = build_ref_planes(
+            self.refs.expect("inter frame references"),
+            ref_frame,
+            &self.ref_frame_idx,
+            plane,
+        );
         let grid = BlockGrid {
-            mi_row: r as i32,
-            mi_col: c as i32,
+            mi_row: op.r as i32,
+            mi_col: op.c as i32,
             mi_rows: self.mi_rows as i32,
             mi_cols: self.mi_cols as i32,
-            mi_size,
+            mi_size: op.mi_size,
         };
         let geom = ScaleGeom {
             // ref_frame_width/height are per-list and overridden inside
             // the driver from each RefPlane; these frame-level dims feed
             // the §8.5.2.3 scale ratio numerator.
-            ref_frame_width: inter.frame_width as i32,
-            ref_frame_height: inter.frame_height as i32,
-            frame_width: inter.frame_width as i32,
-            frame_height: inter.frame_height as i32,
+            ref_frame_width: self.frame_width as i32,
+            ref_frame_height: self.frame_height as i32,
+            frame_width: self.frame_width as i32,
+            frame_height: self.frame_height as i32,
             subsampling_x: self.subsampling_x,
             subsampling_y: self.subsampling_y,
         };
         let args = InterPredArgs {
             plane,
-            x,
-            y,
-            w,
-            h,
-            block_idx,
-            interp_filter: interp_filter as usize,
+            x: i32::from(op.x),
+            y: i32::from(op.y),
+            w: usize::from(op.w),
+            h: usize::from(op.h),
+            block_idx: usize::from(op.block_idx),
+            interp_filter: usize::from(op.interp_filter),
             bit_depth: self.bit_depth,
-            is_compound,
-        };
-        let dst: &mut Plane = match plane {
-            0 => self.y,
-            1 => self.u,
-            _ => self.v,
+            is_compound: op.is_compound,
         };
         crate::inter_pred::predict_inter_with(
             dst,
             &args,
             &grid,
             &geom,
-            block_mvs,
+            &op.block_mvs,
             &refs,
             self.subsampling_x,
             self.subsampling_y,
-            self.pred,
+            pred,
         );
+    }
+}
+
+/// Replay a logged superblock row's pixel work into the tile's planes
+/// (`tok_buf` all-zero on entry and exit).
+fn replay(
+    log: &ReconLog,
+    ctx: &PixelCtx<'_>,
+    planes: [&mut Plane; 3],
+    pred: &mut crate::inter_pred::PredScratch,
+    tok_buf: &mut [i64; 1024],
+) {
+    let [y, u, v] = planes;
+    for op in &log.ops {
+        match op {
+            PixelOp::Intra(op) => {
+                let dst: &mut Plane = match op.plane {
+                    0 => &mut *y,
+                    1 => &mut *u,
+                    _ => &mut *v,
+                };
+                intra_op(dst, op, ctx.bit_depth);
+            }
+            PixelOp::Inter(op) => {
+                let dst: &mut Plane = match op.plane {
+                    0 => &mut *y,
+                    1 => &mut *u,
+                    _ => &mut *v,
+                };
+                ctx.inter(dst, pred, op);
+            }
+            PixelOp::Recon(op) => {
+                let dst: &mut Plane = match op.plane {
+                    0 => &mut *y,
+                    1 => &mut *u,
+                    _ => &mut *v,
+                };
+                let n0 = 1usize << (op.tx_sz + 2);
+                let (start, len) = (op.coefs.0 as usize, op.coefs.1 as usize);
+                let coefs = &log.coefs[start..start + len];
+                for &(p, val) in coefs {
+                    tok_buf[p as usize] = i64::from(val);
+                }
+                reconstruct_block(
+                    dst,
+                    usize::from(op.x),
+                    usize::from(op.y),
+                    u32::from(op.tx_sz),
+                    &tok_buf[..n0 * n0],
+                    op.dc_quant,
+                    op.ac_quant,
+                    op.tx_type,
+                    ctx.lossless,
+                    ctx.bit_depth,
+                );
+                for &(p, _) in coefs {
+                    tok_buf[p as usize] = 0;
+                }
+            }
+        }
     }
 }
 
@@ -1181,16 +1443,14 @@ struct TileTask<'a> {
 /// shared serial state over the worker's columns).
 struct TileWorkState<'a> {
     state: &'a mut Vp9FrameState,
-    plane_y: &'a mut Plane,
-    plane_u: &'a mut Plane,
-    plane_v: &'a mut Plane,
+    /// The log the tile's pixel work goes to (see [`Sink`]).
+    log: &'a mut ReconLog,
     nz: &'a mut [NonzeroContext; 3],
     pctx: &'a mut PartitionContextState,
     seg_pred_ctx: &'a mut SegPredContextState,
     counts: &'a mut crate::prob_adapt::FrameCounts,
     token_cache: &'a mut [u8; 1024],
     tok_buf: &'a mut [i64; 1024],
-    pred: &'a mut crate::inter_pred::PredScratch,
 }
 
 /// The previous frame's §6.5 motion field and the §6.4.14
@@ -1280,7 +1540,7 @@ fn decode_one_tile(
     ws: TileWorkState<'_>,
     prev: &mut PrevRows,
     before_row: &dyn Fn(&mut PrevRows, u32) -> Result<(), Error>,
-    on_row: &mut dyn FnMut(u32, &Plane, &Plane, &Plane, &Vp9FrameState),
+    on_row: &mut dyn FnMut(u32, &mut ReconLog, &Vp9FrameState),
 ) -> Result<(), Error> {
     // §6.4 line 2326: init_bool( tile_size ).
     let mut coder = BoolCoder::init_bool(task.slice, task.slice.len())?;
@@ -1293,16 +1553,13 @@ fn decode_one_tile(
     };
     let TileWorkState {
         state,
-        plane_y,
-        plane_u,
-        plane_v,
+        log,
         nz,
         pctx,
         seg_pred_ctx,
         counts,
         token_cache,
         tok_buf,
-        pred,
     } = ws;
 
     // §6.4.2 decode_tile( ): superblock raster with the
@@ -1363,13 +1620,10 @@ fn decode_one_tile(
                 bit_depth: sh.bit_depth,
                 lossless: sh.lossless,
                 state: &mut *state,
-                y: &mut *plane_y,
-                u: &mut *plane_u,
-                v: &mut *plane_v,
+                sink: Sink::Log(&mut *log),
                 nz: &mut *nz,
                 token_cache: &mut *token_cache,
                 tok_buf: &mut *tok_buf,
-                pred: &mut *pred,
                 counts: &mut *counts,
                 inter: inter_ctx,
             };
@@ -1397,7 +1651,7 @@ fn decode_one_tile(
                 c += 8;
             }
         }
-        on_row(r, plane_y, plane_u, plane_v, state);
+        on_row(r, log, state);
         r += 8;
     }
 
@@ -1528,8 +1782,10 @@ struct LfParams {
 }
 
 struct Progress {
-    /// Tile columns that have published each superblock row.
+    /// Tile columns that have published each superblock row's pixels /
+    /// mode info.
     tiles_done: Vec<usize>,
+    mi_done: Vec<usize>,
     /// Halo slots each loop-filter row has published.
     lf_published: Vec<usize>,
     abort: bool,
@@ -1570,6 +1826,9 @@ struct FramePipe {
     tile_out: Mutex<Vec<Option<TileResult>>>,
     /// Signalled when a tile column finishes.
     tiles_finished: Condvar,
+    /// Per tile column: logged rows from its entropy decode to its
+    /// reconstruction.
+    row_queues: Vec<RowQueue>,
     /// The next superblock row a loop-filter job claims.
     next_lf_row: AtomicUsize,
 }
@@ -1638,42 +1897,112 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A tile column's reusable working storage (kept by the sequence
-/// decoder across frames). The token buffer is all-zero between blocks,
-/// so a scratch that saw a decode error is dropped, not returned.
-pub(crate) struct TileScratch {
-    y: Plane,
-    u: Plane,
-    v: Plane,
+/// A tile column's reusable entropy-decode storage (kept by the
+/// sequence decoder across frames). The token buffer is all-zero between
+/// blocks, so a scratch that saw a decode error is dropped, not
+/// returned.
+pub(crate) struct ParseScratch {
     token_cache: Box<[u8; 1024]>,
     tok_buf: Box<[i64; 1024]>,
-    pred: Box<crate::inter_pred::PredScratch>,
     /// The §6.4.4 state allocation (zeroed before use).
     state: Option<Vp9FrameState>,
     prev: PrevRows,
 }
 
-/// The decoder's pool of [`TileScratch`].
-pub(crate) type ScratchPool = Arc<Mutex<Vec<TileScratch>>>;
+/// A tile column's reusable reconstruction storage: the working planes,
+/// the prediction scratch and the (all-zero between blocks) dequant
+/// buffer.
+pub(crate) struct ReconScratch {
+    y: Plane,
+    u: Plane,
+    v: Plane,
+    tok_buf: Box<[i64; 1024]>,
+    pred: Box<crate::inter_pred::PredScratch>,
+}
 
-fn take_scratch(pool: &ScratchPool, job: &FrameJob) -> TileScratch {
+/// The decoder's pools of tile-column storage.
+#[derive(Default)]
+pub(crate) struct Scratches {
+    parse: Vec<ParseScratch>,
+    recon: Vec<ReconScratch>,
+    logs: Vec<ReconLog>,
+}
+
+/// The decoder's tile-column storage, shared with the jobs.
+pub(crate) type ScratchPool = Arc<Mutex<Scratches>>;
+
+fn take_parse_scratch(pool: &ScratchPool) -> ParseScratch {
+    lock(pool).parse.pop().unwrap_or_else(|| ParseScratch {
+        token_cache: Box::new([0; 1024]),
+        tok_buf: Box::new([0; 1024]),
+        state: None,
+        prev: PrevRows::new(),
+    })
+}
+
+fn take_recon_scratch(pool: &ScratchPool, job: &FrameJob) -> ReconScratch {
     let (yw, yh, ..) = job.geom[0];
     let (cw, chh, ..) = job.geom[1];
     let mut list = lock(pool);
-    while let Some(s) = list.pop() {
+    while let Some(s) = list.recon.pop() {
         if (s.y.width(), s.y.height(), s.u.width(), s.u.height()) == (yw, yh, cw, chh) {
             return s;
         }
     }
-    TileScratch {
+    ReconScratch {
         y: Plane::new(yw, yh),
         u: Plane::new(cw, chh),
         v: Plane::new(cw, chh),
-        token_cache: Box::new([0; 1024]),
         tok_buf: Box::new([0; 1024]),
         pred: crate::inter_pred::PredScratch::new_boxed(),
-        state: None,
-        prev: PrevRows::new(),
+    }
+}
+
+/// A logged superblock row in flight: `(mi_row, MiColStart, MiColEnd,
+/// log)`.
+type LoggedRow = (u32, u32, u32, ReconLog);
+
+/// One tile column's logged superblock rows on their way from the
+/// column's entropy-decode job to its reconstruction job, in order, plus
+/// "no more rows".
+#[derive(Default)]
+struct RowQueue {
+    rows: Mutex<(VecDeque<LoggedRow>, bool)>,
+    ready: Condvar,
+}
+
+impl RowQueue {
+    fn push(&self, item: LoggedRow) {
+        lock(&self.rows).0.push_back(item);
+        self.ready.notify_all();
+    }
+
+    fn close(&self) {
+        lock(&self.rows).1 = true;
+        self.ready.notify_all();
+    }
+
+    /// The next row, or `None` once the queue is closed and drained.
+    fn pop(&self) -> Option<LoggedRow> {
+        let mut q = lock(&self.rows);
+        loop {
+            if let Some(item) = q.0.pop_front() {
+                return Some(item);
+            }
+            if q.1 {
+                return None;
+            }
+            q = self.ready.wait(q).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// Closes a row queue when its producer ends (normally or by panic).
+struct CloseOnDrop<'a>(&'a RowQueue);
+
+impl Drop for CloseOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.close();
     }
 }
 
@@ -1698,12 +2027,15 @@ fn copy_mi_rows<T: Copy, U>(
     }
 }
 
-/// The tile-column job body: decode every tile of column `col`,
-/// publishing each finished superblock row.
-fn tile_column_job(job: &FrameJob, pipe: &FramePipe, scratch_pool: &ScratchPool, col: usize) {
+/// The entropy-decode job of tile column `col`: decode every tile of
+/// the column (partition, mode info, motion vectors, tokens), logging
+/// each superblock row's pixel work for the column's reconstruction job
+/// and publishing the row's mode info.
+fn tile_parse_job(job: &FrameJob, pipe: &FramePipe, scratch_pool: &ScratchPool, col: usize) {
     let _guard = AbortOnPanic(pipe);
+    let _close = CloseOnDrop(&pipe.row_queues[col]);
     let sh = job.shared();
-    let mut scratch = take_scratch(scratch_pool, job);
+    let mut scratch = take_parse_scratch(scratch_pool);
     let (mi_rows, mi_cols) = (job.mi_rows, job.mi_cols);
     let mut state = match scratch.state.take() {
         Some(mut st) if (st.mi_rows, st.mi_cols) == (mi_rows, mi_cols) => {
@@ -1731,19 +2063,17 @@ fn tile_column_job(job: &FrameJob, pipe: &FramePipe, scratch_pool: &ScratchPool,
     let mut seg_pred_ctx = SegPredContextState::new(mi_cols, mi_rows);
     let mut counts = crate::prob_adapt::FrameCounts::new_boxed();
     scratch.prev.fit(mi_rows, mi_cols);
+    let new_log = || lock(scratch_pool).logs.pop().unwrap_or_default();
+    let mut log = new_log();
 
     let mut failure = None;
     for idx in (col..job.tiles.len()).step_by(job.tile_cols) {
         let task = job.task(idx);
         let (c0, c1) = (task.mi_col_start, task.mi_col_end);
-        let TileScratch {
-            y,
-            u,
-            v,
+        let ParseScratch {
             token_cache,
             tok_buf,
             prev,
-            pred,
             ..
         } = &mut scratch;
         let before = |prev: &mut PrevRows, r: u32| -> Result<(), Error> {
@@ -1755,24 +2085,23 @@ fn tile_column_job(job: &FrameJob, pipe: &FramePipe, scratch_pool: &ScratchPool,
                 mi_cols,
             )
         };
-        let mut publish = |r: u32, y: &Plane, u: &Plane, v: &Plane, st: &Vp9FrameState| {
-            publish_tile_row(job, pipe, r, c0, c1, [y, u, v], st);
+        let mut publish = |r: u32, l: &mut ReconLog, st: &Vp9FrameState| {
+            publish_tile_mi(job, pipe, r, c0, c1, st);
+            let row = std::mem::replace(l, new_log());
+            pipe.row_queues[col].push((r, c0, c1, row));
         };
         let res = decode_one_tile(
             &sh,
             &task,
             TileWorkState {
                 state: &mut state,
-                plane_y: y,
-                plane_u: u,
-                plane_v: v,
+                log: &mut log,
                 nz: &mut nz,
                 pctx: &mut pctx,
                 seg_pred_ctx: &mut seg_pred_ctx,
                 counts: &mut counts,
                 token_cache,
                 tok_buf,
-                pred,
             },
             prev,
             &before,
@@ -1790,7 +2119,10 @@ fn tile_column_job(job: &FrameJob, pipe: &FramePipe, scratch_pool: &ScratchPool,
         }
         None => {
             scratch.state = Some(state);
-            lock(scratch_pool).push(scratch);
+            let mut pools = lock(scratch_pool);
+            pools.parse.push(scratch);
+            log.clear();
+            pools.logs.push(log);
             Ok(TileOut { counts })
         }
     };
@@ -1798,18 +2130,49 @@ fn tile_column_job(job: &FrameJob, pipe: &FramePipe, scratch_pool: &ScratchPool,
     pipe.tiles_finished.notify_all();
 }
 
+/// The reconstruction job of tile column `col`: replay each logged
+/// superblock row into the column's working planes and publish it.
+fn tile_recon_job(job: &FrameJob, pipe: &FramePipe, scratch_pool: &ScratchPool, col: usize) {
+    let _guard = AbortOnPanic(pipe);
+    let mut scratch = take_recon_scratch(scratch_pool, job);
+    let ctx = PixelCtx {
+        refs: job.refs.as_ref(),
+        ref_frame_idx: job.hdr.ref_frame_idx.unwrap_or([0, 1, 2]),
+        frame_width: job.hdr.frame_width,
+        frame_height: job.hdr.frame_height,
+        mi_rows: job.mi_rows,
+        mi_cols: job.mi_cols,
+        subsampling_x: job.ssx,
+        subsampling_y: job.ssy,
+        bit_depth: job.bit_depth,
+        lossless: job.lossless,
+    };
+    while let Some((r, c0, c1, mut log)) = pipe.row_queues[col].pop() {
+        let ReconScratch {
+            y,
+            u,
+            v,
+            tok_buf,
+            pred,
+        } = &mut scratch;
+        replay(&log, &ctx, [&mut *y, &mut *u, &mut *v], pred, tok_buf);
+        publish_tile_pixels(job, pipe, r, c0, c1, [y, u, v]);
+        log.clear();
+        lock(scratch_pool).logs.push(log);
+    }
+    lock(scratch_pool).recon.push(scratch);
+}
+
 /// Copy superblock row `r`'s reconstruction (MI columns `[ c0, c1 )`)
-/// into the row's band and its mode info into the row's record, then
-/// publish it (the last column to publish freezes the mode info — and,
-/// without a loop filter, the band).
-fn publish_tile_row(
+/// into the row's band, then publish it (without a loop filter the last
+/// column to publish freezes the band).
+fn publish_tile_pixels(
     job: &FrameJob,
     pipe: &FramePipe,
     r: u32,
     c0: u32,
     c1: u32,
     planes: [&Plane; 3],
-    st: &Vp9FrameState,
 ) {
     let sb = (r / 8) as usize;
     {
@@ -1833,6 +2196,22 @@ fn publish_tile_row(
             }
         }
     }
+    let complete = {
+        let mut p = pipe.progress();
+        p.tiles_done[sb] += 1;
+        p.tiles_done[sb] == job.tile_cols
+    };
+    if complete && job.lf.is_none() {
+        let band = std::mem::take(&mut *lock(&pipe.bands[sb]));
+        pipe.frame.freeze_band(sb, band);
+    }
+    pipe.notify(sb);
+}
+
+/// Copy superblock row `r`'s mode info (MI columns `[ c0, c1 )`) into the
+/// row's record; the last column to publish freezes it.
+fn publish_tile_mi(job: &FrameJob, pipe: &FramePipe, r: u32, c0: u32, c1: u32, st: &Vp9FrameState) {
+    let sb = (r / 8) as usize;
     {
         let mut mi = lock(&pipe.mi_build[sb]);
         let cols = job.mi_cols as usize;
@@ -1862,18 +2241,13 @@ fn publish_tile_row(
     }
     let complete = {
         let mut p = pipe.progress();
-        p.tiles_done[sb] += 1;
-        p.tiles_done[sb] == job.tile_cols
+        p.mi_done[sb] += 1;
+        p.mi_done[sb] == job.tile_cols
     };
     if complete {
         let row = std::mem::replace(&mut *lock(&pipe.mi_build[sb]), MiRow::new(0));
         pipe.frame.freeze_mi(sb, row);
-        if job.lf.is_none() {
-            let band = std::mem::take(&mut *lock(&pipe.bands[sb]));
-            pipe.frame.freeze_band(sb, band);
-        }
     }
-    pipe.notify(sb);
 }
 
 /// The loop-filter job body for superblock row `r`.
@@ -2119,6 +2493,7 @@ pub(crate) fn frame_loop_filter_banded(
         slots: (0..sb_rows * sb_cols).map(|_| OnceLock::new()).collect(),
         progress: Mutex::new(Progress {
             tiles_done: vec![0; sb_rows],
+            mi_done: vec![0; sb_rows],
             lf_published: vec![0; sb_rows],
             abort: false,
         }),
@@ -2126,6 +2501,7 @@ pub(crate) fn frame_loop_filter_banded(
         tile_out: Mutex::new(Vec::new()),
         tiles_finished: Condvar::new(),
         next_lf_row: AtomicUsize::new(0),
+        row_queues: Vec::new(),
     });
     let lfp = Arc::new(lfp);
     let jobs: Vec<Job> = (0..sb_rows)
@@ -2267,6 +2643,7 @@ fn launch_frame(
         },
         progress: Mutex::new(Progress {
             tiles_done: vec![0; sb_rows],
+            mi_done: vec![0; sb_rows],
             lf_published: vec![0; sb_rows],
             abort: false,
         }),
@@ -2274,19 +2651,28 @@ fn launch_frame(
         tile_out: Mutex::new((0..job.tile_cols).map(|_| None).collect()),
         tiles_finished: Condvar::new(),
         next_lf_row: AtomicUsize::new(0),
+        row_queues: (0..job.tile_cols).map(|_| RowQueue::default()).collect(),
     });
     let job = Arc::new(job);
 
     let mut jobs: Vec<Job> = Vec::new();
+    // Every column's entropy decode, then every column's reconstruction
+    // (each waits only on its own column's decode, queued earlier).
     for col in 0..job.tile_cols {
         let (job, pipe, scratch) = (
             Arc::clone(&job),
             Arc::clone(&pipe),
             Arc::clone(scratch_pool),
         );
-        jobs.push(Box::new(move || {
-            tile_column_job(&job, &pipe, &scratch, col)
-        }));
+        jobs.push(Box::new(move || tile_parse_job(&job, &pipe, &scratch, col)));
+    }
+    for col in 0..job.tile_cols {
+        let (job, pipe, scratch) = (
+            Arc::clone(&job),
+            Arc::clone(&pipe),
+            Arc::clone(scratch_pool),
+        );
+        jobs.push(Box::new(move || tile_recon_job(&job, &pipe, &scratch, col)));
     }
     if lf_on {
         // A few loop-filter jobs that claim superblock rows in order: a
@@ -3531,13 +3917,15 @@ pub(crate) fn decode_keyframe_blocks_for_test(
             bit_depth: 8,
             lossless: false,
             state: &mut state,
-            y,
-            u,
-            v,
+            sink: Sink::Now {
+                y,
+                u,
+                v,
+                pred: &mut pred_scratch,
+            },
             nz: &mut nz,
             token_cache: &mut token_cache,
             tok_buf: &mut tok_buf,
-            pred: &mut pred_scratch,
             counts: &mut counts,
             inter: None,
         };

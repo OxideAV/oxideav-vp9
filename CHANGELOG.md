@@ -59,6 +59,11 @@ All notable changes to `oxideav-vp9` are recorded here.
   once (block / transform sizes, `skip && inter`, the §8.8.4 level) and
   reads strengths from a per-level table; the lane kernel runs on `i16`
   lanes up to 10-bit (every intermediate fits) and `i32` lanes at 12-bit.
+- Decoded frames (the bands the loop filter works on, the reference
+  frames inter prediction reads, the output source) store `u16`
+  samples instead of `i32` — every §7.2.2 bit depth fits — halving the
+  memory traffic of the band copies, the loop filter and the reference
+  reads. 1080p single thread 2.47 s → 2.15 s.
 - `examples/decode_ivf.rs`: time an IVF stream through `Vp9Decoder` at a
   given thread budget (optionally dumping the planar output).
 - `tests/corpus_threads.rs`: every staged fixture decodes identically at

@@ -43,6 +43,8 @@
 /// bits of precision when performing inter prediction; the sampling
 /// position is carried in 1/16 th-of-a-sample units, so the integer part
 /// is `p >> SUBPEL_BITS` and the fractional phase is `p & SUBPEL_MASK`.
+use crate::frame_buf::Px;
+
 pub(crate) const SUBPEL_BITS: u32 = 4;
 
 /// `SUBPEL_MASK = 15` per spec §3 (`vp9-spec.txt` line 519). Equals
@@ -140,11 +142,14 @@ pub(crate) const SUBPEL_FILTERS: [[[i32; 8]; 16]; 4] = [
 /// Row access to a reference plane: `row( y )` is the plane's row `y`
 /// (at least `lastX + 1` samples).
 pub(crate) trait SampleRows {
-    fn row(&self, y: usize) -> &[i32];
+    /// The stored sample type.
+    type Px: crate::frame_buf::Px;
+
+    fn row(&self, y: usize) -> &[Self::Px];
 
     /// Rows `y0..y1` as one flat slice (`(data, stride)`, row `y` at
     /// `data[ (y - y0) * stride.. ]`) when they are stored contiguously.
-    fn window(&self, y0: usize, y1: usize) -> Option<(&[i32], usize)> {
+    fn window(&self, y0: usize, y1: usize) -> Option<(&[Self::Px], usize)> {
         let _ = (y0, y1);
         None
     }
@@ -158,6 +163,8 @@ pub(crate) struct FlatRows<'a> {
 }
 
 impl SampleRows for FlatRows<'_> {
+    type Px = i32;
+
     #[inline]
     fn row(&self, y: usize) -> &[i32] {
         let s = &self.samples[y * self.stride..];
@@ -345,12 +352,13 @@ pub(crate) fn block_inter_predict_plane<R: SampleRows>(
     for r in rows {
         let ref_row = clip3(0, last_y, (y >> 4) + r as i32 - 3) as usize;
         let row = &rows_of.row(ref_row)[..last_x as usize + 1];
+        let px = |c: usize| crate::frame_buf::Px::get(row[c]);
         let out = &mut intermediate[r * w..(r + 1) * w];
         for (c, slot) in out.iter_mut().enumerate() {
             let p = x + x_step * c as i32;
             let phase = (p & SUBPEL_MASK) as usize;
             if phase == 0 {
-                *slot = row[clip3(0, last_x, p >> 4) as usize];
+                *slot = px(clip3(0, last_x, p >> 4) as usize);
                 continue;
             }
             let taps = &filter[phase];
@@ -359,12 +367,12 @@ pub(crate) fn block_inter_predict_plane<R: SampleRows>(
             if base >= 0 && base + 7 <= last_x {
                 let win = &row[base as usize..base as usize + 8];
                 for (&tap, &v) in taps.iter().zip(win) {
-                    s += tap * v;
+                    s += tap * crate::frame_buf::Px::get(v);
                 }
             } else {
                 for (t, &tap) in taps.iter().enumerate() {
                     let ref_col = clip3(0, last_x, base + t as i32);
-                    s += tap * row[ref_col as usize];
+                    s += tap * px(ref_col as usize);
                 }
             }
             *slot = clip1(round2(s, 7), bit_depth);
@@ -470,15 +478,17 @@ pub(crate) fn block_inter_predict_into<R: SampleRows>(
 }
 
 /// Rows `y0..` of a plane stored contiguously (`stride` apart).
-struct Window<'a> {
-    data: &'a [i32],
+struct Window<'a, P> {
+    data: &'a [P],
     stride: usize,
     y0: usize,
 }
 
-impl SampleRows for Window<'_> {
+impl<P: crate::frame_buf::Px> SampleRows for Window<'_, P> {
+    type Px = P;
+
     #[inline]
-    fn row(&self, y: usize) -> &[i32] {
+    fn row(&self, y: usize) -> &[P] {
         let at = (y - self.y0) * self.stride;
         &self.data[at..at + self.stride]
     }
@@ -513,18 +523,20 @@ fn unscaled_kernel<R: SampleRows>(
     if fx == 0 && fy == 0 {
         for r in 0..h {
             let d = dst_row(out, r);
-            out[d].copy_from_slice(&rows_of.row(iy + r)[ix..ix + w]);
+            for (o, &v) in out[d].iter_mut().zip(&rows_of.row(iy + r)[ix..ix + w]) {
+                *o = v.get();
+            }
         }
         return;
     }
 
-    let hfilt = |row: &[i32], dst: &mut [i32]| {
+    let hfilt = |row: &[R::Px], dst: &mut [i32]| {
         let taps = &filter[fx];
         for (c, d) in dst.iter_mut().enumerate() {
             let win = &row[c..c + 8];
             let mut s = 0i32;
             for k in 0..8 {
-                s += taps[k] * win[k];
+                s += taps[k] * win[k].get();
             }
             *d = ((s + 64) >> 7).clamp(0, max);
         }
@@ -544,7 +556,9 @@ fn unscaled_kernel<R: SampleRows>(
     let inter = &mut scratch[..rows * w];
     if fx == 0 {
         for (r, dst) in inter.chunks_exact_mut(w).enumerate() {
-            dst.copy_from_slice(&rows_of.row(iy + r - 3)[ix..ix + w]);
+            for (o, &v) in dst.iter_mut().zip(&rows_of.row(iy + r - 3)[ix..ix + w]) {
+                *o = v.get();
+            }
         }
     } else {
         for (r, dst) in inter.chunks_exact_mut(w).enumerate() {

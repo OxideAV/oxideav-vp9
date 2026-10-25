@@ -17,6 +17,37 @@
 
 use std::sync::{Condvar, Mutex, OnceLock};
 
+/// A stored sample: `i32` working planes, `u16` decoded frames (every
+/// §7.2.2 bit depth fits).
+pub(crate) trait Px: Copy + Default + Send + Sync + 'static {
+    /// The sample as the §8 processes' integer.
+    fn get(self) -> i32;
+    /// Store a sample (`v` is in `0..1 << BitDepth`).
+    fn put(v: i32) -> Self;
+}
+
+impl Px for i32 {
+    #[inline(always)]
+    fn get(self) -> i32 {
+        self
+    }
+    #[inline(always)]
+    fn put(v: i32) -> Self {
+        v
+    }
+}
+
+impl Px for u16 {
+    #[inline(always)]
+    fn get(self) -> i32 {
+        i32::from(self)
+    }
+    #[inline(always)]
+    fn put(v: i32) -> Self {
+        v as u16
+    }
+}
+
 /// Scratch rows above each band: the reach of the widest §8.8.5
 /// stencil above a superblock row's top edge.
 pub(crate) const HALO: usize = 8;
@@ -44,7 +75,7 @@ impl PlaneGeom {
 }
 
 /// The three planes of one superblock row (halo + own rows each).
-pub(crate) type Band = [Vec<i32>; 3];
+pub(crate) type Band = [Vec<u16>; 3];
 
 /// One superblock row's mode info (`8 * MiCols` entries per array, MI
 /// row-major from the row's first MI row): what the §8.8 loop filter
@@ -103,7 +134,7 @@ pub(crate) struct FrameBuf {
     sync: Mutex<FrameSync>,
     changed: Condvar,
     /// What a row of a failed frame reads as.
-    zero_row: Vec<i32>,
+    zero_row: Vec<u16>,
 }
 
 impl FrameBuf {
@@ -194,7 +225,7 @@ impl FrameBuf {
     /// Row `y` (`< height`) of plane `p`, `stride` samples, blocking
     /// until its band is frozen (zeros if the frame failed).
     #[inline]
-    pub(crate) fn row(&self, p: usize, y: usize) -> &[i32] {
+    pub(crate) fn row(&self, p: usize, y: usize) -> &[u16] {
         let g = &self.geom[p];
         let b = y >> g.band_shift;
         let band = match self.bands[b].get() {
@@ -214,7 +245,7 @@ impl FrameBuf {
     /// band (blocking until it is frozen); `None` across a band edge or
     /// on a failed frame.
     #[inline]
-    pub(crate) fn window(&self, p: usize, y0: usize, y1: usize) -> Option<(&[i32], usize)> {
+    pub(crate) fn window(&self, p: usize, y0: usize, y1: usize) -> Option<(&[u16], usize)> {
         let g = &self.geom[p];
         let b = y0 >> g.band_shift;
         if (y1 - 1) >> g.band_shift != b {
@@ -259,7 +290,7 @@ impl FrameBuf {
     pub(crate) fn crop_u16(&self, p: usize, w: usize, h: usize) -> Vec<u16> {
         let mut out = Vec::with_capacity(w * h);
         for y in 0..h {
-            out.extend(self.row(p, y)[..w].iter().map(|&v| v as u16));
+            out.extend_from_slice(&self.row(p, y)[..w]);
         }
         out
     }
@@ -319,7 +350,12 @@ impl FrameBuf {
                 for k in 0..rows {
                     let y = (b << g.band_shift) + k;
                     let src = &planes[p].0[y * g.stride..(y + 1) * g.stride];
-                    buf[(HALO + k) * g.stride..(HALO + k + 1) * g.stride].copy_from_slice(src);
+                    for (d, &v) in buf[(HALO + k) * g.stride..(HALO + k + 1) * g.stride]
+                        .iter_mut()
+                        .zip(src)
+                    {
+                        *d = v as u16;
+                    }
                 }
                 buf
             });
@@ -351,7 +387,11 @@ mod tests {
         );
         assert_eq!(f.bands.len(), 2);
         for y in 0..height {
-            assert_eq!(f.row(0, y), &flat[y * stride..(y + 1) * stride]);
+            let want: Vec<u16> = flat[y * stride..(y + 1) * stride]
+                .iter()
+                .map(|&v| v as u16)
+                .collect();
+            assert_eq!(f.row(0, y), &want[..]);
         }
         assert_eq!(band_rows(height, 5, 2), 6);
         assert_eq!(f.crop_u16(0, 3, 2), vec![0, 1, 2, 5, 6, 7]);
@@ -372,7 +412,7 @@ mod tests {
             let f = std::sync::Arc::clone(&f);
             std::thread::spawn(move || f.row(0, 70)[0])
         };
-        let band = |v: i32| -> Band { std::array::from_fn(|_| vec![v; geom[0].band_len(0)]) };
+        let band = |v: u16| -> Band { std::array::from_fn(|_| vec![v; geom[0].band_len(0)]) };
         f.freeze_band(1, band(7));
         f.freeze_band(0, band(3));
         assert_eq!(reader.join().unwrap(), 7);

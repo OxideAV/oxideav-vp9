@@ -151,7 +151,7 @@ fn buf_to_frame(f: &FrameBuf, pts: Option<i64>) -> CoreResult<(PixelFormat, Fram
             let mut data = Vec::with_capacity(pw * ph * 2);
             for y in 0..ph {
                 for &s in &f.row(p, y)[..pw] {
-                    data.extend_from_slice(&(s as u16).to_le_bytes());
+                    data.extend_from_slice(&s.to_le_bytes());
                 }
             }
             VideoPlane {

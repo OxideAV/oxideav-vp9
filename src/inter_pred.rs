@@ -93,29 +93,32 @@ pub(crate) struct RefPlane<'a> {
     pub bands: Option<(&'a crate::frame_buf::FrameBuf, usize)>,
 }
 
-impl crate::block_inter_pred::SampleRows for RefPlane<'_> {
-    #[inline]
-    fn row(&self, y: usize) -> &[i32] {
+impl RefPlane<'_> {
+    /// The plane's top-left sample (tests).
+    #[cfg(test)]
+    pub(crate) fn first_sample(&self) -> i32 {
         match self.bands {
-            Some((f, p)) => f.row(p, y),
-            None => {
-                let s = &self.samples[y * self.stride..];
-                &s[..self.stride.min(s.len())]
-            }
+            Some((f, p)) => i32::from(f.row(p, 0)[0]),
+            None => self.samples[0],
         }
+    }
+}
+
+/// A decoded frame's plane as §8.5.2.4 reference rows (`u16` samples).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FrameRows<'a>(pub &'a crate::frame_buf::FrameBuf, pub usize);
+
+impl crate::block_inter_pred::SampleRows for FrameRows<'_> {
+    type Px = u16;
+
+    #[inline]
+    fn row(&self, y: usize) -> &[u16] {
+        self.0.row(self.1, y)
     }
 
     #[inline]
-    fn window(&self, y0: usize, y1: usize) -> Option<(&[i32], usize)> {
-        match self.bands {
-            Some((f, p)) => f.window(p, y0, y1),
-            None => (y1 * self.stride <= self.samples.len()).then(|| {
-                (
-                    &self.samples[y0 * self.stride..y1 * self.stride],
-                    self.stride,
-                )
-            }),
-        }
+    fn window(&self, y0: usize, y1: usize) -> Option<(&[u16], usize)> {
+        self.0.window(self.1, y0, y1)
     }
 }
 
@@ -290,22 +293,33 @@ fn predict_inter_with(
         } else {
             (&mut preds[ref_list][..], w)
         };
-        crate::block_inter_pred::block_inter_predict_into(
-            &ref_plane,
-            scaled.start_x,
-            scaled.start_y,
-            scaled.step_x,
-            scaled.step_y,
-            w,
-            h,
-            args.interp_filter,
-            last_x,
-            last_y,
-            args.bit_depth,
-            out,
-            out_stride,
-            inter,
-        );
+        macro_rules! run {
+            ($rows:expr) => {
+                crate::block_inter_pred::block_inter_predict_into(
+                    $rows,
+                    scaled.start_x,
+                    scaled.start_y,
+                    scaled.step_x,
+                    scaled.step_y,
+                    w,
+                    h,
+                    args.interp_filter,
+                    last_x,
+                    last_y,
+                    args.bit_depth,
+                    out,
+                    out_stride,
+                    inter,
+                )
+            };
+        }
+        match ref_plane.bands {
+            Some((f, p)) => run!(&FrameRows(f, p)),
+            None => run!(&crate::block_inter_pred::FlatRows {
+                samples: ref_plane.samples,
+                stride: ref_plane.stride,
+            }),
+        }
     }
 
     // §8.5.2 derivation of the inter predicted samples: preds[ 0 ], or

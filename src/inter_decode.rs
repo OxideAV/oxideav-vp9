@@ -182,7 +182,6 @@ pub(crate) fn build_ref_planes<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_inter_pred::SampleRows;
     use crate::mode_info::{ALTREF_FRAME, GOLDEN_FRAME, INTRA_FRAME, LAST_FRAME, NONE_REF_FRAME};
     use crate::ref_buffer::CurrFramePlanes;
 
@@ -297,7 +296,7 @@ mod tests {
         let map = [0u8, 1, 2];
         let refs = build_ref_planes(&bufs, [LAST_FRAME, NONE_REF_FRAME], &map, 0);
         let p0 = refs.list[0].expect("luma ref plane");
-        assert_eq!(p0.row(0)[0], 10);
+        assert_eq!(p0.first_sample(), 10);
         assert_eq!(p0.stride, 64);
         assert_eq!(p0.ref_frame_width, 64);
         assert_eq!(p0.ref_frame_height, 64);
@@ -310,10 +309,10 @@ mod tests {
         let map = [0u8, 1, 2];
         let refs_u = build_ref_planes(&bufs, [LAST_FRAME, NONE_REF_FRAME], &map, 1);
         let p = refs_u.list[0].expect("U ref plane");
-        assert_eq!(p.row(0)[0], 20);
+        assert_eq!(p.first_sample(), 20);
         assert_eq!(p.stride, 32);
         let refs_v = build_ref_planes(&bufs, [LAST_FRAME, NONE_REF_FRAME], &map, 2);
-        assert_eq!(refs_v.list[0].expect("V ref plane").row(0)[0], 30);
+        assert_eq!(refs_v.list[0].expect("V ref plane").first_sample(), 30);
     }
 
     #[test]
@@ -322,8 +321,8 @@ mod tests {
         let map = [0u8, 1, 2];
         // Compound: LAST (slot 0, luma 10) + GOLDEN (slot 1, luma 40).
         let refs = build_ref_planes(&bufs, [LAST_FRAME, GOLDEN_FRAME], &map, 0);
-        assert_eq!(refs.list[0].expect("list0").row(0)[0], 10);
-        assert_eq!(refs.list[1].expect("list1").row(0)[0], 40);
+        assert_eq!(refs.list[0].expect("list0").first_sample(), 10);
+        assert_eq!(refs.list[1].expect("list1").first_sample(), 40);
     }
 
     #[test]

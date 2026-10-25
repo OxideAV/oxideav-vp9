@@ -73,7 +73,7 @@ impl RefSlot {
 
     /// Sample `(x, y)` of plane `p` (tests).
     pub fn sample(&self, p: usize, x: usize, y: usize) -> i32 {
-        self.frame.as_ref().expect("initialised slot").row(p, y)[x]
+        i32::from(self.frame.as_ref().expect("initialised slot").row(p, y)[x])
     }
 
     /// The stored frame cropped to its §8.10 visible extents.

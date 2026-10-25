@@ -1553,7 +1553,7 @@ struct FramePipe {
     mi_build: Vec<Mutex<MiRow>>,
     /// `slots[ r * Sb64Cols + c ]`: the bottom `HALO` rows of superblock
     /// `(r, c)` per plane, as loop-filter row `r` leaves them.
-    slots: Vec<OnceLock<[Vec<i32>; 3]>>,
+    slots: Vec<OnceLock<[Vec<u16>; 3]>>,
     progress: Mutex<Progress>,
     /// `changed[ r ]`: signalled when loop-filter row `r`'s inputs move
     /// (a tile column published row `r`, or row `r - 1` published a
@@ -1814,8 +1814,12 @@ fn publish_tile_row(
             let src = plane.samples();
             for k in 0..rows {
                 let at = (y0 + k) * w;
-                band[p][(HALO + k) * w + x0..(HALO + k) * w + x1]
-                    .copy_from_slice(&src[at + x0..at + x1]);
+                for (d, &v) in band[p][(HALO + k) * w + x0..(HALO + k) * w + x1]
+                    .iter_mut()
+                    .zip(&src[at + x0..at + x1])
+                {
+                    *d = v as u16;
+                }
             }
         }
     }
@@ -1920,7 +1924,7 @@ fn loop_filter_row_job(lfp: &LfParams, pipe: &FramePipe, r: usize) {
     };
     // The bottom HALO own rows of this row's band at superblock `c`.
     let publish_slot = |band: &Band, c: usize| {
-        let cells: [Vec<i32>; 3] = std::array::from_fn(|p| {
+        let cells: [Vec<u16>; 3] = std::array::from_fn(|p| {
             let (w, h, shift, _) = lfp.geom[p];
             let own = band_rows(h, shift, r);
             let (x0, x1) = col_range(p, c);
@@ -2083,11 +2087,15 @@ pub(crate) fn frame_loop_filter_banded(
                     let (w, h, shift, _) = geom[p];
                     let rows = band_rows(h, shift, b);
                     let v = &curr.planes[p];
-                    let mut buf = vec![0i32; (HALO + rows) * w];
+                    let mut buf = vec![0u16; (HALO + rows) * w];
                     for k in 0..rows {
                         let y = (b << shift) + k;
-                        buf[(HALO + k) * w..(HALO + k + 1) * w]
-                            .copy_from_slice(&v.data[y * v.stride..y * v.stride + w]);
+                        for (d, &s) in buf[(HALO + k) * w..(HALO + k + 1) * w]
+                            .iter_mut()
+                            .zip(&v.data[y * v.stride..y * v.stride + w])
+                        {
+                            *d = s as u16;
+                        }
                     }
                     buf
                 }))
@@ -2116,7 +2124,12 @@ pub(crate) fn frame_loop_filter_banded(
     for (p, &(w, h, ..)) in geom.iter().enumerate() {
         let v = &mut curr.planes[p];
         for y in 0..h {
-            v.data[y * v.stride..y * v.stride + w].copy_from_slice(&target.row(p, y)[..w]);
+            for (d, &s) in v.data[y * v.stride..y * v.stride + w]
+                .iter_mut()
+                .zip(&target.row(p, y)[..w])
+            {
+                *d = i32::from(s);
+            }
         }
     }
 }
@@ -2222,7 +2235,7 @@ fn launch_frame(
         .map(|b| {
             let band = match reuse.as_mut() {
                 Some(r) => r[b].take().expect("checked band"),
-                None => std::array::from_fn(|p| vec![0i32; fgeom[p].band_len(b)]),
+                None => std::array::from_fn(|p| vec![0u16; fgeom[p].band_len(b)]),
             };
             Mutex::new(band)
         })

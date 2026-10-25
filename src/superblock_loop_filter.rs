@@ -59,6 +59,7 @@
 
 use crate::adaptive_filter_strength::{FilterStrength, adaptive_filter_strength};
 use crate::filter_size::{PASS_VERTICAL, filter_size};
+use crate::frame_buf::Px;
 use crate::loop_filter::LvlLookup;
 use crate::residual::get_uv_tx_size;
 use crate::sample_filtering::{SampleFilterOutput, SampleFilterSamples, sample_filtering};
@@ -102,15 +103,15 @@ pub struct SuperblockFilterPlane<'a> {
 /// inside the window, so the clamped / dropped handling below only ever
 /// meets the echoed tail positions, exactly as at the frame edges.
 #[derive(Debug)]
-pub(crate) struct PlaneWindow<'a> {
-    pub(crate) data: &'a mut [i32],
+pub(crate) struct PlaneWindow<'a, T = i32> {
+    pub(crate) data: &'a mut [T],
     pub(crate) stride: usize,
     pub(crate) width: usize,
     pub(crate) height: usize,
     pub(crate) y_origin: usize,
 }
 
-impl PlaneWindow<'_> {
+impl<T: Px> PlaneWindow<'_, T> {
     /// The index of position `-8` and the index step between positions
     /// when all sixteen positions `(x + k*dx, y + k*dy)`, `k` in
     /// `-8..=7`, lie inside the window (`dx`, `dy` are 0 or 1).
@@ -136,7 +137,7 @@ impl PlaneWindow<'_> {
         let top = self.y_origin as i64;
         let cx = x.clamp(0, self.width as i64 - 1) as usize;
         let cy = (y.clamp(top, top + self.height as i64 - 1) - top) as usize;
-        self.data[cy * self.stride + cx]
+        self.data[cy * self.stride + cx].get()
     }
 
     /// Write `value` at `(x, y)` if the true coordinate lies inside
@@ -146,7 +147,7 @@ impl PlaneWindow<'_> {
     fn set_in_bounds(&mut self, x: i64, y: i64, value: i32) {
         let top = self.y_origin as i64;
         if x >= 0 && y >= top && (x as usize) < self.width && y < top + self.height as i64 {
-            self.data[(y - top) as usize * self.stride + x as usize] = value;
+            self.data[(y - top) as usize * self.stride + x as usize] = T::put(value);
         }
     }
 }
@@ -206,11 +207,17 @@ pub struct SuperblockFilterFrame<'a> {
 /// Gather the §8.8.5.1 16-sample stencil at plane position `(x, y)`
 /// along the `(dx, dy)` filter direction per `vp9-spec.txt` lines
 /// 5703-5727 (`q_k` at `+k`, `p_k` at `-(k + 1)`).
-fn gather_stencil(plane: &PlaneWindow, x: i64, y: i64, dx: i64, dy: i64) -> SampleFilterSamples {
+fn gather_stencil<T: Px>(
+    plane: &PlaneWindow<'_, T>,
+    x: i64,
+    y: i64,
+    dx: i64,
+    dy: i64,
+) -> SampleFilterSamples {
     if let Some((base, step)) = plane.interior(x, y, dx, dy) {
         // Every position inside the plane: no clamping needed.
         let d = &plane.data;
-        let s = |k: usize| d[base + k * step];
+        let s = |k: usize| d[base + k * step].get();
         return SampleFilterSamples {
             p7: s(0),
             p6: s(1),
@@ -254,8 +261,8 @@ fn gather_stencil(plane: &PlaneWindow, x: i64, y: i64, dx: i64, dy: i64) -> Samp
 /// Scatter the §8.8.5 post-filter stencil back to `CurrFrame[ plane ]`
 /// at the true (unclamped) sample positions; positions outside the
 /// plane are dropped (their values are clamped-read echoes).
-fn scatter_stencil(
-    plane: &mut PlaneWindow,
+fn scatter_stencil<T: Px>(
+    plane: &mut PlaneWindow<'_, T>,
     x: i64,
     y: i64,
     dx: i64,
@@ -282,7 +289,7 @@ fn scatter_stencil(
     ];
     if let Some((base, step)) = plane.interior(x, y, dx, dy) {
         for (k, v) in positions {
-            plane.data[base + (k + 8) as usize * step] = v;
+            plane.data[base + (k + 8) as usize * step] = T::put(v);
         }
         return;
     }
@@ -346,8 +353,8 @@ pub fn superblock_loop_filter(
 
 /// [`superblock_loop_filter`] over a [`PlaneWindow`]: the rows of
 /// superblock row `row` that the window holds are filtered in place.
-pub(crate) fn superblock_loop_filter_window(
-    plane_buf: &mut PlaneWindow,
+pub(crate) fn superblock_loop_filter_window<T: Px>(
+    plane_buf: &mut PlaneWindow<'_, T>,
     frame: &SuperblockFilterFrame,
     plane: u8,
     pass: u8,
@@ -362,8 +369,8 @@ pub(crate) fn superblock_loop_filter_window(
 /// is the entry of `( r, c )`), so a superblock row can be filtered from
 /// just its own rows of mode info. The §8.8.2 steps read mode info only
 /// inside the superblock being filtered.
-pub(crate) fn superblock_loop_filter_window_at(
-    plane_buf: &mut PlaneWindow,
+pub(crate) fn superblock_loop_filter_window_at<T: Px>(
+    plane_buf: &mut PlaneWindow<'_, T>,
     frame: &SuperblockFilterFrame,
     mi_row_base: u32,
     plane: u8,
@@ -637,8 +644,8 @@ impl LfRowCells {
 /// [`LfRowCells`]: the same §8.8.2 steps per mode-info run (the
 /// predicates of [`superblock_filter_edge`], [`filter_size`] and the
 /// §8.8.4 strength), read from the resolved cells.
-pub(crate) fn superblock_loop_filter_cells(
-    plane_buf: &mut PlaneWindow,
+pub(crate) fn superblock_loop_filter_cells<T: Px>(
+    plane_buf: &mut PlaneWindow<'_, T>,
     lf: &LfRowCells,
     plane: u8,
     pass: u8,
@@ -764,8 +771,8 @@ const LANES: usize = 8;
 /// kernel when every stencil lies inside the window, else the
 /// per-position gather / §8.8.5 / scatter path (frame borders).
 #[allow(clippy::too_many_arguments)]
-fn filter_run(
-    plane_buf: &mut PlaneWindow,
+fn filter_run<T: Px>(
+    plane_buf: &mut PlaneWindow<'_, T>,
     bit_depth: u8,
     geom: &crate::superblock_filter::SuperblockFilterGeometry,
     (pass, sub_x, sub_y): (u8, u32, u32),
@@ -833,8 +840,8 @@ macro_rules! lane_kernel {
         // The lane loops index several parallel tap arrays by lane on
         // purpose.
         #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
-        fn $name(
-            data: &mut [i32],
+        fn $name<T: Px>(
+            data: &mut [T],
             q0: usize,
             step: usize,
             along: usize,
@@ -853,14 +860,14 @@ macro_rules! lane_kernel {
                 for (k, tap) in t.iter_mut().enumerate().take(k_hi).skip(k_lo) {
                     let at = (q0 + k * step) - 8 * step;
                     for (d, &v) in tap.iter_mut().zip(&data[at..at + LANES]) {
-                        *d = v as $t;
+                        *d = v.get() as $t;
                     }
                 }
             } else if along == 1 {
                 for (k, tap) in t.iter_mut().enumerate().take(k_hi).skip(k_lo) {
                     let at = (q0 + k * step) - 8 * step;
                     for (d, &v) in tap.iter_mut().zip(&data[at..at + n]) {
-                        *d = v as $t;
+                        *d = v.get() as $t;
                     }
                 }
             } else {
@@ -868,7 +875,7 @@ macro_rules! lane_kernel {
                     let at = q0 + l * along - 8;
                     let line = &data[at + k_lo..at + k_hi];
                     for (k, &v) in (k_lo..k_hi).zip(line) {
-                        t[k][l] = v as $t;
+                        t[k][l] = v.get() as $t;
                     }
                 }
             }
@@ -993,14 +1000,14 @@ macro_rules! lane_kernel {
                 for (k, tap) in o.iter().enumerate().take(w_hi).skip(w_lo) {
                     let at = (q0 + k * step) - 8 * step;
                     for (d, &v) in data[at..at + LANES].iter_mut().zip(tap) {
-                        *d = i32::from(v);
+                        *d = T::put(i32::from(v));
                     }
                 }
             } else if along == 1 {
                 for (k, tap) in o.iter().enumerate().take(w_hi).skip(w_lo) {
                     let at = (q0 + k * step) - 8 * step;
                     for (d, &v) in data[at..at + n].iter_mut().zip(tap) {
-                        *d = i32::from(v);
+                        *d = T::put(i32::from(v));
                     }
                 }
             } else {
@@ -1008,7 +1015,7 @@ macro_rules! lane_kernel {
                     let at = q0 + l * along - 8;
                     let line = &mut data[at + w_lo..at + w_hi];
                     for (k, v) in (w_lo..w_hi).zip(line) {
-                        *v = i32::from(o[k][l]);
+                        *v = T::put(i32::from(o[k][l]));
                     }
                 }
             }
@@ -1028,8 +1035,8 @@ lane_kernel!(filter_lanes_i32, i32);
 /// taps a filter can modify are written back).
 #[allow(clippy::too_many_arguments)]
 #[inline]
-fn filter_lanes(
-    data: &mut [i32],
+fn filter_lanes<T: Px>(
+    data: &mut [T],
     q0: usize,
     step: usize,
     along: usize,

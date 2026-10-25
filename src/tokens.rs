@@ -637,6 +637,33 @@ pub(crate) fn build_token_probs(cell: &[u8; 3]) -> [u8; 10] {
     probs
 }
 
+/// The §9.3.2 `(nb0, nb1)` context neighbours of every scan index for a
+/// `(txSz, TxType)` pair, with the §6.4.25 scan they were built from
+/// ([`token_cache_neighbours`] applied to each scan position).
+#[allow(clippy::type_complexity)]
+pub(crate) fn neighbour_table(
+    tx_sz: u32,
+    tx_type: u8,
+) -> Option<(&'static [u16], &'static [[u16; 2]])> {
+    use std::sync::OnceLock;
+    static TABLES: [[OnceLock<Vec<[u16; 2]>>; 4]; 4] =
+        [const { [const { OnceLock::new() }; 4] }; 4];
+    if tx_sz > 3 || tx_type > 3 {
+        return None;
+    }
+    let scan = crate::scan::get_scan(0, tx_sz, tx_type);
+    let nb = TABLES[tx_sz as usize][tx_type as usize].get_or_init(|| {
+        scan.iter()
+            .enumerate()
+            .map(|(c, &pos)| {
+                let (a, b) = token_cache_neighbours(c, pos as usize, tx_sz, tx_type);
+                [a as u16, b as u16]
+            })
+            .collect()
+    });
+    Some((scan, nb))
+}
+
 /// Per-plane non-zero context strips used by the §6.4.21 residual driver
 /// and read by the §6.4.24 `tokens( )` DC-context derivation.
 ///
@@ -796,6 +823,15 @@ pub(crate) fn tokens_eob(
     // `coef_probs[txSz]` slab is constant for the whole block.
     let tx_slab = &coef_probs[tx_sz as usize][plane_gt0][is_inter];
 
+    // The §9.3.2 context neighbours of every scan position, from the
+    // per-(size, type) table when `scan` is the §6.4.25 scan for this
+    // block (it always is in the decoder), else derived per position.
+    let nb_table = neighbour_table(tx_sz, block.tx_type)
+        .filter(|(table_scan, _)| std::ptr::eq(table_scan.as_ptr(), scan.as_ptr()))
+        .map(|(_, nb)| nb);
+    let more_counts = &mut counts.more_coefs[tx_sz as usize][plane_gt0][is_inter];
+    let token_counts = &mut counts.token[tx_sz as usize][plane_gt0][is_inter];
+
     let mut check_eob = true;
     let mut c = 0usize;
     while c < seg_eob {
@@ -820,7 +856,10 @@ pub(crate) fn tokens_eob(
             }
             (above + left) as usize
         } else {
-            let (nb0, nb1) = token_cache_neighbours(c, pos, tx_sz, block.tx_type);
+            let (nb0, nb1) = match nb_table {
+                Some(nb) => (nb[c][0] as usize, nb[c][1] as usize),
+                None => token_cache_neighbours(c, pos, tx_sz, block.tx_type),
+            };
             (1 + token_cache[nb0] as usize + token_cache[nb1] as usize) >> 1
         };
 
@@ -832,8 +871,7 @@ pub(crate) fn tokens_eob(
             // count exactly one `counts_more_coefs` event per decoded
             // `more_coefs`, at this position's band/ctx. Positions with
             // `checkEob == 0` never reach here and are never counted.
-            counts.more_coefs[tx_sz as usize][plane_gt0][is_inter][band][ctx][usize::from(more)] +=
-                1;
+            more_counts[band][ctx][usize::from(more)] += 1;
             if !more {
                 break;
             }
@@ -841,14 +879,15 @@ pub(crate) fn tokens_eob(
 
         let token = read_token_cell(coder, cell)?;
         // §9.3.4: counts_token[…][Min(2, syntax)] += 1.
-        counts.token[tx_sz as usize][plane_gt0][is_inter][band][ctx][(token as usize).min(2)] += 1;
+        token_counts[band][ctx][(token as usize).min(2)] += 1;
         token_cache[pos] = ENERGY_CLASS[token as usize];
         if token == ZERO_TOKEN {
             tokens[pos] = 0;
             check_eob = false;
         } else {
             let mag = read_coef(coder, token, block.bit_depth)?;
-            let sign = coder.read_literal(1)?;
+            // sign_bit: L(1), one read_bool( 128 ).
+            let sign = coder.read_bool(128)?;
             tokens[pos] = if sign == 1 { -(mag as i64) } else { mag as i64 };
             check_eob = true;
         }

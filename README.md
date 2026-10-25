@@ -197,21 +197,34 @@ present. This is VP9-intrinsic framing (Annex B of the bitstream spec) —
 the split must precede the §6.2 per-frame header walk for any chunk that
 might carry hidden alt-ref frames.
 
-**Tile-parallel decode (round 448):** [`decode_vp9_sequence_with`] and
-`Vp9SequenceDecoder::set_execution_context` accept an
-`oxideav_core::ExecutionContext` — the single threading authority —
-and decode a multi-tile-column frame's tile columns concurrently
-(`effective_workers( tileCols )` workers, the §9.2.4 multi-coder
-model; serial stays the default), and run the §8.8 loop filter's
-superblock rows as a wavefront on the same budget (#21). Tile columns are independent by
-construction (§6.4.4 `AvailL = MiCol > MiColStart`, SB64-aligned tile
-boundaries bounding every §8.5.1 edge read, §6.5 candidate scans
-clamped to the tile window), so each worker decodes its columns into
-private state and the disjoint MI column ranges merge back
-deterministically — the output (samples *and* the §9.3.4 count bank
-feeding §6.1.2 `refresh_probs( )`) is **byte-identical to the serial
-walk at every thread budget**, pinned by unit, whole-corpus, and
-registry parity sweeps.
+**Threading:** [`decode_vp9_sequence_with`],
+`Vp9SequenceDecoder::set_execution_context` and the framework
+`Vp9Decoder::set_execution_context` accept an
+`oxideav_core::ExecutionContext` — the single threading authority
+(serial stays the default). Frames run as batches of jobs on a
+persistent worker pool owned by the decoder (sized by the budget, capped
+at a frame's tile columns plus superblock rows; no per-frame thread
+spawn): a job per §6.4 tile column decodes into private working planes
+and publishes each finished superblock row into that row's band, and
+three loop-filter jobs claim the superblock rows in order, filtering
+each as soon as every column has published it, two superblocks behind
+the row above. Finished rows — filtered pixels and mode info — freeze
+into the shared frame in raster order, so the next frames' inter
+prediction, §6.5 previous-frame motion vectors and §6.4.14 previous
+segment ids start on them while the frame is still decoding (the
+framework decoder keeps several frames in flight; frames drain on
+`flush`). Tile columns are independent by construction (§6.4.4
+`AvailL = MiCol > MiColStart`, SB64-aligned tile boundaries bounding
+every §8.5.1 edge read, §6.5 candidate scans clamped to the tile
+window), every band and slot has exactly one writer, and the §9.3.4
+counts feeding §6.1.2 `refresh_probs( )` are summed, so the output is
+**byte-identical to the serial walk at every thread budget** — pinned
+by unit, whole-corpus (1 / 2 / 4 / 8 / 18 / auto threads against every
+staged `expected.yuv`) and registry parity sweeps. A decode error
+restores the state the failing frame started from and replays the
+frames after it, exactly as a serial decode would. On a 1080p30 10 s
+libvpx clip (4 tile columns) the decoder runs ~2.1 s on one thread and
+~0.34 s on an 18-core machine (`examples/decode_ivf.rs`).
 
 The decode path composes:
 

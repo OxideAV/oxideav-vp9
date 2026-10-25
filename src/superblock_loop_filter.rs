@@ -764,7 +764,7 @@ pub(crate) fn superblock_loop_filter_cells<T: Px>(
 }
 
 /// Positions the lane-parallel §8.8.5 kernel filters at once.
-const LANES: usize = 8;
+const LANES: usize = 16;
 
 /// Filter the `n` consecutive edge positions starting at `i = i0` of
 /// `edge` with one decision `(filterSize, strength)`: the lane-parallel

@@ -41,6 +41,7 @@
 //! §8.7, §8.8, §8.10).
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use oxideav_core::ExecutionContext;
@@ -1563,6 +1564,8 @@ struct FramePipe {
     tile_out: Mutex<Vec<Option<TileResult>>>,
     /// Signalled when a tile column finishes.
     tiles_finished: Condvar,
+    /// The next superblock row a loop-filter job claims.
+    next_lf_row: AtomicUsize,
 }
 
 impl FramePipe {
@@ -2100,6 +2103,7 @@ pub(crate) fn frame_loop_filter_banded(
         changed: (0..sb_rows).map(|_| Condvar::new()).collect(),
         tile_out: Mutex::new(Vec::new()),
         tiles_finished: Condvar::new(),
+        next_lf_row: AtomicUsize::new(0),
     });
     let lfp = Arc::new(lfp);
     let jobs: Vec<Job> = (0..sb_rows)
@@ -2116,6 +2120,10 @@ pub(crate) fn frame_loop_filter_banded(
         }
     }
 }
+
+/// Loop-filter jobs per frame (each filters every `LF_JOBS`-th
+/// superblock row).
+const LF_JOBS: usize = 3;
 
 /// A frame whose batch has been submitted.
 pub(crate) struct InFlight {
@@ -2238,6 +2246,7 @@ fn launch_frame(
         changed: (0..sb_rows).map(|_| Condvar::new()).collect(),
         tile_out: Mutex::new((0..job.tile_cols).map(|_| None).collect()),
         tiles_finished: Condvar::new(),
+        next_lf_row: AtomicUsize::new(0),
     });
     let job = Arc::new(job);
 
@@ -2253,10 +2262,24 @@ fn launch_frame(
         }));
     }
     if lf_on {
-        for r in 0..sb_rows {
+        // A few loop-filter jobs that claim superblock rows in order: a
+        // waiting job holds its thread, so one job per row would park
+        // most of the pool on rows not decoded yet (and keep the next
+        // frame's tile columns queued behind them). Claiming in order
+        // keeps the FIFO argument: a row only ever waits on the tile
+        // columns (queued earlier) and on the row above, which a running
+        // job claimed first.
+        for _ in 0..LF_JOBS.min(sb_rows) {
             let (job, pipe) = (Arc::clone(&job), Arc::clone(&pipe));
             jobs.push(Box::new(move || {
-                loop_filter_row_job(job.lf.as_ref().expect("loop filter on"), &pipe, r);
+                let lfp = job.lf.as_ref().expect("loop filter on");
+                loop {
+                    let r = pipe.next_lf_row.fetch_add(1, Ordering::Relaxed);
+                    if r >= lfp.sb_rows {
+                        break;
+                    }
+                    loop_filter_row_job(lfp, &pipe, r);
+                }
             }));
         }
     }

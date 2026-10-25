@@ -141,6 +141,13 @@ pub(crate) const SUBPEL_FILTERS: [[[i32; 8]; 16]; 4] = [
 /// (at least `lastX + 1` samples).
 pub(crate) trait SampleRows {
     fn row(&self, y: usize) -> &[i32];
+
+    /// Rows `y0..y1` as one flat slice (`(data, stride)`, row `y` at
+    /// `data[ (y - y0) * stride.. ]`) when they are stored contiguously.
+    fn window(&self, y0: usize, y1: usize) -> Option<(&[i32], usize)> {
+        let _ = (y0, y1);
+        None
+    }
 }
 
 /// A flat row-major plane of `stride` samples per row.
@@ -155,6 +162,16 @@ impl SampleRows for FlatRows<'_> {
     fn row(&self, y: usize) -> &[i32] {
         let s = &self.samples[y * self.stride..];
         &s[..self.stride.min(s.len())]
+    }
+
+    #[inline]
+    fn window(&self, y0: usize, y1: usize) -> Option<(&[i32], usize)> {
+        (y1 * self.stride <= self.samples.len()).then(|| {
+            (
+                &self.samples[y0 * self.stride..y1 * self.stride],
+                self.stride,
+            )
+        })
     }
 }
 
@@ -377,7 +394,7 @@ pub(crate) fn block_inter_predict_plane<R: SampleRows>(
 }
 
 /// [`block_inter_predict_plane`] writing its `w x h` prediction into
-/// `out[ ..w * h ]` (row-major, stride `w`).
+/// `out` (row `r` at `out[ r * out_stride.. ]`).
 ///
 /// The common case — an unscaled reference (`xStep == yStep == 16`)
 /// whose whole 8-tap footprint lies inside the plane — runs a direct
@@ -401,6 +418,7 @@ pub(crate) fn block_inter_predict_into<R: SampleRows>(
     last_y: i32,
     bit_depth: u32,
     out: &mut [i32],
+    out_stride: usize,
     scratch: &mut [i32; 64 * 71],
 ) {
     let (ix, iy) = (x >> 4, y >> 4);
@@ -426,19 +444,76 @@ pub(crate) fn block_inter_predict_into<R: SampleRows>(
             last_y,
             bit_depth,
         );
-        out[..w * h].copy_from_slice(&pred);
+        for (r, src) in pred.chunks_exact(w).enumerate() {
+            out[r * out_stride..r * out_stride + w].copy_from_slice(src);
+        }
         return;
     }
     let (ix, iy) = (ix as usize, iy as usize);
     let fx = (x & SUBPEL_MASK) as usize;
     let fy = (y & SUBPEL_MASK) as usize;
+    // The rows the footprint reads, as one flat window when the source
+    // stores them contiguously (the common case).
+    let (y0, y1) = if fy == 0 {
+        (iy, iy + h)
+    } else {
+        (iy - 3, iy + h + 4)
+    };
+    let args = (ix, iy, fx, fy, w, h, interp_filter, bit_depth);
+    match rows_of.window(y0, y1) {
+        Some((data, stride)) => {
+            let win = Window { data, stride, y0 };
+            unscaled_kernel(&win, args, out, out_stride, scratch);
+        }
+        None => unscaled_kernel(rows_of, args, out, out_stride, scratch),
+    }
+}
+
+/// Rows `y0..` of a plane stored contiguously (`stride` apart).
+struct Window<'a> {
+    data: &'a [i32],
+    stride: usize,
+    y0: usize,
+}
+
+impl SampleRows for Window<'_> {
+    #[inline]
+    fn row(&self, y: usize) -> &[i32] {
+        let at = (y - self.y0) * self.stride;
+        &self.data[at..at + self.stride]
+    }
+}
+
+/// The unscaled, in-plane §8.5.2.4 filter of
+/// [`block_inter_predict_into`].
+#[inline(always)]
+fn unscaled_kernel<R: SampleRows>(
+    rows_of: &R,
+    (ix, iy, fx, fy, w, h, interp_filter, bit_depth): (
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        u32,
+    ),
+    out: &mut [i32],
+    out_stride: usize,
+    scratch: &mut [i32; 64 * 71],
+) {
     let max = (1i32 << bit_depth) - 1;
     let filter = &SUBPEL_FILTERS[interp_filter];
-    let out = &mut out[..w * h];
+    let dst_row = |out: &mut [i32], r: usize| -> std::ops::Range<usize> {
+        let _ = out;
+        r * out_stride..r * out_stride + w
+    };
 
     if fx == 0 && fy == 0 {
-        for (r, dst) in out.chunks_exact_mut(w).enumerate() {
-            dst.copy_from_slice(&rows_of.row(iy + r)[ix..ix + w]);
+        for r in 0..h {
+            let d = dst_row(out, r);
+            out[d].copy_from_slice(&rows_of.row(iy + r)[ix..ix + w]);
         }
         return;
     }
@@ -457,8 +532,9 @@ pub(crate) fn block_inter_predict_into<R: SampleRows>(
 
     if fy == 0 {
         // Horizontal only: the rows the vertical pass would copy.
-        for (r, dst) in out.chunks_exact_mut(w).enumerate() {
-            hfilt(&rows_of.row(iy + r)[ix - 3..ix + w + 4], dst);
+        for r in 0..h {
+            let d = dst_row(out, r);
+            hfilt(&rows_of.row(iy + r)[ix - 3..ix + w + 4], &mut out[d]);
         }
         return;
     }
@@ -476,14 +552,15 @@ pub(crate) fn block_inter_predict_into<R: SampleRows>(
         }
     }
     let taps = &filter[fy];
-    for (r, dst) in out.chunks_exact_mut(w).enumerate() {
+    for r in 0..h {
         let src = &inter[r * w..(r + 8) * w];
-        for (c, d) in dst.iter_mut().enumerate() {
+        let d = dst_row(out, r);
+        for (c, o) in out[d].iter_mut().enumerate() {
             let mut s = 0i32;
             for k in 0..8 {
                 s += taps[k] * src[k * w + c];
             }
-            *d = ((s + 64) >> 7).clamp(0, max);
+            *o = ((s + 64) >> 7).clamp(0, max);
         }
     }
 }
@@ -544,6 +621,7 @@ mod tests {
                                 last_y,
                                 8,
                                 &mut c,
+                                w,
                                 &mut scratch,
                             );
                             assert_eq!(a, c, "into: filter {filt} ({xs},{ys}) {w}x{h} ({x},{y})");

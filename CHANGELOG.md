@@ -43,12 +43,18 @@ All notable changes to `oxideav-vp9` are recorded here.
   frozen rows and block only on rows not finished yet. Backward
   probability adaptation (non-frame-parallel streams) still runs
   between frames, once the previous frame's counts exist. The framework
-  `Vp9Decoder` keeps up to two frames in flight under a multi-thread
+  `Vp9Decoder` keeps several frames in flight under a multi-thread
   budget (output drains on `flush`, per the decoder contract); a decode
   error restores the state the failing frame started from and replays
   the frames after it, exactly as a serial decode would have left them.
-  `push_frame` / `decode_vp9_sequence*` stay frame-synchronous. 1080p
-  reference clip, auto threads: 0.78 s → 0.46 s.
+  `push_frame` / `decode_vp9_sequence*` stay frame-synchronous. The
+  loop filter runs as three jobs per frame that claim superblock rows in
+  order (a parked job holds a thread, so a job per row starved the
+  next frames' tile columns); the framework decoder keeps up to four
+  frames in flight. Single-reference blocks inside the working plane are
+  predicted straight into it (compound blocks average onto it), reading
+  a reference band as one flat window. 1080p reference clip, auto
+  threads: 0.78 s → 0.38 s.
 - `examples/decode_ivf.rs`: time an IVF stream through `Vp9Decoder` at a
   given thread budget (optionally dumping the planar output).
 - `tests/corpus_threads.rs`: every staged fixture decodes identically at

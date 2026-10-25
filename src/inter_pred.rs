@@ -104,6 +104,19 @@ impl crate::block_inter_pred::SampleRows for RefPlane<'_> {
             }
         }
     }
+
+    #[inline]
+    fn window(&self, y0: usize, y1: usize) -> Option<(&[i32], usize)> {
+        match self.bands {
+            Some((f, p)) => f.window(p, y0, y1),
+            None => (y1 * self.stride <= self.samples.len()).then(|| {
+                (
+                    &self.samples[y0 * self.stride..y1 * self.stride],
+                    self.stride,
+                )
+            }),
+        }
+    }
 }
 
 /// The two reference lists' planes (`preds[ 0 ]` / `preds[ 1 ]`).
@@ -213,8 +226,21 @@ fn predict_inter_with(
 ) {
     let PredScratch { preds, inter } = scratch;
     let n_lists = if args.is_compound { 2 } else { 1 };
+    let (px, py) = (args.x as usize, args.y as usize);
+    let (pw, ph) = (dst.width(), dst.height());
+    let (w, h) = (args.w, args.h);
+    // A block wholly inside the working plane is predicted straight into
+    // it (refList 0; refList 1 then averages onto it). The store is
+    // otherwise clipped at the allocated working extent for the same
+    // reason as the §8.5.1 / §8.6.2 stores (see `predict_intra` /
+    // `reconstruct_block`): a frame-edge block the §6.4.3 `hasRows` /
+    // `hasCols` rules admit may overhang the MiCols*8 x MiRows*8 working
+    // planes into (unobservable) superblock padding a spec CurrFrame
+    // would carry. Fuzz/corpus-found on a 176x144 stream whose bottom
+    // superblock row codes 64-tall inter leaves overhanging the frame.
+    let inside = args.x >= 0 && args.y >= 0 && px + w <= pw && py + h <= ph;
 
-    for (ref_list, pred_slot) in preds.iter_mut().enumerate().take(n_lists) {
+    for ref_list in 0..n_lists {
         let ref_plane = refs.list[ref_list].expect("missing reference plane for active refList");
 
         // §8.5.2 step 2 — §8.5.2.1 motion vector selection.
@@ -259,40 +285,48 @@ fn predict_inter_with(
         let last_y = ((ref_plane.ref_frame_height + sub_y as i32) >> sub_y) - 1;
 
         // §8.5.2 step 5 — §8.5.2.4 block inter prediction.
+        let (out, out_stride): (&mut [i32], usize) = if inside && ref_list == 0 {
+            (&mut dst.samples_mut()[py * pw + px..], pw)
+        } else {
+            (&mut preds[ref_list][..], w)
+        };
         crate::block_inter_pred::block_inter_predict_into(
             &ref_plane,
             scaled.start_x,
             scaled.start_y,
             scaled.step_x,
             scaled.step_y,
-            args.w,
-            args.h,
+            w,
+            h,
             args.interp_filter,
             last_x,
             last_y,
             args.bit_depth,
-            pred_slot,
+            out,
+            out_stride,
             inter,
         );
     }
 
-    // §8.5.2 derivation of the inter predicted samples.
-    //
-    // The store is clipped at the allocated working extent for the same
-    // reason as the §8.5.1 / §8.6.2 stores (see `predict_intra` /
-    // `reconstruct_block`): a frame-edge block the §6.4.3 `hasRows` /
-    // `hasCols` rules admit may overhang the MiCols*8 x MiRows*8 working
-    // planes into (unobservable) superblock padding a spec CurrFrame
-    // would carry. Fuzz/corpus-found on a 176x144 stream whose bottom
-    // superblock row codes 64-tall inter leaves overhanging the frame.
-    let (px, py) = (args.x as usize, args.y as usize);
-    let (pw, ph) = (dst.width(), dst.height());
+    // §8.5.2 derivation of the inter predicted samples: preds[ 0 ], or
+    // Round2( preds[ 0 ] + preds[ 1 ], 1 ) for a compound block.
+    if inside {
+        if args.is_compound {
+            let data = dst.samples_mut();
+            for i in 0..h {
+                let o = &mut data[(py + i) * pw + px..][..w];
+                for (o, &b) in o.iter_mut().zip(&preds[1][i * w..(i + 1) * w]) {
+                    *o = round2(*o + b, 1);
+                }
+            }
+        }
+        return;
+    }
     if px >= pw || py >= ph {
         return;
     }
-    let cols = args.w.min(pw - px);
-    let rows = args.h.min(ph - py);
-    let w = args.w;
+    let cols = w.min(pw - px);
+    let rows = h.min(ph - py);
     let data = dst.samples_mut();
     for i in 0..rows {
         let out = &mut data[(py + i) * pw + px..][..cols];

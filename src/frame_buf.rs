@@ -210,6 +210,31 @@ impl FrameBuf {
         &band[p][at..at + g.stride]
     }
 
+    /// Rows `y0..y1` of plane `p` as one flat slice when they share a
+    /// band (blocking until it is frozen); `None` across a band edge or
+    /// on a failed frame.
+    #[inline]
+    pub(crate) fn window(&self, p: usize, y0: usize, y1: usize) -> Option<(&[i32], usize)> {
+        let g = &self.geom[p];
+        let b = y0 >> g.band_shift;
+        if (y1 - 1) >> g.band_shift != b {
+            return None;
+        }
+        let band = match self.bands[b].get() {
+            Some(band) => band,
+            None => {
+                if !self.wait_band(b) {
+                    return None;
+                }
+                self.bands[b].get()?
+            }
+        };
+        let mask = (1 << g.band_shift) - 1;
+        let at = (HALO + (y0 & mask)) * g.stride;
+        let end = (HALO + ((y1 - 1) & mask) + 1) * g.stride;
+        Some((&band[p][at..end], g.stride))
+    }
+
     /// Wait for every band; `false` if the frame failed.
     pub(crate) fn wait_complete(&self) -> bool {
         self.bands.is_empty() || self.wait_band(self.bands.len() - 1)

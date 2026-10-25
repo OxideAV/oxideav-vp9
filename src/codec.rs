@@ -198,7 +198,7 @@ pub struct Vp9Decoder {
 
 /// Frames the framework decoder keeps decoding concurrently under a
 /// multi-thread budget.
-const IN_FLIGHT: usize = 2;
+const IN_FLIGHT: usize = 4;
 
 /// The tag of a packet without a presentation timestamp.
 const NO_PTS: i64 = i64::MIN;

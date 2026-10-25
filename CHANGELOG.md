@@ -85,6 +85,9 @@ All notable changes to `oxideav-vp9` are recorded here.
   the bytes are unchanged, but decode runs ahead of reconstruction and a
   frame's entropy decode only waits on the previous frame's mode info.
   1080p reference clip, auto threads: 0.31 s → 0.26 s.
+- Loop-filter kernel: up to 16 positions per call, horizontal and
+  vertical edges as separate instantiations with fixed tap ranges (the
+  vertical edges' transposing gather / scatter got ~40% cheaper).
 - `examples/decode_ivf.rs`: time an IVF stream through `Vp9Decoder` at a
   given thread budget (optionally dumping the planar output).
 - `tests/corpus_threads.rs`: every staged fixture decodes identically at

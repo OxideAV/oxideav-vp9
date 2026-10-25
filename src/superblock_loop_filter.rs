@@ -840,7 +840,7 @@ macro_rules! lane_kernel {
         // The lane loops index several parallel tap arrays by lane on
         // purpose.
         #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
-        fn $name<T: Px>(
+        fn $name<T: Px, const HORIZONTAL: bool>(
             data: &mut [T],
             q0: usize,
             step: usize,
@@ -855,29 +855,54 @@ macro_rules! lane_kernel {
             let wide16 = filter_size >= TX_16X16;
             // t[ k ][ l ]: the sample at offset k - 8 across the edge, lane l.
             let mut t = [[0 as $t; LANES]; 16];
-            let (k_lo, k_hi) = if wide16 { (0, 16) } else { (4, 12) };
-            if along == 1 && n == LANES {
-                for (k, tap) in t.iter_mut().enumerate().take(k_hi).skip(k_lo) {
-                    let at = (q0 + k * step) - 8 * step;
-                    for (d, &v) in tap.iter_mut().zip(&data[at..at + LANES]) {
-                        *d = v.get() as $t;
+            // Fixed tap ranges per case, so every copy loop has constant
+            // bounds.
+            #[inline(always)]
+            fn gather_h<T: Px>(
+                t: &mut [[$t; LANES]; 16],
+                data: &[T],
+                q0: usize,
+                step: usize,
+                n: usize,
+                (lo, hi): (usize, usize),
+            ) {
+                if n == LANES {
+                    for (k, tap) in t.iter_mut().enumerate().take(hi).skip(lo) {
+                        let at = (q0 + k * step) - 8 * step;
+                        for (d, &v) in tap.iter_mut().zip(&data[at..at + LANES]) {
+                            *d = v.get() as $t;
+                        }
+                    }
+                } else {
+                    for (k, tap) in t.iter_mut().enumerate().take(hi).skip(lo) {
+                        let at = (q0 + k * step) - 8 * step;
+                        for (d, &v) in tap.iter_mut().zip(&data[at..at + n]) {
+                            *d = v.get() as $t;
+                        }
                     }
                 }
-            } else if along == 1 {
-                for (k, tap) in t.iter_mut().enumerate().take(k_hi).skip(k_lo) {
-                    let at = (q0 + k * step) - 8 * step;
-                    for (d, &v) in tap.iter_mut().zip(&data[at..at + n]) {
-                        *d = v.get() as $t;
-                    }
-                }
-            } else {
+            }
+            #[inline(always)]
+            fn gather_v<T: Px, const LO: usize, const HI: usize>(
+                t: &mut [[$t; LANES]; 16],
+                data: &[T],
+                q0: usize,
+                along: usize,
+                n: usize,
+            ) {
                 for l in 0..n {
                     let at = q0 + l * along - 8;
-                    let line = &data[at + k_lo..at + k_hi];
-                    for (k, &v) in (k_lo..k_hi).zip(line) {
-                        t[k][l] = v.get() as $t;
+                    let line = &data[at + LO..at + HI];
+                    for k in LO..HI {
+                        t[k][l] = line[k - LO].get() as $t;
                     }
                 }
+            }
+            match (HORIZONTAL, wide16) {
+                (true, true) => gather_h(&mut t, data, q0, step, n, (0, 16)),
+                (true, false) => gather_h(&mut t, data, q0, step, n, (4, 12)),
+                (false, true) => gather_v::<T, 0, 16>(&mut t, data, q0, along, n),
+                (false, false) => gather_v::<T, 4, 12>(&mut t, data, q0, along, n),
             }
 
             let shift = u32::from(bit_depth - 8);
@@ -989,35 +1014,61 @@ macro_rules! lane_kernel {
             }
 
             // Write back the taps a filter can modify (p6..q6 / p2..q2 / p1..q1).
-            let (w_lo, w_hi) = if wide16 {
-                (1, 15)
-            } else if filter_size >= TX_8X8 {
-                (5, 11)
-            } else {
-                (6, 10)
-            };
-            if along == 1 && n == LANES {
-                for (k, tap) in o.iter().enumerate().take(w_hi).skip(w_lo) {
-                    let at = (q0 + k * step) - 8 * step;
-                    for (d, &v) in data[at..at + LANES].iter_mut().zip(tap) {
-                        *d = T::put(i32::from(v));
+            #[inline(always)]
+            fn scatter_h<T: Px>(
+                o: &[[$t; LANES]; 16],
+                data: &mut [T],
+                q0: usize,
+                step: usize,
+                n: usize,
+                (lo, hi): (usize, usize),
+            ) {
+                if n == LANES {
+                    for (k, tap) in o.iter().enumerate().take(hi).skip(lo) {
+                        let at = (q0 + k * step) - 8 * step;
+                        for (d, &v) in data[at..at + LANES].iter_mut().zip(tap) {
+                            *d = T::put(i32::from(v));
+                        }
+                    }
+                } else {
+                    for (k, tap) in o.iter().enumerate().take(hi).skip(lo) {
+                        let at = (q0 + k * step) - 8 * step;
+                        for (d, &v) in data[at..at + n].iter_mut().zip(tap) {
+                            *d = T::put(i32::from(v));
+                        }
                     }
                 }
-            } else if along == 1 {
-                for (k, tap) in o.iter().enumerate().take(w_hi).skip(w_lo) {
-                    let at = (q0 + k * step) - 8 * step;
-                    for (d, &v) in data[at..at + n].iter_mut().zip(tap) {
-                        *d = T::put(i32::from(v));
-                    }
-                }
-            } else {
+            }
+            #[inline(always)]
+            fn scatter_v<T: Px, const LO: usize, const HI: usize>(
+                o: &[[$t; LANES]; 16],
+                data: &mut [T],
+                q0: usize,
+                along: usize,
+                n: usize,
+            ) {
                 for l in 0..n {
                     let at = q0 + l * along - 8;
-                    let line = &mut data[at + w_lo..at + w_hi];
-                    for (k, v) in (w_lo..w_hi).zip(line) {
-                        *v = T::put(i32::from(o[k][l]));
+                    let line = &mut data[at + LO..at + HI];
+                    for k in LO..HI {
+                        line[k - LO] = T::put(i32::from(o[k][l]));
                     }
                 }
+            }
+            let width = if wide16 {
+                2
+            } else if filter_size >= TX_8X8 {
+                1
+            } else {
+                0
+            };
+            match (HORIZONTAL, width) {
+                (true, 2) => scatter_h(&o, data, q0, step, n, (1, 15)),
+                (true, 1) => scatter_h(&o, data, q0, step, n, (5, 11)),
+                (true, _) => scatter_h(&o, data, q0, step, n, (6, 10)),
+                (false, 2) => scatter_v::<T, 1, 15>(&o, data, q0, along, n),
+                (false, 1) => scatter_v::<T, 5, 11>(&o, data, q0, along, n),
+                (false, _) => scatter_v::<T, 6, 10>(&o, data, q0, along, n),
             }
         }
     };
@@ -1046,9 +1097,35 @@ fn filter_lanes<T: Px>(
     bit_depth: u8,
 ) {
     if bit_depth <= 10 {
-        filter_lanes_i16(data, q0, step, along, n, strength, filter_size, bit_depth);
+        if along == 1 {
+            filter_lanes_i16::<T, true>(data, q0, step, along, n, strength, filter_size, bit_depth);
+        } else {
+            filter_lanes_i16::<T, false>(
+                data,
+                q0,
+                step,
+                along,
+                n,
+                strength,
+                filter_size,
+                bit_depth,
+            );
+        }
     } else {
-        filter_lanes_i32(data, q0, step, along, n, strength, filter_size, bit_depth);
+        if along == 1 {
+            filter_lanes_i32::<T, true>(data, q0, step, along, n, strength, filter_size, bit_depth);
+        } else {
+            filter_lanes_i32::<T, false>(
+                data,
+                q0,
+                step,
+                along,
+                n,
+                strength,
+                filter_size,
+                bit_depth,
+            );
+        }
     }
 }
 

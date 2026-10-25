@@ -4,6 +4,31 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.15](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.14...v0.0.15) - 2026-10-25
+
+### Other
+
+- :output_params + output_params_generation: emitted size, format and colour signal
+- the compressed-header kind feeds launch_single_frame
+- working planes store u16 samples; logged inter ops out of line
+- loop-filter decisions: per-cell block-edge masks, per-edge on-screen hoisting
+- the threading model (entropy-decode / reconstruction split, top-then-tail band freezing)
+- inter prediction: vertical-only filter straight from the reference rows, row-slice vertical pass
+- loop-filter kernel: separate horizontal / vertical instantiations with fixed tap ranges
+- loop filter kernel: batch up to 16 positions per call
+- tile columns split into entropy-decode and reconstruction jobs (logged pixel work, replayed in order)
+- rustfmt the frame-buffer pieces test
+- bands freeze top-then-tail: later frames start a superblock row sooner
+- token contexts from per-(size, type) neighbour tables; README: the threading model
+- inter prediction: edge-emulated unscaled footprints, no scale division for equal-size references
+- decoded frames store u16 samples (bands, references, output source)
+- loop filter: per-row resolved cells, per-level strength table, i16 lane kernel up to 10-bit
+- loop filter as three row-claiming jobs per frame, four frames in flight, direct inter prediction stores
+- frame threading: frames freeze finished rows, later frames read them as they land
+- persistent worker pool + superblock-row pipeline: tile columns publish rows, the loop filter follows
+- windowed boolean decoder, lazy token probabilities, no per-block token buffer refills
+- decoder hot paths: lane-parallel loop filter, direct inter prediction, flattened inverse transform
+
 ### Added
 
 - `Vp9Decoder` implements `Decoder::output_params` /

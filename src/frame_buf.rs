@@ -48,6 +48,10 @@ impl Px for u16 {
     }
 }
 
+/// Rows at the bottom of a band the next superblock row's §8.8 loop
+/// filter still modifies (its top edge's `p6..p0`, read with `p7`).
+pub(crate) const TAIL: usize = 8;
+
 /// Scratch rows above each band: the reach of the widest §8.8.5
 /// stencil above a superblock row's top edge.
 pub(crate) const HALO: usize = 8;
@@ -111,8 +115,9 @@ impl MiRow {
 
 #[derive(Debug, Default)]
 struct FrameSync {
-    /// Leading bands / mode-info rows frozen so far.
-    bands_final: usize,
+    /// Leading band tops / band tails / mode-info rows frozen so far.
+    tops_final: usize,
+    tails_final: usize,
     mi_final: usize,
     /// The frame's decode failed: its unfrozen rows never arrive.
     failed: bool,
@@ -129,7 +134,12 @@ pub(crate) struct FrameBuf {
     pub(crate) subsampling_x: bool,
     pub(crate) subsampling_y: bool,
     pub(crate) bit_depth: u8,
+    /// Per band: the band's buffer, final above its tail (see [`TAIL`]).
     bands: Vec<OnceLock<Band>>,
+    /// Per band: its last `TAIL` rows (fewer in a shorter band), which
+    /// the next superblock row's loop filter still changes after the
+    /// band's own filter is done.
+    tails: Vec<OnceLock<Band>>,
     mi: Vec<OnceLock<MiRow>>,
     sync: Mutex<FrameSync>,
     changed: Condvar,
@@ -159,6 +169,7 @@ impl FrameBuf {
             subsampling_y,
             bit_depth,
             bands: (0..n_bands).map(|_| OnceLock::new()).collect(),
+            tails: (0..n_bands).map(|_| OnceLock::new()).collect(),
             mi: (0..n_mi).map(|_| OnceLock::new()).collect(),
             sync: Mutex::new(FrameSync::default()),
             changed: Condvar::new(),
@@ -170,14 +181,45 @@ impl FrameBuf {
         self.sync.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Freeze band `b` (its contents are final).
-    pub(crate) fn freeze_band(&self, b: usize, band: Band) {
+    /// Rows of plane `p`'s band `b` that live in its tail.
+    #[inline]
+    pub(crate) fn tail_rows(&self, p: usize, b: usize) -> usize {
+        let g = &self.geom[p];
+        TAIL.min(band_rows(g.height, g.band_shift, b))
+    }
+
+    /// Freeze band `b` above its tail (the tail rows of `band` are
+    /// ignored).
+    pub(crate) fn freeze_top(&self, b: usize, band: Band) {
         let _ = self.bands[b].set(band);
         let mut s = self.lock();
-        while s.bands_final < self.bands.len() && self.bands[s.bands_final].get().is_some() {
-            s.bands_final += 1;
+        while s.tops_final < self.bands.len() && self.bands[s.tops_final].get().is_some() {
+            s.tops_final += 1;
         }
         self.changed.notify_all();
+    }
+
+    /// Freeze band `b`'s tail (`tail[ p ]`: its last
+    /// [`Self::tail_rows`] rows of plane `p`).
+    pub(crate) fn freeze_tail(&self, b: usize, tail: Band) {
+        let _ = self.tails[b].set(tail);
+        let mut s = self.lock();
+        while s.tails_final < self.tails.len() && self.tails[s.tails_final].get().is_some() {
+            s.tails_final += 1;
+        }
+        self.changed.notify_all();
+    }
+
+    /// Freeze all of band `b` (its contents are final).
+    pub(crate) fn freeze_band(&self, b: usize, band: Band) {
+        let tail: Band = std::array::from_fn(|p| {
+            let g = &self.geom[p];
+            let own = band_rows(g.height, g.band_shift, b);
+            let t = self.tail_rows(p, b);
+            band[p][(HALO + own - t) * g.stride..(HALO + own) * g.stride].to_vec()
+        });
+        self.freeze_tail(b, tail);
+        self.freeze_top(b, band);
     }
 
     /// Freeze superblock row `r`'s mode info.
@@ -196,16 +238,18 @@ impl FrameBuf {
         self.changed.notify_all();
     }
 
-    /// Block until band `b` is frozen; `false` if the frame failed.
-    pub(crate) fn wait_band(&self, b: usize) -> bool {
-        if self.bands[b].get().is_some() {
+    /// Block until band `b`'s top (`tail == false`) or tail is
+    /// frozen; `false` if the frame failed first.
+    fn wait_part(&self, b: usize, tail: bool) -> bool {
+        let slot = if tail { &self.tails[b] } else { &self.bands[b] };
+        if slot.get().is_some() {
             return true;
         }
         let mut s = self.lock();
-        while s.bands_final <= b && !s.failed {
+        while (if tail { s.tails_final } else { s.tops_final }) <= b && !s.failed {
             s = self.changed.wait(s).unwrap_or_else(|e| e.into_inner());
         }
-        self.bands[b].get().is_some()
+        slot.get().is_some()
     }
 
     /// Superblock row `r`'s mode info once frozen; `None` if the frame
@@ -223,52 +267,108 @@ impl FrameBuf {
     }
 
     /// Row `y` (`< height`) of plane `p`, `stride` samples, blocking
-    /// until its band is frozen (zeros if the frame failed).
+    /// until it is frozen (zeros if the frame failed).
     #[inline]
     pub(crate) fn row(&self, p: usize, y: usize) -> &[u16] {
         let g = &self.geom[p];
         let b = y >> g.band_shift;
-        let band = match self.bands[b].get() {
-            Some(band) => band,
+        let local = y & ((1 << g.band_shift) - 1);
+        let tail_at = band_rows(g.height, g.band_shift, b) - self.tail_rows(p, b);
+        let (slot, at) = if local < tail_at {
+            (&self.bands[b], (HALO + local) * g.stride)
+        } else {
+            (&self.tails[b], (local - tail_at) * g.stride)
+        };
+        let part = match slot.get() {
+            Some(part) => part,
             None => {
-                if !self.wait_band(b) {
+                if !self.wait_part(b, local >= tail_at) {
                     return &self.zero_row[..g.stride];
                 }
-                self.bands[b].get().expect("frozen band")
+                slot.get().expect("frozen part")
             }
         };
-        let at = (HALO + (y & ((1 << g.band_shift) - 1))) * g.stride;
-        &band[p][at..at + g.stride]
+        &part[p][at..at + g.stride]
     }
 
-    /// Rows `y0..y1` of plane `p` as one flat slice when they share a
-    /// band (blocking until it is frozen); `None` across a band edge or
-    /// on a failed frame.
+    /// Rows `y0..y1` of plane `p` as one flat slice when they lie in one
+    /// band above its tail (blocking until that is frozen); `None`
+    /// otherwise or on a failed frame.
     #[inline]
     pub(crate) fn window(&self, p: usize, y0: usize, y1: usize) -> Option<(&[u16], usize)> {
         let g = &self.geom[p];
         let b = y0 >> g.band_shift;
-        if (y1 - 1) >> g.band_shift != b {
+        let mask = (1 << g.band_shift) - 1;
+        let tail_at = band_rows(g.height, g.band_shift, b) - self.tail_rows(p, b);
+        if (y1 - 1) >> g.band_shift != b || ((y1 - 1) & mask) >= tail_at {
             return None;
         }
         let band = match self.bands[b].get() {
             Some(band) => band,
             None => {
-                if !self.wait_band(b) {
+                if !self.wait_part(b, false) {
                     return None;
                 }
                 self.bands[b].get()?
             }
         };
-        let mask = (1 << g.band_shift) - 1;
         let at = (HALO + (y0 & mask)) * g.stride;
         let end = (HALO + ((y1 - 1) & mask) + 1) * g.stride;
         Some((&band[p][at..end], g.stride))
     }
 
-    /// Wait for every band; `false` if the frame failed.
+    /// Rows `y0..y1` of plane `p` as the contiguous pieces of the band
+    /// tops / tails they span (blocking until each is frozen); `None`
+    /// past four pieces or on a failed frame.
+    pub(crate) fn pieces(
+        &self,
+        p: usize,
+        y0: usize,
+        y1: usize,
+    ) -> Option<crate::block_inter_pred::Pieces<'_, u16>> {
+        let g = &self.geom[p];
+        let mut parts: [(&[u16], usize, usize); 4] = [(&[], 0, 0); 4];
+        let mut n = 0;
+        let mut y = y0;
+        while y < y1 {
+            if n == 4 {
+                return None;
+            }
+            let b = y >> g.band_shift;
+            let start = b << g.band_shift;
+            let own = band_rows(g.height, g.band_shift, b);
+            let tail_at = start + own - self.tail_rows(p, b);
+            let (slot, first, end, base) = if y < tail_at {
+                (&self.bands[b], start, tail_at, HALO)
+            } else {
+                (&self.tails[b], tail_at, start + own, 0)
+            };
+            if slot.get().is_none() && !self.wait_part(b, y >= tail_at) {
+                return None;
+            }
+            let part = &slot.get()?[p];
+            let end = end.min(y1);
+            parts[n] = (
+                &part[(base + y - first) * g.stride..(base + end - first) * g.stride],
+                y,
+                end,
+            );
+            n += 1;
+            y = end;
+        }
+        Some(crate::block_inter_pred::Pieces {
+            parts,
+            n,
+            stride: g.stride,
+        })
+    }
+
+    /// Wait for every row; `false` if the frame failed.
     pub(crate) fn wait_complete(&self) -> bool {
-        self.bands.is_empty() || self.wait_band(self.bands.len() - 1)
+        match self.bands.len() {
+            0 => true,
+            n => self.wait_part(n - 1, false) && self.wait_part(n - 1, true),
+        }
     }
 
     /// Take the band storage back (recycling a frame nobody references).
@@ -393,6 +493,17 @@ mod tests {
                 .collect();
             assert_eq!(f.row(0, y), &want[..]);
         }
+        // Any row range reads back through the band-top / tail pieces.
+        use crate::block_inter_pred::SampleRows;
+        for (y0, y1) in [(0, 70), (20, 40), (50, 60), (60, 70), (0, 1), (69, 70)] {
+            let pieces = f.pieces(0, y0, y1).expect("pieces");
+            for y in y0..y1 {
+                assert_eq!(pieces.row(y), f.row(0, y), "rows {y0}..{y1} at {y}");
+            }
+        }
+        // Band 0 is rows 0..64 with its tail at 56..64.
+        assert!(f.window(0, 50, 60).is_none(), "the window stops at the tail");
+        assert_eq!(f.window(0, 2, 20).expect("in-top window").0.len(), 18 * stride);
         assert_eq!(band_rows(height, 5, 2), 6);
         assert_eq!(f.crop_u16(0, 3, 2), vec![0, 1, 2, 5, 6, 7]);
         assert!(f.wait_complete());

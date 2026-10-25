@@ -70,6 +70,12 @@ All notable changes to `oxideav-vp9` are recorded here.
   references take the general per-tap path); an equal-size reference
   skips the §8.5.2.3 scale division; the prediction scratch lives with
   the tile column instead of in thread-local storage.
+- A band freezes in two parts: everything above its last eight rows
+  when its own loop-filter row finishes, the tail once the row below has
+  filtered across their shared edge — a later frame reads most of a
+  band one superblock row sooner. Inter prediction reads a footprint
+  spanning band tops / tails as up to four contiguous pieces. The §9.3.2
+  token contexts come from per-(size, type) neighbour tables.
 - `examples/decode_ivf.rs`: time an IVF stream through `Vp9Decoder` at a
   given thread budget (optionally dumping the planar output).
 - `tests/corpus_threads.rs`: every staged fixture decodes identically at

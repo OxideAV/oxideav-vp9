@@ -2008,19 +2008,23 @@ fn loop_filter_row_job(lfp: &LfParams, pipe: &FramePipe, r: usize) {
     }
     pipe.progress().lf_published[r] = sb_cols;
     pipe.notify(r + 1);
-    // The halo rows are final: they are the bottom rows of the band
-    // above, which nothing touches any more.
+    // The halo rows are final: they are the tail of the band above
+    // (whose top froze when its own row finished).
     if r > 0 {
-        let mut above = std::mem::take(&mut *lock(&pipe.bands[r - 1]));
-        for p in 0..3 {
-            let (w, h, shift, _) = lfp.geom[p];
-            let own_above = band_rows(h, shift, r - 1);
-            above[p][own_above * w..(own_above + HALO) * w].copy_from_slice(&band[p][..HALO * w]);
-        }
-        pipe.frame.freeze_band(r - 1, above);
+        let tail: Band = std::array::from_fn(|p| {
+            let (w, ..) = lfp.geom[p];
+            debug_assert_eq!(pipe.frame.tail_rows(p, r - 1), HALO);
+            band[p][..HALO * w].to_vec()
+        });
+        pipe.frame.freeze_tail(r - 1, tail);
     }
+    // This band is final above its tail; the next row's filter only
+    // changes the tail (through its own halo copy).
+    let own = std::mem::take(&mut *band);
     if r + 1 == sb_rows {
-        pipe.frame.freeze_band(r, std::mem::take(&mut *band));
+        pipe.frame.freeze_band(r, own);
+    } else {
+        pipe.frame.freeze_top(r, own);
     }
 }
 

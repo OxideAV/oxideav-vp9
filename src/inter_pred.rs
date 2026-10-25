@@ -120,6 +120,11 @@ impl crate::block_inter_pred::SampleRows for FrameRows<'_> {
     fn window(&self, y0: usize, y1: usize) -> Option<(&[u16], usize)> {
         self.0.window(self.1, y0, y1)
     }
+
+    #[inline]
+    fn pieces(&self, y0: usize, y1: usize) -> Option<crate::block_inter_pred::Pieces<'_, u16>> {
+        self.0.pieces(self.1, y0, y1)
+    }
 }
 
 /// The two reference lists' planes (`preds[ 0 ]` / `preds[ 1 ]`).

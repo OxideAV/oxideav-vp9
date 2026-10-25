@@ -153,6 +153,36 @@ pub(crate) trait SampleRows {
         let _ = (y0, y1);
         None
     }
+
+    /// Rows `y0..y1` as a few contiguous pieces when [`Self::window`]
+    /// cannot give one slice.
+    fn pieces(&self, y0: usize, y1: usize) -> Option<Pieces<'_, Self::Px>> {
+        let _ = (y0, y1);
+        None
+    }
+}
+
+/// Up to four contiguous row ranges of a plane (`parts[ i ]`: rows
+/// `start..end` at `data[ (y - start) * stride.. ]`).
+pub(crate) struct Pieces<'a, P> {
+    pub(crate) parts: [(&'a [P], usize, usize); 4],
+    pub(crate) n: usize,
+    pub(crate) stride: usize,
+}
+
+impl<P: crate::frame_buf::Px> SampleRows for Pieces<'_, P> {
+    type Px = P;
+
+    #[inline]
+    fn row(&self, y: usize) -> &[P] {
+        for &(data, start, end) in &self.parts[..self.n] {
+            if y < end {
+                let at = (y - start) * self.stride;
+                return &data[at..at + self.stride];
+            }
+        }
+        unreachable!("row outside the pieces")
+    }
 }
 
 /// A flat row-major plane of `stride` samples per row.
@@ -497,12 +527,13 @@ pub(crate) fn block_inter_predict_into<R: SampleRows>(
         (iy - 3, iy + h + 4)
     };
     let args = (ix, iy, fx, fy, w, h, interp_filter, bit_depth);
-    match rows_of.window(y0, y1) {
-        Some((data, stride)) => {
-            let win = Window { data, stride, y0 };
-            unscaled_kernel(&win, args, out, out_stride, scratch);
-        }
-        None => unscaled_kernel(rows_of, args, out, out_stride, scratch),
+    if let Some((data, stride)) = rows_of.window(y0, y1) {
+        let win = Window { data, stride, y0 };
+        unscaled_kernel(&win, args, out, out_stride, scratch);
+    } else if let Some(pieces) = rows_of.pieces(y0, y1) {
+        unscaled_kernel(&pieces, args, out, out_stride, scratch);
+    } else {
+        unscaled_kernel(rows_of, args, out, out_stride, scratch);
     }
 }
 

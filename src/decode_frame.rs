@@ -86,7 +86,7 @@ use crate::residual::{
 };
 use crate::scan::get_scan;
 use crate::superblock_loop_filter::{
-    PlaneWindow, SuperblockFilterFrame, superblock_loop_filter_window_at,
+    LfRowCells, PlaneWindow, SuperblockFilterFrame, superblock_loop_filter_cells,
 };
 use crate::tokens::{NonzeroContext, TokenBlockCtx, tokens_eob};
 use crate::worker_pool::{Batch, Job, WorkerPool};
@@ -1913,6 +1913,7 @@ fn loop_filter_row_job(lfp: &LfParams, pipe: &FramePipe, r: usize) {
         bit_depth: lfp.bit_depth,
         lvl_lookup: &lfp.lvl_lookup,
     };
+    let cells = LfRowCells::new(&frame, (r * 8) as u32);
     let col_range = |p: usize, c: usize| -> (usize, usize) {
         let (w, _, _, sbw) = lfp.geom[p];
         ((c << sbw).min(w), ((c + 1) << sbw).min(w))
@@ -1972,10 +1973,9 @@ fn loop_filter_row_job(lfp: &LfParams, pipe: &FramePipe, r: usize) {
                 }
             };
             for pass in 0..2u8 {
-                superblock_loop_filter_window_at(
+                superblock_loop_filter_cells(
                     &mut window,
-                    &frame,
-                    (r * 8) as u32,
+                    &cells,
                     p as u8,
                     pass,
                     (r * 8) as u32,

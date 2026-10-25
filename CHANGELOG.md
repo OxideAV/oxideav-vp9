@@ -55,6 +55,10 @@ All notable changes to `oxideav-vp9` are recorded here.
   predicted straight into it (compound blocks average onto it), reading
   a reference band as one flat window. 1080p reference clip, auto
   threads: 0.78 s → 0.38 s.
+- Loop filter: the decoder resolves each superblock row's mode info
+  once (block / transform sizes, `skip && inter`, the §8.8.4 level) and
+  reads strengths from a per-level table; the lane kernel runs on `i16`
+  lanes up to 10-bit (every intermediate fits) and `i32` lanes at 12-bit.
 - `examples/decode_ivf.rs`: time an IVF stream through `Vp9Decoder` at a
   given thread budget (optionally dumping the planar output).
 - `tests/corpus_threads.rs`: every staged fixture decodes identically at

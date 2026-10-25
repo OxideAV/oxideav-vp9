@@ -525,7 +525,7 @@ pub(crate) fn superblock_loop_filter_window_at(
                     if let Some(run) = p {
                         filter_run(
                             plane_buf,
-                            frame,
+                            frame.bit_depth,
                             &geom,
                             (pass, sub_x, sub_y),
                             row,
@@ -541,7 +541,210 @@ pub(crate) fn superblock_loop_filter_window_at(
         if let Some(run) = pending {
             filter_run(
                 plane_buf,
-                frame,
+                frame.bit_depth,
+                &geom,
+                (pass, sub_x, sub_y),
+                row,
+                col,
+                edge,
+                run,
+            );
+        }
+    }
+}
+
+/// One mode-info cell's §8.8.2 / §8.8.4 inputs, resolved once per
+/// superblock row for the decoder's loop filter.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LfCell {
+    mi_size: u8,
+    /// `tx_size` (luma) and §6.4.22 `get_uv_tx_size( )` (chroma).
+    tx: u8,
+    uv_tx: u8,
+    /// `skip && is_inter` — the cell's inner transform edges are not
+    /// filtered (§8.8.2 step 14).
+    skip_inter: bool,
+    /// The §8.8.4 `lvl` (`LvlLookup[ segment ][ ref ][ modeType ]`), or
+    /// `INVALID_LVL` for an out-of-range segment / reference.
+    lvl: u8,
+}
+
+const INVALID_LVL: u8 = u8::MAX;
+
+/// A superblock row's mode info prepared for
+/// [`superblock_loop_filter_cells`]: per-cell [`LfCell`]s (`8 * MiCols`
+/// entries from MI row `mi_row_base`) and the §8.8.4 strength of every
+/// level.
+pub(crate) struct LfRowCells {
+    cells: Vec<LfCell>,
+    mi_row_base: u32,
+    mi_cols: u32,
+    mi_rows: u32,
+    subsampling_x: u8,
+    subsampling_y: u8,
+    bit_depth: u8,
+    strengths: [FilterStrength; 64],
+}
+
+impl LfRowCells {
+    /// Resolve the cells of MI rows `mi_row_base ..+ 8` of `frame` (whose
+    /// arrays start at that row).
+    pub(crate) fn new(frame: &SuperblockFilterFrame, mi_row_base: u32) -> Self {
+        let cols = frame.mi_cols as usize;
+        let rows = (frame.mi_rows.saturating_sub(mi_row_base)).min(8) as usize;
+        let mut cells = vec![LfCell::default(); 8 * cols];
+        for (i, cell) in cells.iter_mut().enumerate().take(rows * cols) {
+            let mi_size = frame.mi_sizes[i];
+            let tx = frame.tx_sizes[i];
+            let ref0 = frame.ref_frames_0[i];
+            let mode_type = crate::adaptive_filter_strength::mode_to_mode_type(frame.y_modes[i]);
+            let lvl = frame
+                .lvl_lookup
+                .get(frame.segment_ids[i] as usize, ref0, mode_type)
+                .unwrap_or(INVALID_LVL);
+            *cell = LfCell {
+                mi_size,
+                tx,
+                uv_tx: get_uv_tx_size(
+                    u32::from(tx),
+                    mi_size,
+                    frame.subsampling_x == 1,
+                    frame.subsampling_y == 1,
+                ) as u8,
+                skip_inter: frame.skips[i] && ref0 > crate::mode_info::INTRA_FRAME,
+                lvl,
+            };
+        }
+        Self {
+            cells,
+            mi_row_base,
+            mi_cols: frame.mi_cols,
+            mi_rows: frame.mi_rows,
+            subsampling_x: frame.subsampling_x,
+            subsampling_y: frame.subsampling_y,
+            bit_depth: frame.bit_depth,
+            strengths: std::array::from_fn(|lvl| {
+                crate::adaptive_filter_strength::strength_for_level(
+                    lvl as u8,
+                    frame.loop_filter_sharpness,
+                )
+            }),
+        }
+    }
+}
+
+/// [`superblock_loop_filter_window`] over a superblock row's prepared
+/// [`LfRowCells`]: the same §8.8.2 steps per mode-info run (the
+/// predicates of [`superblock_filter_edge`], [`filter_size`] and the
+/// §8.8.4 strength), read from the resolved cells.
+pub(crate) fn superblock_loop_filter_cells(
+    plane_buf: &mut PlaneWindow,
+    lf: &LfRowCells,
+    plane: u8,
+    pass: u8,
+    row: u32,
+    col: u32,
+) {
+    use crate::partition::{NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP};
+    use crate::residual::BLOCK_16X16;
+    let (sub_x, sub_y) = if plane == 0 {
+        (0u32, 0u32)
+    } else {
+        (u32::from(lf.subsampling_x), u32::from(lf.subsampling_y))
+    };
+    let geom = superblock_filter_geometry(pass, sub_x, sub_y);
+    let vertical = pass == PASS_VERTICAL;
+    let (mi_cols, mi_rows) = (lf.mi_cols, lf.mi_rows);
+    let along_sub = if vertical { sub_y } else { sub_x };
+    let run_len = 8u32 >> along_sub;
+    for edge in 0..(16u32 >> geom.sub) {
+        let mut pending: Option<(u32, u32, u8, FilterStrength)> = None;
+        let mut i = 0u32;
+        while i < geom.edge_len {
+            let (x, y) = if vertical {
+                (col * 8 + edge * (4 << sub_x), row * 8 + (i << sub_y))
+            } else {
+                (col * 8 + (i << sub_x), row * 8 + edge * (4 << sub_y))
+            };
+            let i0 = i;
+            i += run_len;
+            let decision = if x >= 8 * mi_cols || y >= 8 * mi_rows {
+                None
+            } else {
+                let loop_col = ((x >> 3) >> sub_x) << sub_x;
+                let loop_row = ((y >> 3) >> sub_y) << sub_y;
+                let c = lf.cells
+                    [(loop_row - lf.mi_row_base) as usize * mi_cols as usize + loop_col as usize];
+                let tx_sz = if plane > 0 { c.uv_tx } else { c.tx };
+                let sb_size = if geom.sub == 0 {
+                    c.mi_size
+                } else {
+                    c.mi_size.max(BLOCK_16X16)
+                };
+                let is_block_edge = if vertical {
+                    x & (8 * u32::from(NUM_8X8_BLOCKS_WIDE_LOOKUP[sb_size as usize]) - 1) == 0
+                } else {
+                    y & (8 * u32::from(NUM_8X8_BLOCKS_HIGH_LOOKUP[sb_size as usize]) - 1) == 0
+                };
+                let is_tx_edge = if !vertical
+                    && sub_x == 1
+                    && (mi_cols & 1) == 1
+                    && (edge & 1) == 1
+                    && (x + 8) >= mi_cols * 8
+                {
+                    false
+                } else {
+                    edge & ((1u32 << tx_sz) - 1) == 0
+                };
+                let on_screen = !(vertical && x == 0) && !(!vertical && y == 0);
+                if on_screen && (is_block_edge || (is_tx_edge && !c.skip_inter)) {
+                    assert!(
+                        c.lvl != INVALID_LVL,
+                        "§8.8.4: segment_id must be < 8 and ref_frame in 0..=3"
+                    );
+                    let f_size = filter_size(
+                        tx_sz,
+                        edge & 7 == 0,
+                        pass,
+                        x,
+                        y,
+                        sub_x as u8,
+                        sub_y as u8,
+                        mi_cols,
+                        mi_rows,
+                    );
+                    (c.lvl > 0).then(|| (f_size, lf.strengths[c.lvl as usize & 63]))
+                } else {
+                    None
+                }
+            };
+            match (pending, decision) {
+                (Some((s0, n, fs, st)), Some((fs2, st2)))
+                    if fs == fs2 && st == st2 && s0 + n == i0 && n + run_len <= LANES as u32 =>
+                {
+                    pending = Some((s0, n + run_len, fs, st));
+                }
+                (p, d) => {
+                    if let Some(run) = p {
+                        filter_run(
+                            plane_buf,
+                            lf.bit_depth,
+                            &geom,
+                            (pass, sub_x, sub_y),
+                            row,
+                            col,
+                            edge,
+                            run,
+                        );
+                    }
+                    pending = d.map(|(fs, st)| (i0, run_len, fs, st));
+                }
+            }
+        }
+        if let Some(run) = pending {
+            filter_run(
+                plane_buf,
+                lf.bit_depth,
                 &geom,
                 (pass, sub_x, sub_y),
                 row,
@@ -563,7 +766,7 @@ const LANES: usize = 8;
 #[allow(clippy::too_many_arguments)]
 fn filter_run(
     plane_buf: &mut PlaneWindow,
-    frame: &SuperblockFilterFrame,
+    bit_depth: u8,
     geom: &crate::superblock_filter::SuperblockFilterGeometry,
     (pass, sub_x, sub_y): (u8, u32, u32),
     row: u32,
@@ -600,7 +803,7 @@ fn filter_run(
             n as usize,
             strength,
             f_size,
-            frame.bit_depth,
+            bit_depth,
         );
         return;
     }
@@ -613,11 +816,208 @@ fn filter_run(
             strength.blimit,
             strength.thresh,
             f_size,
-            frame.bit_depth,
+            bit_depth,
         );
         scatter_stencil(plane_buf, px, py, dx, dy, &out);
     }
 }
+
+/// Generates the lane kernel over one lane type: `i16` lanes (eight to a
+/// 128-bit vector) cover every bit depth up to 10 — the largest
+/// intermediate, the 16-tap §8.8.5.3 window sum plus rounding, stays
+/// below `16 * 1023 + 8`, and the §8.8.5.4 narrow filter's
+/// `filter + 3 * (qs0 - ps0)` below `512 + 3 * 1023` — and `i32` lanes
+/// the 12-bit case. Both are the same arithmetic.
+macro_rules! lane_kernel {
+    ($name:ident, $t:ty) => {
+        // The lane loops index several parallel tap arrays by lane on
+        // purpose.
+        #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+        fn $name(
+            data: &mut [i32],
+            q0: usize,
+            step: usize,
+            along: usize,
+            n: usize,
+            strength: FilterStrength,
+            filter_size: u8,
+            bit_depth: u8,
+        ) {
+            use crate::filter_size::{TX_4X4, TX_8X8, TX_16X16};
+            debug_assert!((1..=LANES).contains(&n));
+            let wide16 = filter_size >= TX_16X16;
+            // t[ k ][ l ]: the sample at offset k - 8 across the edge, lane l.
+            let mut t = [[0 as $t; LANES]; 16];
+            let (k_lo, k_hi) = if wide16 { (0, 16) } else { (4, 12) };
+            if along == 1 && n == LANES {
+                for (k, tap) in t.iter_mut().enumerate().take(k_hi).skip(k_lo) {
+                    let at = (q0 + k * step) - 8 * step;
+                    for (d, &v) in tap.iter_mut().zip(&data[at..at + LANES]) {
+                        *d = v as $t;
+                    }
+                }
+            } else if along == 1 {
+                for (k, tap) in t.iter_mut().enumerate().take(k_hi).skip(k_lo) {
+                    let at = (q0 + k * step) - 8 * step;
+                    for (d, &v) in tap.iter_mut().zip(&data[at..at + n]) {
+                        *d = v as $t;
+                    }
+                }
+            } else {
+                for l in 0..n {
+                    let at = q0 + l * along - 8;
+                    let line = &data[at + k_lo..at + k_hi];
+                    for (k, &v) in (k_lo..k_hi).zip(line) {
+                        t[k][l] = v as $t;
+                    }
+                }
+            }
+
+            let shift = u32::from(bit_depth - 8);
+            let limit = (strength.limit as $t) << shift;
+            let blimit = (strength.blimit as $t) << shift;
+            let thresh = (strength.thresh as $t) << shift;
+            let one = (1 as $t) << shift;
+            let half = (1 as $t) << (bit_depth - 1);
+            let offset = (0x80 as $t) << shift;
+
+            // Per-lane decisions as all-ones / zero masks (branch-free so the
+            // lane loops vectorise): `m_narrow` / `m_wide8` / `m_wide16` pick the
+            // §8.8.5 dispatch arm; a lane with none of them set is echoed.
+            let ad = |a: $t, b: $t| (a - b).abs();
+            let bit = |c: bool| -(c as $t);
+            let mut m_narrow = [0 as $t; LANES];
+            let mut m_wide8 = [0 as $t; LANES];
+            let mut m_wide16 = [0 as $t; LANES];
+            let mut m_hev = [0 as $t; LANES];
+            let filter8 = (filter_size >= TX_8X8) as $t;
+            let not4 = bit(filter_size != TX_4X4);
+            for l in 0..LANES {
+                let (p3, p2, p1, p0) = (t[4][l], t[5][l], t[6][l], t[7][l]);
+                let (q0, q1, q2, q3) = (t[8][l], t[9][l], t[10][l], t[11][l]);
+                let mask = bit(l < n)
+                    & bit(ad(p3, p2) <= limit)
+                    & bit(ad(p2, p1) <= limit)
+                    & bit(ad(p1, p0) <= limit)
+                    & bit(ad(q1, q0) <= limit)
+                    & bit(ad(q2, q1) <= limit)
+                    & bit(ad(q3, q2) <= limit)
+                    & bit(ad(p0, q0) * 2 + ad(p1, q1) / 2 <= blimit);
+                m_hev[l] = bit(ad(p1, p0) > thresh) | bit(ad(q1, q0) > thresh);
+                let flat = -filter8
+                    & bit(ad(p1, p0) <= one)
+                    & bit(ad(q1, q0) <= one)
+                    & bit(ad(p2, p0) <= one)
+                    & bit(ad(q2, q0) <= one)
+                    & bit(ad(p3, p0) <= one)
+                    & bit(ad(q3, q0) <= one);
+                let flat2 = bit(wide16)
+                    & bit(ad(t[0][l], p0) <= one)
+                    & bit(ad(t[15][l], q0) <= one)
+                    & bit(ad(t[1][l], p0) <= one)
+                    & bit(ad(t[14][l], q0) <= one)
+                    & bit(ad(t[2][l], p0) <= one)
+                    & bit(ad(t[13][l], q0) <= one)
+                    & bit(ad(t[3][l], p0) <= one)
+                    & bit(ad(t[12][l], q0) <= one);
+                let wide = mask & not4 & flat;
+                m_narrow[l] = mask & !wide;
+                m_wide16[l] = wide & flat2;
+                m_wide8[l] = wide & !flat2;
+            }
+            let any = |m: &[$t; LANES]| m.iter().fold(0, |a, &v| a | v) != 0;
+            let (any_n, any_w8, any_w16) = (any(&m_narrow), any(&m_wide8), any(&m_wide16));
+            if !(any_n || any_w8 || any_w16) {
+                return;
+            }
+
+            let mut o = t;
+            let sel = |m: $t, new: $t, old: $t| (new & m) | (old & !m);
+            if any_n {
+                // §8.8.5.4 narrow filter.
+                let c = |v: $t| v.clamp(-half, half - 1);
+                for l in 0..LANES {
+                    let (m, hev) = (m_narrow[l], m_hev[l]);
+                    let (ps1, ps0) = (t[6][l] - offset, t[7][l] - offset);
+                    let (qs0, qs1) = (t[8][l] - offset, t[9][l] - offset);
+                    let f = c(ps1 - qs1) & hev;
+                    let f = c(f + 3 * (qs0 - ps0));
+                    let f1 = c(f + 4) >> 3;
+                    let f2 = c(f + 3) >> 3;
+                    o[8][l] = sel(m, c(qs0 - f1) + offset, o[8][l]);
+                    o[7][l] = sel(m, c(ps0 + f2) + offset, o[7][l]);
+                    let fs = (f1 + 1) >> 1;
+                    let m1 = m & !hev;
+                    o[9][l] = sel(m1, c(qs1 - fs) + offset, o[9][l]);
+                    o[6][l] = sel(m1, c(ps1 + fs) + offset, o[6][l]);
+                }
+            }
+            if any_w8 {
+                // §8.8.5.3 wide filter, log2Size = 3 (n = 3: taps clamp to
+                // offsets -4..=3).
+                for l in 0..LANES {
+                    let m = m_wide8[l];
+                    let get = |k: i32| t[(k.clamp(-4, 3) + 8) as usize][l];
+                    let mut window: $t = (-3..=3).map(|j| get(-3 + j)).sum();
+                    for i in -3..3 {
+                        let slot = &mut o[(i + 8) as usize][l];
+                        *slot = sel(m, (get(i) + window + 4) >> 3, *slot);
+                        window += get(i + 4) - get(i - 3);
+                    }
+                }
+            }
+            if any_w16 {
+                // §8.8.5.3 wide filter, log2Size = 4 (n = 7: taps clamp to
+                // offsets -8..=7).
+                for l in 0..LANES {
+                    let m = m_wide16[l];
+                    let get = |k: i32| t[(k.clamp(-8, 7) + 8) as usize][l];
+                    let mut window: $t = (-7..=7).map(|j| get(-7 + j)).sum();
+                    for i in -7..7 {
+                        let slot = &mut o[(i + 8) as usize][l];
+                        *slot = sel(m, (get(i) + window + 8) >> 4, *slot);
+                        window += get(i + 8) - get(i - 7);
+                    }
+                }
+            }
+
+            // Write back the taps a filter can modify (p6..q6 / p2..q2 / p1..q1).
+            let (w_lo, w_hi) = if wide16 {
+                (1, 15)
+            } else if filter_size >= TX_8X8 {
+                (5, 11)
+            } else {
+                (6, 10)
+            };
+            if along == 1 && n == LANES {
+                for (k, tap) in o.iter().enumerate().take(w_hi).skip(w_lo) {
+                    let at = (q0 + k * step) - 8 * step;
+                    for (d, &v) in data[at..at + LANES].iter_mut().zip(tap) {
+                        *d = i32::from(v);
+                    }
+                }
+            } else if along == 1 {
+                for (k, tap) in o.iter().enumerate().take(w_hi).skip(w_lo) {
+                    let at = (q0 + k * step) - 8 * step;
+                    for (d, &v) in data[at..at + n].iter_mut().zip(tap) {
+                        *d = i32::from(v);
+                    }
+                }
+            } else {
+                for l in 0..n {
+                    let at = q0 + l * along - 8;
+                    let line = &mut data[at + w_lo..at + w_hi];
+                    for (k, v) in (w_lo..w_hi).zip(line) {
+                        *v = i32::from(o[k][l]);
+                    }
+                }
+            }
+        }
+    };
+}
+
+lane_kernel!(filter_lanes_i16, i16);
+lane_kernel!(filter_lanes_i32, i32);
 
 /// The §8.8.5 sample filter over up to [`LANES`] interior positions at
 /// once: position `l` has `q0` at `data[ q0 + l * along ]`, `p_k` at
@@ -626,8 +1026,8 @@ fn filter_run(
 /// of the gather → [`sample_filtering`] → scatter round trip (the
 /// echoed outputs are the samples already in the plane, so only the
 /// taps a filter can modify are written back).
-// The lane loops index several parallel tap arrays by lane on purpose.
-#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+#[allow(clippy::too_many_arguments)]
+#[inline]
 fn filter_lanes(
     data: &mut [i32],
     q0: usize,
@@ -638,169 +1038,10 @@ fn filter_lanes(
     filter_size: u8,
     bit_depth: u8,
 ) {
-    use crate::filter_size::{TX_4X4, TX_8X8, TX_16X16};
-    debug_assert!((1..=LANES).contains(&n));
-    let wide16 = filter_size >= TX_16X16;
-    // t[ k ][ l ]: the sample at offset k - 8 across the edge, lane l.
-    let mut t = [[0i32; LANES]; 16];
-    let (k_lo, k_hi) = if wide16 { (0, 16) } else { (4, 12) };
-    if along == 1 && n == LANES {
-        for (k, tap) in t.iter_mut().enumerate().take(k_hi).skip(k_lo) {
-            let at = (q0 + k * step) - 8 * step;
-            *tap = data[at..at + LANES].try_into().expect("LANES samples");
-        }
-    } else if along == 1 {
-        for (k, tap) in t.iter_mut().enumerate().take(k_hi).skip(k_lo) {
-            let at = (q0 + k * step) - 8 * step;
-            tap[..n].copy_from_slice(&data[at..at + n]);
-        }
+    if bit_depth <= 10 {
+        filter_lanes_i16(data, q0, step, along, n, strength, filter_size, bit_depth);
     } else {
-        for l in 0..n {
-            let at = q0 + l * along - 8;
-            let line = &data[at + k_lo..at + k_hi];
-            for (k, &v) in (k_lo..k_hi).zip(line) {
-                t[k][l] = v;
-            }
-        }
-    }
-
-    let shift = u32::from(bit_depth - 8);
-    let limit = i32::from(strength.limit) << shift;
-    let blimit = i32::from(strength.blimit) << shift;
-    let thresh = i32::from(strength.thresh) << shift;
-    let one = 1i32 << shift;
-    let half = 1i32 << (bit_depth - 1);
-    let offset = 0x80i32 << shift;
-
-    // Per-lane decisions as all-ones / zero masks (branch-free so the
-    // lane loops vectorise): `m_narrow` / `m_wide8` / `m_wide16` pick the
-    // §8.8.5 dispatch arm; a lane with none of them set is echoed.
-    let ad = |a: i32, b: i32| (a - b).abs();
-    let bit = |c: bool| -i32::from(c);
-    let mut m_narrow = [0i32; LANES];
-    let mut m_wide8 = [0i32; LANES];
-    let mut m_wide16 = [0i32; LANES];
-    let mut m_hev = [0i32; LANES];
-    let filter8 = i32::from(filter_size >= TX_8X8);
-    let not4 = bit(filter_size != TX_4X4);
-    for l in 0..LANES {
-        let (p3, p2, p1, p0) = (t[4][l], t[5][l], t[6][l], t[7][l]);
-        let (q0, q1, q2, q3) = (t[8][l], t[9][l], t[10][l], t[11][l]);
-        let mask = bit(l < n)
-            & bit(ad(p3, p2) <= limit)
-            & bit(ad(p2, p1) <= limit)
-            & bit(ad(p1, p0) <= limit)
-            & bit(ad(q1, q0) <= limit)
-            & bit(ad(q2, q1) <= limit)
-            & bit(ad(q3, q2) <= limit)
-            & bit(ad(p0, q0) * 2 + ad(p1, q1) / 2 <= blimit);
-        m_hev[l] = bit(ad(p1, p0) > thresh) | bit(ad(q1, q0) > thresh);
-        let flat = -filter8
-            & bit(ad(p1, p0) <= one)
-            & bit(ad(q1, q0) <= one)
-            & bit(ad(p2, p0) <= one)
-            & bit(ad(q2, q0) <= one)
-            & bit(ad(p3, p0) <= one)
-            & bit(ad(q3, q0) <= one);
-        let flat2 = bit(wide16)
-            & bit(ad(t[0][l], p0) <= one)
-            & bit(ad(t[15][l], q0) <= one)
-            & bit(ad(t[1][l], p0) <= one)
-            & bit(ad(t[14][l], q0) <= one)
-            & bit(ad(t[2][l], p0) <= one)
-            & bit(ad(t[13][l], q0) <= one)
-            & bit(ad(t[3][l], p0) <= one)
-            & bit(ad(t[12][l], q0) <= one);
-        let wide = mask & not4 & flat;
-        m_narrow[l] = mask & !wide;
-        m_wide16[l] = wide & flat2;
-        m_wide8[l] = wide & !flat2;
-    }
-    let any = |m: &[i32; LANES]| m.iter().fold(0, |a, &v| a | v) != 0;
-    let (any_n, any_w8, any_w16) = (any(&m_narrow), any(&m_wide8), any(&m_wide16));
-    if !(any_n || any_w8 || any_w16) {
-        return;
-    }
-
-    let mut o = t;
-    let sel = |m: i32, new: i32, old: i32| (new & m) | (old & !m);
-    if any_n {
-        // §8.8.5.4 narrow filter.
-        let c = |v: i32| v.clamp(-half, half - 1);
-        for l in 0..LANES {
-            let (m, hev) = (m_narrow[l], m_hev[l]);
-            let (ps1, ps0) = (t[6][l] - offset, t[7][l] - offset);
-            let (qs0, qs1) = (t[8][l] - offset, t[9][l] - offset);
-            let f = c(ps1 - qs1) & hev;
-            let f = c(f + 3 * (qs0 - ps0));
-            let f1 = c(f + 4) >> 3;
-            let f2 = c(f + 3) >> 3;
-            o[8][l] = sel(m, c(qs0 - f1) + offset, o[8][l]);
-            o[7][l] = sel(m, c(ps0 + f2) + offset, o[7][l]);
-            let fs = (f1 + 1) >> 1;
-            let m1 = m & !hev;
-            o[9][l] = sel(m1, c(qs1 - fs) + offset, o[9][l]);
-            o[6][l] = sel(m1, c(ps1 + fs) + offset, o[6][l]);
-        }
-    }
-    if any_w8 {
-        // §8.8.5.3 wide filter, log2Size = 3 (n = 3: taps clamp to
-        // offsets -4..=3).
-        for l in 0..LANES {
-            let m = m_wide8[l];
-            let get = |k: i32| t[(k.clamp(-4, 3) + 8) as usize][l];
-            let mut window: i32 = (-3..=3).map(|j| get(-3 + j)).sum();
-            for i in -3..3 {
-                let slot = &mut o[(i + 8) as usize][l];
-                *slot = sel(m, (get(i) + window + 4) >> 3, *slot);
-                window += get(i + 4) - get(i - 3);
-            }
-        }
-    }
-    if any_w16 {
-        // §8.8.5.3 wide filter, log2Size = 4 (n = 7: taps clamp to
-        // offsets -8..=7).
-        for l in 0..LANES {
-            let m = m_wide16[l];
-            let get = |k: i32| t[(k.clamp(-8, 7) + 8) as usize][l];
-            let mut window: i32 = (-7..=7).map(|j| get(-7 + j)).sum();
-            for i in -7..7 {
-                let slot = &mut o[(i + 8) as usize][l];
-                *slot = sel(m, (get(i) + window + 8) >> 4, *slot);
-                window += get(i + 8) - get(i - 7);
-            }
-        }
-    }
-
-    // Write back the taps a filter can modify (p6..q6 / p2..q2 / p1..q1).
-    let (w_lo, w_hi) = if wide16 {
-        (1, 15)
-    } else if filter_size >= TX_8X8 {
-        (5, 11)
-    } else {
-        (6, 10)
-    };
-    if along == 1 && n == LANES {
-        for (k, tap) in o.iter().enumerate().take(w_hi).skip(w_lo) {
-            let at = (q0 + k * step) - 8 * step;
-            let dst: &mut [i32; LANES] = (&mut data[at..at + LANES])
-                .try_into()
-                .expect("LANES samples");
-            *dst = *tap;
-        }
-    } else if along == 1 {
-        for (k, tap) in o.iter().enumerate().take(w_hi).skip(w_lo) {
-            let at = (q0 + k * step) - 8 * step;
-            data[at..at + n].copy_from_slice(&tap[..n]);
-        }
-    } else {
-        for l in 0..n {
-            let at = q0 + l * along - 8;
-            let line = &mut data[at + w_lo..at + w_hi];
-            for (k, v) in (w_lo..w_hi).zip(line) {
-                *v = o[k][l];
-            }
-        }
+        filter_lanes_i32(data, q0, step, along, n, strength, filter_size, bit_depth);
     }
 }
 

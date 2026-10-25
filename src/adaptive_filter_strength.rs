@@ -198,7 +198,14 @@ pub fn adaptive_filter_strength(
     let mode_type = mode_to_mode_type(y_mode);
     debug_assert!(mode_type < MAX_MODE_LF_DELTAS);
     let lvl = lvl_lookup.get(segment_id, ref_frame, mode_type)?;
+    Some(strength_for_level(lvl, loop_filter_sharpness))
+}
 
+/// §8.8.4 steps 2-5: `limit` / `blimit` / `thresh` for a resolved `lvl`
+/// and `loop_filter_sharpness` (the part of [`adaptive_filter_strength`]
+/// after the `LvlLookup` read).
+#[inline]
+pub(crate) fn strength_for_level(lvl: u8, loop_filter_sharpness: u8) -> FilterStrength {
     // §8.8.4 step 2: shift = f(loop_filter_sharpness).
     let shift = if loop_filter_sharpness > 4 {
         2
@@ -231,12 +238,12 @@ pub fn adaptive_filter_strength(
     // §8.8.4 step 5: thresh = lvl >> 4.
     let thresh = lvl >> 4;
 
-    Some(FilterStrength {
+    FilterStrength {
         lvl,
         limit,
         blimit,
         thresh,
-    })
+    }
 }
 
 #[cfg(test)]

@@ -18,69 +18,58 @@ use crate::Error;
 
 /// Decoder state for the VP9 Boolean (range) coder (spec §9.2).
 ///
-/// The state holds the three §9.2.1 variables (`BoolValue`,
-/// `BoolRange`, `BoolMaxBits`) plus a borrow on the slice of bytes
-/// being consumed and a bit-cursor into that slice. The cursor only
-/// ever advances forward — there is no rewind.
+/// The §9.2.1 `BoolValue` register is the top byte of a 64-bit window
+/// whose lower bits hold the next `count` stream bits, so a §9.2.2
+/// renormalisation shifts all of its refill bits in at once instead of
+/// one `read_bits_raw( 1 )` per bit. `consumed` counts the bits shifted
+/// into `BoolValue` after the initial `f(8)`; it never exceeds
+/// `BoolMaxBits = 8 * sz - 8`, and a read that would need more fails
+/// exactly where the per-bit §9.2.2 loop would. Every `read_bool`
+/// returns the bit, and leaves `BoolValue` / `BoolRange`, as §9.2.2
+/// specifies.
 #[derive(Debug)]
 pub(crate) struct BoolCoder<'a> {
+    /// The `sz` bytes the coder may consume.
     data: &'a [u8],
-    /// Absolute bit position within `data` of the next bit to read.
-    bit_pos: usize,
-    /// Spec §9.2.1 `BoolValue`. 8-bit window per `f(8)` init, then
-    /// shifted under `read_bool` renormalisation up to 8 bits at a
-    /// time.
-    bool_value: u32,
-    /// Spec §9.2.1 `BoolRange`. Initialised to 255 and kept in the
-    /// half-open range \[128, 256) after each `read_bool`.
-    bool_range: u32,
-    /// Spec §9.2.1 `BoolMaxBits = 8 * sz - 8`. Decremented for each
-    /// renormalisation refill bit. The spec requires the partition
-    /// never underflow this counter (§9.2.2: "It is a requirement of
-    /// bitstream conformance that this never happens").
-    bool_max_bits: i64,
+    /// Next byte of `data` to load into the window.
+    pos: usize,
+    /// Bits 63..56: `BoolValue`; then `count` upcoming stream bits
+    /// (zeros past the end of `data`, never consumed).
+    value: u64,
+    count: i32,
+    /// §9.2.1 `BoolRange`.
+    range: u32,
+    /// Refill bits consumed so far, and the §9.2.1 `BoolMaxBits` bound.
+    consumed: u64,
+    max_bits: u64,
 }
 
 impl<'a> BoolCoder<'a> {
-    /// `init_bool( sz )` per spec §9.2.1.
+    /// `init_bool( sz )` per spec §9.2.1: `BoolValue = f(8)`, `BoolRange
+    /// = 255`, `BoolMaxBits = 8 * sz - 8`, then the marker
+    /// `read_bool( 128 )`, which shall be 0.
     ///
-    /// `data` is the bitstream slice the coder will read from
-    /// starting at bit 0; `sz` is the number of bytes the coder is
-    /// permitted to consume (the compressed header's
-    /// `header_size_in_bytes`, or a per-tile `tile_size`). The
-    /// constructor reads `BoolValue` via `f(8)`, sets `BoolRange` to
-    /// 255, sets `BoolMaxBits = 8 * sz - 8`, then invokes
-    /// `read_bool(128)` once to consume the §9.2.1 marker bit (which
-    /// shall decode to 0 for a conformant stream).
-    ///
-    /// Returns [`Error::InvalidBitstream`] if `sz < 1` (the spec
-    /// forbids this) or if the marker bit decodes to a nonzero value.
-    /// Returns [`Error::UnexpectedEof`] if the slice is shorter than
-    /// `sz` bytes or the marker read runs off the slice.
+    /// Returns [`Error::InvalidBitstream`] if `sz < 1` or the marker
+    /// bit is nonzero, [`Error::UnexpectedEof`] if `data` is shorter
+    /// than `sz` bytes.
     pub(crate) fn init_bool(data: &'a [u8], sz: usize) -> Result<Self, Error> {
         if sz < 1 {
-            // §9.2.1: "The bitstream shall not contain data that
-            // results in this process being called with sz < 1."
             return Err(Error::InvalidBitstream);
         }
         if data.len() < sz {
             return Err(Error::UnexpectedEof);
         }
-        // Only the first `sz` bytes are visible to the coder; clip
-        // the borrow so a renormalisation refill that overshoots
-        // `sz` triggers `UnexpectedEof` rather than silently
-        // borrowing the next packet's bytes.
-        let visible = &data[..sz];
+        let data = &data[..sz];
         let mut c = Self {
-            data: visible,
-            bit_pos: 0,
-            bool_value: 0,
-            bool_range: 255,
-            bool_max_bits: (8 * sz as i64) - 8,
+            data,
+            pos: 1,
+            value: u64::from(data[0]) << 56,
+            count: 0,
+            range: 255,
+            consumed: 0,
+            max_bits: 8 * sz as u64 - 8,
         };
-        // `BoolValue` is read using `f(8)` (§9.2.1).
-        c.bool_value = c.read_bits_raw(8)?;
-        // Marker bit — must decode to 0.
+        c.fill();
         let marker = c.read_bool(128)?;
         if marker != 0 {
             return Err(Error::InvalidBitstream);
@@ -88,52 +77,63 @@ impl<'a> BoolCoder<'a> {
         Ok(c)
     }
 
+    /// Top the window up to at least 49 upcoming bits (virtual zero
+    /// bits past the end of `data`).
+    #[inline]
+    fn fill(&mut self) {
+        while self.count <= 48 {
+            match self.data.get(self.pos) {
+                Some(&b) => {
+                    self.value |= u64::from(b) << (48 - self.count);
+                    self.pos += 1;
+                    self.count += 8;
+                }
+                None => {
+                    self.count = 56;
+                    break;
+                }
+            }
+        }
+    }
+
     /// `read_bool( p )` per spec §9.2.2.
     ///
-    /// `p` is the probability in `0..=255` that the decoded bit is 0.
-    /// Returns the decoded bit (0 or 1).
-    ///
-    /// May return [`Error::UnexpectedEof`] if renormalisation needs
-    /// more bits than the slice has and `BoolMaxBits` is positive (the
-    /// slice underran), or [`Error::InvalidBitstream`] if
-    /// `BoolMaxBits` is exhausted (spec: "It is a requirement of
-    /// bitstream conformance that this never happens").
+    /// Returns [`Error::InvalidBitstream`] when the renormalisation
+    /// would consume more than `BoolMaxBits` bits (the §9.2.2
+    /// conformance requirement).
+    #[inline]
     pub(crate) fn read_bool(&mut self, p: u32) -> Result<u32, Error> {
         debug_assert!(p <= 255);
-        let split = 1 + (((self.bool_range - 1) * p) >> 8);
-        let bit = if self.bool_value < split {
-            self.bool_range = split;
+        let split = 1 + (((self.range - 1) * p) >> 8);
+        let big = u64::from(split) << 56;
+        let bit = if self.value < big {
+            self.range = split;
             0
         } else {
-            self.bool_range -= split;
-            self.bool_value -= split;
+            self.range -= split;
+            self.value -= big;
             1
         };
-        // Renormalise: while BoolRange < 128, shift in fresh bits.
-        while self.bool_range < 128 {
-            let new_bit = if self.bool_max_bits > 0 {
-                let nb = self.read_bits_raw(1)?;
-                self.bool_max_bits -= 1;
-                nb
-            } else {
-                // Spec §9.2.2: a conformant stream never reaches
-                // this branch. Flag the bitstream as invalid rather
-                // than silently inject 0 — the spec's "set equal to
-                // 0" is a permissive fallback; we want to surface
-                // truncation explicitly.
+        if self.range < 128 {
+            // §9.2.2: one refill bit per doubling of BoolRange until it
+            // is at least 128.
+            let shift = self.range.leading_zeros() - 24;
+            if self.consumed + u64::from(shift) > self.max_bits {
                 return Err(Error::InvalidBitstream);
-            };
-            self.bool_range <<= 1;
-            self.bool_value = (self.bool_value << 1) + new_bit;
+            }
+            if self.count < shift as i32 {
+                self.fill();
+            }
+            self.value <<= shift;
+            self.range <<= shift;
+            self.count -= shift as i32;
+            self.consumed += u64::from(shift);
         }
         Ok(bit)
     }
 
-    /// `read_literal( n )` per spec §9.2.4.
-    ///
-    /// Folds `n` calls to `read_bool(128)` into an MSB-first
-    /// unsigned integer. `n` must be at most 32 — VP9 never asks for
-    /// more.
+    /// `read_literal( n )` per spec §9.2.4: `n` `read_bool( 128 )`
+    /// calls, most significant bit first.
     pub(crate) fn read_literal(&mut self, n: u32) -> Result<u32, Error> {
         debug_assert!(n <= 32);
         let mut x: u32 = 0;
@@ -143,55 +143,267 @@ impl<'a> BoolCoder<'a> {
         Ok(x)
     }
 
-    /// `exit_bool( )` per spec §9.2.3.
-    ///
-    /// Consumes the remaining `BoolMaxBits` of padding from the
-    /// stream. Spec requires every padding bit to be 0, so any 1 in
-    /// the tail yields [`Error::InvalidBitstream`]. Returns the bit
-    /// position (within the slice handed to `init_bool`) where the
-    /// coder finishes.
-    ///
-    /// Not yet wired into the round-3 compressed-header walker
-    /// (which only reads `read_tx_mode` and exits early); kept as
-    /// part of the §9.2 surface so the next round's
-    /// `diff_update_prob` chain can shut the coder down properly.
+    /// `exit_bool( )` per spec §9.2.3: the remaining `BoolMaxBits`
+    /// padding bits shall all be 0. Returns the bit position after the
+    /// padding (`8 * sz`).
     #[allow(dead_code)]
     pub(crate) fn exit_bool(&mut self) -> Result<usize, Error> {
-        while self.bool_max_bits > 0 {
-            let pad = self.read_bits_raw(1)?;
-            self.bool_max_bits -= 1;
-            if pad != 0 {
+        // The padding is stream bits 8 + consumed .. 8 * sz.
+        let start = 8 + self.consumed as usize;
+        let end = 8 * self.data.len();
+        let (first, offset) = (start >> 3, start & 7);
+        if first < self.data.len() {
+            if offset != 0 && self.data[first] & (0xFF >> offset) != 0 {
+                return Err(Error::InvalidBitstream);
+            }
+            let whole = if offset == 0 { first } else { first + 1 };
+            if self.data[whole.min(self.data.len())..]
+                .iter()
+                .any(|&b| b != 0)
+            {
                 return Err(Error::InvalidBitstream);
             }
         }
-        Ok(self.bit_pos)
-    }
-
-    /// MSB-first raw `f(n)` reader used by `init_bool` for `BoolValue`
-    /// and by `read_bool` / `exit_bool` for renormalisation /
-    /// padding consumption. Not exposed outside the module — the
-    /// §9.2 spec only describes raw bit fetches in the context of
-    /// the Boolean coder itself.
-    fn read_bits_raw(&mut self, n: u32) -> Result<u32, Error> {
-        debug_assert!(n <= 32);
-        let mut value: u32 = 0;
-        for _ in 0..n {
-            let byte_index = self.bit_pos >> 3;
-            if byte_index >= self.data.len() {
-                return Err(Error::UnexpectedEof);
-            }
-            let bit_in_byte = 7 - (self.bit_pos & 7);
-            let bit = (self.data[byte_index] >> bit_in_byte) & 1;
-            self.bit_pos += 1;
-            value = (value << 1) | (bit as u32);
-        }
-        Ok(value)
+        self.consumed = self.max_bits;
+        Ok(end)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The spec-literal per-bit §9.2 coder — the oracle the windowed
+    /// [`BoolCoder`] is pinned against.
+    /// Decoder state for the VP9 Boolean (range) coder (spec §9.2).
+    ///
+    /// The state holds the three §9.2.1 variables (`BoolValue`,
+    /// `BoolRange`, `BoolMaxBits`) plus a borrow on the slice of bytes
+    /// being consumed and a bit-cursor into that slice. The cursor only
+    /// ever advances forward — there is no rewind.
+    #[derive(Debug)]
+    pub(crate) struct SpecBoolCoder<'a> {
+        data: &'a [u8],
+        /// Absolute bit position within `data` of the next bit to read.
+        bit_pos: usize,
+        /// Spec §9.2.1 `BoolValue`. 8-bit window per `f(8)` init, then
+        /// shifted under `read_bool` renormalisation up to 8 bits at a
+        /// time.
+        bool_value: u32,
+        /// Spec §9.2.1 `BoolRange`. Initialised to 255 and kept in the
+        /// half-open range \[128, 256) after each `read_bool`.
+        bool_range: u32,
+        /// Spec §9.2.1 `BoolMaxBits = 8 * sz - 8`. Decremented for each
+        /// renormalisation refill bit. The spec requires the partition
+        /// never underflow this counter (§9.2.2: "It is a requirement of
+        /// bitstream conformance that this never happens").
+        bool_max_bits: i64,
+    }
+
+    impl<'a> SpecBoolCoder<'a> {
+        /// `init_bool( sz )` per spec §9.2.1.
+        ///
+        /// `data` is the bitstream slice the coder will read from
+        /// starting at bit 0; `sz` is the number of bytes the coder is
+        /// permitted to consume (the compressed header's
+        /// `header_size_in_bytes`, or a per-tile `tile_size`). The
+        /// constructor reads `BoolValue` via `f(8)`, sets `BoolRange` to
+        /// 255, sets `BoolMaxBits = 8 * sz - 8`, then invokes
+        /// `read_bool(128)` once to consume the §9.2.1 marker bit (which
+        /// shall decode to 0 for a conformant stream).
+        ///
+        /// Returns [`Error::InvalidBitstream`] if `sz < 1` (the spec
+        /// forbids this) or if the marker bit decodes to a nonzero value.
+        /// Returns [`Error::UnexpectedEof`] if the slice is shorter than
+        /// `sz` bytes or the marker read runs off the slice.
+        pub(crate) fn init_bool(data: &'a [u8], sz: usize) -> Result<Self, Error> {
+            if sz < 1 {
+                // §9.2.1: "The bitstream shall not contain data that
+                // results in this process being called with sz < 1."
+                return Err(Error::InvalidBitstream);
+            }
+            if data.len() < sz {
+                return Err(Error::UnexpectedEof);
+            }
+            // Only the first `sz` bytes are visible to the coder; clip
+            // the borrow so a renormalisation refill that overshoots
+            // `sz` triggers `UnexpectedEof` rather than silently
+            // borrowing the next packet's bytes.
+            let visible = &data[..sz];
+            let mut c = Self {
+                data: visible,
+                bit_pos: 0,
+                bool_value: 0,
+                bool_range: 255,
+                bool_max_bits: (8 * sz as i64) - 8,
+            };
+            // `BoolValue` is read using `f(8)` (§9.2.1).
+            c.bool_value = c.read_bits_raw(8)?;
+            // Marker bit — must decode to 0.
+            let marker = c.read_bool(128)?;
+            if marker != 0 {
+                return Err(Error::InvalidBitstream);
+            }
+            Ok(c)
+        }
+
+        /// `read_bool( p )` per spec §9.2.2.
+        ///
+        /// `p` is the probability in `0..=255` that the decoded bit is 0.
+        /// Returns the decoded bit (0 or 1).
+        ///
+        /// May return [`Error::UnexpectedEof`] if renormalisation needs
+        /// more bits than the slice has and `BoolMaxBits` is positive (the
+        /// slice underran), or [`Error::InvalidBitstream`] if
+        /// `BoolMaxBits` is exhausted (spec: "It is a requirement of
+        /// bitstream conformance that this never happens").
+        pub(crate) fn read_bool(&mut self, p: u32) -> Result<u32, Error> {
+            debug_assert!(p <= 255);
+            let split = 1 + (((self.bool_range - 1) * p) >> 8);
+            let bit = if self.bool_value < split {
+                self.bool_range = split;
+                0
+            } else {
+                self.bool_range -= split;
+                self.bool_value -= split;
+                1
+            };
+            // Renormalise: while BoolRange < 128, shift in fresh bits.
+            while self.bool_range < 128 {
+                let new_bit = if self.bool_max_bits > 0 {
+                    let nb = self.read_bits_raw(1)?;
+                    self.bool_max_bits -= 1;
+                    nb
+                } else {
+                    // Spec §9.2.2: a conformant stream never reaches
+                    // this branch. Flag the bitstream as invalid rather
+                    // than silently inject 0 — the spec's "set equal to
+                    // 0" is a permissive fallback; we want to surface
+                    // truncation explicitly.
+                    return Err(Error::InvalidBitstream);
+                };
+                self.bool_range <<= 1;
+                self.bool_value = (self.bool_value << 1) + new_bit;
+            }
+            Ok(bit)
+        }
+
+        /// `read_literal( n )` per spec §9.2.4.
+        ///
+        /// Folds `n` calls to `read_bool(128)` into an MSB-first
+        /// unsigned integer. `n` must be at most 32 — VP9 never asks for
+        /// more.
+        pub(crate) fn read_literal(&mut self, n: u32) -> Result<u32, Error> {
+            debug_assert!(n <= 32);
+            let mut x: u32 = 0;
+            for _ in 0..n {
+                x = (x << 1) + self.read_bool(128)?;
+            }
+            Ok(x)
+        }
+
+        /// `exit_bool( )` per spec §9.2.3.
+        ///
+        /// Consumes the remaining `BoolMaxBits` of padding from the
+        /// stream. Spec requires every padding bit to be 0, so any 1 in
+        /// the tail yields [`Error::InvalidBitstream`]. Returns the bit
+        /// position (within the slice handed to `init_bool`) where the
+        /// coder finishes.
+        ///
+        /// Not yet wired into the round-3 compressed-header walker
+        /// (which only reads `read_tx_mode` and exits early); kept as
+        /// part of the §9.2 surface so the next round's
+        /// `diff_update_prob` chain can shut the coder down properly.
+        #[allow(dead_code)]
+        pub(crate) fn exit_bool(&mut self) -> Result<usize, Error> {
+            while self.bool_max_bits > 0 {
+                let pad = self.read_bits_raw(1)?;
+                self.bool_max_bits -= 1;
+                if pad != 0 {
+                    return Err(Error::InvalidBitstream);
+                }
+            }
+            Ok(self.bit_pos)
+        }
+
+        /// MSB-first raw `f(n)` reader used by `init_bool` for `BoolValue`
+        /// and by `read_bool` / `exit_bool` for renormalisation /
+        /// padding consumption. Not exposed outside the module — the
+        /// §9.2 spec only describes raw bit fetches in the context of
+        /// the Boolean coder itself.
+        fn read_bits_raw(&mut self, n: u32) -> Result<u32, Error> {
+            debug_assert!(n <= 32);
+            let mut value: u32 = 0;
+            for _ in 0..n {
+                let byte_index = self.bit_pos >> 3;
+                if byte_index >= self.data.len() {
+                    return Err(Error::UnexpectedEof);
+                }
+                let bit_in_byte = 7 - (self.bit_pos & 7);
+                let bit = (self.data[byte_index] >> bit_in_byte) & 1;
+                self.bit_pos += 1;
+                value = (value << 1) | (bit as u32);
+            }
+            Ok(value)
+        }
+    }
+
+    /// The windowed coder decodes exactly the spec-literal bits and
+    /// fails exactly where it fails, over random payloads, sizes,
+    /// probabilities and literal widths, including exit_bool( ).
+    #[test]
+    fn windowed_coder_matches_spec_literal() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for trial in 0..3000 {
+            let sz = 1 + (next() % 40) as usize;
+            let mut data: Vec<u8> = (0..sz + (next() % 3) as usize)
+                .map(|_| next() as u8)
+                .collect();
+            if trial % 3 == 0 {
+                // Zero tails exercise the exit_bool( ) acceptance path.
+                let keep = (next() % sz as u64) as usize;
+                for b in data.iter_mut().skip(keep) {
+                    *b = 0;
+                }
+                data[0] &= 0x7f;
+            }
+            let a = BoolCoder::init_bool(&data, sz);
+            let b = SpecBoolCoder::init_bool(&data, sz);
+            let (mut a, mut b) = match (a, b) {
+                (Ok(a), Ok(b)) => (a, b),
+                (Err(x), Err(y)) => {
+                    assert_eq!(x, y);
+                    continue;
+                }
+                (x, y) => panic!("init diverged: {:?} vs {:?}", x.is_ok(), y.is_ok()),
+            };
+            let reads = (next() % 400) as usize;
+            let mut failed = false;
+            for _ in 0..reads {
+                let (ra, rb) = if next() % 5 == 0 {
+                    let n = (next() % 17) as u32;
+                    (a.read_literal(n), b.read_literal(n))
+                } else {
+                    let p = (next() % 256) as u32;
+                    (a.read_bool(p), b.read_bool(p))
+                };
+                assert_eq!(ra, rb, "trial {trial}");
+                if ra.is_err() {
+                    failed = true;
+                    break;
+                }
+            }
+            if !failed {
+                assert_eq!(a.exit_bool(), b.exit_bool(), "trial {trial} exit");
+            }
+        }
+    }
 
     // Test vectors below were derived by directly stepping the §9.2
     // decoder by hand and confirming each buffer produces the

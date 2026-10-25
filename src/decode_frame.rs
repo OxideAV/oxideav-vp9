@@ -82,7 +82,7 @@ use crate::residual::{
 };
 use crate::scan::get_scan;
 use crate::superblock_loop_filter::{SuperblockFilterFrame, SuperblockFilterPlane};
-use crate::tokens::{NonzeroContext, TokenBlockCtx, tokens};
+use crate::tokens::{NonzeroContext, TokenBlockCtx, tokens_eob};
 
 /// One decoded VP9 frame, cropped to the §8.10 output extents.
 ///
@@ -476,8 +476,11 @@ impl BlockDecoder<'_> {
                                 max_x: ((2 * self.mi_cols) >> u32::from(sub_x)) as usize,
                                 max_y: ((2 * self.mi_rows) >> u32::from(sub_y)) as usize,
                             };
-                            self.token_cache[..seg_eob].fill(0);
-                            nonzero = tokens(
+                            // No TokenCache[ ] reset: every context
+                            // neighbour precedes its position in the scan
+                            // (pinned by a tokens.rs unit test), so only
+                            // this block's own entries are read.
+                            let eob = tokens_eob(
                                 coder,
                                 &tbc,
                                 tx_sz,
@@ -488,6 +491,7 @@ impl BlockDecoder<'_> {
                                 &mut self.tok_buf[..seg_eob],
                                 self.counts,
                             )?;
+                            nonzero = eob > 0;
                             // §6.4.24: EobTotal += nonzero.
                             eob_total += u32::from(nonzero);
 
@@ -507,6 +511,10 @@ impl BlockDecoder<'_> {
                                     self.lossless,
                                     self.bit_depth,
                                 );
+                                // Keep Tokens[ ] all-zero between blocks.
+                                for &p in &scan[..eob] {
+                                    self.tok_buf[p as usize] = 0;
+                                }
                             }
                         }
                     }
@@ -968,8 +976,11 @@ impl BlockDecoder<'_> {
                                 max_x: ((2 * self.mi_cols) >> u32::from(sub_x)) as usize,
                                 max_y: ((2 * self.mi_rows) >> u32::from(sub_y)) as usize,
                             };
-                            self.token_cache[..seg_eob].fill(0);
-                            nonzero = tokens(
+                            // No TokenCache[ ] reset: every context
+                            // neighbour precedes its position in the scan
+                            // (pinned by a tokens.rs unit test), so only
+                            // this block's own entries are read.
+                            let eob = tokens_eob(
                                 coder,
                                 &tbc,
                                 tx_sz,
@@ -980,6 +991,7 @@ impl BlockDecoder<'_> {
                                 &mut self.tok_buf[..seg_eob],
                                 self.counts,
                             )?;
+                            nonzero = eob > 0;
                             eob_total += u32::from(nonzero);
 
                             // An all-zero residual (no token read) leaves
@@ -999,6 +1011,10 @@ impl BlockDecoder<'_> {
                                     self.lossless,
                                     self.bit_depth,
                                 );
+                                // Keep Tokens[ ] all-zero between blocks.
+                                for &p in &scan[..eob] {
+                                    self.tok_buf[p as usize] = 0;
+                                }
                             }
                         }
                     }
@@ -2610,7 +2626,7 @@ pub(crate) fn decode_inter_blocks_for_test(
         BLOCK_8X8, BLOCK_INVALID, NUM_4X4_BLOCKS_HIGH_LOOKUP, NUM_4X4_BLOCKS_WIDE_LOOKUP,
         get_plane_block_size, get_uv_tx_size,
     };
-    use crate::tokens::{TokenBlockCtx, tokens};
+    use crate::tokens::TokenBlockCtx;
 
     let chdr_inter = build_inter_chdr_for_test(ctx, tx_mode, reference_mode, comp_config);
     let mut state = Vp9FrameState::new(mi_rows, mi_cols);
@@ -2833,7 +2849,7 @@ pub(crate) fn decode_inter_blocks_for_test(
                             max_y: ((2 * mi_rows) >> u32::from(sub)) as usize,
                         };
                         token_cache[..seg_eob].fill(0);
-                        nonzero = tokens(
+                        nonzero = crate::tokens::tokens(
                             &mut coder,
                             &tbc,
                             tx_sz,

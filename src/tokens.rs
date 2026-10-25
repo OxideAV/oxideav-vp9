@@ -405,6 +405,28 @@ pub(crate) fn read_token(coder: &mut BoolCoder<'_>, probs: &[u8; 10]) -> Result<
     }
 }
 
+/// [`read_token`] over the [`build_token_probs`] table of `cell`,
+/// deriving each §9.3 node probability only when the tree walk reaches
+/// it (node 0 reads `cell[ 1 ]`, node 1 `cell[ 2 ]`, deeper nodes the
+/// Pareto extension of `cell[ 2 ]`).
+#[inline]
+pub(crate) fn read_token_cell(coder: &mut BoolCoder<'_>, cell: &[u8; 3]) -> Result<u32, Error> {
+    let mut n: i32 = 0;
+    loop {
+        let node = (n >> 1) as u32;
+        let prob = match node {
+            0 => cell[1],
+            1 => cell[2],
+            _ => pareto(node, cell[2]),
+        };
+        let bit = coder.read_bool(u32::from(prob))?;
+        n = TOKEN_TREE[n as usize + bit as usize];
+        if n <= 0 {
+            return Ok((-n) as u32);
+        }
+    }
+}
+
 /// `read_coef( token )` per spec §6.4.26.
 ///
 /// Decodes the magnitude of a non-zero coefficient given its `token`.
@@ -572,8 +594,8 @@ pub(crate) fn token_cache_neighbours(
         return (0, 0);
     }
     let n = 4usize << tx_sz;
-    let i = pos / n;
-    let j = pos % n;
+    let i = pos >> (2 + tx_sz);
+    let j = pos & (n - 1);
     if i > 0 && j > 0 {
         let a = (i - 1) * n + j;
         let a2 = i * n + j - 1;
@@ -728,6 +750,42 @@ pub(crate) fn tokens(
     tokens: &mut [i64],
     counts: &mut crate::prob_adapt::FrameCounts,
 ) -> Result<bool, Error> {
+    let eob = tokens_eob(
+        coder,
+        block,
+        tx_sz,
+        scan,
+        coef_probs,
+        nz,
+        token_cache,
+        tokens,
+        counts,
+    )?;
+    // §6.4.24: zero every scan position from `c` to the end.
+    for &p in &scan[eob..] {
+        tokens[p as usize] = 0;
+    }
+    Ok(eob > 0)
+}
+
+/// [`tokens`] without the trailing zero fill: returns the number of
+/// scan positions read (`c` at the end of the §6.4.24 loop; `nonzero =
+/// eob > 0`) and leaves `tokens[ scan[ eob.. ] ]` untouched, so a
+/// caller that keeps its `Tokens[ ]` buffer all-zero between blocks
+/// (clearing `scan[ ..eob ]` after use) gets the same block contents
+/// without touching the whole array.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn tokens_eob(
+    coder: &mut BoolCoder<'_>,
+    block: &TokenBlockCtx,
+    tx_sz: u32,
+    scan: &[u16],
+    coef_probs: &crate::coef_probs::CoefProbs,
+    nz: &NonzeroContext,
+    token_cache: &mut [u8],
+    tokens: &mut [i64],
+    counts: &mut crate::prob_adapt::FrameCounts,
+) -> Result<usize, Error> {
     let seg_eob = 16usize << (tx_sz << 1);
     debug_assert_eq!(scan.len(), seg_eob);
     debug_assert_eq!(tokens.len(), seg_eob);
@@ -781,8 +839,7 @@ pub(crate) fn tokens(
             }
         }
 
-        let token_probs = build_token_probs(cell);
-        let token = read_token(coder, &token_probs)?;
+        let token = read_token_cell(coder, cell)?;
         // §9.3.4: counts_token[…][Min(2, syntax)] += 1.
         counts.token[tx_sz as usize][plane_gt0][is_inter][band][ctx][(token as usize).min(2)] += 1;
         token_cache[pos] = ENERGY_CLASS[token as usize];
@@ -798,17 +855,40 @@ pub(crate) fn tokens(
         c += 1;
     }
 
-    let nonzero = c > 0;
-    // §6.4.24: zero every scan position from `c` to the end.
-    for &p in &scan[c..] {
-        tokens[p as usize] = 0;
-    }
-    Ok(nonzero)
+    Ok(c)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every §6.4.24 context neighbour precedes its position in the
+    /// scan order for every (size, type) the decoder pairs, so
+    /// `TokenCache[ ]` reads only entries written earlier in the same
+    /// block — stale entries from a previous block are never read.
+    #[test]
+    fn token_cache_neighbours_precede_in_scan_order() {
+        use crate::idct::{ADST_ADST, ADST_DCT, DCT_ADST, DCT_DCT};
+        for tx_sz in 0..4u32 {
+            for tx_type in [DCT_DCT, ADST_DCT, DCT_ADST, ADST_ADST] {
+                if tx_sz == 3 && tx_type != DCT_DCT {
+                    continue;
+                }
+                let scan = crate::scan::get_scan(0, tx_sz, tx_type);
+                let mut order = vec![usize::MAX; scan.len()];
+                for (c, &p) in scan.iter().enumerate() {
+                    order[p as usize] = c;
+                }
+                for (c, &p) in scan.iter().enumerate().skip(1) {
+                    let (a, b) = token_cache_neighbours(c, p as usize, tx_sz, tx_type);
+                    assert!(
+                        order[a] < c && order[b] < c,
+                        "tx {tx_sz} type {tx_type} c {c}"
+                    );
+                }
+            }
+        }
+    }
     use crate::idct::{ADST_ADST, DCT_DCT};
 
     // The hand-traced golden buffers below were derived by stepping

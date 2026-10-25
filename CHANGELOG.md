@@ -15,6 +15,13 @@ All notable changes to `oxideav-vp9` are recorded here.
   shortcuts (pinned bit-exact against the spec-literal recursion); an
   all-zero residual skips reconstruction. 1080p single-thread decode:
   7.9 s → 2.5 s on the 300-frame reference clip.
+- §9.2 boolean decoder: a 64-bit window renormalises in one shift per
+  `read_bool` (pinned bit- and error-exact against the per-bit
+  spec-literal coder); §6.4.24 tokens derive Pareto node probabilities
+  only for the tree nodes reached, the decoder keeps its `Tokens[ ]`
+  buffer zero between blocks instead of refilling it, and skips the
+  `TokenCache[ ]` reset (every context neighbour precedes its position
+  in the scan — pinned by a unit test).
 - `examples/decode_ivf.rs`: time an IVF stream through `Vp9Decoder` at a
   given thread budget (optionally dumping the planar output).
 - `tests/corpus_threads.rs`: every staged fixture decodes identically at

@@ -63,7 +63,7 @@ use crate::header::{
 };
 use crate::inter_decode::{FrameStateMvSource, PrevFrameMvs, build_ref_planes};
 use crate::inter_mv::{BlockGrid, ScaleGeom};
-use crate::inter_pred::{InterPredArgs, predict_inter};
+use crate::inter_pred::InterPredArgs;
 use crate::intra::{Plane, PredMode, predict_intra};
 use crate::loop_filter::loop_filter_frame_init;
 use crate::mode_info::{
@@ -148,6 +148,8 @@ struct BlockDecoder<'a> {
     nz: &'a mut [NonzeroContext; 3],
     token_cache: &'a mut [u8; 1024],
     tok_buf: &'a mut [i64; 1024],
+    /// §8.5.2 prediction working storage.
+    pred: &'a mut crate::inter_pred::PredScratch,
     /// §9.3.4 per-frame syntax-element count bank (cleared per frame by
     /// §8.3 `clear_counts( )`; consumed by §6.1.2 `refresh_probs( )`).
     counts: &'a mut crate::prob_adapt::FrameCounts,
@@ -1103,7 +1105,7 @@ impl BlockDecoder<'_> {
             1 => self.u,
             _ => self.v,
         };
-        predict_inter(
+        crate::inter_pred::predict_inter_with(
             dst,
             &args,
             &grid,
@@ -1112,6 +1114,7 @@ impl BlockDecoder<'_> {
             &refs,
             self.subsampling_x,
             self.subsampling_y,
+            self.pred,
         );
     }
 }
@@ -1187,6 +1190,7 @@ struct TileWorkState<'a> {
     counts: &'a mut crate::prob_adapt::FrameCounts,
     token_cache: &'a mut [u8; 1024],
     tok_buf: &'a mut [i64; 1024],
+    pred: &'a mut crate::inter_pred::PredScratch,
 }
 
 /// The previous frame's §6.5 motion field and the §6.4.14
@@ -1298,6 +1302,7 @@ fn decode_one_tile(
         counts,
         token_cache,
         tok_buf,
+        pred,
     } = ws;
 
     // §6.4.2 decode_tile( ): superblock raster with the
@@ -1364,6 +1369,7 @@ fn decode_one_tile(
                 nz: &mut *nz,
                 token_cache: &mut *token_cache,
                 tok_buf: &mut *tok_buf,
+                pred: &mut *pred,
                 counts: &mut *counts,
                 inter: inter_ctx,
             };
@@ -1641,6 +1647,7 @@ pub(crate) struct TileScratch {
     v: Plane,
     token_cache: Box<[u8; 1024]>,
     tok_buf: Box<[i64; 1024]>,
+    pred: Box<crate::inter_pred::PredScratch>,
     /// The §6.4.4 state allocation (zeroed before use).
     state: Option<Vp9FrameState>,
     prev: PrevRows,
@@ -1664,6 +1671,7 @@ fn take_scratch(pool: &ScratchPool, job: &FrameJob) -> TileScratch {
         v: Plane::new(cw, chh),
         token_cache: Box::new([0; 1024]),
         tok_buf: Box::new([0; 1024]),
+        pred: crate::inter_pred::PredScratch::new_boxed(),
         state: None,
         prev: PrevRows::new(),
     }
@@ -1735,6 +1743,7 @@ fn tile_column_job(job: &FrameJob, pipe: &FramePipe, scratch_pool: &ScratchPool,
             token_cache,
             tok_buf,
             prev,
+            pred,
             ..
         } = &mut scratch;
         let before = |prev: &mut PrevRows, r: u32| -> Result<(), Error> {
@@ -1763,6 +1772,7 @@ fn tile_column_job(job: &FrameJob, pipe: &FramePipe, scratch_pool: &ScratchPool,
                 counts: &mut counts,
                 token_cache,
                 tok_buf,
+                pred,
             },
             prev,
             &before,
@@ -3499,6 +3509,7 @@ pub(crate) fn decode_keyframe_blocks_for_test(
     ];
     let mut token_cache = [0u8; 1024];
     let mut tok_buf = [0i64; 1024];
+    let mut pred_scratch = crate::inter_pred::PredScratch::new_boxed();
     let mut counts = crate::prob_adapt::FrameCounts::new_boxed();
 
     let mut results = Vec::with_capacity(blocks.len());
@@ -3522,6 +3533,7 @@ pub(crate) fn decode_keyframe_blocks_for_test(
             nz: &mut nz,
             token_cache: &mut token_cache,
             tok_buf: &mut tok_buf,
+            pred: &mut pred_scratch,
             counts: &mut counts,
             inter: None,
         };

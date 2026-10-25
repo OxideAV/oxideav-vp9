@@ -64,6 +64,12 @@ All notable changes to `oxideav-vp9` are recorded here.
   samples instead of `i32` — every §7.2.2 bit depth fits — halving the
   memory traffic of the band copies, the loop filter and the reference
   reads. 1080p single thread 2.47 s → 2.15 s.
+- Inter prediction: an unscaled block whose 8-tap footprint crosses the
+  reference edge gathers the footprint with the §8.5.2.4 coordinate
+  clamps applied and filters it like an interior block (only scaled
+  references take the general per-tap path); an equal-size reference
+  skips the §8.5.2.3 scale division; the prediction scratch lives with
+  the tile column instead of in thread-local storage.
 - `examples/decode_ivf.rs`: time an IVF stream through `Vp9Decoder` at a
   given thread budget (optionally dumping the planar output).
 - `tests/corpus_threads.rs`: every staged fixture decodes identically at

@@ -198,11 +198,21 @@ pub(crate) fn predict_inter(
 }
 
 /// One thread's §8.5.2.3 working storage.
-struct PredScratch {
+pub(crate) struct PredScratch {
     /// `preds[ refList ]`, row-major `w x h`.
     preds: [[i32; 64 * 64]; 2],
     /// The horizontal-pass intermediate (`h + 7` rows).
     inter: [i32; 64 * 71],
+}
+
+impl PredScratch {
+    /// Fresh (boxed: ~40 KiB) storage.
+    pub(crate) fn new_boxed() -> Box<Self> {
+        Box::new(PredScratch {
+            preds: [[0; 64 * 64]; 2],
+            inter: [0; 64 * 71],
+        })
+    }
 }
 
 thread_local! {
@@ -215,8 +225,9 @@ thread_local! {
         }));
 }
 
+/// [`predict_inter`] on caller-owned working storage.
 #[allow(clippy::too_many_arguments)]
-fn predict_inter_with(
+pub(crate) fn predict_inter_with(
     dst: &mut Plane,
     args: &InterPredArgs,
     grid: &BlockGrid,

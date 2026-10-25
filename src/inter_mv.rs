@@ -272,8 +272,17 @@ pub(crate) fn scale_mv(
 ) -> ScaledMv {
     // xScale / yScale: reference size relative to current, in
     // 1 << REF_SCALE_SHIFT fixed-point.
-    let x_scale = (geom.ref_frame_width << REF_SCALE_SHIFT) / geom.frame_width;
-    let y_scale = (geom.ref_frame_height << REF_SCALE_SHIFT) / geom.frame_height;
+    // (An equal-size reference is exactly 1 << REF_SCALE_SHIFT; skipping
+    // the division there is the same value.)
+    let ratio = |r: i32, f: i32| {
+        if r == f {
+            1 << REF_SCALE_SHIFT
+        } else {
+            (r << REF_SCALE_SHIFT) / f
+        }
+    };
+    let x_scale = ratio(geom.ref_frame_width, geom.frame_width);
+    let y_scale = ratio(geom.ref_frame_height, geom.frame_height);
 
     // baseX / baseY: where a zero motion vector lands in the reference.
     let base_x = (x * x_scale) >> REF_SCALE_SHIFT;

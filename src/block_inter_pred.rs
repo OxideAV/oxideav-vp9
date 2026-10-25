@@ -430,15 +430,44 @@ pub(crate) fn block_inter_predict_into<R: SampleRows>(
     scratch: &mut [i32; 64 * 71],
 ) {
     let (ix, iy) = (x >> 4, y >> 4);
-    let unscaled_inside = x_step == 16
-        && y_step == 16
-        && ix - 3 >= 0
+    let unscaled = x_step == 16 && y_step == 16 && w <= 64 && h <= 64;
+    let inside = ix - 3 >= 0
         && ix + w as i32 + 4 <= last_x + 1
         && iy - 3 >= 0
-        && iy + h as i32 + 4 <= last_y + 1
-        && w <= 64
-        && h <= 64;
-    if !unscaled_inside {
+        && iy + h as i32 + 4 <= last_y + 1;
+    if unscaled && !inside {
+        // The footprint crosses the plane edge: gather it with the
+        // §8.5.2.4 Clip3( 0, lastX / lastY, · ) coordinate clamps applied
+        // (edge replication — exactly the samples the per-tap clamped
+        // reads return), then filter it like an interior block.
+        let (fw, fh) = (w + 7, h + 7);
+        let mut emu = [0i32; 71 * 71];
+        for r in 0..fh {
+            let ry = (iy + r as i32 - 3).clamp(0, last_y) as usize;
+            let row = rows_of.row(ry);
+            for (c, d) in emu[r * fw..(r + 1) * fw].iter_mut().enumerate() {
+                *d = row[(ix + c as i32 - 3).clamp(0, last_x) as usize].get();
+            }
+        }
+        let win = Window {
+            data: &emu[..fw * fh],
+            stride: fw,
+            y0: 0,
+        };
+        let args = (
+            3,
+            3,
+            (x & SUBPEL_MASK) as usize,
+            (y & SUBPEL_MASK) as usize,
+            w,
+            h,
+            interp_filter,
+            bit_depth,
+        );
+        unscaled_kernel(&win, args, out, out_stride, scratch);
+        return;
+    }
+    if !unscaled {
         let pred = block_inter_predict_plane(
             rows_of,
             x,

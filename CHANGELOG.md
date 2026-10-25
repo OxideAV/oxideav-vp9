@@ -92,6 +92,9 @@ All notable changes to `oxideav-vp9` are recorded here.
   rows directly (no intermediate copy), and the vertical pass indexes
   eight row slices — 4x4 to 64x64 blocks with a vertical phase run 15–60%
   faster in isolation.
+- Loop-filter decisions: each mode-info cell carries its §8.8.2 block-edge
+  masks, and an edge's fixed coordinate settles its off-screen / frame-
+  border cases once per edge instead of per position.
 - `examples/decode_ivf.rs`: time an IVF stream through `Vp9Decoder` at a
   given thread budget (optionally dumping the planar output).
 - `tests/corpus_threads.rs`: every staged fixture decodes identically at

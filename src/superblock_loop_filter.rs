@@ -564,7 +564,9 @@ pub(crate) fn superblock_loop_filter_window_at<T: Px>(
 /// superblock row for the decoder's loop filter.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LfCell {
-    mi_size: u8,
+    /// `8 * num_8x8_blocks_{wide,high}( sbSize ) - 1` for the §8.8.2
+    /// `isBlockEdge` test, per pass, for `sub == 0` / `sub == 1`.
+    block_mask: [[u8; 2]; 2],
     /// `tx_size` (luma) and §6.4.22 `get_uv_tx_size( )` (chroma).
     tx: u8,
     uv_tx: u8,
@@ -609,8 +611,19 @@ impl LfRowCells {
                 .lvl_lookup
                 .get(frame.segment_ids[i] as usize, ref0, mode_type)
                 .unwrap_or(INVALID_LVL);
+            let sb = |sub: usize| {
+                if sub == 0 {
+                    mi_size
+                } else {
+                    mi_size.max(crate::residual::BLOCK_16X16)
+                }
+            };
+            let wide =
+                |sub: usize| 8 * crate::partition::NUM_8X8_BLOCKS_WIDE_LOOKUP[sb(sub) as usize] - 1;
+            let high =
+                |sub: usize| 8 * crate::partition::NUM_8X8_BLOCKS_HIGH_LOOKUP[sb(sub) as usize] - 1;
             *cell = LfCell {
-                mi_size,
+                block_mask: [[wide(0), wide(1)], [high(0), high(1)]],
                 tx,
                 uv_tx: get_uv_tx_size(
                     u32::from(tx),
@@ -652,8 +665,6 @@ pub(crate) fn superblock_loop_filter_cells<T: Px>(
     row: u32,
     col: u32,
 ) {
-    use crate::partition::{NUM_8X8_BLOCKS_HIGH_LOOKUP, NUM_8X8_BLOCKS_WIDE_LOOKUP};
-    use crate::residual::BLOCK_16X16;
     let (sub_x, sub_y) = if plane == 0 {
         (0u32, 0u32)
     } else {
@@ -664,54 +675,61 @@ pub(crate) fn superblock_loop_filter_cells<T: Px>(
     let (mi_cols, mi_rows) = (lf.mi_cols, lf.mi_rows);
     let along_sub = if vertical { sub_y } else { sub_x };
     let run_len = 8u32 >> along_sub;
+    let sub = geom.sub as usize;
+    let pass_idx = usize::from(!vertical);
+    let cols = mi_cols as usize;
     for edge in 0..(16u32 >> geom.sub) {
+        // The edge's own coordinate is fixed: an edge past the frame
+        // (and every later one) or on the left / top frame border has
+        // no on-screen position (§8.8.2 step 13).
+        let fixed = if vertical {
+            col * 8 + edge * (4 << sub_x)
+        } else {
+            row * 8 + edge * (4 << sub_y)
+        };
+        if fixed >= 8 * if vertical { mi_cols } else { mi_rows } {
+            break;
+        }
+        if fixed == 0 {
+            continue;
+        }
+        let is_32_edge = edge & 7 == 0;
+        // The H-pass chroma special case of §8.8.2 step 10 (odd MiCols,
+        // odd edge, right frame edge).
+        let odd_tail = !vertical && sub_x == 1 && (mi_cols & 1) == 1 && (edge & 1) == 1;
         let mut pending: Option<(u32, u32, u8, FilterStrength)> = None;
         let mut i = 0u32;
         while i < geom.edge_len {
             let (x, y) = if vertical {
-                (col * 8 + edge * (4 << sub_x), row * 8 + (i << sub_y))
+                (fixed, row * 8 + (i << sub_y))
             } else {
-                (col * 8 + (i << sub_x), row * 8 + edge * (4 << sub_y))
+                (col * 8 + (i << sub_x), fixed)
             };
+            if if vertical {
+                y >= 8 * mi_rows
+            } else {
+                x >= 8 * mi_cols
+            } {
+                break;
+            }
             let i0 = i;
             i += run_len;
-            let decision = if x >= 8 * mi_cols || y >= 8 * mi_rows {
-                None
-            } else {
-                let loop_col = ((x >> 3) >> sub_x) << sub_x;
-                let loop_row = ((y >> 3) >> sub_y) << sub_y;
-                let c = lf.cells
-                    [(loop_row - lf.mi_row_base) as usize * mi_cols as usize + loop_col as usize];
-                let tx_sz = if plane > 0 { c.uv_tx } else { c.tx };
-                let sb_size = if geom.sub == 0 {
-                    c.mi_size
-                } else {
-                    c.mi_size.max(BLOCK_16X16)
-                };
-                let is_block_edge = if vertical {
-                    x & (8 * u32::from(NUM_8X8_BLOCKS_WIDE_LOOKUP[sb_size as usize]) - 1) == 0
-                } else {
-                    y & (8 * u32::from(NUM_8X8_BLOCKS_HIGH_LOOKUP[sb_size as usize]) - 1) == 0
-                };
-                let is_tx_edge = if !vertical
-                    && sub_x == 1
-                    && (mi_cols & 1) == 1
-                    && (edge & 1) == 1
-                    && (x + 8) >= mi_cols * 8
-                {
-                    false
-                } else {
-                    edge & ((1u32 << tx_sz) - 1) == 0
-                };
-                let on_screen = !(vertical && x == 0) && !(!vertical && y == 0);
-                if on_screen && (is_block_edge || (is_tx_edge && !c.skip_inter)) {
-                    assert!(
-                        c.lvl != INVALID_LVL,
-                        "§8.8.4: segment_id must be < 8 and ref_frame in 0..=3"
-                    );
+            let loop_col = ((x >> 3) >> sub_x) << sub_x;
+            let loop_row = ((y >> 3) >> sub_y) << sub_y;
+            let c = lf.cells[(loop_row - lf.mi_row_base) as usize * cols + loop_col as usize];
+            let tx_sz = if plane > 0 { c.uv_tx } else { c.tx };
+            let is_block_edge = fixed & u32::from(c.block_mask[pass_idx][sub]) == 0;
+            let is_tx_edge =
+                !(odd_tail && (x + 8) >= mi_cols * 8) && edge & ((1u32 << tx_sz) - 1) == 0;
+            let decision = if is_block_edge || (is_tx_edge && !c.skip_inter) {
+                assert!(
+                    c.lvl != INVALID_LVL,
+                    "§8.8.4: segment_id must be < 8 and ref_frame in 0..=3"
+                );
+                (c.lvl > 0).then(|| {
                     let f_size = filter_size(
                         tx_sz,
-                        edge & 7 == 0,
+                        is_32_edge,
                         pass,
                         x,
                         y,
@@ -720,10 +738,10 @@ pub(crate) fn superblock_loop_filter_cells<T: Px>(
                         mi_cols,
                         mi_rows,
                     );
-                    (c.lvl > 0).then(|| (f_size, lf.strengths[c.lvl as usize & 63]))
-                } else {
-                    None
-                }
+                    (f_size, lf.strengths[c.lvl as usize & 63])
+                })
+            } else {
+                None
             };
             match (pending, decision) {
                 (Some((s0, n, fs, st)), Some((fs2, st2)))

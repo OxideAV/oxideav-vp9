@@ -161,10 +161,54 @@ pub(crate) fn predict_inter(
     subsampling_x: bool,
     subsampling_y: bool,
 ) {
-    let n_lists = if args.is_compound { 2 } else { 1 };
-
     // preds[ refList ] — each a flattened w×h prediction block.
-    let mut preds: [Vec<i32>; 2] = [Vec::new(), Vec::new()];
+    PRED_SCRATCH.with_borrow_mut(|preds| {
+        predict_inter_with(
+            dst,
+            args,
+            grid,
+            geom,
+            block_mvs,
+            refs,
+            subsampling_x,
+            subsampling_y,
+            preds,
+        )
+    });
+}
+
+/// One thread's §8.5.2.3 working storage.
+struct PredScratch {
+    /// `preds[ refList ]`, row-major `w x h`.
+    preds: [[i32; 64 * 64]; 2],
+    /// The horizontal-pass intermediate (`h + 7` rows).
+    inter: [i32; 64 * 71],
+}
+
+thread_local! {
+    /// Per-thread prediction scratch (one 64x64 block per ref list), so
+    /// the per-block §8.5.2.3 outputs never touch the allocator.
+    static PRED_SCRATCH: std::cell::RefCell<Box<PredScratch>> =
+        std::cell::RefCell::new(Box::new(PredScratch {
+            preds: [[0; 64 * 64]; 2],
+            inter: [0; 64 * 71],
+        }));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn predict_inter_with(
+    dst: &mut Plane,
+    args: &InterPredArgs,
+    grid: &BlockGrid,
+    geom: &ScaleGeom,
+    block_mvs: &[[[i32; 2]; 4]; 2],
+    refs: &RefPlanes<'_>,
+    subsampling_x: bool,
+    subsampling_y: bool,
+    scratch: &mut PredScratch,
+) {
+    let PredScratch { preds, inter } = scratch;
+    let n_lists = if args.is_compound { 2 } else { 1 };
 
     for (ref_list, pred_slot) in preds.iter_mut().enumerate().take(n_lists) {
         let ref_plane = refs.list[ref_list].expect("missing reference plane for active refList");
@@ -211,7 +255,7 @@ pub(crate) fn predict_inter(
         let last_y = ((ref_plane.ref_frame_height + sub_y as i32) >> sub_y) - 1;
 
         // §8.5.2 step 5 — §8.5.2.4 block inter prediction.
-        *pred_slot = crate::block_inter_pred::block_inter_predict_plane(
+        crate::block_inter_pred::block_inter_predict_into(
             ref_plane.samples,
             ref_plane.stride,
             scaled.start_x,
@@ -224,6 +268,8 @@ pub(crate) fn predict_inter(
             last_x,
             last_y,
             args.bit_depth,
+            pred_slot,
+            inter,
         );
     }
 
@@ -237,20 +283,24 @@ pub(crate) fn predict_inter(
     // would carry. Fuzz/corpus-found on a 176x144 stream whose bottom
     // superblock row codes 64-tall inter leaves overhanging the frame.
     let (px, py) = (args.x as usize, args.y as usize);
-    for i in 0..args.h {
-        if py + i >= dst.height() {
-            break;
-        }
-        for j in 0..args.w {
-            if px + j >= dst.width() {
-                break;
+    let (pw, ph) = (dst.width(), dst.height());
+    if px >= pw || py >= ph {
+        return;
+    }
+    let cols = args.w.min(pw - px);
+    let rows = args.h.min(ph - py);
+    let w = args.w;
+    let data = dst.samples_mut();
+    for i in 0..rows {
+        let out = &mut data[(py + i) * pw + px..][..cols];
+        let p0 = &preds[0][i * w..i * w + cols];
+        if args.is_compound {
+            let p1 = &preds[1][i * w..i * w + cols];
+            for ((o, &a), &b) in out.iter_mut().zip(p0).zip(p1) {
+                *o = round2(a + b, 1);
             }
-            let value = if args.is_compound {
-                round2(preds[0][i * args.w + j] + preds[1][i * args.w + j], 1)
-            } else {
-                preds[0][i * args.w + j]
-            };
-            dst.set(px + j, py + i, value);
+        } else {
+            out.copy_from_slice(p0);
         }
     }
 }

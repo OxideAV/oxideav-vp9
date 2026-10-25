@@ -130,8 +130,40 @@ pub(crate) fn reconstruct_block(
     bit_depth: u32,
 ) {
     // §8.6.2: dqDenom = 2 if txSz == TX_32X32, else 1.
+    match tx_sz {
+        0 => reconstruct_n::<16>(
+            plane_buf, x, y, tx_sz, tokens, dc_quant, ac_quant, tx_type, lossless, bit_depth,
+        ),
+        1 => reconstruct_n::<64>(
+            plane_buf, x, y, tx_sz, tokens, dc_quant, ac_quant, tx_type, lossless, bit_depth,
+        ),
+        2 => reconstruct_n::<256>(
+            plane_buf, x, y, tx_sz, tokens, dc_quant, ac_quant, tx_type, lossless, bit_depth,
+        ),
+        _ => reconstruct_n::<1024>(
+            plane_buf, x, y, tx_sz, tokens, dc_quant, ac_quant, tx_type, lossless, bit_depth,
+        ),
+    }
+}
+
+/// [`reconstruct_block`] with the `Dequant` block on the stack (`SQ` =
+/// `n0 * n0` samples).
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn reconstruct_n<const SQ: usize>(
+    plane_buf: &mut Plane,
+    x: usize,
+    y: usize,
+    tx_sz: u32,
+    tokens: &[i64],
+    dc_quant: i32,
+    ac_quant: i32,
+    tx_type: u8,
+    lossless: bool,
+    bit_depth: u32,
+) {
+    // §8.6.2 step 1: dqDenom = 2 for TX_32X32, else 1.
     let dq_denom: i64 = if tx_sz == 3 { 2 } else { 1 };
-    // n = 2 + txSz, n0 = 1 << n.
     let n = 2 + tx_sz;
     let n0 = 1usize << n;
 
@@ -141,56 +173,38 @@ pub(crate) fn reconstruct_block(
         "Tokens length must be n0*n0 for the transform size"
     );
 
-    // Step 1: Dequant[i][j] = (Tokens[i*n0+j] * ac_quant) / dqDenom.
-    // Integer division truncates toward zero (§4.1); Rust's `/` on i64
-    // matches.
-    let mut dequant = vec![0i64; n0 * n0];
+    // §8.6.2 step 2: Dequant[ i ][ j ] = ( Tokens[ i * n0 + j ] *
+    // get_ac_quant( plane ) ) / dqDenom, with the DC term using
+    // get_dc_quant( plane ).
+    let mut dequant = [0i64; SQ];
     let ac = ac_quant as i64;
     for (slot, &tok) in dequant.iter_mut().zip(tokens.iter()) {
         *slot = (tok * ac) / dq_denom;
     }
-    // Step 2: Dequant[0][0] = (Tokens[0] * dc_quant) / dqDenom.
     dequant[0] = (tokens[0] * dc_quant as i64) / dq_denom;
 
-    // Step 3: 2D inverse transform writes the residual back into Dequant.
+    // §8.6.2 step 3: invoke the §8.7.2 2D inverse transform.
     inverse_transform_2d(&mut dequant, n, tx_type, lossless);
 
-    // Step 4: CurrFrame[plane][y+i][x+j] =
-    //   Clip1( CurrFrame[plane][y+i][x+j] + Dequant[i][j] ).
-    //
-    // Clipped to the allocated working extent for the same reason as
-    // the §8.5.1 store (see `predict_intra`): a frame-edge block the
-    // §6.4.3 `hasRows` / `hasCols` rules admit may extend past the
-    // MiCols*8 x MiRows*8 planes into (unobservable) superblock
-    // padding a spec CurrFrame would carry.
-    for i in 0..n0 {
-        if y + i >= plane_buf.height() {
-            break;
-        }
-        for j in 0..n0 {
-            if x + j >= plane_buf.width() {
-                break;
-            }
-            let pred = plane_buf.get(x + j, y + i) as i64;
-            let recon = clip1(pred + dequant[i * n0 + j], bit_depth);
-            plane_buf.set(x + j, y + i, recon as i32);
+    // §8.6.2 step 4: CurrFrame[ plane ][ y + i ][ x + j ] =
+    // Clip1( CurrFrame[ plane ][ y + i ][ x + j ] + Dequant[ i ][ j ] ),
+    // limited to the plane extent.
+    let (pw, ph) = (plane_buf.width(), plane_buf.height());
+    if x >= pw || y >= ph {
+        return;
+    }
+    let cols = n0.min(pw - x);
+    let rows = n0.min(ph - y);
+    let max = (1i64 << bit_depth) - 1;
+    let data = plane_buf.samples_mut();
+    for (i, res) in dequant.chunks_exact(n0).take(rows).enumerate() {
+        let out = &mut data[(y + i) * pw + x..][..cols];
+        for (o, &r) in out.iter_mut().zip(res) {
+            *o = (*o as i64 + r).clamp(0, max) as i32;
         }
     }
 }
 
-/// End-to-end reconstruct of one luma intra transform block.
-///
-/// Ties §8.5.1 intra prediction (round 10) to the §8.6.2 reconstruct
-/// process (this round): it predicts the block with [`predict_intra`],
-/// derives the `TxType` via [`tx_type_for_intra`] (forced to `DCT_DCT`
-/// when `lossless` is set or `txSz == TX_32X32`, per §6.4.25), then runs
-/// [`reconstruct_block`].
-///
-/// Arguments fold the [`predict_intra`] inputs (`have_left` /
-/// `have_above` / `not_on_right` / `max_x` / `max_y`) together with the
-/// §8.6.2 inputs (`tokens` / `dc_quant` / `ac_quant` / `lossless`). This
-/// is the single-block shape the (deferred) §6.4.21 residual loop will
-/// drive once it threads the real availability and quantizer state.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn reconstruct_intra_block(
     plane_buf: &mut Plane,

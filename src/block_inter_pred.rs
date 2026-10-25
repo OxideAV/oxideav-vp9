@@ -356,6 +356,124 @@ pub(crate) fn block_inter_predict_plane(
     pred
 }
 
+/// [`block_inter_predict_plane`] writing its `w x h` prediction into
+/// `out[ ..w * h ]` (row-major, stride `w`).
+///
+/// The common case — an unscaled reference (`xStep == yStep == 16`)
+/// whose whole 8-tap footprint lies inside the plane — runs a direct
+/// separable filter over row slices with the phase fixed per block
+/// (an unscaled position advances by whole samples, so `p & 15` is the
+/// same for every column / row); its clamps are no-ops there, so the
+/// bytes are those of the §8.5.2.3 process. Everything else (scaled
+/// references, footprints crossing the plane edge) takes the general
+/// path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn block_inter_predict_into(
+    samples: &[i32],
+    stride: usize,
+    x: i32,
+    y: i32,
+    x_step: i32,
+    y_step: i32,
+    w: usize,
+    h: usize,
+    interp_filter: usize,
+    last_x: i32,
+    last_y: i32,
+    bit_depth: u32,
+    out: &mut [i32],
+    scratch: &mut [i32; 64 * 71],
+) {
+    let (ix, iy) = (x >> 4, y >> 4);
+    let unscaled_inside = x_step == 16
+        && y_step == 16
+        && ix - 3 >= 0
+        && ix + w as i32 + 4 <= last_x + 1
+        && iy - 3 >= 0
+        && iy + h as i32 + 4 <= last_y + 1
+        && w <= 64
+        && h <= 64;
+    if !unscaled_inside {
+        let pred = block_inter_predict_plane(
+            samples,
+            stride,
+            x,
+            y,
+            x_step,
+            y_step,
+            w,
+            h,
+            interp_filter,
+            last_x,
+            last_y,
+            bit_depth,
+        );
+        out[..w * h].copy_from_slice(&pred);
+        return;
+    }
+    let (ix, iy) = (ix as usize, iy as usize);
+    let fx = (x & SUBPEL_MASK) as usize;
+    let fy = (y & SUBPEL_MASK) as usize;
+    let max = (1i32 << bit_depth) - 1;
+    let filter = &SUBPEL_FILTERS[interp_filter];
+    let out = &mut out[..w * h];
+
+    if fx == 0 && fy == 0 {
+        for (r, dst) in out.chunks_exact_mut(w).enumerate() {
+            let at = (iy + r) * stride + ix;
+            dst.copy_from_slice(&samples[at..at + w]);
+        }
+        return;
+    }
+
+    let hfilt = |row: &[i32], dst: &mut [i32]| {
+        let taps = &filter[fx];
+        for (c, d) in dst.iter_mut().enumerate() {
+            let win = &row[c..c + 8];
+            let mut s = 0i32;
+            for k in 0..8 {
+                s += taps[k] * win[k];
+            }
+            *d = ((s + 64) >> 7).clamp(0, max);
+        }
+    };
+
+    if fy == 0 {
+        // Horizontal only: the rows the vertical pass would copy.
+        for (r, dst) in out.chunks_exact_mut(w).enumerate() {
+            let at = (iy + r) * stride + ix - 3;
+            hfilt(&samples[at..at + w + 7], dst);
+        }
+        return;
+    }
+
+    // Intermediate rows iy - 3 .. iy + h + 4 (h + 7 rows).
+    let rows = h + 7;
+    let inter = &mut scratch[..rows * w];
+    if fx == 0 {
+        for (r, dst) in inter.chunks_exact_mut(w).enumerate() {
+            let at = (iy + r - 3) * stride + ix;
+            dst.copy_from_slice(&samples[at..at + w]);
+        }
+    } else {
+        for (r, dst) in inter.chunks_exact_mut(w).enumerate() {
+            let at = (iy + r - 3) * stride + ix - 3;
+            hfilt(&samples[at..at + w + 7], dst);
+        }
+    }
+    let taps = &filter[fy];
+    for (r, dst) in out.chunks_exact_mut(w).enumerate() {
+        let src = &inter[r * w..(r + 8) * w];
+        for (c, d) in dst.iter_mut().enumerate() {
+            let mut s = 0i32;
+            for k in 0..8 {
+                s += taps[k] * src[k * w + c];
+            }
+            *d = ((s + 64) >> 7).clamp(0, max);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

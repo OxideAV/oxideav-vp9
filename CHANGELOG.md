@@ -4,6 +4,22 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ## [Unreleased]
 
+### Performance
+
+- Decoder hot paths (byte-identical output): the §8.8 loop filter runs a
+  lane-parallel in-place kernel over each run of edge positions sharing
+  one mode-info decision; unscaled in-frame §8.5.2.3 inter prediction
+  filters row slices with the phase fixed per block (thread-local
+  scratch, no per-block allocation); the §8.7 inverse transform is a
+  flattened, size-specialised stage sequence with zero-row and DC-only
+  shortcuts (pinned bit-exact against the spec-literal recursion); an
+  all-zero residual skips reconstruction. 1080p single-thread decode:
+  7.9 s → 2.5 s on the 300-frame reference clip.
+- `examples/decode_ivf.rs`: time an IVF stream through `Vp9Decoder` at a
+  given thread budget (optionally dumping the planar output).
+- `tests/corpus_threads.rs`: every staged fixture decodes identically at
+  1 / 2 / 4 / 8 / 18 / auto threads and matches its `expected.yuv`.
+
 ## [0.0.14](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.13...v0.0.14) - 2026-10-24
 
 ### Fixed

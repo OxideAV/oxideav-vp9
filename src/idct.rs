@@ -160,7 +160,8 @@ fn sh(t: &mut [i64], s: &[i64], a: usize, b: usize) {
 /// §8.7.1.2 inverse-DCT array permutation: `T[i] = copyT[ brev(n, i) ]`.
 fn idct_permute(t: &mut [i64], n: u32) {
     let len = 1usize << n;
-    let copy_t: Vec<i64> = t[..len].to_vec();
+    let mut copy_t = [0i64; 32];
+    copy_t[..len].copy_from_slice(&t[..len]);
     for i in 0..len {
         t[i] = copy_t[brev(n, i)];
     }
@@ -259,7 +260,8 @@ fn inverse_dct(t: &mut [i64], n: u32) {
 fn adst_input_permute(t: &mut [i64], n: u32) {
     let n0 = 1usize << n;
     let n1 = 1usize << (n - 1);
-    let copy_t: Vec<i64> = t[..n0].to_vec();
+    let mut copy_t = [0i64; 32];
+    copy_t[..n0].copy_from_slice(&t[..n0]);
     for i in 0..n1 {
         t[2 * i] = copy_t[n0 - 1 - 2 * i];
         t[2 * i + 1] = copy_t[2 * i];
@@ -270,7 +272,8 @@ fn adst_input_permute(t: &mut [i64], n: u32) {
 /// `1<<n` for `n` in `{3, 4}`.
 fn adst_output_permute(t: &mut [i64], n: u32) {
     let n0 = 1usize << n;
-    let copy_t: Vec<i64> = t[..n0].to_vec();
+    let mut copy_t = [0i64; 32];
+    copy_t[..n0].copy_from_slice(&t[..n0]);
     if n == 4 {
         for a in 0..2usize {
             for b in 0..2usize {
@@ -495,6 +498,23 @@ fn apply_1d(t: &mut [i64], n: u32, use_dct: bool) {
 ///
 /// On return `dequant` holds the spatial-domain residual.
 pub(crate) fn inverse_transform_2d(dequant: &mut [i64], n: u32, tx_type: u8, lossless: bool) {
+    match n {
+        2 => inverse_transform_2d_n::<2>(dequant, tx_type, lossless),
+        3 => inverse_transform_2d_n::<3>(dequant, tx_type, lossless),
+        4 => inverse_transform_2d_n::<4>(dequant, tx_type, lossless),
+        _ => inverse_transform_2d_n::<5>(dequant, tx_type, lossless),
+    }
+}
+
+/// The spec-literal §8.7.2 driver over the recursive §8.7.1 processes
+/// — the oracle the fast [`inverse_transform_2d`] is pinned against.
+#[cfg(test)]
+pub(crate) fn inverse_transform_2d_reference(
+    dequant: &mut [i64],
+    n: u32,
+    tx_type: u8,
+    lossless: bool,
+) {
     let n0 = 1usize << n;
     let mut t = vec![0i64; n0];
 
@@ -537,9 +557,265 @@ pub(crate) fn inverse_transform_2d(dequant: &mut [i64], n: u32, tx_type: u8, los
     }
 }
 
+// ───────────── fast §8.7 paths (same arithmetic, unrolled) ─────────────
+//
+// The processes below perform exactly the §8.7.1 / §8.7.2 operations of
+// the spec-literal functions above, in the same order and with the same
+// 64-bit intermediates: the recursive §8.7.1.3 DCT is flattened into its
+// stage sequence (`inverse_dct( n )` is `B( 0, 1, 16, 1 )` followed by
+// the per-level tails for 2..=n), the arrays live on the stack, and the
+// transform size is a compile-time constant so every angle / index
+// folds. An all-zero input row stays zero through every 1D process (each
+// output is a sum of products of the inputs, rounded: Round2( 0, k ) =
+// 0), so the row pass skips such rows; a DC-only DCT_DCT block is
+// constant (each DCT stage maps a vector whose only non-zero entry is
+// T[ 0 ] to a constant vector: the base butterfly writes Round2( T[ 0 ] *
+// cos64( 16 ), 14 ) to T[ 0 ] and T[ 1 ], and every later butterfly sees
+// zeros while every Hadamard adds a zero), which is evaluated directly.
+
+/// `brev( n, i )` for `n = 2..=5`, `i < 1 << n`.
+const BREV: [[u8; 32]; 6] = {
+    let mut t = [[0u8; 32]; 6];
+    let mut n = 2;
+    while n <= 5 {
+        let mut i = 0;
+        while i < (1 << n) {
+            let mut r = 0;
+            let mut b = 0;
+            while b < n {
+                r |= ((i >> b) & 1) << (n - 1 - b);
+                b += 1;
+            }
+            t[n][i] = r as u8;
+            i += 1;
+        }
+        n += 1;
+    }
+    t
+};
+
+#[inline(always)]
+fn fb(t: &mut [i64; 32], a: usize, b: usize, angle: i32, flip: bool) {
+    let (x, y) = if (angle & 31) == 16 {
+        let (v, w) = if (angle & 32) != 0 {
+            (t[a] + t[b], -t[a] + t[b])
+        } else {
+            (t[a] - t[b], t[a] + t[b])
+        };
+        let c = cos64(angle);
+        (v * c, w * c)
+    } else {
+        (
+            t[a] * cos64(angle) - t[b] * sin64(angle),
+            t[a] * sin64(angle) + t[b] * cos64(angle),
+        )
+    };
+    if flip {
+        t[b] = round2(x, 14);
+        t[a] = round2(y, 14);
+    } else {
+        t[a] = round2(x, 14);
+        t[b] = round2(y, 14);
+    }
+}
+
+#[inline(always)]
+fn fh(t: &mut [i64; 32], a: usize, b: usize, flip: bool) {
+    let (a, b) = if flip { (b, a) } else { (a, b) };
+    let (x, y) = (t[a], t[b]);
+    t[a] = x + y;
+    t[b] = x - y;
+}
+
+/// The §8.7.1.3 level-`n` tail (everything after the recursive call).
+#[inline(always)]
+fn dct_level(t: &mut [i64; 32], n: u32) {
+    let n0 = 1usize << n;
+    let n1 = 1usize << (n - 1);
+    let n2 = 1usize << (n - 2);
+    let n3 = if n >= 3 { 1usize << (n - 3) } else { 0 };
+    let ni = n as i32;
+    for i in 0..n2 {
+        let angle = 32 - BREV[5][n1 + i] as i32;
+        fb(t, n1 + i, n0 - 1 - i, angle, false);
+    }
+    if n >= 3 {
+        for i in 0..n3 {
+            for j in 0..2 {
+                fh(t, n1 + 4 * i + 2 * j, n1 + 1 + 4 * i + 2 * j, j != 0);
+            }
+        }
+    }
+    if n == 5 {
+        for i in 0..2usize {
+            for j in 0..2usize {
+                let a = n0 as i32 - ni + 3 - n2 as i32 * j as i32 - 4 * i as i32;
+                let b = n1 as i32 + ni - 4 + n2 as i32 * j as i32 + 4 * i as i32;
+                fb(
+                    t,
+                    a as usize,
+                    b as usize,
+                    28 - 16 * i as i32 + 56 * j as i32,
+                    true,
+                );
+            }
+        }
+        for i in 0..2usize {
+            for j in 0..4usize {
+                fh(t, n1 + n3 * j + i, n1 + n2 - 5 + n3 * j - i, (j & 1) != 0);
+            }
+        }
+    }
+    if n >= 4 {
+        let i_max = if n == 5 { 1usize } else { 0usize };
+        for i in 0..=i_max {
+            for j in 0..2usize {
+                let a = n0 as i32 - ni + 2 - i as i32 - n2 as i32 * j as i32;
+                let b = n1 as i32 + ni - 3 + i as i32 + n2 as i32 * j as i32;
+                fb(t, a as usize, b as usize, 24 + 48 * j as i32, true);
+            }
+        }
+        for i in 0..=(2 * ni - 7) as usize {
+            for j in 0..2usize {
+                fh(t, n1 + n2 * j + i, n1 + n2 - 1 + n2 * j - i, (j & 1) != 0);
+            }
+        }
+    }
+    if n >= 3 {
+        for i in 0..n3 {
+            fb(t, n0 - n3 - 1 - i, n1 + n3 + i, 16, true);
+        }
+    }
+    for i in 0..n1 {
+        fh(t, i, n0 - 1 - i, false);
+    }
+}
+
+/// §8.7.1.2 permutation + §8.7.1.3 inverse DCT of `t[ ..1 << N ]`.
+#[inline(always)]
+fn idct_fast<const N: u32>(t: &mut [i64; 32]) {
+    let len = 1usize << N;
+    let c = *t;
+    for i in 0..len {
+        t[i] = c[BREV[N as usize][i] as usize];
+    }
+    fb(t, 0, 1, 16, true);
+    for m in 2..=N {
+        dct_level(t, m);
+    }
+}
+
+#[inline(always)]
+fn apply_1d_fast<const N: u32>(t: &mut [i64; 32], use_dct: bool) {
+    if use_dct {
+        idct_fast::<N>(t);
+    } else {
+        inverse_adst(&mut t[..1 << N], N);
+    }
+}
+
+/// [`inverse_transform_2d`] at a constant size `N` (see the section
+/// note for the zero-row and DC-only shortcuts).
+fn inverse_transform_2d_n<const N: u32>(dequant: &mut [i64], tx_type: u8, lossless: bool) {
+    let n0 = 1usize << N;
+    let block = &mut dequant[..n0 * n0];
+    let shift = core::cmp::min(6, N + 2);
+
+    if !lossless && tx_type == DCT_DCT && block[1..].iter().all(|&v| v == 0) {
+        let c = COS64_LOOKUP[16];
+        let row = round2(block[0] * c, 14);
+        let col = round2(row * c, 14);
+        block.fill(round2(col, shift));
+        return;
+    }
+
+    let row_dct = tx_type == DCT_DCT || tx_type == ADST_DCT;
+    let col_dct = tx_type == DCT_DCT || tx_type == DCT_ADST;
+    let mut t = [0i64; 32];
+    for row in block.chunks_exact_mut(n0) {
+        if row.iter().all(|&v| v == 0) {
+            continue;
+        }
+        t[..n0].copy_from_slice(row);
+        if lossless {
+            inverse_wht(&mut t, 2);
+        } else {
+            apply_1d_fast::<N>(&mut t, row_dct);
+        }
+        row.copy_from_slice(&t[..n0]);
+    }
+
+    for j in 0..n0 {
+        for i in 0..n0 {
+            t[i] = block[i * n0 + j];
+        }
+        if lossless {
+            inverse_wht(&mut t, 0);
+            for i in 0..n0 {
+                block[i * n0 + j] = t[i];
+            }
+        } else {
+            apply_1d_fast::<N>(&mut t, col_dct);
+            for i in 0..n0 {
+                block[i * n0 + j] = round2(t[i], shift);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The fast driver is the spec-literal one, bit for bit, at every
+    /// size / type (including the lossless WHT path) on sparse and dense
+    /// random coefficient blocks.
+    #[test]
+    fn fast_transform_matches_spec_literal() {
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for n in 2..=5u32 {
+            let n0 = 1usize << n;
+            for tx_type in [DCT_DCT, ADST_DCT, DCT_ADST, ADST_ADST] {
+                if n == 5 && tx_type != DCT_DCT {
+                    continue;
+                }
+                for lossless in [false, true] {
+                    if lossless && n != 2 {
+                        continue;
+                    }
+                    for trial in 0..400 {
+                        let mut block = vec![0i64; n0 * n0];
+                        let density = trial % 5;
+                        for (k, v) in block.iter_mut().enumerate() {
+                            let r = next();
+                            let keep = match density {
+                                0 => k == 0,
+                                1 => k < 3 && r % 2 == 0,
+                                2 => r % 7 == 0,
+                                3 => r % 2 == 0,
+                                _ => true,
+                            };
+                            if keep {
+                                let mag = (next() % (1 << (6 + trial % 12))) as i64;
+                                *v = if next() & 1 == 0 { mag } else { -mag };
+                            }
+                        }
+                        let mut a = block.clone();
+                        let mut b = block;
+                        inverse_transform_2d(&mut a, n, tx_type, lossless);
+                        inverse_transform_2d_reference(&mut b, n, tx_type, lossless);
+                        assert_eq!(a, b, "n={n} tx_type={tx_type} lossless={lossless}");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn cos64_lookup_anchors() {

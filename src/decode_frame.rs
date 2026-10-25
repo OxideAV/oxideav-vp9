@@ -492,19 +492,22 @@ impl BlockDecoder<'_> {
                             eob_total += u32::from(nonzero);
 
                             // §8.6.2 reconstruct( plane, startX, startY,
-                            // txSz ).
-                            reconstruct_block(
-                                plane_buf,
-                                start_x as usize,
-                                start_y as usize,
-                                tx_sz,
-                                &self.tok_buf[..seg_eob],
-                                dc_quant,
-                                ac_quant,
-                                tx_type,
-                                self.lossless,
-                                self.bit_depth,
-                            );
+                            // txSz ) — a no-op on an all-zero residual
+                            // (the transform of zeros is zero).
+                            if nonzero {
+                                reconstruct_block(
+                                    plane_buf,
+                                    start_x as usize,
+                                    start_y as usize,
+                                    tx_sz,
+                                    &self.tok_buf[..seg_eob],
+                                    dc_quant,
+                                    ac_quant,
+                                    tx_type,
+                                    self.lossless,
+                                    self.bit_depth,
+                                );
+                            }
                         }
                     }
 
@@ -979,18 +982,24 @@ impl BlockDecoder<'_> {
                             )?;
                             eob_total += u32::from(nonzero);
 
-                            reconstruct_block(
-                                plane_buf,
-                                start_x as usize,
-                                start_y as usize,
-                                tx_sz,
-                                &self.tok_buf[..seg_eob],
-                                dc_quant,
-                                ac_quant,
-                                tx_type,
-                                self.lossless,
-                                self.bit_depth,
-                            );
+                            // An all-zero residual (no token read) leaves
+                            // the prediction unchanged: the §8.7 transform
+                            // of zeros is zero and Clip1 of an in-range
+                            // sample is the sample.
+                            if nonzero {
+                                reconstruct_block(
+                                    plane_buf,
+                                    start_x as usize,
+                                    start_y as usize,
+                                    tx_sz,
+                                    &self.tok_buf[..seg_eob],
+                                    dc_quant,
+                                    ac_quant,
+                                    tx_type,
+                                    self.lossless,
+                                    self.bit_depth,
+                                );
+                            }
                         }
                     }
 

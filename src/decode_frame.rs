@@ -40,6 +40,7 @@
 //! (§6.2, §6.3, §6.4-§6.4.26, §7.2.6, §7.4.1-§7.4.4, §8.5.1, §8.6,
 //! §8.7, §8.8, §8.10).
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use oxideav_core::ExecutionContext;
@@ -53,7 +54,7 @@ use crate::compressed::{
 };
 use crate::decode_block::{DecodedBlockResult, Vp9FrameState, decode_block_apply};
 use crate::dequant::{get_ac_quant, get_dc_quant, seg_feature_active};
-use crate::frame_buf::{BandPlane, FrameBuf, HALO};
+use crate::frame_buf::{Band, FrameBuf, HALO, MiRow, PlaneGeom, band_rows};
 use crate::header::{
     ColorConfig, FrameType, MAX_SEGMENTS, QuantizationParams, RefFrameState, SEG_LVL_MAX,
     SegmentationParams, Vp9FrameHeader, parse_uncompressed_header,
@@ -87,7 +88,7 @@ use crate::superblock_loop_filter::{
     PlaneWindow, SuperblockFilterFrame, superblock_loop_filter_window_at,
 };
 use crate::tokens::{NonzeroContext, TokenBlockCtx, tokens_eob};
-use crate::worker_pool::WorkerPool;
+use crate::worker_pool::{Batch, Job, WorkerPool};
 
 /// One decoded VP9 frame, cropped to the §8.10 output extents.
 ///
@@ -1120,11 +1121,9 @@ struct FrameDecodeProducts {
     /// The MI-aligned decoded planes + geometry (shared by the §8.10
     /// reference slots and the output).
     frame: Arc<FrameBuf>,
-    /// The §6.4.4 frame-wide state (carries `Mvs` / `RefFrames` /
-    /// `SegmentIds` for the next frame's §6.5 / §6.4.14 reads).
-    state: Vp9FrameState,
     /// The §9.3.4 syntax-element count bank accumulated over the frame,
     /// consumed by the §6.1.2 `refresh_probs( )` backward adaptation.
+    #[cfg_attr(not(test), allow(dead_code))]
     counts: Box<crate::prob_adapt::FrameCounts>,
 }
 
@@ -1135,28 +1134,11 @@ enum ChdrKind {
     Inter(Box<Vp9CompressedHeaderInter>),
 }
 
-/// The previous-frame state an inter frame's §6.5 / §6.4.14 reads need.
-struct PrevFrameState {
-    /// The previous decoded frame's §6.4.4 state: `RefFrames[ ][ ][ ]`
-    /// / `Mvs[ ][ ][ ]` stored `[mi * 2 + list]`, `SegmentId[ ][ ]`.
-    state: Arc<Vp9FrameState>,
-    /// The §6.4.14 `PrevSegmentIds[ ][ ]` map when it is not the
-    /// previous frame's own `SegmentIds` (the last map-bearing frame, or
-    /// the zero map an error-resilient frame resets to).
-    segment_ids: Option<Arc<Vec<u8>>>,
-    /// §7.2.6 condition (c): `show_frame` of the previous
-    /// `compute_image_size( )` invocation. Gates `UsePrevFrameMvs`
-    /// ONLY — §8.1 step 3 refreshes `PrevSegmentIds` after every decoded
-    /// `update_map = 1` frame, shown or hidden, so the §6.4.14 predictor
-    /// stays readable behind a hidden alt-ref.
-    prev_shown: bool,
-}
-
 /// The read-only per-frame inputs every §6.4.2 `decode_tile( )` call
-/// shares — the parsed headers, the §8.10 reference buffers, and the
-/// previous frame's §6.5 / §6.4.14 snapshots. One instance is built per
-/// frame and borrowed by every tile decode (serial or tile-parallel:
-/// nothing in here is written during the §6.4 tile walk).
+/// shares — the parsed headers and the §8.10 reference buffers (the
+/// previous frame's §6.5 / §6.4.14 snapshots arrive per superblock row,
+/// see `PrevRows`). Nothing in here is written during the §6.4 tile
+/// walk.
 struct TileDecodeShared<'a> {
     hdr: &'a Vp9FrameHeader,
     chdr: &'a Vp9CompressedHeader,
@@ -1169,9 +1151,6 @@ struct TileDecodeShared<'a> {
     bit_depth: u32,
     lossless: bool,
     use_prev_frame_mvs: bool,
-    prev_ref_frames: &'a [i32],
-    prev_mvs: &'a [(i16, i16)],
-    prev_segment_ids: &'a [u8],
 }
 
 /// One `(tileRow, tileCol)` cell of the §6.4 tile grid: its
@@ -1209,81 +1188,97 @@ struct TileWorkState<'a> {
     tok_buf: &'a mut [i64; 1024],
 }
 
+/// The previous frame's §6.5 motion field and the §6.4.14
+/// `PrevSegmentIds[ ][ ]` map as one tile column reads them: frame-wide
+/// arrays (the layout the §6.5 / §6.4.14 readers index) filled one
+/// superblock row at a time, right before that row decodes, from the
+/// source frames' frozen mode-info rows — so a frame can start while
+/// the frame before it is still decoding. Every read of a superblock
+/// row's blocks stays inside that row (§6.5 reads the co-located
+/// `PrevMvs[ MiRow ][ MiCol ]`; §6.4.14 the block's own extent).
+pub(crate) struct PrevRows {
+    ref_frames: Vec<i32>,
+    mvs: Vec<(i16, i16)>,
+    seg: Vec<u8>,
+}
+
+impl PrevRows {
+    fn new() -> Self {
+        Self {
+            ref_frames: Vec::new(),
+            mvs: Vec::new(),
+            seg: Vec::new(),
+        }
+    }
+
+    /// Size the arrays for a `mi_rows x mi_cols` frame (contents are
+    /// rewritten row by row before use).
+    fn fit(&mut self, mi_rows: u32, mi_cols: u32) {
+        let n = (mi_rows * mi_cols) as usize;
+        self.ref_frames.resize(2 * n, 0);
+        self.mvs.resize(2 * n, (0, 0));
+        self.seg.resize(n, 0);
+    }
+
+    /// Fill superblock row `sb` (MI rows `8 * sb ..`) from `mv_src` /
+    /// `seg_src` (zero when absent), waiting for their rows to freeze.
+    fn import(
+        &mut self,
+        sb: usize,
+        mv_src: Option<&FrameBuf>,
+        seg_src: Option<&FrameBuf>,
+        mi_rows: u32,
+        mi_cols: u32,
+    ) -> Result<(), Error> {
+        let cols = mi_cols as usize;
+        let r0 = sb * 8;
+        let r1 = (r0 + 8).min(mi_rows as usize);
+        let n = (r1 - r0) * cols;
+        let at = r0 * cols;
+        match mv_src.map(|f| f.mi_row(sb)) {
+            Some(None) => return Err(Error::InvalidBitstream),
+            Some(Some(row)) => {
+                for i in 0..n {
+                    self.ref_frames[2 * (at + i)] = row.ref0[i];
+                    self.ref_frames[2 * (at + i) + 1] = row.ref1[i];
+                    self.mvs[2 * (at + i)] = row.mv0[i];
+                    self.mvs[2 * (at + i) + 1] = row.mv1[i];
+                }
+            }
+            None => {
+                self.ref_frames[2 * at..2 * (at + n)].fill(INTRA_FRAME);
+                self.mvs[2 * at..2 * (at + n)].fill((0, 0));
+            }
+        }
+        match seg_src.map(|f| f.mi_row(sb)) {
+            Some(None) => return Err(Error::InvalidBitstream),
+            Some(Some(row)) => self.seg[at..at + n].copy_from_slice(&row.seg_ids[..n]),
+            None => self.seg[at..at + n].fill(0),
+        }
+        Ok(())
+    }
+}
+
 /// §6.4.2 `decode_tile( )` with its §6.4 line-2326/2328 coder bracket:
 /// `init_bool( tile_size )`, the superblock raster with the §7.4.2
-/// per-superblock-row left resets, `exit_bool( )`. Both the serial
-/// raster and the tile-parallel workers run tiles through this one
-/// body, so the two paths cannot drift.
-/// `on_row( r, y, u, v, state )` runs after each superblock row (MI
-/// row `r`) of the tile is complete, with the tile's planes and state.
+/// per-superblock-row left resets, `exit_bool( )`. Every tile — serial
+/// or concurrent — runs through this one body.
+///
+/// `before_row( prev, r )` runs before each superblock row (MI row `r`)
+/// and fills that row's previous-frame snapshots into `prev` (see
+/// `PrevRows`); `on_row( r, y, u, v, state )` runs after it, with the
+/// tile's planes and state.
+#[allow(clippy::type_complexity)]
 fn decode_one_tile(
     sh: &TileDecodeShared<'_>,
     task: &TileTask<'_>,
     ws: TileWorkState<'_>,
+    prev: &mut PrevRows,
+    before_row: &dyn Fn(&mut PrevRows, u32) -> Result<(), Error>,
     on_row: &mut dyn FnMut(u32, &Plane, &Plane, &Plane, &Vp9FrameState),
 ) -> Result<(), Error> {
     // §6.4 line 2326: init_bool( tile_size ).
     let mut coder = BoolCoder::init_bool(task.slice, task.slice.len())?;
-
-    // Build the per-tile inter context (re-borrowing the per-frame /
-    // per-worker `seg_pred_ctx`). On keyframes / intra-only frames
-    // this is `None` and the §6.4.6 intra arm runs.
-    let inter_ctx = match (sh.chdr_inter, sh.refs) {
-        (Some(ci), Some(rb)) => {
-            let comp_config = ci
-                .compound_reference_config
-                .unwrap_or(CompoundReferenceConfig {
-                    fixed_ref: LAST_FRAME,
-                    var_ref: [GOLDEN_FRAME, ALTREF_FRAME],
-                });
-            // §6.2.5 ref_frame_sign_bias[ 4 ] indexed by §3 value.
-            let mut sb = [false; 4];
-            let hdr_sb = sh.hdr.ref_frame_sign_bias;
-            sb[LAST_FRAME as usize] = hdr_sb[0];
-            sb[GOLDEN_FRAME as usize] = hdr_sb[1];
-            sb[ALTREF_FRAME as usize] = hdr_sb[2];
-            Some(InterCtx {
-                chdr: ci,
-                refs: rb,
-                ref_frame_idx: sh.hdr.ref_frame_idx.unwrap_or([0, 1, 2]),
-                sign_bias: sb,
-                interpolation_filter: sh.hdr.interpolation_filter,
-                allow_high_precision_mv: sh.hdr.allow_high_precision_mv,
-                use_prev_frame_mvs: sh.use_prev_frame_mvs,
-                comp_config,
-                frame_width: sh.hdr.frame_width,
-                frame_height: sh.hdr.frame_height,
-                prev_ref_frames: sh.prev_ref_frames,
-                prev_mvs: sh.prev_mvs,
-                prev_segment_ids: sh.prev_segment_ids,
-                seg_pred_ctx: ws.seg_pred_ctx,
-            })
-        }
-        _ => None,
-    };
-
-    let mut block_decoder = BlockDecoder {
-        seg: &sh.hdr.segmentation,
-        quant: &sh.hdr.quantization,
-        chdr: sh.chdr,
-        mi_rows: sh.mi_rows,
-        mi_cols: sh.mi_cols,
-        mi_col_start: task.mi_col_start,
-        mi_col_end: task.mi_col_end,
-        subsampling_x: sh.ssx,
-        subsampling_y: sh.ssy,
-        bit_depth: sh.bit_depth,
-        lossless: sh.lossless,
-        state: ws.state,
-        y: ws.plane_y,
-        u: ws.plane_u,
-        v: ws.plane_v,
-        nz: ws.nz,
-        token_cache: ws.token_cache,
-        tok_buf: ws.tok_buf,
-        counts: ws.counts,
-        inter: inter_ctx,
-    };
 
     // §6.4.3 partition probs: keyframe fixed table or the inter
     // running `partition_probs[ ]`.
@@ -1291,41 +1286,111 @@ fn decode_one_tile(
         Some(ci) => PartitionProbsKind::Inter(&ci.partition_probs),
         None => PartitionProbsKind::Keyframe,
     };
+    let TileWorkState {
+        state,
+        plane_y,
+        plane_u,
+        plane_v,
+        nz,
+        pctx,
+        seg_pred_ctx,
+        counts,
+        token_cache,
+        tok_buf,
+    } = ws;
 
     // §6.4.2 decode_tile( ): superblock raster with the
     // §7.4.2 clear_left_context( ) reset per superblock row
     // (LeftNonzeroContext + LeftPartitionContext).
     let mut r = task.mi_row_start;
     while r < task.mi_row_end {
-        ws.pctx.clear_left();
-        if let Some(ic) = block_decoder.inter.as_mut() {
-            ic.seg_pred_ctx.clear_left();
+        before_row(prev, r)?;
+        let prev = &*prev;
+        // The per-row inter context (re-borrowing the per-worker
+        // `seg_pred_ctx`). On keyframes / intra-only frames this is
+        // `None` and the §6.4.6 intra arm runs.
+        let inter_ctx = match (sh.chdr_inter, sh.refs) {
+            (Some(ci), Some(rb)) => {
+                let comp_config = ci
+                    .compound_reference_config
+                    .unwrap_or(CompoundReferenceConfig {
+                        fixed_ref: LAST_FRAME,
+                        var_ref: [GOLDEN_FRAME, ALTREF_FRAME],
+                    });
+                // §6.2.5 ref_frame_sign_bias[ 4 ] indexed by §3 value.
+                let mut sb = [false; 4];
+                let hdr_sb = sh.hdr.ref_frame_sign_bias;
+                sb[LAST_FRAME as usize] = hdr_sb[0];
+                sb[GOLDEN_FRAME as usize] = hdr_sb[1];
+                sb[ALTREF_FRAME as usize] = hdr_sb[2];
+                Some(InterCtx {
+                    chdr: ci,
+                    refs: rb,
+                    ref_frame_idx: sh.hdr.ref_frame_idx.unwrap_or([0, 1, 2]),
+                    sign_bias: sb,
+                    interpolation_filter: sh.hdr.interpolation_filter,
+                    allow_high_precision_mv: sh.hdr.allow_high_precision_mv,
+                    use_prev_frame_mvs: sh.use_prev_frame_mvs,
+                    comp_config,
+                    frame_width: sh.hdr.frame_width,
+                    frame_height: sh.hdr.frame_height,
+                    prev_ref_frames: &prev.ref_frames,
+                    prev_mvs: &prev.mvs,
+                    prev_segment_ids: &prev.seg,
+                    seg_pred_ctx: &mut *seg_pred_ctx,
+                })
+            }
+            _ => None,
+        };
+
+        {
+            let mut block_decoder = BlockDecoder {
+                seg: &sh.hdr.segmentation,
+                quant: &sh.hdr.quantization,
+                chdr: sh.chdr,
+                mi_rows: sh.mi_rows,
+                mi_cols: sh.mi_cols,
+                mi_col_start: task.mi_col_start,
+                mi_col_end: task.mi_col_end,
+                subsampling_x: sh.ssx,
+                subsampling_y: sh.ssy,
+                bit_depth: sh.bit_depth,
+                lossless: sh.lossless,
+                state: &mut *state,
+                y: &mut *plane_y,
+                u: &mut *plane_u,
+                v: &mut *plane_v,
+                nz: &mut *nz,
+                token_cache: &mut *token_cache,
+                tok_buf: &mut *tok_buf,
+                counts: &mut *counts,
+                inter: inter_ctx,
+            };
+
+            pctx.clear_left();
+            if let Some(ic) = block_decoder.inter.as_mut() {
+                ic.seg_pred_ctx.clear_left();
+            }
+            for plane_nz in block_decoder.nz.iter_mut() {
+                plane_nz.left.fill(0);
+            }
+            let mut c = task.mi_col_start;
+            while c < task.mi_col_end {
+                decode_partition(
+                    &mut coder,
+                    r,
+                    c,
+                    BLOCK_64X64,
+                    sh.mi_rows,
+                    sh.mi_cols,
+                    pctx,
+                    part_kind,
+                    &mut block_decoder,
+                )?;
+                c += 8;
+            }
         }
-        for plane_nz in block_decoder.nz.iter_mut() {
-            plane_nz.left.fill(0);
-        }
-        let mut c = task.mi_col_start;
-        while c < task.mi_col_end {
-            decode_partition(
-                &mut coder,
-                r,
-                c,
-                BLOCK_64X64,
-                sh.mi_rows,
-                sh.mi_cols,
-                ws.pctx,
-                part_kind,
-                &mut block_decoder,
-            )?;
-            c += 8;
-        }
-        on_row(
-            r,
-            block_decoder.y,
-            block_decoder.u,
-            block_decoder.v,
-            block_decoder.state,
-        );
+        on_row(r, plane_y, plane_u, plane_v, state);
         r += 8;
     }
 
@@ -1337,7 +1402,8 @@ fn decode_one_tile(
 // ───────────────────────── frame pipeline ─────────────────────────
 //
 // A frame decodes as a batch of jobs on the decoder's persistent
-// [`WorkerPool`] (or inline, in the same order, without one):
+// [`WorkerPool`] (or on the caller, in the same order, without helper
+// threads):
 //
 // 1. one job per §6.4 tile *column* (every tile row of it, in row
 //    order), decoding into the worker's private working planes and
@@ -1346,15 +1412,23 @@ fn decode_one_tile(
 //    §8.5.1 edge reads bounded by the block, §6.5 candidate scans
 //    clamped to the tile window), so each column evolves exactly as in
 //    the serial raster. After each superblock row the job copies its
-//    reconstructed rows into that row's band of the frame and its mode
-//    info into the row's loop-filter view, then publishes the row;
+//    reconstructed rows into that row's band and its mode info into the
+//    row's mode-info record, then publishes the row; the last column to
+//    publish a row freezes its mode info into the frame;
 // 2. one job per superblock row for the §8.8 loop filter, which starts
 //    as soon as every tile column has published the row and runs two
-//    superblocks behind the row above (see
-//    [`crate::frame_loop_filter::frame_loop_filter_rows`] for why that
-//    wavefront reproduces the raster). Intra prediction reads the
-//    tile's private (unfiltered) planes, never the bands, so filtering
-//    overlaps decoding.
+//    superblocks behind the row above (see [`loop_filter_row_job`] for
+//    why that wavefront reproduces the raster), freezing each band once
+//    nothing can change it any more. Intra prediction reads the tile's
+//    private (unfiltered) planes, never the bands, so filtering overlaps
+//    decoding.
+//
+// Consecutive frames overlap too: a frame's batch may be submitted
+// while earlier ones still run. Its tile rows read the reference frames
+// and the previous frame's motion field / segment map through the
+// frozen rows of those frames, blocking only on rows not frozen yet
+// (`FrameBuf::row`, `PrevRows::import`); every such wait is on a job
+// queued earlier, which the pool's FIFO order keeps deadlock-free.
 //
 // The bytes do not depend on the schedule: every band and every slot is
 // written by exactly one job, merges are by disjoint column ranges, and
@@ -1378,12 +1452,10 @@ struct FrameJob {
     chdr: Vp9CompressedHeader,
     chdr_inter: Option<Vp9CompressedHeaderInter>,
     refs: Option<RefBuffers>,
-    prev: Option<PrevFrameState>,
-    /// The zero §6.5 / §6.4.14 snapshots used when there is no
-    /// same-size previous frame (empty otherwise).
-    zero_ref: Vec<i32>,
-    zero_mvs: Vec<(i16, i16)>,
-    zero_seg: Vec<u8>,
+    /// The §6.5 previous-frame motion field source (`None` = zeros).
+    prev_mvs: Option<Arc<FrameBuf>>,
+    /// The §6.4.14 `PrevSegmentIds[ ][ ]` source (`None` = zeros).
+    prev_seg: Option<Arc<FrameBuf>>,
     use_prev_frame_mvs: bool,
     tiles: Vec<TileSpan>,
     tile_cols: usize,
@@ -1399,6 +1471,35 @@ struct FrameJob {
     geom: [(usize, usize, u32, u32); 3],
     /// `Some` when the §8.8 loop filter runs (`loop_filter_level != 0`).
     lf: Option<LfParams>,
+}
+
+impl FrameJob {
+    fn shared(&self) -> TileDecodeShared<'_> {
+        TileDecodeShared {
+            hdr: &self.hdr,
+            chdr: &self.chdr,
+            chdr_inter: self.chdr_inter.as_ref(),
+            refs: self.refs.as_ref(),
+            mi_rows: self.mi_rows,
+            mi_cols: self.mi_cols,
+            ssx: self.ssx,
+            ssy: self.ssy,
+            bit_depth: self.bit_depth,
+            lossless: self.lossless,
+            use_prev_frame_mvs: self.use_prev_frame_mvs,
+        }
+    }
+
+    fn task(&self, i: usize) -> TileTask<'_> {
+        let t = &self.tiles[i];
+        TileTask {
+            mi_row_start: t.mi_row_start,
+            mi_row_end: t.mi_row_end,
+            mi_col_start: t.mi_col_start,
+            mi_col_end: t.mi_col_end,
+            slice: &self.data[t.start..t.start + t.len],
+        }
+    }
 }
 
 /// What the §8.8 loop-filter row jobs need to know about the frame.
@@ -1419,82 +1520,6 @@ struct LfParams {
     ready_at: usize,
 }
 
-impl FrameJob {
-    /// The §6.5 / §6.4.14 previous-frame snapshots (zero when absent).
-    fn prev_slices(&self) -> (&[i32], &[(i16, i16)], &[u8]) {
-        let n = (self.mi_rows * self.mi_cols) as usize;
-        match &self.prev {
-            Some(p) => {
-                let seg = p
-                    .segment_ids
-                    .as_deref()
-                    .map(Vec::as_slice)
-                    .unwrap_or(&p.state.segment_ids);
-                if p.state.ref_frames.len() == n * 2 && p.state.mvs.len() == n * 2 && seg.len() == n
-                {
-                    return (&p.state.ref_frames, &p.state.mvs, seg);
-                }
-                (&self.zero_ref, &self.zero_mvs, &self.zero_seg)
-            }
-            None => (&self.zero_ref, &self.zero_mvs, &self.zero_seg),
-        }
-    }
-
-    fn shared(&self) -> TileDecodeShared<'_> {
-        let (prev_ref_frames, prev_mvs, prev_segment_ids) = self.prev_slices();
-        TileDecodeShared {
-            hdr: &self.hdr,
-            chdr: &self.chdr,
-            chdr_inter: self.chdr_inter.as_ref(),
-            refs: self.refs.as_ref(),
-            mi_rows: self.mi_rows,
-            mi_cols: self.mi_cols,
-            ssx: self.ssx,
-            ssy: self.ssy,
-            bit_depth: self.bit_depth,
-            lossless: self.lossless,
-            use_prev_frame_mvs: self.use_prev_frame_mvs,
-            prev_ref_frames,
-            prev_mvs,
-            prev_segment_ids,
-        }
-    }
-
-    fn task(&self, i: usize) -> TileTask<'_> {
-        let t = &self.tiles[i];
-        TileTask {
-            mi_row_start: t.mi_row_start,
-            mi_row_end: t.mi_row_end,
-            mi_col_start: t.mi_col_start,
-            mi_col_end: t.mi_col_end,
-            slice: &self.data[t.start..t.start + t.len],
-        }
-    }
-}
-
-/// One superblock row's mode info as the §8.8 loop filter reads it.
-struct LfRow {
-    mi_sizes: Vec<u8>,
-    tx_sizes: Vec<u8>,
-    skips: Vec<bool>,
-    ref0: Vec<i32>,
-    y_modes: Vec<u8>,
-    seg_ids: Vec<u8>,
-}
-
-impl LfRow {
-    fn new(n: usize) -> Self {
-        Self {
-            mi_sizes: vec![0; n],
-            tx_sizes: vec![0; n],
-            skips: vec![false; n],
-            ref0: vec![0; n],
-            y_modes: vec![0; n],
-            seg_ids: vec![0; n],
-        }
-    }
-}
-
 struct Progress {
     /// Tile columns that have published each superblock row.
     tiles_done: Vec<usize>,
@@ -1505,25 +1530,26 @@ struct Progress {
 
 /// A finished tile column.
 struct TileOut {
-    col_lo: u32,
-    col_hi: u32,
-    state: Vp9FrameState,
     counts: Box<crate::prob_adapt::FrameCounts>,
 }
 
-/// A tile column's outcome: its products, or its first error with the
+/// A tile column's outcome: its counts, or its first error with the
 /// tile index.
 type TileResult = Result<TileOut, (usize, Error)>;
 
-/// Recycled band storage for the next frame (per plane, per band).
-pub(crate) type Bands = [Vec<Vec<i32>>; 3];
+/// Recycled band storage for the next frame (one entry per band).
+pub(crate) type Bands = Vec<Option<Band>>;
 
 /// The shared mutable state of one frame's batch.
 struct FramePipe {
-    /// Per superblock row: the three planes' bands (`HALO` scratch rows
-    /// then the band's own rows).
-    bands: Vec<Mutex<[Vec<i32>; 3]>>,
-    lf_rows: Vec<Mutex<LfRow>>,
+    /// The frame being built: rows are frozen into it as they finish.
+    frame: Arc<FrameBuf>,
+    /// Per superblock row: the three planes' working bands (`HALO`
+    /// scratch rows then the band's own rows), until frozen.
+    bands: Vec<Mutex<Band>>,
+    /// Per superblock row: the mode info the tile columns publish,
+    /// until frozen.
+    mi_build: Vec<Mutex<MiRow>>,
     /// `slots[ r * Sb64Cols + c ]`: the bottom `HALO` rows of superblock
     /// `(r, c)` per plane, as loop-filter row `r` leaves them.
     slots: Vec<OnceLock<[Vec<i32>; 3]>>,
@@ -1535,6 +1561,8 @@ struct FramePipe {
     /// Per tile column: its products, or its first error (with the tile
     /// index, for the deterministic raster-order error surface).
     tile_out: Mutex<Vec<Option<TileResult>>>,
+    /// Signalled when a tile column finishes.
+    tiles_finished: Condvar,
 }
 
 impl FramePipe {
@@ -1562,6 +1590,7 @@ impl FramePipe {
         for cv in &self.changed {
             cv.notify_all();
         }
+        self.frame.fail();
     }
 
     /// Wake row `r`'s waiter (if that row exists).
@@ -1569,6 +1598,18 @@ impl FramePipe {
         if let Some(cv) = self.changed.get(r) {
             cv.notify_all();
         }
+    }
+
+    /// Block until every tile column has finished; their outcomes.
+    fn wait_tiles(&self) -> std::sync::MutexGuard<'_, Vec<Option<TileResult>>> {
+        let mut t = lock(&self.tile_out);
+        while t.iter().any(Option::is_none) {
+            t = self
+                .tiles_finished
+                .wait(t)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        t
     }
 }
 
@@ -1597,8 +1638,9 @@ pub(crate) struct TileScratch {
     v: Plane,
     token_cache: Box<[u8; 1024]>,
     tok_buf: Box<[i64; 1024]>,
-    /// A spare §6.4.4 state allocation (zeroed before use).
+    /// The §6.4.4 state allocation (zeroed before use).
     state: Option<Vp9FrameState>,
+    prev: PrevRows,
 }
 
 /// The decoder's pool of [`TileScratch`].
@@ -1620,22 +1662,25 @@ fn take_scratch(pool: &ScratchPool, job: &FrameJob) -> TileScratch {
         token_cache: Box::new([0; 1024]),
         tok_buf: Box::new([0; 1024]),
         state: None,
+        prev: PrevRows::new(),
     }
 }
 
 /// Copy MI row range `[ r0, r1 )`, columns `[ c0, c1 )` of `src` (`m`
-/// entries per MI, the first one taken) into a row-local array starting
-/// at MI row `base`.
+/// entries per MI, entry `k` taken) into a row-local array starting at
+/// MI row `base`.
+#[allow(clippy::too_many_arguments)]
 fn copy_mi_rows<T: Copy, U>(
     dst: &mut [U],
     src: &[T],
     (r0, r1, c0, c1, base, cols): (usize, usize, usize, usize, usize, usize),
     f: impl Fn(T) -> U,
     m: usize,
+    k: usize,
 ) {
     for r in r0..r1 {
         let d = &mut dst[(r - base) * cols + c0..(r - base) * cols + c1];
-        let s = &src[(r * cols + c0) * m..(r * cols + c1) * m];
+        let s = &src[(r * cols + c0) * m + k..(r * cols + c1) * m];
         for (o, v) in d.iter_mut().zip(s.iter().step_by(m)) {
             *o = f(*v);
         }
@@ -1674,26 +1719,33 @@ fn tile_column_job(job: &FrameJob, pipe: &FramePipe, scratch_pool: &ScratchPool,
     pctx.clear_above();
     let mut seg_pred_ctx = SegPredContextState::new(mi_cols, mi_rows);
     let mut counts = crate::prob_adapt::FrameCounts::new_boxed();
+    scratch.prev.fit(mi_rows, mi_cols);
 
-    let mut col_lo = u32::MAX;
-    let mut col_hi = 0u32;
     let mut failure = None;
     for idx in (col..job.tiles.len()).step_by(job.tile_cols) {
         let task = job.task(idx);
-        col_lo = col_lo.min(task.mi_col_start);
-        col_hi = col_hi.max(task.mi_col_end);
         let (c0, c1) = (task.mi_col_start, task.mi_col_end);
-        let mut publish = |r: u32, y: &Plane, u: &Plane, v: &Plane, st: &Vp9FrameState| {
-            publish_tile_row(job, pipe, r, c0, c1, [y, u, v], st);
-        };
         let TileScratch {
             y,
             u,
             v,
             token_cache,
             tok_buf,
+            prev,
             ..
         } = &mut scratch;
+        let before = |prev: &mut PrevRows, r: u32| -> Result<(), Error> {
+            prev.import(
+                (r / 8) as usize,
+                job.prev_mvs.as_deref(),
+                job.prev_seg.as_deref(),
+                mi_rows,
+                mi_cols,
+            )
+        };
+        let mut publish = |r: u32, y: &Plane, u: &Plane, v: &Plane, st: &Vp9FrameState| {
+            publish_tile_row(job, pipe, r, c0, c1, [y, u, v], st);
+        };
         let res = decode_one_tile(
             &sh,
             &task,
@@ -1709,6 +1761,8 @@ fn tile_column_job(job: &FrameJob, pipe: &FramePipe, scratch_pool: &ScratchPool,
                 token_cache,
                 tok_buf,
             },
+            prev,
+            &before,
             &mut publish,
         );
         if let Err(e) = res {
@@ -1722,21 +1776,19 @@ fn tile_column_job(job: &FrameJob, pipe: &FramePipe, scratch_pool: &ScratchPool,
             Err(err)
         }
         None => {
+            scratch.state = Some(state);
             lock(scratch_pool).push(scratch);
-            Ok(TileOut {
-                col_lo,
-                col_hi,
-                state,
-                counts,
-            })
+            Ok(TileOut { counts })
         }
     };
     lock(&pipe.tile_out)[col] = Some(out);
+    pipe.tiles_finished.notify_all();
 }
 
 /// Copy superblock row `r`'s reconstruction (MI columns `[ c0, c1 )`)
-/// into the row's band and mode info into its loop-filter view, then
-/// publish it.
+/// into the row's band and its mode info into the row's record, then
+/// publish it (the last column to publish freezes the mode info — and,
+/// without a loop filter, the band).
 fn publish_tile_row(
     job: &FrameJob,
     pipe: &FramePipe,
@@ -1753,7 +1805,7 @@ fn publish_tile_row(
             let (w, h, shift, _) = job.geom[p];
             let sx = if p == 0 { 0 } else { u32::from(job.ssx) };
             let y0 = sb << shift;
-            let rows = BandPlane::band_rows(h, shift, sb);
+            let rows = band_rows(h, shift, sb);
             let x0 = ((c0 * 8) >> sx) as usize;
             let x1 = (((c1 * 8) >> sx) as usize).min(w);
             let src = plane.samples();
@@ -1764,28 +1816,46 @@ fn publish_tile_row(
             }
         }
     }
-    if job.lf.is_some() {
-        let mut lf = lock(&pipe.lf_rows[sb]);
+    {
+        let mut mi = lock(&pipe.mi_build[sb]);
         let cols = job.mi_cols as usize;
         let r0 = r as usize;
         let r1 = (r as usize + 8).min(job.mi_rows as usize);
         let g = (r0, r1, c0 as usize, c1 as usize, r0, cols);
-        let LfRow {
+        let MiRow {
             mi_sizes,
             tx_sizes,
             skips,
             ref0,
+            ref1,
+            mv0,
+            mv1,
             y_modes,
             seg_ids,
-        } = &mut *lf;
-        copy_mi_rows(mi_sizes, &st.mi_sizes, g, |v| v, 1);
-        copy_mi_rows(tx_sizes, &st.tx_sizes, g, |v| v, 1);
-        copy_mi_rows(skips, &st.skips, g, |v| v != 0, 1);
-        copy_mi_rows(ref0, &st.ref_frames, g, |v| v, 2);
-        copy_mi_rows(y_modes, &st.y_modes, g, |v| v, 1);
-        copy_mi_rows(seg_ids, &st.segment_ids, g, |v| v, 1);
+        } = &mut *mi;
+        copy_mi_rows(mi_sizes, &st.mi_sizes, g, |v| v, 1, 0);
+        copy_mi_rows(tx_sizes, &st.tx_sizes, g, |v| v, 1, 0);
+        copy_mi_rows(skips, &st.skips, g, |v| v != 0, 1, 0);
+        copy_mi_rows(ref0, &st.ref_frames, g, |v| v, 2, 0);
+        copy_mi_rows(ref1, &st.ref_frames, g, |v| v, 2, 1);
+        copy_mi_rows(mv0, &st.mvs, g, |v| v, 2, 0);
+        copy_mi_rows(mv1, &st.mvs, g, |v| v, 2, 1);
+        copy_mi_rows(y_modes, &st.y_modes, g, |v| v, 1, 0);
+        copy_mi_rows(seg_ids, &st.segment_ids, g, |v| v, 1, 0);
     }
-    pipe.progress().tiles_done[sb] += 1;
+    let complete = {
+        let mut p = pipe.progress();
+        p.tiles_done[sb] += 1;
+        p.tiles_done[sb] == job.tile_cols
+    };
+    if complete {
+        let row = std::mem::replace(&mut *lock(&pipe.mi_build[sb]), MiRow::new(0));
+        pipe.frame.freeze_mi(sb, row);
+        if job.lf.is_none() {
+            let band = std::mem::take(&mut *lock(&pipe.bands[sb]));
+            pipe.frame.freeze_band(sb, band);
+        }
+    }
     pipe.notify(sb);
 }
 
@@ -1813,15 +1883,18 @@ fn publish_tile_row(
 /// `col - 1` (final as far as it is concerned) into a per-superblock
 /// slot; the row below copies the slot into its band's halo rows before
 /// filtering superblock `col - 1`, and once done writes the (now final)
-/// halo rows back into the band above.
+/// halo rows back into the band above, which it then freezes (the last
+/// row freezes its own band too).
 fn loop_filter_row_job(lfp: &LfParams, pipe: &FramePipe, r: usize) {
     let _guard = AbortOnPanic(pipe);
     let (sb_rows, sb_cols) = (lfp.sb_rows, lfp.sb_cols);
     if !pipe.wait(r, |p| p.tiles_done[r] >= lfp.ready_at) {
         return;
     }
+    let Some(lf) = pipe.frame.mi_row(r) else {
+        return;
+    };
     let mut band = lock(&pipe.bands[r]);
-    let lf = lock(&pipe.lf_rows[r]);
     let frame = SuperblockFilterFrame {
         mi_sizes: &lf.mi_sizes,
         tx_sizes: &lf.tx_sizes,
@@ -1842,10 +1915,10 @@ fn loop_filter_row_job(lfp: &LfParams, pipe: &FramePipe, r: usize) {
         ((c << sbw).min(w), ((c + 1) << sbw).min(w))
     };
     // The bottom HALO own rows of this row's band at superblock `c`.
-    let publish_slot = |band: &[Vec<i32>; 3], c: usize| {
+    let publish_slot = |band: &Band, c: usize| {
         let cells: [Vec<i32>; 3] = std::array::from_fn(|p| {
             let (w, h, shift, _) = lfp.geom[p];
-            let own = BandPlane::band_rows(h, shift, r);
+            let own = band_rows(h, shift, r);
             let (x0, x1) = col_range(p, c);
             let mut cell = Vec::with_capacity(HALO * (x1 - x0));
             for k in own..own + HALO {
@@ -1876,7 +1949,7 @@ fn loop_filter_row_job(lfp: &LfParams, pipe: &FramePipe, r: usize) {
         }
         for p in 0..3 {
             let (w, h, shift, _) = lfp.geom[p];
-            let own = BandPlane::band_rows(h, shift, r);
+            let own = band_rows(h, shift, r);
             let y0 = r << shift;
             let mut window = if r == 0 {
                 PlaneWindow {
@@ -1918,15 +1991,19 @@ fn loop_filter_row_job(lfp: &LfParams, pipe: &FramePipe, r: usize) {
     }
     pipe.progress().lf_published[r] = sb_cols;
     pipe.notify(r + 1);
-    drop(lf);
-    // The halo rows are final: they are the bottom rows of the band above.
+    // The halo rows are final: they are the bottom rows of the band
+    // above, which nothing touches any more.
     if r > 0 {
-        let mut above = lock(&pipe.bands[r - 1]);
+        let mut above = std::mem::take(&mut *lock(&pipe.bands[r - 1]));
         for p in 0..3 {
             let (w, h, shift, _) = lfp.geom[p];
-            let own_above = BandPlane::band_rows(h, shift, r - 1);
+            let own_above = band_rows(h, shift, r - 1);
             above[p][own_above * w..(own_above + HALO) * w].copy_from_slice(&band[p][..HALO * w]);
         }
+        pipe.frame.freeze_band(r - 1, above);
+    }
+    if r + 1 == sb_rows {
+        pipe.frame.freeze_band(r, std::mem::take(&mut *band));
     }
 }
 
@@ -1966,12 +2043,42 @@ pub(crate) fn frame_loop_filter_banded(
         lvl_lookup: *frame.lvl_lookup,
         ready_at: 0,
     };
+    let fgeom: [PlaneGeom; 3] = std::array::from_fn(|p| PlaneGeom {
+        stride: geom[p].0,
+        height: geom[p].1,
+        band_shift: geom[p].2,
+    });
+    let target = Arc::new(FrameBuf::new(
+        fgeom,
+        curr.planes[0].width as u32,
+        curr.planes[0].height as u32,
+        sxu == 1,
+        syu == 1,
+        frame.bit_depth,
+        mi_rows,
+    ));
+    for r in 0..sb_rows {
+        let mut row = MiRow::new(8 * mi_cols as usize);
+        let cols = mi_cols as usize;
+        let r0 = r * 8;
+        let r1 = (r0 + 8).min(mi_rows as usize);
+        for (i, src) in (r0 * cols..r1 * cols).enumerate() {
+            row.mi_sizes[i] = frame.mi_sizes[src];
+            row.tx_sizes[i] = frame.tx_sizes[src];
+            row.skips[i] = frame.skips[src];
+            row.ref0[i] = frame.ref_frames_0[src];
+            row.y_modes[i] = frame.y_modes[src];
+            row.seg_ids[i] = frame.segment_ids[src];
+        }
+        target.freeze_mi(r, row);
+    }
     let pipe = Arc::new(FramePipe {
+        frame: Arc::clone(&target),
         bands: (0..sb_rows)
             .map(|b| {
                 Mutex::new(std::array::from_fn(|p| {
                     let (w, h, shift, _) = geom[p];
-                    let rows = BandPlane::band_rows(h, shift, b);
+                    let rows = band_rows(h, shift, b);
                     let v = &curr.planes[p];
                     let mut buf = vec![0i32; (HALO + rows) * w];
                     for k in 0..rows {
@@ -1983,23 +2090,7 @@ pub(crate) fn frame_loop_filter_banded(
                 }))
             })
             .collect(),
-        lf_rows: (0..sb_rows)
-            .map(|r| {
-                let mut row = LfRow::new(8 * mi_cols as usize);
-                let cols = mi_cols as usize;
-                let r0 = r * 8;
-                let r1 = (r0 + 8).min(mi_rows as usize);
-                for (i, src) in (r0 * cols..r1 * cols).enumerate() {
-                    row.mi_sizes[i] = frame.mi_sizes[src];
-                    row.tx_sizes[i] = frame.tx_sizes[src];
-                    row.skips[i] = frame.skips[src];
-                    row.ref0[i] = frame.ref_frames_0[src];
-                    row.y_modes[i] = frame.y_modes[src];
-                    row.seg_ids[i] = frame.segment_ids[src];
-                }
-                Mutex::new(row)
-            })
-            .collect(),
+        mi_build: Vec::new(),
         slots: (0..sb_rows * sb_cols).map(|_| OnceLock::new()).collect(),
         progress: Mutex::new(Progress {
             tiles_done: vec![0; sb_rows],
@@ -2008,75 +2099,132 @@ pub(crate) fn frame_loop_filter_banded(
         }),
         changed: (0..sb_rows).map(|_| Condvar::new()).collect(),
         tile_out: Mutex::new(Vec::new()),
+        tiles_finished: Condvar::new(),
     });
     let lfp = Arc::new(lfp);
-    let jobs: Vec<Box<dyn FnOnce() + Send>> = (0..sb_rows)
+    let jobs: Vec<Job> = (0..sb_rows)
         .map(|r| {
             let (lfp, pipe) = (Arc::clone(&lfp), Arc::clone(&pipe));
-            Box::new(move || loop_filter_row_job(&lfp, &pipe, r)) as Box<dyn FnOnce() + Send>
+            Box::new(move || loop_filter_row_job(&lfp, &pipe, r)) as Job
         })
         .collect();
     WorkerPool::new(workers.saturating_sub(1)).run(jobs);
-    let pipe = Arc::try_unwrap(pipe).unwrap_or_else(|_| unreachable!("batch finished"));
-    for (b, band) in pipe.bands.into_iter().enumerate() {
-        let band = band.into_inner().expect("band");
-        for p in 0..3 {
-            let (w, h, shift, _) = geom[p];
-            let v = &mut curr.planes[p];
-            for k in 0..BandPlane::band_rows(h, shift, b) {
-                let y = (b << shift) + k;
-                v.data[y * v.stride..y * v.stride + w]
-                    .copy_from_slice(&band[p][(HALO + k) * w..(HALO + k + 1) * w]);
-            }
+    for (p, &(w, h, ..)) in geom.iter().enumerate() {
+        let v = &mut curr.planes[p];
+        for y in 0..h {
+            v.data[y * v.stride..y * v.stride + w].copy_from_slice(&target.row(p, y)[..w]);
         }
     }
 }
 
-/// Run one frame's batch and assemble its products.
-fn run_frame_pipeline(
+/// A frame whose batch has been submitted.
+pub(crate) struct InFlight {
+    frame: Arc<FrameBuf>,
+    pipe: Arc<FramePipe>,
+    batch: Option<Batch>,
+    /// The merged §9.3.4 counts (or the first tile error), once known.
+    counts: Option<Result<Box<crate::prob_adapt::FrameCounts>, Error>>,
+}
+
+impl InFlight {
+    /// The frame being decoded.
+    pub(crate) fn frame(&self) -> &Arc<FrameBuf> {
+        &self.frame
+    }
+
+    /// Block until every tile column has finished; the merged §9.3.4
+    /// counts, or the lowest raster-order tile error (the one the serial
+    /// §6.4 walk would have hit first).
+    fn counts(&mut self) -> Result<&crate::prob_adapt::FrameCounts, Error> {
+        if self.counts.is_none() {
+            let mut outs = self.pipe.wait_tiles();
+            let mut first_err: Option<(usize, Error)> = None;
+            let mut merged: Option<Box<crate::prob_adapt::FrameCounts>> = None;
+            for out in outs.iter_mut() {
+                match out.take().expect("every tile column ran") {
+                    Ok(o) => match merged.as_mut() {
+                        Some(m) => m.merge_from(&o.counts),
+                        None => merged = Some(o.counts),
+                    },
+                    Err((idx, e)) => {
+                        if first_err.as_ref().is_none_or(|(i, _)| idx < *i) {
+                            first_err = Some((idx, e));
+                        }
+                    }
+                }
+            }
+            drop(outs);
+            self.counts = Some(match first_err {
+                Some((_, e)) => Err(e),
+                None => Ok(merged.unwrap_or_else(crate::prob_adapt::FrameCounts::new_boxed)),
+            });
+        }
+        match self.counts.as_ref().expect("computed") {
+            Ok(c) => Ok(c),
+            Err(e) => Err(*e),
+        }
+    }
+
+    /// The counts after a successful [`Self::counts`].
+    fn take_counts(&mut self) -> Box<crate::prob_adapt::FrameCounts> {
+        match self.counts.take() {
+            Some(Ok(c)) => c,
+            _ => crate::prob_adapt::FrameCounts::new_boxed(),
+        }
+    }
+}
+
+/// Submit one frame's batch (tile columns, then loop-filter rows) and
+/// return without waiting. `reuse` lends a recycled frame's bands.
+fn launch_frame(
     job: FrameJob,
     pool: Option<&WorkerPool>,
     scratch_pool: &ScratchPool,
     reuse: Option<Bands>,
-) -> Result<FrameDecodeProducts, Error> {
+) -> InFlight {
     let sb_rows = job.sb64_rows as usize;
     let sb_cols = job.sb64_cols as usize;
     let lf_on = job.lf.is_some();
+    let fgeom: [PlaneGeom; 3] = std::array::from_fn(|p| PlaneGeom {
+        stride: job.geom[p].0,
+        height: job.geom[p].1,
+        band_shift: job.geom[p].2,
+    });
+    let frame = Arc::new(FrameBuf::new(
+        fgeom,
+        job.hdr.frame_width,
+        job.hdr.frame_height,
+        job.ssx,
+        job.ssy,
+        job.hdr.color_config.bit_depth,
+        job.mi_rows,
+    ));
     // Band storage: a recycled frame's when the geometry matches (every
     // own row is overwritten by the tile columns and every halo row the
     // loop filter reads is first filled from a slot, so stale contents
     // are never observed), else fresh.
-    let band_len = |p: usize, b: usize| {
-        let (w, h, shift, _) = job.geom[p];
-        (HALO + BandPlane::band_rows(h, shift, b)) * w
-    };
     let mut reuse = reuse.filter(|r| {
-        (0..3).all(|p| {
-            r[p].len() == sb_rows
-                && r[p]
-                    .iter()
-                    .enumerate()
-                    .all(|(b, v)| v.len() == band_len(p, b))
-        })
+        r.len() == sb_rows
+            && r.iter().enumerate().all(|(b, band)| {
+                band.as_ref()
+                    .is_some_and(|band| (0..3).all(|p| band[p].len() == fgeom[p].band_len(b)))
+            })
     });
-    let mut band_list: Vec<Mutex<[Vec<i32>; 3]>> = Vec::with_capacity(sb_rows);
-    for b in (0..sb_rows).rev() {
-        let planes: [Vec<i32>; 3] = std::array::from_fn(|p| match reuse.as_mut() {
-            Some(r) => r[p].pop().expect("checked length"),
-            None => vec![0i32; band_len(p, b)],
-        });
-        band_list.push(Mutex::new(planes));
-    }
-    band_list.reverse();
+    let bands: Vec<Mutex<Band>> = (0..sb_rows)
+        .map(|b| {
+            let band = match reuse.as_mut() {
+                Some(r) => r[b].take().expect("checked band"),
+                None => std::array::from_fn(|p| vec![0i32; fgeom[p].band_len(b)]),
+            };
+            Mutex::new(band)
+        })
+        .collect();
     let pipe = Arc::new(FramePipe {
-        bands: band_list,
-        lf_rows: if lf_on {
-            (0..sb_rows)
-                .map(|_| Mutex::new(LfRow::new(8 * job.mi_cols as usize)))
-                .collect()
-        } else {
-            Vec::new()
-        },
+        frame: Arc::clone(&frame),
+        bands,
+        mi_build: (0..sb_rows)
+            .map(|_| Mutex::new(MiRow::new(8 * job.mi_cols as usize)))
+            .collect(),
         slots: if lf_on {
             (0..sb_rows * sb_cols).map(|_| OnceLock::new()).collect()
         } else {
@@ -2089,10 +2237,11 @@ fn run_frame_pipeline(
         }),
         changed: (0..sb_rows).map(|_| Condvar::new()).collect(),
         tile_out: Mutex::new((0..job.tile_cols).map(|_| None).collect()),
+        tiles_finished: Condvar::new(),
     });
     let job = Arc::new(job);
 
-    let mut jobs: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+    let mut jobs: Vec<Job> = Vec::new();
     for col in 0..job.tile_cols {
         let (job, pipe, scratch) = (
             Arc::clone(&job),
@@ -2111,87 +2260,36 @@ fn run_frame_pipeline(
             }));
         }
     }
-    match pool {
-        Some(pool) => pool.run(jobs),
-        None => jobs.into_iter().for_each(|j| j()),
-    }
-
-    let pipe = Arc::try_unwrap(pipe).unwrap_or_else(|_| unreachable!("batch finished"));
-    let outs = pipe
-        .tile_out
-        .into_inner()
-        .unwrap_or_else(|e| e.into_inner());
-    // Deterministic error surface: the lowest raster-order tile error is
-    // the one the serial §6.4 walk would have hit first.
-    let mut first_err: Option<(usize, Error)> = None;
-    let mut done = Vec::with_capacity(outs.len());
-    for out in outs {
-        match out.expect("every tile column ran") {
-            Ok(o) => done.push(o),
-            Err((idx, e)) => {
-                if first_err.as_ref().is_none_or(|(i, _)| idx < *i) {
-                    first_err = Some((idx, e));
-                }
-            }
-        }
-    }
-    if let Some((_, e)) = first_err {
-        return Err(e);
-    }
-
-    // Merge the tile columns' disjoint MI ranges in column order.
-    let (state, counts) = if done.len() == 1 {
-        let o = done.pop().expect("one column");
-        (o.state, o.counts)
-    } else {
-        let mut state = Vp9FrameState::new(job.mi_rows, job.mi_cols);
-        let mut counts = crate::prob_adapt::FrameCounts::new_boxed();
-        for o in &done {
-            if o.col_lo < o.col_hi {
-                state.merge_cols_from(&o.state, o.col_lo, o.col_hi);
-            }
-            counts.merge_from(&o.counts);
-        }
-        // Hand the column states back to the scratch pool for reuse.
-        let mut list = lock(scratch_pool);
-        for (o, s) in done
-            .into_iter()
-            .zip(list.iter_mut().filter(|s| s.state.is_none()))
-        {
-            s.state = Some(o.state);
-        }
-        drop(list);
-        (state, counts)
-    };
-
-    let mut bands: [Vec<Vec<i32>>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-    for b in pipe.bands {
-        let [y, u, v] = b.into_inner().unwrap_or_else(|e| e.into_inner());
-        bands[0].push(y);
-        bands[1].push(u);
-        bands[2].push(v);
-    }
-    let [by, bu, bv] = bands;
-    let plane = |p: usize, bands: Vec<Vec<i32>>| {
-        let (w, h, shift, _) = job.geom[p];
-        BandPlane {
-            stride: w,
-            height: h,
-            band_shift: shift,
-            bands,
+    let batch = match pool {
+        Some(pool) => Some(pool.submit(jobs)),
+        None => {
+            jobs.into_iter().for_each(|j| j());
+            None
         }
     };
-    let frame = Arc::new(FrameBuf {
-        planes: [plane(0, by), plane(1, bu), plane(2, bv)],
-        frame_width: job.hdr.frame_width,
-        frame_height: job.hdr.frame_height,
-        subsampling_x: job.ssx,
-        subsampling_y: job.ssy,
-        bit_depth: job.hdr.color_config.bit_depth,
-    });
-    Ok(FrameDecodeProducts {
+    InFlight {
         frame,
-        state,
+        pipe,
+        batch,
+        counts: None,
+    }
+}
+
+/// Wait for a launched frame and collect its products.
+fn finish_frame(
+    pool: Option<&WorkerPool>,
+    mut inflight: InFlight,
+) -> Result<FrameDecodeProducts, Error> {
+    if let (Some(pool), Some(batch)) = (pool, inflight.batch.as_ref()) {
+        pool.wait(batch);
+    }
+    inflight.counts()?;
+    if !inflight.frame.wait_complete() {
+        return Err(Error::InvalidBitstream);
+    }
+    let counts = inflight.take_counts();
+    Ok(FrameDecodeProducts {
+        frame: inflight.frame,
         counts,
     })
 }
@@ -2235,10 +2333,18 @@ pub fn decode_intra_frame(data: &[u8]) -> Result<Vp9DecodedFrame, Error> {
     )?));
     let payload: Arc<[u8]> = Arc::from(data);
     let scratch = ScratchPool::default();
-    let products = decode_single_frame(
-        &payload, &hdr, ch_end, chdr, None, None, None, &scratch, None,
+    let inflight = launch_single_frame(
+        &payload,
+        &hdr,
+        ch_end,
+        chdr,
+        None,
+        (None, None, false),
+        None,
+        &scratch,
+        None,
     )?;
-    Ok(products.frame.to_decoded_frame())
+    Ok(finish_frame(None, inflight)?.frame.to_decoded_frame())
 }
 
 /// The default (serial) execution context for the entry points that
@@ -2282,17 +2388,18 @@ pub(crate) fn decode_intra_products_for_test(
     let payload: Arc<[u8]> = Arc::from(data);
     let scratch = ScratchPool::default();
     let pool = (exec.threads > 1).then(|| WorkerPool::new(exec.threads - 1));
-    let products = decode_single_frame(
+    let inflight = launch_single_frame(
         &payload,
         &hdr,
         ch_end,
         chdr,
         None,
-        None,
+        (None, None, false),
         pool.as_ref(),
         &scratch,
         None,
     )?;
+    let products = finish_frame(pool.as_ref(), inflight)?;
     Ok((products.frame.to_decoded_frame(), products.counts))
 }
 
@@ -2308,25 +2415,25 @@ const MAX_LUMA_PICTURE_SIZE: u64 = 35_651_584;
 
 /// Decode one frame (intra or inter) given the parsed header, the
 /// compressed header, the optional §8.10 reference buffers, and the
-/// optional previous-frame motion field. Returns the reconstruction
-/// products (the decoded frame + §6.4.4 state + §9.3.4 counts).
+/// optional previous-frame mode-info sources. Returns the in-flight
+/// frame (see [`finish_frame`]).
 ///
 /// The frame runs as one batch of tile-column and loop-filter-row jobs
 /// (see the frame-pipeline section) on `pool` — inline, in the same
 /// order, when there is none. The output is byte-identical for every
 /// pool size.
 #[allow(clippy::too_many_arguments)]
-fn decode_single_frame(
+fn launch_single_frame(
     data: &Arc<[u8]>,
     hdr: &Vp9FrameHeader,
     ch_end: usize,
     chdr_kind: ChdrKind,
     refs: Option<&RefBuffers>,
-    prev: Option<PrevFrameState>,
+    (prev_mvs, prev_seg, prev_shown): (Option<Arc<FrameBuf>>, Option<Arc<FrameBuf>>, bool),
     pool: Option<&WorkerPool>,
     scratch: &ScratchPool,
     reuse: Option<Bands>,
-) -> Result<FrameDecodeProducts, Error> {
+) -> Result<InFlight, Error> {
     let lossless = hdr.quantization.lossless;
 
     // §7.2.6: MiCols / MiRows; §7.2 Sb64 extents for the §7.4.1 strip
@@ -2367,32 +2474,11 @@ fn decode_single_frame(
     let is_inter_frame = chdr_inter.is_some();
 
     // §7.2.6 UsePrevFrameMvs: requires a same-dimension prev frame that
-    // was shown, error_resilient_mode == 0, and FrameIsIntra == 0.
-    // (A size-mismatched prev never reaches here — the caller passes
-    // `None` — and the zero snapshots stand in, as §6.4.14 clears
+    // was shown, error_resilient_mode == 0, and FrameIsIntra == 0. (A
+    // size-mismatched prev never reaches here — the caller passes no
+    // source — and the zero snapshots stand in, as §6.4.14 clears
     // PrevSegmentIds.)
-    let use_prev_frame_mvs =
-        is_inter_frame && prev.as_ref().is_some_and(|p| p.prev_shown) && !hdr.error_resilient_mode;
-    let n_mi = (mi_rows * mi_cols) as usize;
-    let needs_zero = match &prev {
-        Some(p) => {
-            let seg_len = p
-                .segment_ids
-                .as_ref()
-                .map_or(p.state.segment_ids.len(), |s| s.len());
-            p.state.ref_frames.len() != n_mi * 2 || p.state.mvs.len() != n_mi * 2 || seg_len != n_mi
-        }
-        None => true,
-    };
-    let (zero_ref, zero_mvs, zero_seg) = if needs_zero {
-        (
-            vec![INTRA_FRAME; n_mi * 2],
-            vec![(0i16, 0i16); n_mi * 2],
-            vec![0u8; n_mi],
-        )
-    } else {
-        (Vec::new(), Vec::new(), Vec::new())
-    };
+    let use_prev_frame_mvs = is_inter_frame && prev_shown && !hdr.error_resilient_mode;
 
     // §6.4 decode_tiles( sz ): per-tile byte budget walk, then the
     // per-tile bool-coder bracket around §6.4.2 decode_tile( ).
@@ -2473,10 +2559,8 @@ fn decode_single_frame(
         chdr,
         chdr_inter,
         refs: refs.cloned(),
-        prev,
-        zero_ref,
-        zero_mvs,
-        zero_seg,
+        prev_mvs,
+        prev_seg,
         use_prev_frame_mvs,
         tiles,
         tile_cols: tile_cols as usize,
@@ -2491,7 +2575,7 @@ fn decode_single_frame(
         geom,
         lf,
     };
-    run_frame_pipeline(job, pool, scratch, reuse)
+    Ok(launch_frame(job, pool, scratch, reuse))
 }
 
 /// Decode a multi-frame VP9 stream (keyframe followed by inter / P-frames)
@@ -2567,13 +2651,42 @@ pub fn decode_vp9_sequence_with(
 /// this struct). Superframes (Annex B) must be split *before* pushing
 /// — see [`crate::split_superframe`].
 pub struct Vp9SequenceDecoder {
+    // Every piece of §-defined persistent decode state (see below).
+    st: SeqState,
+    // The threading authority for the frame batches (serial until told
+    // otherwise, per the framework contract).
+    exec: ExecutionContext,
+    // The last decoded frame's §9.3.4 count bank — the encoder-side
+    // decoder-mirror tests compare the writer's counts against it.
+    last_counts: Option<Box<crate::prob_adapt::FrameCounts>>,
+    // The persistent worker pool the frame batches run on (created on
+    // the first frame that can use more than one thread, sized by the
+    // ExecutionContext budget and the frame's useful parallelism).
+    pool: Option<WorkerPool>,
+    // Tile-column working storage reused across frames.
+    scratch: ScratchPool,
+    // Every frame this decoder produced that may still be referenced;
+    // one nobody else holds any more donates its band storage to the
+    // next frame.
+    recycle: Vec<Arc<FrameBuf>>,
+    // Frames submitted and not yet completed, oldest first.
+    inflight: VecDeque<Pending>,
+    // Completed shown frames (with the caller's tag), in output order.
+    ready: VecDeque<(Arc<FrameBuf>, i64)>,
+}
+
+/// The §-defined persistent decode state a frame's header processing
+/// reads and updates.
+#[derive(Clone)]
+struct SeqState {
     bufs: RefBuffers,
     // The most-recently-decoded color config + frame dims (for the §6.2
     // inter header's inherited color config + §8.10 ref dims).
     last_color: Option<ColorConfig>,
-    // The previous decoded frame's §6.4.4 state + show/size for the §6.5
-    // prev-MV scan + §7.2.6 UsePrevFrameMvs derivation.
-    prev_state: Option<(Arc<Vp9FrameState>, u32, u32, bool)>,
+    // The previous decoded frame (its §6.4.4 mode info rows) + its
+    // size + show_frame, for the §6.5 prev-MV scan + §7.2.6
+    // UsePrevFrameMvs derivation.
+    prev_state: Option<(Arc<FrameBuf>, u32, u32, bool)>,
     // §6.1.2 / §7.2 `FrameContext[ 4 ]` — the persistent entropy
     // probability banks `load_probs( )` / `save_probs( )` thread across
     // frames. Initialised to the §10.5 defaults; a key / intra-only /
@@ -2606,41 +2719,66 @@ pub struct Vp9SequenceDecoder {
     persist_ref_deltas: [i8; 4],
     persist_mode_deltas: [i8; 2],
     // §6.4.14 `PrevSegmentIds[ ][ ]` — the persistent segmentation map a
-    // §6.4.12 `temporal_update` / `update_map == 0` frame predicts from.
-    // §8.1 step 3 only refreshes it after a frame with
-    // `segmentation_update_map == 1`; a frame that reuses the map
-    // (`update_map == 0`) leaves it pointing at the *last map-bearing*
-    // frame, NOT its own (possibly Min-collapsed) `SegmentIds`. Tracking
-    // it separately from the per-frame `prev_state` snapshot is what keeps
-    // a run of `update_map == 0` inter frames reading the original map.
-    prev_segment_ids_map: Option<(Arc<Vec<u8>>, u32, u32)>,
-    // The threading authority for the §6.4 tile walk (serial until told
-    // otherwise, per the framework contract); tile-column fan-out is
-    // bounded by `exec.effective_workers( tileCols )` per frame.
-    exec: ExecutionContext,
-    // The last decoded frame's §9.3.4 count bank — the encoder-side
-    // decoder-mirror tests compare the writer's counts against it.
-    last_counts: Option<Box<crate::prob_adapt::FrameCounts>>,
-    // The persistent worker pool the frame batches run on (created on
-    // the first frame that can use more than one thread, sized by the
-    // ExecutionContext budget and the frame's useful parallelism).
-    pool: Option<WorkerPool>,
-    // Tile-column working storage reused across frames.
-    scratch: ScratchPool,
-    // Every frame this decoder produced that may still be referenced;
-    // one nobody else holds any more donates its band storage to the
-    // next frame.
-    recycle: Vec<Arc<FrameBuf>>,
+    // §6.4.12 `temporal_update` / `update_map == 0` frame predicts from:
+    // the last frame with `segmentation_update_map == 1` (its mode-info
+    // rows), with its size. §8.1 step 3 only refreshes it after such a
+    // frame; a frame that reuses the map leaves it pointing at the *last
+    // map-bearing* frame, NOT its own (possibly Min-collapsed)
+    // `SegmentIds`. Tracking it separately from the per-frame
+    // `prev_state` is what keeps a run of `update_map == 0` inter frames
+    // reading the original map.
+    prev_segment_ids_map: Option<(Arc<FrameBuf>, u32, u32)>,
+}
+
+/// An intra frame's forward-updated `(tx_probs, skip_prob)` — the
+/// tables its §6.1.2 `refresh_probs( )` keeps.
+type IntraForward = ([[[u8; 3]; 2]; 4], [u8; 3]);
+
+/// The §6.1.2 `refresh_probs( )` backward adaptation a submitted frame
+/// owes the bank it decoded from, applied once its counts exist.
+struct PendingAdapt {
+    idx: usize,
+    base: FrameContext,
+    /// `Some( (tx_probs, skip_prob) )` for an intra frame (the forward
+    /// updates `load_probs( )` keeps), `None` for an inter frame.
+    intra_fwd: Option<IntraForward>,
+    last_frame_type_was_key: bool,
+    interp_switchable: bool,
+    tx_mode_select: bool,
+    allow_high_precision_mv: bool,
+}
+
+/// A submitted coded frame.
+struct Pending {
+    /// The coded frame (replayed if an earlier frame fails).
+    payload: Arc<[u8]>,
+    /// The caller's tag for the output (the packet `pts`).
+    tag: i64,
+    kind: PendingKind,
+}
+
+enum PendingKind {
+    /// A §8.9 `show_existing_frame` re-display of a stored frame.
+    ShowExisting(Arc<FrameBuf>),
+    Decode {
+        inflight: InFlight,
+        shown: bool,
+        /// The decoder state as it was before this frame's decode
+        /// updates (restored if the decode fails).
+        snapshot: Box<SeqState>,
+        adapt: Option<Box<PendingAdapt>>,
+    },
 }
 
 impl std::fmt::Debug for Vp9SequenceDecoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The banks/buffers are megabyte-scale working state; summarise.
         f.debug_struct("Vp9SequenceDecoder")
-            .field("last_color", &self.last_color)
-            .field("has_prev_frame", &self.prev_state.is_some())
-            .field("persist_ref_deltas", &self.persist_ref_deltas)
-            .field("persist_mode_deltas", &self.persist_mode_deltas)
+            .field("last_color", &self.st.last_color)
+            .field("has_prev_frame", &self.st.prev_state.is_some())
+            .field("persist_ref_deltas", &self.st.persist_ref_deltas)
+            .field("persist_mode_deltas", &self.st.persist_mode_deltas)
+            .field("in_flight", &self.inflight.len())
             .finish_non_exhaustive()
     }
 }
@@ -2651,27 +2789,38 @@ impl Default for Vp9SequenceDecoder {
     }
 }
 
+impl Drop for Vp9SequenceDecoder {
+    fn drop(&mut self) {
+        // Let every submitted batch finish before the pool goes away.
+        self.drain();
+    }
+}
+
 impl Vp9SequenceDecoder {
     /// Fresh decoder state: empty §8.10 buffers, default §10.5
     /// probability banks, default §7.2.8 deltas, no previous frame.
     pub fn new() -> Self {
         Self {
-            bufs: RefBuffers::new(),
-            last_color: None,
-            prev_state: None,
-            frame_contexts: Default::default(),
-            last_frame_type_was_key: false,
-            persist_feature_enabled: [[false; SEG_LVL_MAX]; MAX_SEGMENTS],
-            persist_feature_data: [[0i16; SEG_LVL_MAX]; MAX_SEGMENTS],
-            persist_abs_or_delta: false,
-            persist_ref_deltas: DEFAULT_LOOP_FILTER_REF_DELTAS,
-            persist_mode_deltas: DEFAULT_LOOP_FILTER_MODE_DELTAS,
-            prev_segment_ids_map: None,
+            st: SeqState {
+                bufs: RefBuffers::new(),
+                last_color: None,
+                prev_state: None,
+                frame_contexts: Default::default(),
+                last_frame_type_was_key: false,
+                persist_feature_enabled: [[false; SEG_LVL_MAX]; MAX_SEGMENTS],
+                persist_feature_data: [[0i16; SEG_LVL_MAX]; MAX_SEGMENTS],
+                persist_abs_or_delta: false,
+                persist_ref_deltas: DEFAULT_LOOP_FILTER_REF_DELTAS,
+                persist_mode_deltas: DEFAULT_LOOP_FILTER_MODE_DELTAS,
+                prev_segment_ids_map: None,
+            },
             exec: ExecutionContext::serial(),
             last_counts: None,
             pool: None,
             scratch: ScratchPool::default(),
             recycle: Vec::new(),
+            inflight: VecDeque::new(),
+            ready: VecDeque::new(),
         }
     }
 
@@ -2679,7 +2828,7 @@ impl Vp9SequenceDecoder {
     /// the last pushed frame (encoder-mirror tests).
     #[cfg(test)]
     pub(crate) fn frame_context(&self, idx: usize) -> &FrameContext {
-        &self.frame_contexts[idx & 3]
+        &self.st.frame_contexts[idx & 3]
     }
 
     /// The last decoded frame's §9.3.4 counts (`None` before the first
@@ -2689,14 +2838,14 @@ impl Vp9SequenceDecoder {
         self.last_counts.as_deref()
     }
 
-    /// Set the threading authority for the §6.4 tile walk of every
-    /// subsequently pushed frame (the framework
-    /// `set_execution_context` contract: serial until told otherwise;
-    /// the per-frame tile-column fan-out is bounded by
-    /// `exec.effective_workers( tileCols )`). Decoded output is
-    /// byte-identical at every budget — see
-    /// [`decode_vp9_sequence_with`].
+    /// Set the threading authority for every subsequently pushed frame
+    /// (the framework `set_execution_context` contract: serial until
+    /// told otherwise). The frame batches run on a persistent pool of
+    /// `exec.effective_workers( useful )` threads, where `useful` is a
+    /// frame's tile columns plus superblock rows. Decoded output is
+    /// byte-identical at every budget — see [`decode_vp9_sequence_with`].
     pub fn set_execution_context(&mut self, exec: &ExecutionContext) {
+        self.drain();
         self.exec = exec.clone();
         // Rebuilt at the new budget on the next frame.
         self.pool = None;
@@ -2715,34 +2864,181 @@ impl Vp9SequenceDecoder {
         Ok(self.push_frame_buf(frame)?.map(|f| f.to_decoded_frame()))
     }
 
-    /// [`Self::push_frame`] returning the shown frame's decoded storage
-    /// (the framework decoder packs its output straight from it).
+    /// [`Self::push_frame`] returning the shown frame's decoded storage.
     pub(crate) fn push_frame_buf(&mut self, frame: &[u8]) -> Result<Option<Arc<FrameBuf>>, Error> {
+        self.drain();
+        self.ready.clear();
+        self.submit(frame, 0, 0)?;
+        Ok(self.ready.pop_front().map(|(f, _)| f))
+    }
+
+    /// Submit one coded frame for decoding, completing the oldest
+    /// submitted frames until at most `max_in_flight` remain. Completed
+    /// shown frames queue (tagged with `tag`) for [`Self::pop_ready`].
+    /// Header errors return immediately; a decode error returns from the
+    /// call that completes the failing frame — the decoder state is then
+    /// exactly as if that frame had been pushed alone and failed, and the
+    /// frames submitted after it are replayed on top of it.
+    pub(crate) fn submit(
+        &mut self,
+        frame: &[u8],
+        tag: i64,
+        max_in_flight: usize,
+    ) -> Result<(), Error> {
+        self.last_counts = None;
+        // The bank this frame loads from may still owe the previous
+        // frame's backward adaptation.
+        self.resolve_adaptation()?;
+        let payload: Arc<[u8]> = Arc::from(frame);
+        let pending = self.start_frame(payload, tag)?;
+        self.inflight.push_back(pending);
+        while self.inflight.len() > max_in_flight {
+            self.complete_front()?;
+        }
+        Ok(())
+    }
+
+    /// Complete every submitted frame (errors are dropped: the caller
+    /// asked for a full stop).
+    pub(crate) fn drain(&mut self) {
+        while !self.inflight.is_empty() {
+            let _ = self.complete_front();
+        }
+    }
+
+    /// Complete the oldest submitted frame, if any.
+    pub(crate) fn finish_one(&mut self) -> Option<Result<(), Error>> {
+        if self.inflight.is_empty() {
+            None
+        } else {
+            Some(self.complete_front())
+        }
+    }
+
+    /// The oldest completed shown frame and its tag.
+    pub(crate) fn pop_ready(&mut self) -> Option<(Arc<FrameBuf>, i64)> {
+        self.ready.pop_front()
+    }
+
+    /// Apply the latest submitted frame's owed backward adaptation (its
+    /// counts complete first); a failure there completes the queue up to
+    /// the failing frame.
+    fn resolve_adaptation(&mut self) -> Result<(), Error> {
+        let Some(Pending {
+            kind: PendingKind::Decode {
+                inflight, adapt, ..
+            },
+            ..
+        }) = self.inflight.back_mut()
+        else {
+            return Ok(());
+        };
+        if adapt.is_none() {
+            return Ok(());
+        }
+        match inflight.counts() {
+            Ok(counts) => {
+                let a = adapt.take().expect("checked");
+                apply_adaptation(&mut self.st.frame_contexts, a, counts);
+                Ok(())
+            }
+            Err(_) => {
+                // Complete in order: the first failing frame reports.
+                while !self.inflight.is_empty() {
+                    self.complete_front()?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Complete the front frame: wait for it, queue its output, and on
+    /// failure restore the state it started from and replay the frames
+    /// queued after it.
+    fn complete_front(&mut self) -> Result<(), Error> {
+        let Some(front) = self.inflight.pop_front() else {
+            return Ok(());
+        };
+        match front.kind {
+            PendingKind::ShowExisting(f) => {
+                self.ready.push_back((f, front.tag));
+                Ok(())
+            }
+            PendingKind::Decode {
+                mut inflight,
+                shown,
+                snapshot,
+                adapt,
+            } => {
+                if let (Some(pool), Some(batch)) = (self.pool.as_ref(), inflight.batch.as_ref()) {
+                    pool.wait(batch);
+                }
+                let result = match inflight.counts().map(|_| ()) {
+                    Ok(()) if inflight.frame.wait_complete() => Ok(()),
+                    Ok(()) => Err(Error::InvalidBitstream),
+                    Err(e) => Err(e),
+                };
+                match result {
+                    Ok(()) => {
+                        let counts = inflight.take_counts();
+                        if let Some(a) = adapt {
+                            apply_adaptation(&mut self.st.frame_contexts, a, &counts);
+                        }
+                        self.last_counts = Some(counts);
+                        if shown {
+                            self.ready
+                                .push_back((Arc::clone(&inflight.frame), front.tag));
+                        }
+                        Ok(())
+                    }
+                    Err(e) => {
+                        // Wait out everything after it, then rebuild the
+                        // state the failing frame left (as a lone push
+                        // would) and replay the later frames on it.
+                        let later: Vec<Pending> = self.inflight.drain(..).collect();
+                        for p in &later {
+                            if let PendingKind::Decode { inflight, .. } = &p.kind
+                                && let (Some(pool), Some(batch)) =
+                                    (self.pool.as_ref(), inflight.batch.as_ref())
+                            {
+                                pool.wait(batch);
+                            }
+                        }
+                        self.st = *snapshot;
+                        self.last_counts = None;
+                        for p in later {
+                            // Errors of replayed frames are dropped: the
+                            // first failure is the one reported.
+                            if let Ok(pending) = self.start_frame(Arc::clone(&p.payload), p.tag) {
+                                self.inflight.push_back(pending);
+                                let _ = self.complete_front();
+                            }
+                        }
+                        Err(e)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Process one coded frame's headers, update the persistent state,
+    /// and launch its decode.
+    fn start_frame(&mut self, payload: Arc<[u8]>, tag: i64) -> Result<Pending, Error> {
+        let frame: &[u8] = &payload;
         let Self {
-            bufs,
-            last_color,
-            prev_state,
-            frame_contexts,
-            last_frame_type_was_key,
-            persist_feature_enabled,
-            persist_feature_data,
-            persist_abs_or_delta,
-            persist_ref_deltas,
-            persist_mode_deltas,
-            prev_segment_ids_map,
+            st,
             exec,
-            last_counts,
             pool,
             scratch,
             recycle,
+            ..
         } = self;
-        *last_counts = None;
         // Peek the uncompressed header (with inherited ref state so inter
         // frames parse).
         let ref_dims: Vec<(u32, u32)> = (0..8)
-            .map(|i| (bufs.ref_frame_width(i), bufs.ref_frame_height(i)))
+            .map(|i| (st.bufs.ref_frame_width(i), st.bufs.ref_frame_height(i)))
             .collect();
-        let ref_state = last_color.map(|cc| RefFrameState {
+        let ref_state = st.last_color.map(|cc| RefFrameState {
             ref_dims: &ref_dims,
             color_config: cc,
         });
@@ -2756,14 +3052,18 @@ impl Vp9SequenceDecoder {
             // dimensions, subsampling and bit depth, so the displayable
             // frame is rebuilt from it.
             let idx = hdr.frame_to_show_map_idx.ok_or(Error::InvalidBitstream)? as usize;
-            if idx >= crate::ref_buffer::NUM_REF_FRAMES || !bufs.is_initialised(idx) {
+            if idx >= crate::ref_buffer::NUM_REF_FRAMES || !st.bufs.is_initialised(idx) {
                 return Err(Error::InvalidBitstream);
             }
-            let f = Arc::clone(bufs.slot(idx).frame.as_ref().expect("initialised slot"));
+            let f = Arc::clone(st.bufs.slot(idx).frame.as_ref().expect("initialised slot"));
             // §7.2.6 NOTE: compute_image_size is not invoked for a
             // show_existing_frame packet, so it leaves `prev_state` (the
             // §7.2.6 "previous invocation" record) untouched.
-            return Ok(Some(f));
+            return Ok(Pending {
+                payload,
+                tag,
+                kind: PendingKind::ShowExisting(f),
+            });
         }
 
         let frame_is_intra = matches!(hdr.frame_type, FrameType::KeyFrame) || hdr.intra_only;
@@ -2774,11 +3074,11 @@ impl Vp9SequenceDecoder {
         // defaults BEFORE its own loop_filter_params( ) /
         // segmentation_params( ) apply on top.
         if frame_is_intra || hdr.error_resilient_mode {
-            *persist_feature_enabled = [[false; SEG_LVL_MAX]; MAX_SEGMENTS];
-            *persist_feature_data = [[0i16; SEG_LVL_MAX]; MAX_SEGMENTS];
-            *persist_abs_or_delta = false;
-            *persist_ref_deltas = DEFAULT_LOOP_FILTER_REF_DELTAS;
-            *persist_mode_deltas = DEFAULT_LOOP_FILTER_MODE_DELTAS;
+            st.persist_feature_enabled = [[false; SEG_LVL_MAX]; MAX_SEGMENTS];
+            st.persist_feature_data = [[0i16; SEG_LVL_MAX]; MAX_SEGMENTS];
+            st.persist_abs_or_delta = false;
+            st.persist_ref_deltas = DEFAULT_LOOP_FILTER_REF_DELTAS;
+            st.persist_mode_deltas = DEFAULT_LOOP_FILTER_MODE_DELTAS;
             // §7.2: `ref_frame_sign_bias[ i ] = 0 for i = 0..3`. The
             // §6.2 ref-frames loop consumes the sign-bias *bits* before
             // setup_past_independence( ) runs (the reset sits after the
@@ -2797,7 +3097,8 @@ impl Vp9SequenceDecoder {
         // per-delta updates it carries into the persistent deltas (an
         // individual absent update keeps the prior value); every frame
         // then decodes with the fully-resolved persistent values.
-        for (slot, delta) in persist_ref_deltas
+        for (slot, delta) in st
+            .persist_ref_deltas
             .iter_mut()
             .zip(hdr.loop_filter.ref_deltas)
         {
@@ -2805,7 +3106,8 @@ impl Vp9SequenceDecoder {
                 *slot = d;
             }
         }
-        for (slot, delta) in persist_mode_deltas
+        for (slot, delta) in st
+            .persist_mode_deltas
             .iter_mut()
             .zip(hdr.loop_filter.mode_deltas)
         {
@@ -2813,20 +3115,20 @@ impl Vp9SequenceDecoder {
                 *slot = d;
             }
         }
-        hdr.loop_filter.ref_deltas = persist_ref_deltas.map(Some);
-        hdr.loop_filter.mode_deltas = persist_mode_deltas.map(Some);
+        hdr.loop_filter.ref_deltas = st.persist_ref_deltas.map(Some);
+        hdr.loop_filter.mode_deltas = st.persist_mode_deltas.map(Some);
 
         // §7.2.10: `segmentation_update_data == 0` keeps the existing
         // feature table (even across `segmentation_enabled == 0`
         // frames); `segmentation_update_data == 1` rewrites it.
         if hdr.segmentation.update_data {
-            *persist_feature_enabled = hdr.segmentation.feature_enabled;
-            *persist_feature_data = hdr.segmentation.feature_data;
-            *persist_abs_or_delta = hdr.segmentation.abs_or_delta_update;
+            st.persist_feature_enabled = hdr.segmentation.feature_enabled;
+            st.persist_feature_data = hdr.segmentation.feature_data;
+            st.persist_abs_or_delta = hdr.segmentation.abs_or_delta_update;
         } else {
-            hdr.segmentation.feature_enabled = *persist_feature_enabled;
-            hdr.segmentation.feature_data = *persist_feature_data;
-            hdr.segmentation.abs_or_delta_update = *persist_abs_or_delta;
+            hdr.segmentation.feature_enabled = st.persist_feature_enabled;
+            hdr.segmentation.feature_data = st.persist_feature_data;
+            hdr.segmentation.abs_or_delta_update = st.persist_abs_or_delta;
         }
 
         let lossless = hdr.quantization.lossless;
@@ -2842,44 +3144,34 @@ impl Vp9SequenceDecoder {
             return Err(Error::UnexpectedEof);
         }
 
-        // §6.4.14 PrevSegmentIds: the last map-bearing frame's
-        // `SegmentIds`, if it matches the current dimensions. A run of
-        // `update_map == 0` frames keeps predicting from this same map.
-        // §7.2 setup_past_independence( ) on an error-resilient frame
-        // clears `PrevSegmentIds[ ][ ]` to zero — model that with an
-        // explicit zero map (falling through to the previous frame's
-        // ids would resurrect the cleared state).
-        let prev_seg_map: Option<Arc<Vec<u8>>> = if hdr.error_resilient_mode {
-            let mi_cols = ((hdr.frame_width + 7) >> 3) as usize;
-            let mi_rows = ((hdr.frame_height + 7) >> 3) as usize;
-            Some(Arc::new(vec![0u8; mi_cols * mi_rows]))
-        } else {
-            prev_segment_ids_map.as_ref().and_then(|(map, mw, mh)| {
-                if *mw == hdr.frame_width && *mh == hdr.frame_height {
-                    Some(Arc::clone(map))
-                } else {
-                    None
-                }
-            })
-        };
-
         // §6.5 / §6.4.14 previous-frame snapshot (same-dimension only).
         // §6.5 MV/ref prediction reads the immediately-preceding decoded
-        // frame (and only when it was shown — §7.2.6 (c), applied
-        // inside decode_frame_with_prev through `prev_shown`); §6.4.14
+        // frame (and only when it was shown — §7.2.6 (c)); §6.4.14
         // segment prediction reads the separately-tracked
         // `prev_segment_ids_map` (last `update_map == 1` frame), which a
         // hidden predecessor does NOT invalidate (§8.1 step 3 has no
-        // show_frame condition).
-        let prev = prev_state.as_ref().and_then(|(ps, pw, ph, shown)| {
-            if *pw == hdr.frame_width && *ph == hdr.frame_height {
-                Some(PrevFrameState {
-                    state: Arc::clone(ps),
-                    segment_ids: prev_seg_map,
-                    prev_shown: *shown,
-                })
-            } else {
+        // show_frame condition). §7.2 setup_past_independence( ) on an
+        // error-resilient frame clears `PrevSegmentIds[ ][ ]` to zero
+        // (falling through to the previous frame's ids would resurrect
+        // the cleared state). Without a same-size previous frame both
+        // snapshots are zero (§7.2.6 UsePrevFrameMvs = 0, §6.4.14
+        // PrevSegmentIds cleared).
+        let prev = st
+            .prev_state
+            .as_ref()
+            .filter(|(_, pw, ph, _)| *pw == hdr.frame_width && *ph == hdr.frame_height);
+        let prev_shown = prev.is_some_and(|(_, _, _, shown)| *shown);
+        let prev_mvs = prev.map(|(f, ..)| Arc::clone(f));
+        let prev_seg = prev.and_then(|(f, ..)| {
+            if hdr.error_resilient_mode {
                 None
+            } else {
+                Some(
+                    st.prev_segment_ids_map
+                        .as_ref()
+                        .filter(|(_, mw, mh)| *mw == hdr.frame_width && *mh == hdr.frame_height)
+                        .map_or_else(|| Arc::clone(f), |(m, ..)| Arc::clone(m)),
+                )
             }
         });
 
@@ -2894,16 +3186,12 @@ impl Vp9SequenceDecoder {
         if helpers > 0 && pool.as_ref().is_none_or(|p| p.helpers() < helpers) {
             *pool = Some(WorkerPool::new(helpers));
         }
-        let payload: Arc<[u8]> = Arc::from(frame);
         // A frame no slot / caller holds any more lends its storage.
-        let mut reuse: Option<Bands> = recycle
+        let reuse: Option<Bands> = recycle
             .iter()
             .position(|f| Arc::strong_count(f) == 1)
             .and_then(|i| Arc::try_unwrap(recycle.swap_remove(i)).ok())
-            .map(|f| {
-                let [y, u, v] = f.planes;
-                [y.bands, u.bands, v.bands]
-            });
+            .map(FrameBuf::into_bands);
 
         // §6.2 setup_past_independence + reset_frame_context: a key /
         // intra-only / error-resilient frame decodes free of prior-frame
@@ -2917,9 +3205,9 @@ impl Vp9SequenceDecoder {
                 || hdr.error_resilient_mode
                 || hdr.reset_frame_context == 3;
             if reset_all {
-                *frame_contexts = Default::default();
+                st.frame_contexts = Default::default();
             } else if hdr.reset_frame_context == 2 {
-                frame_contexts[hdr.frame_context_idx as usize] = FrameContext::default();
+                st.frame_contexts[hdr.frame_context_idx as usize] = FrameContext::default();
             }
             0usize
         } else {
@@ -2929,7 +3217,7 @@ impl Vp9SequenceDecoder {
         // §6.1.2 load_probs( frame_context_idx ): the compressed-header
         // forward updates fold onto the loaded bank, not the static
         // defaults.
-        let base_ctx = frame_contexts[frame_context_idx].clone();
+        let base_ctx = st.frame_contexts[frame_context_idx].clone();
 
         // §6.1.2 refresh_probs( ) gate: with error_resilient_mode == 0
         // and frame_parallel_decoding_mode == 0, the §8.4 backward
@@ -2937,54 +3225,37 @@ impl Vp9SequenceDecoder {
         // reloads the PRE-frame bank (discarding this frame's forward
         // updates on every table except tx_probs / skip_prob, which
         // load_probs( ) does not cover), the counts adapt it, and
-        // save_probs( idx ) persists the result. In parallel /
-        // error-resilient mode save_probs( ) persists the
-        // forward-updated working tables instead.
+        // save_probs( idx ) persists the result (`PendingAdapt`, applied
+        // once the counts exist). In parallel / error-resilient mode
+        // save_probs( ) persists the forward-updated working tables
+        // instead.
         let non_parallel = !hdr.error_resilient_mode && !hdr.frame_parallel_decoding_mode;
+        let owes_adaptation = hdr.refresh_frame_context && non_parallel;
 
-        let products = if frame_is_intra {
+        let (chdr, adapt) = if frame_is_intra {
             let chdr_parsed =
                 parse_compressed_header_with_ctx(&frame[ch_start..ch_end], lossless, &base_ctx)?;
-            // The forward-updated tx_probs / skip_prob survive an intra
-            // frame's refresh_probs( ) (load_probs( ) skips them and
-            // FrameIsIntra bypasses load_probs2( )).
-            let fwd_tx_probs = chdr_parsed.tx_probs;
-            let fwd_skip_prob = chdr_parsed.skip_prob;
             // §6.1.2 save_probs( frame_context_idx ) — parallel-mode
             // path: no backward adaptation, persist the forward-updated
             // tables directly.
             if hdr.refresh_frame_context && !non_parallel {
-                frame_contexts[frame_context_idx].apply_intra(&chdr_parsed);
+                st.frame_contexts[frame_context_idx].apply_intra(&chdr_parsed);
             }
-            let chdr = ChdrKind::Intra(Box::new(chdr_parsed));
-            let products = decode_single_frame(
-                &payload,
-                &hdr,
-                ch_end,
-                chdr,
-                Some(bufs),
-                prev,
-                pool.as_ref(),
-                scratch,
-                reuse.take(),
-            )?;
-            if hdr.refresh_frame_context && non_parallel {
-                // refresh_probs( ), FrameIsIntra == 1 arm:
-                //   load_probs( idx ) ; adapt_coef_probs( ) ;
-                //   save_probs( idx ).
-                let mut work = base_ctx.clone();
-                work.tx_probs = fwd_tx_probs;
-                work.skip_prob = fwd_skip_prob;
-                crate::prob_adapt::adapt_coef_probs(
-                    &mut work.coef_probs,
-                    &products.counts.token,
-                    &products.counts.more_coefs,
-                    true,
-                    *last_frame_type_was_key,
-                );
-                frame_contexts[frame_context_idx] = work;
-            }
-            products
+            // The forward-updated tx_probs / skip_prob survive an intra
+            // frame's refresh_probs( ) (load_probs( ) skips them and
+            // FrameIsIntra bypasses load_probs2( )).
+            let adapt = owes_adaptation.then(|| {
+                Box::new(PendingAdapt {
+                    idx: frame_context_idx,
+                    base: base_ctx.clone(),
+                    intra_fwd: Some((chdr_parsed.tx_probs, chdr_parsed.skip_prob)),
+                    last_frame_type_was_key: st.last_frame_type_was_key,
+                    interp_switchable: false,
+                    tx_mode_select: false,
+                    allow_high_precision_mv: false,
+                })
+            });
+            (ChdrKind::Intra(Box::new(chdr_parsed)), adapt)
         } else {
             let inputs = Vp9CompressedHeaderInterInputs {
                 interpolation_filter_is_switchable: hdr.interpolation_filter == SWITCHABLE_FILTER,
@@ -3004,55 +3275,46 @@ impl Vp9SequenceDecoder {
             let tx_mode_select =
                 chdr_parsed.intra.tx_mode == crate::compressed::TxMode::TxModeSelect;
             if hdr.refresh_frame_context && !non_parallel {
-                frame_contexts[frame_context_idx].apply_inter(&chdr_parsed);
+                st.frame_contexts[frame_context_idx].apply_inter(&chdr_parsed);
             }
-            let chdr = ChdrKind::Inter(Box::new(chdr_parsed));
-            let products = decode_single_frame(
-                &payload,
-                &hdr,
-                ch_end,
-                chdr,
-                Some(bufs),
-                prev,
-                pool.as_ref(),
-                scratch,
-                reuse.take(),
-            )?;
-            if hdr.refresh_frame_context && non_parallel {
-                // refresh_probs( ), FrameIsIntra == 0 arm:
-                //   load_probs( idx ) ; adapt_coef_probs( ) ;
-                //   load_probs2( idx ) ; adapt_noncoef_probs( ) ;
-                //   save_probs( idx ).
-                // load_probs( ) + load_probs2( ) together restore the
-                // whole pre-frame bank, so the frame's forward updates
-                // never persist on this path.
-                let mut work = base_ctx.clone();
-                crate::prob_adapt::adapt_coef_probs(
-                    &mut work.coef_probs,
-                    &products.counts.token,
-                    &products.counts.more_coefs,
-                    false,
-                    *last_frame_type_was_key,
-                );
-                crate::prob_adapt::adapt_noncoef_probs(
-                    &mut work,
-                    &products.counts.noncoef,
-                    hdr.interpolation_filter == SWITCHABLE_FILTER,
+            let adapt = owes_adaptation.then(|| {
+                Box::new(PendingAdapt {
+                    idx: frame_context_idx,
+                    base: base_ctx.clone(),
+                    intra_fwd: None,
+                    last_frame_type_was_key: st.last_frame_type_was_key,
+                    interp_switchable: hdr.interpolation_filter == SWITCHABLE_FILTER,
                     tx_mode_select,
-                    hdr.allow_high_precision_mv,
-                );
-                frame_contexts[frame_context_idx] = work;
-            }
-            products
+                    allow_high_precision_mv: hdr.allow_high_precision_mv,
+                })
+            });
+            (ChdrKind::Inter(Box::new(chdr_parsed)), adapt)
         };
+
+        // The state a failing decode leaves (as before this frame's
+        // decode updates).
+        let snapshot = Box::new(st.clone());
+        let inflight = launch_single_frame(
+            &payload,
+            &hdr,
+            ch_end,
+            chdr,
+            Some(&st.bufs),
+            (prev_mvs, prev_seg, prev_shown),
+            pool.as_ref(),
+            scratch,
+            reuse,
+        )?;
+        let decoded = Arc::clone(inflight.frame());
 
         // §7.2: LastFrameType tracks the just-decoded frame's type for
         // the next frame's §8.4.3 updateFactor selection.
-        *last_frame_type_was_key = matches!(hdr.frame_type, FrameType::KeyFrame);
+        st.last_frame_type_was_key = matches!(hdr.frame_type, FrameType::KeyFrame);
 
         // §8.10 reference frame update: the slots `refresh_frame_flags`
-        // names now hold the (loop-filtered) decoded frame.
-        bufs.update(hdr.refresh_frame_flags, &products.frame);
+        // names now hold the (loop-filtered) decoded frame — later
+        // frames read its rows as they are finished.
+        st.bufs.update(hdr.refresh_frame_flags, &decoded);
         // Keep the frames still referenced plus a couple of free ones
         // (their storage serves the next frames).
         let mut free = 0;
@@ -3061,40 +3323,93 @@ impl Vp9SequenceDecoder {
             free += usize::from(Arc::strong_count(f) == 1);
             keep
         });
-        recycle.push(Arc::clone(&products.frame));
+        recycle.push(Arc::clone(&decoded));
 
         // Carry inherited color config (§6.2: an intra frame establishes
         // it; an inter frame before any intra frame is malformed but we
         // tolerate it by adopting its own config) + the prev-frame motion
         // field.
-        if frame_is_intra || last_color.is_none() {
-            *last_color = Some(hdr.color_config);
+        if frame_is_intra || st.last_color.is_none() {
+            st.last_color = Some(hdr.color_config);
         }
         // §8.1 step 3: refresh PrevSegmentIds only after a frame that
         // built a fresh map (`segmentation_enabled && update_map`). A
         // frame reusing the map leaves the persistent copy untouched so
         // the *next* frame still predicts from the original.
         if hdr.segmentation.enabled && hdr.segmentation.update_map {
-            *prev_segment_ids_map = Some((
-                Arc::new(products.state.segment_ids.clone()),
-                hdr.frame_width,
-                hdr.frame_height,
-            ));
+            st.prev_segment_ids_map =
+                Some((Arc::clone(&decoded), hdr.frame_width, hdr.frame_height));
         }
+        st.prev_state = Some((decoded, hdr.frame_width, hdr.frame_height, hdr.show_frame));
 
-        let shown = hdr.show_frame;
-        *last_counts = Some(products.counts);
-        *prev_state = Some((
-            Arc::new(products.state),
-            hdr.frame_width,
-            hdr.frame_height,
-            shown,
-        ));
-
-        // §8.9: a hidden (`show_frame == 0`) frame is decoded as a reference
-        // but not emitted; only shown frames are output here.
-        Ok(if shown { Some(products.frame) } else { None })
+        // §8.9: a hidden (`show_frame == 0`) frame is decoded as a
+        // reference but not emitted.
+        Ok(Pending {
+            payload,
+            tag,
+            kind: PendingKind::Decode {
+                inflight,
+                shown: hdr.show_frame,
+                snapshot,
+                adapt,
+            },
+        })
     }
+}
+
+/// §6.1.2 `refresh_probs( )`: adapt the pre-frame bank with the frame's
+/// §9.3.4 counts and `save_probs( idx )` the result.
+fn apply_adaptation(
+    banks: &mut [FrameContext; 4],
+    a: Box<PendingAdapt>,
+    counts: &crate::prob_adapt::FrameCounts,
+) {
+    let PendingAdapt {
+        idx,
+        base: mut work,
+        intra_fwd,
+        last_frame_type_was_key,
+        interp_switchable,
+        tx_mode_select,
+        allow_high_precision_mv,
+    } = *a;
+    match intra_fwd {
+        Some((tx_probs, skip_prob)) => {
+            // FrameIsIntra == 1 arm: load_probs( idx ) ;
+            // adapt_coef_probs( ) ; save_probs( idx ).
+            work.tx_probs = tx_probs;
+            work.skip_prob = skip_prob;
+            crate::prob_adapt::adapt_coef_probs(
+                &mut work.coef_probs,
+                &counts.token,
+                &counts.more_coefs,
+                true,
+                last_frame_type_was_key,
+            );
+        }
+        None => {
+            // FrameIsIntra == 0 arm: load_probs( idx ) ;
+            // adapt_coef_probs( ) ; load_probs2( idx ) ;
+            // adapt_noncoef_probs( ) ; save_probs( idx ). load_probs( ) +
+            // load_probs2( ) together restore the whole pre-frame bank,
+            // so the frame's forward updates never persist on this path.
+            crate::prob_adapt::adapt_coef_probs(
+                &mut work.coef_probs,
+                &counts.token,
+                &counts.more_coefs,
+                false,
+                last_frame_type_was_key,
+            );
+            crate::prob_adapt::adapt_noncoef_probs(
+                &mut work,
+                &counts.noncoef,
+                interp_switchable,
+                tx_mode_select,
+                allow_high_precision_mv,
+            );
+        }
+    }
+    banks[idx] = work;
 }
 
 /// `SWITCHABLE = 4` per §7.4.10 — the frame-level interpolation-filter

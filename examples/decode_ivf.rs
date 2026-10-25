@@ -53,20 +53,27 @@ fn main() {
     let mut frames = 0usize;
     let mut decode_time = std::time::Duration::ZERO;
     let start = Instant::now();
+    let mut drain = |dec: &mut Vp9Decoder, decode_time: &mut std::time::Duration| loop {
+        let t = Instant::now();
+        let got = dec.receive_frame();
+        *decode_time += t.elapsed();
+        let Ok(Frame::Video(vf)) = got else { break };
+        frames += 1;
+        if let Some(w) = out.as_mut() {
+            for plane in &vf.planes {
+                w.write_all(&plane.data).expect("write");
+            }
+        }
+    };
     for (pts, payload) in &packets {
         let pkt = Packet::new(0, TimeBase::new(1, 1000), payload.clone()).with_pts(*pts);
         let t = Instant::now();
         dec.send_packet(&pkt).expect("decode");
         decode_time += t.elapsed();
-        while let Ok(Frame::Video(vf)) = dec.receive_frame() {
-            frames += 1;
-            if let Some(w) = out.as_mut() {
-                for plane in &vf.planes {
-                    w.write_all(&plane.data).expect("write");
-                }
-            }
-        }
+        drain(&mut dec, &mut decode_time);
     }
+    dec.flush().expect("flush");
+    drain(&mut dec, &mut decode_time);
     let wall = start.elapsed();
     eprintln!(
         "{frames} frames, decode {:.3} s ({:.1} fps), wall {:.3} s",

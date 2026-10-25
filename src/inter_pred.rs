@@ -87,16 +87,17 @@ pub(crate) struct RefPlane<'a> {
     /// `RefFrameHeight[ refIdx ]` — reference frame height in luma
     /// samples.
     pub ref_frame_height: i32,
-    /// The decoder's banded frame storage; when set it supplies the rows
-    /// and `samples` / `stride` are unused.
-    pub bands: Option<&'a crate::frame_buf::BandPlane>,
+    /// The decoder's banded frame storage (frame, plane); when set it
+    /// supplies the rows — blocking on rows the frame has not finished
+    /// yet — and `samples` is unused.
+    pub bands: Option<(&'a crate::frame_buf::FrameBuf, usize)>,
 }
 
 impl crate::block_inter_pred::SampleRows for RefPlane<'_> {
     #[inline]
     fn row(&self, y: usize) -> &[i32] {
         match self.bands {
-            Some(b) => b.row(y),
+            Some((f, p)) => f.row(p, y),
             None => {
                 let s = &self.samples[y * self.stride..];
                 &s[..self.stride.min(s.len())]

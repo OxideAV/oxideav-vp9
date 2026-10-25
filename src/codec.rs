@@ -33,7 +33,8 @@ use oxideav_core::{
     Result as CoreResult, RuntimeContext, TimeBase, VideoFrame, VideoPlane, parse_options,
 };
 
-use crate::decode_frame::{Vp9DecodedFrame, Vp9SequenceDecoder};
+use crate::decode_frame::Vp9SequenceDecoder;
+use crate::frame_buf::FrameBuf;
 use crate::pixel_encoder::{
     ChainModel, LosslessGopEncoder420, LossyFormat, LossyGopEncoder, padded_targets_from_u8,
     padded_targets_from_u16,
@@ -110,55 +111,60 @@ fn chroma_dims(width: u32, height: u32, ssx: bool, ssy: bool) -> (usize, usize) 
     (cw, ch)
 }
 
-/// Pack a decoded plane (`u16` samples) into framework plane bytes:
-/// one byte per sample at 8-bit, §8.10 little-endian pairs at 10/12.
-fn pack_plane(samples: &[u16], width: usize, bit_depth: u8) -> VideoPlane {
-    if bit_depth == 8 {
-        VideoPlane {
-            stride: width,
-            data: samples.iter().map(|&s| s as u8).collect(),
-        }
-    } else {
-        let mut data = Vec::with_capacity(samples.len() * 2);
-        for &s in samples {
-            data.extend_from_slice(&s.to_le_bytes());
-        }
-        VideoPlane {
-            stride: width * 2,
-            data,
-        }
-    }
-}
-
 /// Convert one decoded frame into a framework [`Frame`], carrying the
 /// packet's presentation timestamp through, and report the frame's
 /// framework pixel format. The plane geometry is the framework's own
 /// `PixelFormat::plane_dimensions` rule for that label (§8.10 `ceil`
 /// on each subsampled axis — for 4:4:0, full-width, half-height
-/// chroma).
-fn decoded_to_frame(f: &Vp9DecodedFrame, pts: Option<i64>) -> CoreResult<(PixelFormat, Frame)> {
+/// chroma); samples pack one byte each at 8-bit, §8.10 little-endian
+/// pairs at 10/12.
+fn buf_to_frame(f: &FrameBuf, pts: Option<i64>) -> CoreResult<(PixelFormat, Frame)> {
     let Some(fmt) = pixel_format_for_triple(f.bit_depth, f.subsampling_x, f.subsampling_y) else {
         return Err(CoreError::unsupported(format!(
             "vp9: no framework pixel-format label for bit depth {} (§7.2.2 allows 8/10/12)",
             f.bit_depth
         )));
     };
-    let (cw, ch) = chroma_dims(f.width, f.height, f.subsampling_x, f.subsampling_y);
+    if !f.wait_complete() {
+        return Err(CoreError::invalid("vp9: frame decode failed"));
+    }
+    let (cw, ch) = chroma_dims(
+        f.frame_width,
+        f.frame_height,
+        f.subsampling_x,
+        f.subsampling_y,
+    );
     debug_assert_eq!(
-        fmt.plane_dimensions(1, f.width, f.height),
+        fmt.plane_dimensions(1, f.frame_width, f.frame_height),
         Some((cw as u32, ch as u32)),
         "framework chroma geometry must agree with §8.10"
     );
-    debug_assert_eq!(f.u.len(), cw * ch);
+    let (w, h) = (f.frame_width as usize, f.frame_height as usize);
+    let pack = |p: usize, pw: usize, ph: usize| -> VideoPlane {
+        if f.bit_depth == 8 {
+            let mut data = Vec::with_capacity(pw * ph);
+            for y in 0..ph {
+                data.extend(f.row(p, y)[..pw].iter().map(|&s| s as u8));
+            }
+            VideoPlane { stride: pw, data }
+        } else {
+            let mut data = Vec::with_capacity(pw * ph * 2);
+            for y in 0..ph {
+                for &s in &f.row(p, y)[..pw] {
+                    data.extend_from_slice(&(s as u16).to_le_bytes());
+                }
+            }
+            VideoPlane {
+                stride: pw * 2,
+                data,
+            }
+        }
+    };
     Ok((
         fmt,
         Frame::Video(VideoFrame {
             pts,
-            planes: vec![
-                pack_plane(&f.y, f.width as usize, f.bit_depth),
-                pack_plane(&f.u, cw, f.bit_depth),
-                pack_plane(&f.v, cw, f.bit_depth),
-            ],
+            planes: vec![pack(0, w, h), pack(1, cw, ch), pack(2, cw, ch)],
         }),
     ))
 }
@@ -190,7 +196,26 @@ pub struct Vp9Decoder {
     exec: ExecutionContext,
 }
 
+/// Frames the framework decoder keeps decoding concurrently under a
+/// multi-thread budget.
+const IN_FLIGHT: usize = 2;
+
+/// The tag of a packet without a presentation timestamp.
+const NO_PTS: i64 = i64::MIN;
+
 impl Vp9Decoder {
+    /// Move the sequence decoder's completed shown frames into the
+    /// output queue.
+    fn collect_ready(&mut self) -> CoreResult<()> {
+        while let Some((buf, tag)) = self.seq.pop_ready() {
+            let pts = (tag != NO_PTS).then_some(tag);
+            let (fmt, frame) = buf_to_frame(&buf, pts)?;
+            self.format = Some(fmt);
+            self.pending.push_back(frame);
+        }
+        Ok(())
+    }
+
     /// Fresh decoder state (the stream must start with a keyframe).
     pub fn new() -> Self {
         Self {
@@ -237,30 +262,41 @@ impl Decoder for Vp9Decoder {
     fn send_packet(&mut self, packet: &Packet) -> CoreResult<()> {
         // §B.2 / §B.4: split the packet into its coded frames (a chunk
         // with no valid superframe index is a single coded frame — the
-        // split is total, per the §B.4 fallback).
+        // split is total, per the §B.4 fallback). Under a multi-thread
+        // budget up to `IN_FLIGHT` frames decode concurrently (each
+        // frame's rows wait on the rows of the frames it reads), so a
+        // shown frame may surface a couple of packets later; serially
+        // every frame completes within its own packet.
+        let in_flight = if self.exec.threads > 1 { IN_FLIGHT } else { 0 };
+        let tag = packet.pts.unwrap_or(NO_PTS);
         let frames = split_superframe(&packet.data);
         for payload in frames {
-            if let Some(decoded) = self.seq.push_frame(payload).map_err(map_err)? {
-                let (fmt, frame) = decoded_to_frame(&decoded, packet.pts)?;
-                self.format = Some(fmt);
-                self.pending.push_back(frame);
-            }
+            self.seq.submit(payload, tag, in_flight).map_err(map_err)?;
+            self.collect_ready()?;
         }
         Ok(())
     }
 
     fn receive_frame(&mut self) -> CoreResult<Frame> {
-        match self.pending.pop_front() {
-            Some(f) => Ok(f),
-            None if self.flushed => Err(CoreError::Eof),
-            None => Err(CoreError::NeedMore),
+        loop {
+            if let Some(f) = self.pending.pop_front() {
+                return Ok(f);
+            }
+            if !self.flushed {
+                return Err(CoreError::NeedMore);
+            }
+            match self.seq.finish_one() {
+                Some(r) => {
+                    r.map_err(map_err)?;
+                    self.collect_ready()?;
+                }
+                None => return Err(CoreError::Eof),
+            }
         }
     }
 
     fn flush(&mut self) -> CoreResult<()> {
-        // VP9 decode is packet-synchronous (every shown frame is
-        // emitted by the send_packet that carried it), so flushing only
-        // marks end-of-stream for the receive loop.
+        // Every frame submitted so far drains through receive_frame.
         self.flushed = true;
         Ok(())
     }

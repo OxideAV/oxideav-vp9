@@ -167,13 +167,13 @@ pub(crate) fn build_ref_planes<'a>(
             // reached for it on a conformant stream.
             continue;
         };
-        let p = &frame.planes[plane.min(2)];
+        let p = plane.min(2);
         *slot = Some(RefPlane {
             samples: &[],
-            stride: p.stride,
+            stride: frame.geom[p].stride,
             ref_frame_width: frame.frame_width as i32,
             ref_frame_height: frame.frame_height as i32,
-            bands: Some(p),
+            bands: Some((frame, p)),
         });
     }
     RefPlanes { list }

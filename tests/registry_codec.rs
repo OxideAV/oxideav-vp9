@@ -108,11 +108,17 @@ fn decode_all(dec: &mut dyn Decoder, packets: &[Packet]) -> Vec<VideoFrame> {
             }
         }
     }
+    // Under a thread budget frames may still be decoding when their
+    // packet returns (the framework contract: flush drains them).
     dec.flush().expect("flush");
-    assert!(
-        matches!(dec.receive_frame(), Err(CoreError::Eof)),
-        "Eof after flush"
-    );
+    loop {
+        match dec.receive_frame() {
+            Ok(Frame::Video(v)) => out.push(v),
+            Ok(_) => panic!("expected video frames"),
+            Err(CoreError::Eof) => break,
+            Err(e) => panic!("receive_frame after flush: {e:?}"),
+        }
+    }
     out
 }
 

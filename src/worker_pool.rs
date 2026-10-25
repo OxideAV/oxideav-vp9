@@ -2,31 +2,50 @@
 //!
 //! The pool lives as long as the [`crate::Vp9SequenceDecoder`] that
 //! owns it, so no thread is spawned per frame. Jobs are `'static`
-//! closures executed in FIFO order; [`WorkerPool::run`] queues a batch,
-//! lets the calling thread work the queue alongside the helpers, and
-//! returns once every job of the batch has finished.
+//! closures executed in FIFO order across all submitted batches;
+//! [`WorkerPool::submit`] queues a frame's batch without blocking and
+//! [`WorkerPool::wait`] blocks until a batch has finished — the calling
+//! thread works the queue meanwhile.
 //!
-//! Jobs of one batch may block on progress published by jobs queued
-//! *earlier* in the same batch (the frame pipeline's loop-filter rows
-//! wait on tile rows and on the row above). FIFO dequeueing makes that
-//! deadlock-free at any pool size: when a job is running, every job
-//! queued before it has been dequeued, so the earliest unfinished job is
-//! always running and only ever waits on finished work. With no helper
-//! threads the caller simply runs the batch in order.
+//! Jobs may block on progress published by jobs queued *earlier* (the
+//! frame pipeline's loop-filter rows wait on tile rows and on the row
+//! above; a frame's tile rows wait on the reference rows of the frames
+//! before it). FIFO dequeueing makes that deadlock-free at any pool
+//! size: when a job is running, every job queued before it has been
+//! dequeued, so the earliest unfinished job is always running and only
+//! ever waits on finished work. With no helper threads the caller runs
+//! the queue in order.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
-type Job = Box<dyn FnOnce() + Send + 'static>;
+pub(crate) type Job = Box<dyn FnOnce() + Send + 'static>;
+
+type Panic = Box<dyn std::any::Any + Send + 'static>;
+
+/// One submitted batch's completion state.
+struct BatchState {
+    /// (jobs not yet finished, first panic payload).
+    pending: Mutex<(usize, Option<Panic>)>,
+    done: Condvar,
+}
+
+/// A handle on a submitted batch (see [`WorkerPool::wait`]).
+pub(crate) struct Batch {
+    state: Arc<BatchState>,
+}
+
+impl Batch {
+    /// Whether every job of the batch has finished.
+    #[cfg(test)]
+    pub(crate) fn is_done(&self) -> bool {
+        lock(&self.state.pending).0 == 0
+    }
+}
 
 struct Queue {
-    jobs: VecDeque<Job>,
-    /// Jobs of the current batch not yet finished (queued or running).
-    pending: usize,
-    /// A job of the current batch panicked; its payload is re-raised on
-    /// the caller once the batch drains.
-    panic: Option<Box<dyn std::any::Any + Send + 'static>>,
+    jobs: VecDeque<(Job, Arc<BatchState>)>,
     shutdown: bool,
 }
 
@@ -34,33 +53,29 @@ struct Shared {
     queue: Mutex<Queue>,
     /// Signalled when a job is queued (helpers wait on it).
     work: Condvar,
-    /// Signalled when the batch's last job finishes.
-    done: Condvar,
 }
 
-impl Shared {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Queue> {
-        self.queue.lock().unwrap_or_else(|e| e.into_inner())
-    }
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
-    /// Run one job, recording a panic instead of unwinding the worker.
-    fn execute(&self, job: Job) {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
-        let mut q = self.lock();
-        if let Err(payload) = result
-            && q.panic.is_none()
-        {
-            q.panic = Some(payload);
-        }
-        q.pending -= 1;
-        if q.pending == 0 {
-            self.done.notify_all();
-        }
+/// Run one job, recording a panic in its batch instead of unwinding.
+fn execute(job: Job, batch: &BatchState) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+    let mut p = lock(&batch.pending);
+    if let Err(payload) = result
+        && p.1.is_none()
+    {
+        p.1 = Some(payload);
+    }
+    p.0 -= 1;
+    if p.0 == 0 {
+        batch.done.notify_all();
     }
 }
 
 /// The persistent pool: `helpers` background threads plus the calling
-/// thread while it is inside [`WorkerPool::run`].
+/// thread while it is inside [`WorkerPool::wait`].
 pub(crate) struct WorkerPool {
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
@@ -76,17 +91,14 @@ impl std::fmt::Debug for WorkerPool {
 
 impl WorkerPool {
     /// A pool with `helpers` background threads (`0` = the caller runs
-    /// every job itself).
+    /// every job itself, inside [`Self::wait`]).
     pub(crate) fn new(helpers: usize) -> Self {
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
                 jobs: VecDeque::new(),
-                pending: 0,
-                panic: None,
                 shutdown: false,
             }),
             work: Condvar::new(),
-            done: Condvar::new(),
         });
         let threads = (0..helpers)
             .map(|i| {
@@ -105,45 +117,63 @@ impl WorkerPool {
         self.threads.len()
     }
 
-    /// Run `jobs` to completion (FIFO; the caller participates). A
-    /// panicking job's payload is re-raised here after the batch drains.
-    pub(crate) fn run(&self, jobs: Vec<Job>) {
-        if jobs.is_empty() {
-            return;
-        }
+    /// Queue `jobs` (FIFO, after every job already queued).
+    pub(crate) fn submit(&self, jobs: Vec<Job>) -> Batch {
+        let state = Arc::new(BatchState {
+            pending: Mutex::new((jobs.len(), None)),
+            done: Condvar::new(),
+        });
         {
-            let mut q = self.shared.lock();
-            debug_assert_eq!(q.pending, 0, "one batch at a time");
-            q.pending = jobs.len();
-            q.jobs.extend(jobs);
+            let mut q = lock(&self.shared.queue);
+            q.jobs
+                .extend(jobs.into_iter().map(|j| (j, Arc::clone(&state))));
         }
         self.shared.work.notify_all();
-        // Work the queue alongside the helpers.
+        Batch { state }
+    }
+
+    /// Block until `batch` has finished, running queued jobs (of any
+    /// batch, in FIFO order) meanwhile. A panicking job's payload is
+    /// re-raised here.
+    pub(crate) fn wait(&self, batch: &Batch) {
         loop {
-            let job = self.shared.lock().jobs.pop_front();
+            if lock(&batch.state.pending).0 == 0 {
+                break;
+            }
+            let job = lock(&self.shared.queue).jobs.pop_front();
             match job {
-                Some(job) => self.shared.execute(job),
-                None => break,
+                Some((job, state)) => execute(job, &state),
+                None => {
+                    // Everything left is running on helpers.
+                    let mut p = lock(&batch.state.pending);
+                    while p.0 > 0 {
+                        p = batch.state.done.wait(p).unwrap_or_else(|e| e.into_inner());
+                    }
+                    break;
+                }
             }
         }
-        let mut q = self.shared.lock();
-        while q.pending > 0 {
-            q = self.shared.done.wait(q).unwrap_or_else(|e| e.into_inner());
-        }
-        if let Some(payload) = q.panic.take() {
-            drop(q);
+        let payload = lock(&batch.state.pending).1.take();
+        if let Some(payload) = payload {
             std::panic::resume_unwind(payload);
         }
+    }
+
+    /// [`Self::submit`] + [`Self::wait`].
+    #[cfg(test)]
+    pub(crate) fn run(&self, jobs: Vec<Job>) {
+        let batch = self.submit(jobs);
+        self.wait(&batch);
     }
 }
 
 fn helper_loop(shared: &Shared) {
     loop {
-        let job = {
-            let mut q = shared.lock();
+        let (job, state) = {
+            let mut q = lock(&shared.queue);
             loop {
-                if let Some(job) = q.jobs.pop_front() {
-                    break job;
+                if let Some(item) = q.jobs.pop_front() {
+                    break item;
                 }
                 if q.shutdown {
                     return;
@@ -151,13 +181,13 @@ fn helper_loop(shared: &Shared) {
                 q = shared.work.wait(q).unwrap_or_else(|e| e.into_inner());
             }
         };
-        shared.execute(job);
+        execute(job, &state);
     }
 }
 
 impl Drop for WorkerPool {
     fn drop(&mut self) {
-        self.shared.lock().shutdown = true;
+        lock(&self.shared.queue).shutdown = true;
         self.shared.work.notify_all();
         for t in self.threads.drain(..) {
             let _ = t.join();
@@ -190,28 +220,34 @@ mod tests {
         }
     }
 
-    /// Jobs waiting on earlier jobs of the batch never deadlock, even
-    /// with fewer threads than jobs.
+    /// Jobs waiting on earlier jobs — of the same or an earlier batch —
+    /// never deadlock, even with fewer threads than jobs.
     #[test]
     fn chained_waits_complete_with_one_thread() {
         for helpers in [0, 1, 2] {
             let pool = WorkerPool::new(helpers);
             let state = Arc::new((Mutex::new(0usize), Condvar::new()));
-            let jobs: Vec<Job> = (0..12)
-                .map(|i| {
-                    let state = Arc::clone(&state);
-                    Box::new(move || {
-                        let (m, cv) = &*state;
-                        let mut g = m.lock().unwrap();
-                        while *g != i {
-                            g = cv.wait(g).unwrap();
-                        }
-                        *g += 1;
-                        cv.notify_all();
-                    }) as Job
-                })
-                .collect();
-            pool.run(jobs);
+            let make = |range: std::ops::Range<usize>| -> Vec<Job> {
+                range
+                    .map(|i| {
+                        let state = Arc::clone(&state);
+                        Box::new(move || {
+                            let (m, cv) = &*state;
+                            let mut g = m.lock().unwrap();
+                            while *g != i {
+                                g = cv.wait(g).unwrap();
+                            }
+                            *g += 1;
+                            cv.notify_all();
+                        }) as Job
+                    })
+                    .collect()
+            };
+            let first = pool.submit(make(0..6));
+            let second = pool.submit(make(6..12));
+            pool.wait(&second);
+            pool.wait(&first);
+            assert!(first.is_done() && second.is_done());
             assert_eq!(*state.0.lock().unwrap(), 12);
         }
     }

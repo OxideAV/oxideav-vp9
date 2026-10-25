@@ -41,7 +41,7 @@
 
 use std::sync::Arc;
 
-use crate::frame_buf::{BandPlane, FrameBuf};
+use crate::frame_buf::FrameBuf;
 use crate::mode_info::LAST_FRAME;
 
 /// `NUM_REF_FRAMES` from §3: the number of `FrameStore` slots.
@@ -71,14 +71,9 @@ impl RefSlot {
         self.frame.as_ref().map_or(0, |f| f.frame_height)
     }
 
-    /// The stored plane `p` (`0` = Y). Panics on an empty slot.
-    pub fn plane(&self, p: usize) -> &BandPlane {
-        &self.frame.as_ref().expect("initialised slot").planes[p]
-    }
-
     /// Sample `(x, y)` of plane `p` (tests).
     pub fn sample(&self, p: usize, x: usize, y: usize) -> i32 {
-        self.plane(p).row(y)[x]
+        self.frame.as_ref().expect("initialised slot").row(p, y)[x]
     }
 
     /// The stored frame cropped to its §8.10 visible extents.
@@ -157,21 +152,18 @@ impl RefBuffers {
 
     /// [`Self::update`] from flat planes (copied into a [`FrameBuf`]).
     pub fn update_planes(&mut self, refresh_frame_flags: u8, curr: &CurrFramePlanes<'_>) {
-        let ssy = u32::from(curr.subsampling_y);
-        let lh = curr.y.len() / curr.y_stride;
-        let ch = curr.u.len() / curr.uv_stride;
-        let frame = Arc::new(FrameBuf {
-            planes: [
-                BandPlane::from_flat(curr.y, curr.y_stride, lh, 6),
-                BandPlane::from_flat(curr.u, curr.uv_stride, ch, 6 - ssy),
-                BandPlane::from_flat(curr.v, curr.uv_stride, ch, 6 - ssy),
+        let frame = Arc::new(FrameBuf::from_flat(
+            [
+                (curr.y, curr.y_stride),
+                (curr.u, curr.uv_stride),
+                (curr.v, curr.uv_stride),
             ],
-            frame_width: curr.frame_width,
-            frame_height: curr.frame_height,
-            subsampling_x: curr.subsampling_x,
-            subsampling_y: curr.subsampling_y,
-            bit_depth: curr.bit_depth,
-        });
+            curr.frame_width,
+            curr.frame_height,
+            curr.subsampling_x,
+            curr.subsampling_y,
+            curr.bit_depth,
+        ));
         self.update(refresh_frame_flags, &frame);
     }
 }

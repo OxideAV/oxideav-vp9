@@ -33,14 +33,19 @@ fn decode_bytes(packets: &[Packet], exec: &ExecutionContext) -> Vec<u8> {
     let mut dec = oxideav_vp9::Vp9Decoder::new();
     dec.set_execution_context(exec);
     let mut out = Vec::new();
-    for p in packets {
-        dec.send_packet(p).expect("decode");
+    let mut drain = |dec: &mut oxideav_vp9::Vp9Decoder| {
         while let Ok(Frame::Video(v)) = dec.receive_frame() {
             for plane in &v.planes {
                 out.extend_from_slice(&plane.data);
             }
         }
+    };
+    for p in packets {
+        dec.send_packet(p).expect("decode");
+        drain(&mut dec);
     }
+    dec.flush().expect("flush");
+    drain(&mut dec);
     out
 }
 

@@ -502,8 +502,14 @@ mod tests {
             }
         }
         // Band 0 is rows 0..64 with its tail at 56..64.
-        assert!(f.window(0, 50, 60).is_none(), "the window stops at the tail");
-        assert_eq!(f.window(0, 2, 20).expect("in-top window").0.len(), 18 * stride);
+        assert!(
+            f.window(0, 50, 60).is_none(),
+            "the window stops at the tail"
+        );
+        assert_eq!(
+            f.window(0, 2, 20).expect("in-top window").0.len(),
+            18 * stride
+        );
         assert_eq!(band_rows(height, 5, 2), 6);
         assert_eq!(f.crop_u16(0, 3, 2), vec![0, 1, 2, 5, 6, 7]);
         assert!(f.wait_complete());

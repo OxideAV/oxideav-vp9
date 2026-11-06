@@ -154,7 +154,26 @@ fn decoder(threads: usize) -> oxideav_vp9::Vp9Decoder {
 /// answer against the frame's planes.
 type Trace = Vec<(CodecParameters, u64)>;
 
-fn drain(dec: &mut oxideav_vp9::Vp9Decoder, trace: &mut Trace, what: &str) {
+/// Full-payload equality (`CodecParameters` has no `PartialEq`; its
+/// `Debug` rendering covers every field).
+fn same_params(a: &CodecParameters, b: &CodecParameters) -> bool {
+    format!("{a:?}") == format!("{b:?}")
+}
+
+/// Pull frames until `NeedMore` / `Eof`, checking the
+/// `Frame::StreamParams` contract on the way:
+///
+/// * an event is returned only when the generation has just moved by
+///   exactly one, and its payload equals `output_params()`;
+/// * the call after an event returns a video frame of exactly that
+///   shape (never a second event, never `NeedMore`);
+/// * every generation step between consecutive frames is announced by
+///   one event (and only then).
+///
+/// Returns the number of events seen.
+fn drain(dec: &mut oxideav_vp9::Vp9Decoder, trace: &mut Trace, what: &str) -> usize {
+    let mut events = 0usize;
+    let mut announced: Option<CodecParameters> = None;
     loop {
         match dec.receive_frame() {
             Ok(Frame::Video(v)) => {
@@ -162,10 +181,43 @@ fn drain(dec: &mut oxideav_vp9::Vp9Decoder, trace: &mut Trace, what: &str) {
                 assert_frame_matches(&v, &p, what);
                 assert_eq!(dec.output_pixel_format(), p.pixel_format, "{what}: narrow");
                 assert_eq!(dec.pixel_format(), p.pixel_format, "{what}: inherent");
-                trace.push((p, dec.output_params_generation()));
+                let g = dec.output_params_generation();
+                if let Some(ev) = announced.take() {
+                    assert!(
+                        same_params(&ev, &p),
+                        "{what}: frame after event has its shape"
+                    );
+                } else if let Some((_, prev)) = trace.last() {
+                    assert_eq!(g, *prev, "{what}: generation moved without an event");
+                }
+                trace.push((p, g));
+            }
+            Ok(Frame::StreamParams(ev)) => {
+                assert!(announced.is_none(), "{what}: two events in a row");
+                let now = dec.output_params().expect("answer at an event");
+                assert!(
+                    same_params(&ev, &now),
+                    "{what}: event payload == output_params()"
+                );
+                if let Some((prev_p, prev_g)) = trace.last() {
+                    assert_eq!(
+                        dec.output_params_generation(),
+                        prev_g.wrapping_add(1),
+                        "{what}: one bump per event"
+                    );
+                    assert!(!same_params(prev_p, &ev), "{what}: event for a real change");
+                }
+                announced = Some(*ev);
+                events += 1;
             }
             Ok(_) => panic!("{what}: non-video frame"),
-            Err(CoreError::NeedMore) | Err(CoreError::Eof) => return,
+            Err(CoreError::NeedMore) | Err(CoreError::Eof) => {
+                assert!(
+                    announced.is_none(),
+                    "{what}: event not followed by its frame"
+                );
+                return events;
+            }
             Err(e) => panic!("{what}: {e}"),
         }
     }
@@ -189,13 +241,19 @@ fn keys(t: &Trace) -> Vec<Key> {
 fn decode_trace(packets: &[Vec<u8>], threads: usize, what: &str) -> Trace {
     let mut dec = decoder(threads);
     let mut trace = Vec::new();
+    let mut events = 0usize;
     for (i, data) in packets.iter().enumerate() {
         dec.send_packet(&Packet::new(0, TimeBase::MILLIS, data.clone()).with_pts(i as i64))
             .unwrap_or_else(|e| panic!("{what}: packet {i}: {e}"));
-        drain(&mut dec, &mut trace, what);
+        events += drain(&mut dec, &mut trace, what);
     }
     dec.flush().unwrap();
-    drain(&mut dec, &mut trace, what);
+    events += drain(&mut dec, &mut trace, what);
+    assert_eq!(
+        events as u64,
+        dec.output_params_generation(),
+        "{what}: one StreamParams event per generation bump"
+    );
     trace
 }
 
@@ -283,7 +341,10 @@ fn generation_bumps_at_the_first_frame_of_each_new_segment() {
     let mut changed_at = Vec::new();
     let mut n = 0usize;
     let mut pull = |dec: &mut oxideav_vp9::Vp9Decoder, stream: &mut CodecParameters| {
-        while let Ok(_f) = dec.receive_frame() {
+        while let Ok(f) = dec.receive_frame() {
+            if f.is_stream_params() {
+                continue;
+            }
             if watch.observe(&*dec, stream) {
                 changed_at.push(n);
             }
@@ -366,7 +427,11 @@ fn reset_follows_the_frame_boundary_rule() {
                 .unwrap();
         }
         dec.flush().unwrap();
-        drain(&mut dec, &mut trace, "seg a");
+        assert_eq!(
+            drain(&mut dec, &mut trace, "seg a"),
+            0,
+            "first shape: no event"
+        );
         assert_eq!(trace.len(), 2);
 
         dec.reset().unwrap();
@@ -375,7 +440,11 @@ fn reset_follows_the_frame_boundary_rule() {
         let p = dec.output_params().unwrap();
         assert_eq!((p.width, dec.output_params_generation()), (Some(48), 0));
         dec.flush().unwrap();
-        drain(&mut dec, &mut trace, "seg b");
+        assert_eq!(
+            drain(&mut dec, &mut trace, "seg b"),
+            1,
+            "drain after flush carries the event"
+        );
         let last = trace.last().unwrap();
         assert_eq!((last.0.width, last.1), (Some(32), 1), "@{threads}t");
 
@@ -384,7 +453,11 @@ fn reset_follows_the_frame_boundary_rule() {
         dec.send_packet(&Packet::new(0, TimeBase::MILLIS, b[0].clone()))
             .unwrap();
         dec.flush().unwrap();
-        drain(&mut dec, &mut trace, "seg b again");
+        assert_eq!(
+            drain(&mut dec, &mut trace, "seg b again"),
+            0,
+            "same shape: no event"
+        );
         assert_eq!(trace.last().unwrap().1, 1, "@{threads}t");
     }
 }
@@ -508,4 +581,289 @@ fn docs_corpus_traces_are_consistent_and_thread_independent() {
         bumped >= 4,
         "the corpus carries mid-stream size changes ({bumped})"
     );
+}
+
+/// Every thread budget the frame-threaded decoder distinguishes
+/// (serial, a single worker beside the caller, an odd count, the
+/// in-flight window, and more workers than frames in flight).
+const BUDGETS: [usize; 5] = [1, 2, 3, 4, 8];
+
+/// What `receive_frame` handed out, call by call: `V` for a video
+/// frame (with its width), `E` for a `StreamParams` event (with the
+/// payload width).
+fn call_sequence(packets: &[Vec<u8>], threads: usize) -> Vec<(char, u32)> {
+    let mut dec = decoder(threads);
+    let mut seq = Vec::new();
+    let mut pull = |dec: &mut oxideav_vp9::Vp9Decoder| loop {
+        match dec.receive_frame() {
+            Ok(Frame::Video(v)) => seq.push(('V', v.planes[0].stride as u32)),
+            Ok(Frame::StreamParams(p)) => seq.push(('E', p.width.unwrap())),
+            Ok(_) => panic!("non-video frame"),
+            Err(CoreError::NeedMore) | Err(CoreError::Eof) => return,
+            Err(e) => panic!("{e}"),
+        }
+    };
+    for (i, data) in packets.iter().enumerate() {
+        dec.send_packet(&Packet::new(0, TimeBase::MILLIS, data.clone()))
+            .unwrap_or_else(|e| panic!("packet {i} @{threads}t: {e}"));
+        pull(&mut dec);
+    }
+    dec.flush().unwrap();
+    pull(&mut dec);
+    seq
+}
+
+/// A hidden (`show_frame = 0`) keyframe at a new shape followed by
+/// §8.9 `show_existing_frame` re-displays of it: the hidden frame
+/// raises nothing; the event lands immediately before the first SHOWN
+/// frame of the new shape — after every queued frame of the old shape —
+/// and a second re-display raises no second event. Built from the
+/// black-box fixtures: `p2-420-10`'s keyframe with its §6.2
+/// `show_frame` bit cleared, between two `p0-420-8` segments.
+#[test]
+fn hidden_keyframe_event_precedes_its_first_shown_redisplay() {
+    let a = ivf_frames("p0-420-8");
+    let mut hidden = ivf_frames("p2-420-10")[0].clone();
+    // §6.2 for profile 2: frame_marker `10`, profile_low_bit 0,
+    // profile_high_bit 1, show_existing_frame 0, frame_type 0
+    // (KEY_FRAME), show_frame, error_resilient_mode.
+    assert_eq!(hidden[0], 0x92, "profile-2 shown keyframe header byte");
+    hidden[0] &= !0x02;
+    // One-byte §6.2 `show_existing_frame` headers for profile 2:
+    // marker, profile bits, show_existing_frame = 1, then the 3-bit
+    // frame_to_show_map_idx (a keyframe refreshes every slot).
+    let show_slot = |idx: u8| vec![0x98 | idx];
+    let mut packets = a.clone();
+    packets.push(hidden);
+    packets.push(show_slot(0));
+    packets.push(show_slot(7));
+    packets.extend(a.iter().cloned());
+
+    let p0 = probe("p0-420-8");
+    let p2 = probe("p2-420-10");
+    // Luma stride: 48 bytes at 8 bits, 96 at 10 bits (both 48 wide).
+    let want = vec![
+        ('V', 48),
+        ('V', 48),
+        ('E', 48),
+        ('V', 96),
+        ('V', 96),
+        ('E', 48),
+        ('V', 48),
+        ('V', 48),
+    ];
+    for threads in BUDGETS {
+        assert_eq!(call_sequence(&packets, threads), want, "@{threads}t");
+        let what = format!("hidden key @{threads}t");
+        let trace = decode_trace(&packets, threads, &what);
+        let gens: Vec<u64> = trace.iter().map(|(_, g)| *g).collect();
+        assert_eq!(gens, vec![0, 0, 1, 1, 2, 2], "{what}");
+        assert_matches_probe(&trace[0].0, &p0, &what);
+        assert_matches_probe(&trace[2].0, &p2, &what);
+        assert_matches_probe(&trace[5].0, &p0, &what);
+    }
+}
+
+/// The concatenated black-box segments (keyframes at new sizes,
+/// profiles 0 / 1 / 3, 8 and 10 bits, RGB) and the in-crate
+/// reference-scaled chain (inter frames at new §7.2.5 sizes): the
+/// event sequence is identical at every thread budget, there is one
+/// event per change and none for the first shape, and a consumer
+/// that tracks the stream from the events alone
+/// (`OutputParamsWatch::observe_frame`, no decoder polling) always
+/// agrees with `output_params()`.
+#[test]
+fn events_alone_track_the_stream_at_every_thread_budget() {
+    let mut concat = Vec::new();
+    for name in [
+        "p0-420-8",
+        "seg-32x24-444-10",
+        "p1-rgb-8",
+        "p1-rgb-8",
+        "odd-35x19-420",
+        "p2-420-10",
+    ] {
+        concat.extend(ivf_frames(name));
+    }
+    let sizes = [(64u32, 48u32), (32, 24), (32, 24), (48, 32), (64, 48)];
+    let pictures: Vec<Vec<u8>> = sizes
+        .iter()
+        .enumerate()
+        .map(|(k, &(w, h))| {
+            let (w, h) = (w as usize, h as usize);
+            let n = w * h + 2 * (w / 2) * (h / 2);
+            (0..n).map(|i| ((i * 5 + k * 11) % 253) as u8).collect()
+        })
+        .collect();
+    let refs: Vec<&[u8]> = pictures.iter().map(|f| f.as_slice()).collect();
+    let resized = oxideav_vp9::encode_vp9_lossy_sequence_resized(&refs, &sizes, 110).unwrap();
+
+    for (name, packets, events) in [("concat", &concat, 4usize), ("resized", &resized, 3)] {
+        let serial = call_sequence(packets, 1);
+        assert_eq!(
+            serial.iter().filter(|(k, _)| *k == 'E').count(),
+            events,
+            "{name}: events"
+        );
+        assert_eq!(serial[0].0, 'V', "{name}: no event for the first shape");
+        for threads in BUDGETS {
+            assert_eq!(
+                call_sequence(packets, threads),
+                serial,
+                "{name} @{threads}t"
+            );
+            assert_eq!(
+                keys(&decode_trace(packets, threads, name)),
+                keys(&decode_trace(packets, 1, name)),
+                "{name} @{threads}t"
+            );
+
+            let mut dec = decoder(threads);
+            let mut stream = CodecParameters::video(CodecId::new("vp9"));
+            let mut watch = OutputParamsWatch::new();
+            let mut primed = false;
+            let mut frames = 0usize;
+            let mut pull = |dec: &mut oxideav_vp9::Vp9Decoder,
+                            stream: &mut CodecParameters,
+                            primed: &mut bool| {
+                while let Ok(f) = dec.receive_frame() {
+                    if !*primed {
+                        assert!(watch.prime(&*dec, stream), "first shape up front");
+                        *primed = true;
+                    }
+                    if watch.observe_frame(&f, stream) {
+                        continue;
+                    }
+                    assert!(!f.is_stream_params(), "{name}: an event changes the stream");
+                    let now = dec.output_params().unwrap();
+                    assert_eq!(
+                        (stream.width, stream.height, stream.pixel_format),
+                        (now.width, now.height, now.pixel_format),
+                        "{name} @{threads}t frame {frames}"
+                    );
+                    // The core merge keeps a previously known colour
+                    // field where the new answer leaves it unspecified
+                    // (`ColorSignal::or`); every field the decoder
+                    // does state must have arrived through the events.
+                    assert_eq!(
+                        now.color_signal.or(stream.color_signal),
+                        stream.color_signal,
+                        "{name} @{threads}t frame {frames}: colour"
+                    );
+                    frames += 1;
+                }
+            };
+            for data in packets {
+                dec.send_packet(&Packet::new(0, TimeBase::MILLIS, data.clone()))
+                    .unwrap();
+                pull(&mut dec, &mut stream, &mut primed);
+            }
+            dec.flush().unwrap();
+            pull(&mut dec, &mut stream, &mut primed);
+            assert_eq!(frames, packets.len(), "{name} @{threads}t: every frame");
+        }
+    }
+}
+
+/// The staged corpus streams that carry hidden alt-refs, superframes,
+/// hidden intra-only frames, §8.9 re-displays and §8.5.2.3
+/// reference-scaled frames, concatenated packet by packet (each is
+/// keyframe-led) with the black-box segments between them: one event
+/// per change at every thread budget, identical everywhere (the
+/// contract checks run inside `drain`).
+#[test]
+fn corpus_concat_with_hidden_frames_is_thread_independent() {
+    let root = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/video/vp9/fixtures"
+    ));
+    if !root.is_dir() {
+        eprintln!("docs corpus not present; docs-gated");
+        return;
+    }
+    let corpus = |name: &str| -> Vec<Vec<u8>> {
+        let data = std::fs::read(root.join(name).join("input.ivf")).expect("corpus ivf");
+        let mut at = u16::from_le_bytes([data[6], data[7]]) as usize;
+        let mut out = Vec::new();
+        while at + 12 <= data.len() {
+            let size = u32::from_le_bytes(data[at..at + 4].try_into().unwrap()) as usize;
+            at += 12;
+            out.push(data[at..at + size].to_vec());
+            at += size;
+        }
+        out
+    };
+    let mut packets = ivf_frames("p0-420-8");
+    for name in [
+        "altref-pyramid-gop",
+        "superframe-2",
+        "intra-only",
+        "show-existing-frame",
+        "scaled-reference",
+        "resized-encoded-gop",
+        "intra-only-emitted-gop",
+        "profile-2-yuv420-10bit",
+        "bit-depth-10-rgb",
+    ] {
+        packets.extend(corpus(name));
+        packets.extend(ivf_frames("p0-420-8"));
+    }
+    let serial = decode_trace(&packets, 1, "corpus concat @1t");
+    let changes = serial
+        .windows(2)
+        .filter(|w| !same_params(&w[0].0, &w[1].0))
+        .count();
+    assert!(changes >= 18, "corpus concat carries changes ({changes})");
+    assert_eq!(serial.last().unwrap().1, changes as u64);
+    let calls = call_sequence(&packets, 1);
+    assert_eq!(calls.iter().filter(|(k, _)| *k == 'E').count(), changes);
+    for threads in &BUDGETS[1..] {
+        let what = format!("corpus concat @{threads}t");
+        assert_eq!(
+            keys(&decode_trace(&packets, *threads, &what)),
+            keys(&serial),
+            "{what}"
+        );
+        assert_eq!(call_sequence(&packets, *threads), calls, "{what}");
+    }
+}
+
+/// The encoder does not re-configure mid-stream: an event restating
+/// its configured input shape is a no-op, any other shape is
+/// `Unsupported`, and encoding carries on after either.
+#[test]
+fn encoder_rejects_a_changed_input_shape() {
+    use oxideav_core::registry::Encoder;
+    let mut params = CodecParameters::video(CodecId::new("vp9"));
+    params.width = Some(32);
+    params.height = Some(16);
+    params.pixel_format = Some(PixelFormat::Yuv420P);
+    let mut enc = oxideav_vp9::Vp9Encoder::new(&params).unwrap();
+    assert!(
+        enc.send_frame(&Frame::StreamParams(Box::new(params.clone())))
+            .is_ok()
+    );
+    let mut bigger = params.clone();
+    bigger.width = Some(64);
+    assert!(matches!(
+        enc.send_frame(&Frame::StreamParams(Box::new(bigger))),
+        Err(CoreError::Unsupported(_))
+    ));
+    let mut deeper = params.clone();
+    deeper.pixel_format = Some(PixelFormat::Yuv420P10Le);
+    assert!(matches!(
+        enc.send_frame(&Frame::StreamParams(Box::new(deeper))),
+        Err(CoreError::Unsupported(_))
+    ));
+    let plane = |w: usize, h: usize| oxideav_core::VideoPlane {
+        stride: w,
+        data: vec![128; w * h],
+    };
+    let frame = Frame::Video(VideoFrame {
+        pts: Some(0),
+        planes: vec![plane(32, 16), plane(16, 8), plane(16, 8)],
+    });
+    enc.send_frame(&frame).unwrap();
+    enc.flush().unwrap();
+    assert!(enc.receive_packet().is_ok(), "the encoder still encodes");
 }

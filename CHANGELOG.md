@@ -6,6 +6,30 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+- `Vp9Decoder::receive_frame` emits `Frame::StreamParams` (oxideav-core
+  0.1.43) exactly where `output_params_generation` moves: one event,
+  payload equal to `output_params()`, immediately before the first
+  SHOWN frame of a new shape — a keyframe at a new size / profile /
+  bit depth / subsampling, an intra-only frame, a reference-scaled
+  inter frame (`frame_size_with_refs` / explicit §7.2.5 size), a §8.9
+  `show_existing_frame` re-display of a differently-shaped slot.
+  Hidden frames never place it; the decision is taken in output order,
+  so the call sequence is identical at 1 / 2 / 3 / 4 / 8 threads. None
+  for constant streams or the first shape; the same rule holds while
+  draining after `flush()` and after `reset()`. The comparison is
+  against the current `output_params()` answer (before the first frame:
+  the keyframe-header announcement), so events and generation bumps
+  correspond 1:1. Pinned by a hidden-keyframe + re-display stream
+  built from the black-box fixtures, the concatenated black-box
+  segments, the reference-scaled chain, and the staged corpus streams
+  with hidden alt-refs / superframes / intra-only frames / re-displays
+  / scaled references concatenated, plus an event-only consumer
+  (`OutputParamsWatch::observe_frame`) that tracks the stream without
+  polling the decoder.
+- `Vp9Encoder::send_frame` handles `Frame::StreamParams`: an event
+  restating the configured input shape is a no-op, any other shape is
+  `Unsupported` (the GOP engines do not re-configure mid-stream).
+
 - `Vp9Decoder` implements `Decoder::output_params` /
   `output_params_generation` (oxideav-core 0.1.42) and forwards
   `output_pixel_format` to it: emitted width / height (§7.2.5

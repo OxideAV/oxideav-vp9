@@ -567,7 +567,16 @@ the dual-API convention:
   moves exactly at the first returned frame of a new shape (keyframe
   or intra-only resize, reference-scaled inter frame, a §8.9
   re-display of a differently-sized slot, the first frame after a
-  `reset( )`), identically at every thread budget. Since round 448 [`Vp9Decoder`]
+  `reset( )`), identically at every thread budget. Each move hands
+  out ONE `Frame::StreamParams` event from `receive_frame( )` just
+  ahead of that frame — payload equal to `output_params( )`, the
+  counter already moved, never for the first shape; hidden
+  (`show_frame = 0`) frames never place it, so it precedes the first
+  SHOWN frame of the new shape, after every queued frame of the old
+  one, also while draining after `flush( )` and after a `reset( )`.
+  The encoder accepts an event restating its configured input shape
+  and rejects any other with `Unsupported` (no mid-stream
+  re-configuration). Since round 448 [`Vp9Decoder`]
   honors the framework `set_execution_context` hook: multi-tile
   streams decode tile-parallel under the granted budget,
   frame-identical to the serial decode, with the budget preserved

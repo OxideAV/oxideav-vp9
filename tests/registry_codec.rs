@@ -102,6 +102,7 @@ fn decode_all(dec: &mut dyn Decoder, packets: &[Packet]) -> Vec<VideoFrame> {
         loop {
             match dec.receive_frame() {
                 Ok(Frame::Video(v)) => out.push(v),
+                Ok(f) if f.is_stream_params() => {}
                 Ok(_) => panic!("expected video frames"),
                 Err(CoreError::NeedMore) => break,
                 Err(e) => panic!("receive_frame: {e:?}"),
@@ -114,6 +115,7 @@ fn decode_all(dec: &mut dyn Decoder, packets: &[Packet]) -> Vec<VideoFrame> {
     loop {
         match dec.receive_frame() {
             Ok(Frame::Video(v)) => out.push(v),
+            Ok(f) if f.is_stream_params() => {}
             Ok(_) => panic!("expected video frames"),
             Err(CoreError::Eof) => break,
             Err(e) => panic!("receive_frame after flush: {e:?}"),

@@ -57,7 +57,13 @@ fn main() {
         let t = Instant::now();
         let got = dec.receive_frame();
         *decode_time += t.elapsed();
-        let Ok(Frame::Video(vf)) = got else { break };
+        let vf = match got {
+            Ok(Frame::Video(vf)) => vf,
+            // A mid-stream shape change: the event precedes the first
+            // frame of the new shape.
+            Ok(f) if f.is_stream_params() => continue,
+            _ => break,
+        };
         frames += 1;
         if let Some(w) = out.as_mut() {
             for plane in &vf.planes {

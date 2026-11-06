@@ -299,6 +299,19 @@ fn buf_to_frame(f: &FrameBuf, pts: Option<i64>) -> CoreResult<(OutputShape, Fram
 /// `show_existing_frame` behaves exactly like the corpus streams do
 /// under [`crate::decode_vp9_sequence`]. Shown frames queue for
 /// [`Self::receive_frame`] with the packet's `pts` attached.
+///
+/// VP9 may change its output shape on any frame — a keyframe at a new
+/// size / profile / bit depth / subsampling, an intra-only frame, or an
+/// inter frame coded at its own §7.2.5 size over §8.5.2.3 scaled
+/// references (`frame_size_with_refs( )`), and a §8.9
+/// `show_existing_frame` re-display of a differently-shaped slot.
+/// [`Self::receive_frame`] then returns ONE [`Frame::StreamParams`]
+/// event immediately before the first SHOWN frame of the new shape
+/// (hidden frames never move it; the decision is taken in output
+/// order, so it lands identically at every thread budget), with
+/// [`Decoder::output_params`] and [`Decoder::output_params_generation`]
+/// already moved and the event's payload equal to that answer. The
+/// first shape of a stream raises no event.
 #[derive(Debug)]
 pub struct Vp9Decoder {
     id: CodecId,
@@ -316,7 +329,10 @@ pub struct Vp9Decoder {
     /// submitted announces (cleared by [`Decoder::reset`]).
     announced: Option<OutputShape>,
     /// [`Decoder::output_params_generation`]: bumped (wrapping) when a
-    /// returned frame's description differs from the previous one's.
+    /// returned frame's description differs from the answer
+    /// [`Decoder::output_params`] gave before it — each bump hands out
+    /// exactly one [`Frame::StreamParams`] event, just ahead of that
+    /// frame.
     generation: u64,
     /// The caller-granted threading budget (framework contract: serial
     /// until `set_execution_context` says otherwise); forwarded to the
@@ -426,9 +442,25 @@ impl Decoder for Vp9Decoder {
                 // shape (a key / intra-only frame at a new size or
                 // format, a reference-scaled inter frame, a §8.9
                 // re-display of a differently-sized slot) — in output
-                // order, so identically at every thread budget.
-                if self.current.is_some_and(|c| c != shape) {
+                // order, so identically at every thread budget. Hidden
+                // (`show_frame == 0`) frames never reach the queue, so
+                // the change is announced at the first SHOWN frame of
+                // the new shape, never at the coded frame that
+                // introduced it. The comparison is against what
+                // `output_params` answers right now (the last returned
+                // frame, or before the first one the keyframe-header
+                // announcement), so the first shape raises no event.
+                if self.shape().is_some_and(|c| c != shape) {
+                    // Move the answer and the counter first, then hand
+                    // out ONE `StreamParams` event carrying exactly
+                    // that answer; the frame itself goes back to the
+                    // head of the queue and is returned by the next
+                    // call (its shape now equals `current`, so it
+                    // raises no second event).
                     self.generation = self.generation.wrapping_add(1);
+                    self.current = Some(shape);
+                    self.pending.push_front((f, shape));
+                    return Ok(Frame::StreamParams(Box::new(shape.to_params(&self.id))));
                 }
                 self.current = Some(shape);
                 return Ok(f);
@@ -680,6 +712,24 @@ impl Encoder for Vp9Encoder {
     }
 
     fn send_frame(&mut self, frame: &Frame) -> CoreResult<()> {
+        if let Some(p) = frame.stream_params() {
+            // The chain-framed GOP engines are sized at construction
+            // (frame buffers, §6.2.5 frame size, §7.2.2 colour config)
+            // and do not re-configure mid-stream. An event that
+            // restates the configured input shape changes nothing; any
+            // other shape is rejected.
+            let fmt = self.output.pixel_format;
+            let same = p.width.is_none_or(|w| w == self.width)
+                && p.height.is_none_or(|h| h == self.height)
+                && p.pixel_format.is_none_or(|f| Some(f) == fmt);
+            return if same {
+                Ok(())
+            } else {
+                Err(CoreError::unsupported(
+                    "vp9 encoder: mid-stream input shape change (StreamParams) is not supported",
+                ))
+            };
+        }
         let Frame::Video(v) = frame else {
             return Err(CoreError::invalid("vp9 encoder: expected a video frame"));
         };

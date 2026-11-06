@@ -34,9 +34,13 @@ fn decode_bytes(packets: &[Packet], exec: &ExecutionContext) -> Vec<u8> {
     dec.set_execution_context(exec);
     let mut out = Vec::new();
     let mut drain = |dec: &mut oxideav_vp9::Vp9Decoder| {
-        while let Ok(Frame::Video(v)) = dec.receive_frame() {
-            for plane in &v.planes {
-                out.extend_from_slice(&plane.data);
+        while let Ok(f) = dec.receive_frame() {
+            // Mid-stream shape changes arrive as `StreamParams` events
+            // ahead of the first frame of the new shape; skip them.
+            if let Frame::Video(v) = f {
+                for plane in &v.planes {
+                    out.extend_from_slice(&plane.data);
+                }
             }
         }
     };

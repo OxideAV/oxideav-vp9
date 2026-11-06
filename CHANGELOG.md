@@ -19,6 +19,17 @@ All notable changes to `oxideav-vp9` are recorded here.
   against ffprobe across 8/10/12-bit, 4:2:0/4:2:2/4:4:0/4:4:4, RGB,
   odd sizes and signalled colour spaces.
 
+### Fixed
+
+- `encode_vp9_lossy_sequence_resized*`: a frame that keeps its
+  predecessor's size inside a resized chain now scans the
+  predecessor's motion field. The decoder derives §7.2.6
+  `UsePrevFrameMvs = 1` there (shown, same-sized, non-error-resilient
+  predecessor), and the writer modelled it as 0, so e.g. 64x48 → 32x24
+  → 32x24 produced a frame that failed the §9.2.3 padding check (and
+  decoded to garbage in a black-box decoder: 9.3 dB, now 37.3 dB).
+  Streams whose every frame changes size are byte-identical.
+
 ### Changed
 
 - A `CS_RGB` stream is labelled `Gbrp8` / `Gbrp10Le` / `Gbrp12Le`

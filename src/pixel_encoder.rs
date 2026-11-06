@@ -5099,10 +5099,14 @@ fn assemble_with_entropy(
 /// SAD, the winner parity-snapped against the §6.5.12 `BestMv` and
 /// §6.4.16-mapped to NEARESTMV / NEARMV when it equals a predictor),
 /// then the per-leaf transform-size + skip elections of the ordinary
-/// inter path. Single reference (`ref_frame_idx = [ s, s, s ]`), no
-/// prev-frame motion field (§7.2.6 (b) fails across a size change).
-/// `entropy` selects the round-455 [`EntropyOpts`] (`None` = the
-/// default bank, no forward updates).
+/// inter path. Single reference (`ref_frame_idx = [ s, s, s ]`).
+/// `prev_frame_mvs` is the §7.2.6 previous-frame motion field: `None`
+/// across a size change (condition (b) fails, so `UsePrevFrameMvs`
+/// derives 0), the shown same-sized predecessor's §6.4.4 arrays
+/// otherwise — the decoder then derives `UsePrevFrameMvs = 1` and
+/// every §6.5 candidate scan here and in the block writer must read
+/// the same field. `entropy` selects the round-455 [`EntropyOpts`]
+/// (`None` = the default bank, no forward updates).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_pframe_lossy_scaled(
     hdr: &Vp9FrameHeader,
@@ -5110,6 +5114,7 @@ pub(crate) fn encode_pframe_lossy_scaled(
     reference: &[(&[i32], usize); 3],
     ref_w: u32,
     ref_h: u32,
+    prev_frame_mvs: Option<&crate::frame_writer::PrevMotionField>,
     entropy: Option<&EntropyOpts<'_>>,
 ) -> Result<EncodedFrame, Error> {
     use crate::frame_writer::{InterFrameTreePlan, InterTreeLeaf, InterTreePlanner};
@@ -5277,8 +5282,13 @@ pub(crate) fn encode_pframe_lossy_scaled(
                     mi_col_start: 0,
                     mi_col_end: mi_cols as i32,
                 };
-                let src = FrameStateMvSource::new(state, None);
-                let mv_refs = geom.find_mv_refs(&src, LAST_FRAME, -1, &sign_bias, false);
+                let prev = prev_frame_mvs.map(|p| crate::inter_decode::PrevFrameMvs {
+                    prev_ref_frames: &p.ref_frames,
+                    prev_mvs: &p.mvs,
+                });
+                let src = FrameStateMvSource::new(state, prev);
+                let mv_refs =
+                    geom.find_mv_refs(&src, LAST_FRAME, -1, &sign_bias, prev_frame_mvs.is_some());
                 let best_refs =
                     geom.find_best_ref_mvs(mv_refs.ref_list_mv, hdr.allow_high_precision_mv);
                 let use_hp = hdr.allow_high_precision_mv && use_mv_hp(best_refs[0]);
@@ -5473,10 +5483,11 @@ pub(crate) fn encode_pframe_lossy_scaled(
         reference_mode: crate::compressed::ReferenceMode::SingleReference,
         partitions,
         prev_segment_ids: None,
-        // §7.2.6 (b): the size changed, so UsePrevFrameMvs derives 0 on
-        // a non-error-resilient header with no supplied field.
-        prev_frame_mvs_absent: true,
-        prev_frame_mvs: None,
+        // §7.2.6: across a size change (b) fails and UsePrevFrameMvs
+        // derives 0 on a non-error-resilient header with no supplied
+        // field; a same-sized shown predecessor supplies its field.
+        prev_frame_mvs_absent: !hdr.error_resilient_mode && prev_frame_mvs.is_none(),
+        prev_frame_mvs: prev_frame_mvs.cloned(),
     };
     let gates = crate::entropy_model::ForwardGates {
         frame_is_intra: false,
@@ -5635,6 +5646,10 @@ pub(crate) fn encode_sequence_lossy_resized_planes(
         .map(|f| kf_stash.record(f))
     };
     let (kf0, kf_recon0, kf_state0) = encode_kf(&kf_hdr)?;
+    // §7.2.6 previous-frame motion field of the frame just coded (every
+    // frame of the chain is shown and non-error-resilient): read by the
+    // next frame only when it keeps the size (condition (b)).
+    let mut prev_field = crate::frame_writer::PrevMotionField::from_state(&kf_state0);
     let mut lf_persist = LfDeltaState::default();
     let (kf_bytes, kf_recon, _) = finish_frame_lossy(
         &kf_hdr,
@@ -5690,6 +5705,8 @@ pub(crate) fn encode_sequence_lossy_resized_planes(
             rdoq: true,
         };
         let stash = EntropyStash::default();
+        let same_size = (w, h) == (pw, ph);
+        let field = same_size.then_some(&prev_field);
         let encode = |hdr2: &Vp9FrameHeader| {
             encode_pframe_lossy_scaled(
                 hdr2,
@@ -5697,11 +5714,13 @@ pub(crate) fn encode_sequence_lossy_resized_planes(
                 &prev_views,
                 pw,
                 ph,
+                field,
                 adaptive.then_some(&eopts),
             )
             .map(|f| stash.record(f))
         };
         let (p0, recon0, state0) = encode(&hdr)?;
+        let next_field = crate::frame_writer::PrevMotionField::from_state(&state0);
         let (bytes, recon, _) = finish_frame_lossy(
             &hdr,
             p0,
@@ -5719,6 +5738,7 @@ pub(crate) fn encode_sequence_lossy_resized_planes(
         }
         out.push(bytes);
         prev_recon = recon;
+        prev_field = next_field;
         (pw, ph) = (w, h);
     }
     Ok(out)

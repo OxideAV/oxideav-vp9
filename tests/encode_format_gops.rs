@@ -6,13 +6,13 @@
 //! at the declared format, byte-deterministic, distortion bounded.
 
 use oxideav_vp9::{
-    Vp9DecodedFrame, Vp9GopConfig, decode_vp9_sequence, encode_vp9_lossy_sequence_resized_422,
-    encode_vp9_lossy_sequence_resized_440, encode_vp9_lossy_sequence_resized_444,
-    encode_vp9_lossy_sequence_resized_hbd, encode_vp9_lossy_sequence_resized_hbd_422,
-    encode_vp9_lossy_sequence_resized_hbd_440, encode_vp9_lossy_sequence_with_422,
-    encode_vp9_lossy_sequence_with_440, encode_vp9_lossy_sequence_with_444,
-    encode_vp9_lossy_sequence_with_hbd, encode_vp9_lossy_sequence_with_hbd_422,
-    encode_vp9_lossy_sequence_with_hbd_440,
+    Vp9DecodedFrame, Vp9GopConfig, decode_vp9_sequence, encode_vp9_lossy_sequence_resized,
+    encode_vp9_lossy_sequence_resized_422, encode_vp9_lossy_sequence_resized_440,
+    encode_vp9_lossy_sequence_resized_444, encode_vp9_lossy_sequence_resized_hbd,
+    encode_vp9_lossy_sequence_resized_hbd_422, encode_vp9_lossy_sequence_resized_hbd_440,
+    encode_vp9_lossy_sequence_with_422, encode_vp9_lossy_sequence_with_440,
+    encode_vp9_lossy_sequence_with_444, encode_vp9_lossy_sequence_with_hbd,
+    encode_vp9_lossy_sequence_with_hbd_422, encode_vp9_lossy_sequence_with_hbd_440,
 };
 
 /// Chroma dims for a subsampling pair.
@@ -249,6 +249,41 @@ fn streams() -> Vec<Stream> {
         out.push((name.into(), packets, src, bd, ssx, ssy, sizes.clone()));
     }
     out
+}
+
+/// Same-size runs inside a resized chain: a frame that keeps its
+/// predecessor's size derives §7.2.6 `UsePrevFrameMvs = 1` (shown,
+/// same-sized, non-error-resilient predecessor), so the writer must
+/// scan that predecessor's motion field exactly as the decoder does.
+/// Every frame decodes (the §9.2.3 padding check catches any parse
+/// divergence) and each one — not just the average — stays close to
+/// its source.
+#[test]
+fn resized_chain_same_size_runs_read_the_previous_motion_field() {
+    let runs: [&[(u32, u32)]; 3] = [
+        &[(64, 48), (32, 24), (32, 24), (32, 24)],
+        &[(64, 48), (64, 48), (64, 48), (48, 32), (48, 32), (96, 64)],
+        &[(48, 32), (96, 64), (96, 64), (48, 32), (48, 32)],
+    ];
+    for sizes in runs {
+        let src: Vec<Vec<u16>> = sizes
+            .iter()
+            .enumerate()
+            .map(|(k, &(w, h))| scene16(w as usize, h as usize, true, true, 8, k))
+            .collect();
+        let src8: Vec<Vec<u8>> = src.iter().map(|s| to_u8(s)).collect();
+        let refs: Vec<&[u8]> = src8.iter().map(Vec::as_slice).collect();
+        let packets = encode_vp9_lossy_sequence_resized(&refs, sizes, 100).expect("encodes");
+        let prefs: Vec<&[u8]> = packets.iter().map(Vec::as_slice).collect();
+        let decoded = decode_vp9_sequence(&prefs)
+            .unwrap_or_else(|e| panic!("{sizes:?}: self-encoded chain must decode: {e}"));
+        assert_eq!(decoded.len(), sizes.len());
+        for (i, (f, s)) in decoded.iter().zip(&src).enumerate() {
+            assert_eq!((f.width, f.height), sizes[i], "{sizes:?} frame {i}");
+            let p = psnr(std::slice::from_ref(f), std::slice::from_ref(s), 8);
+            assert!(p > 27.0, "{sizes:?} frame {i}: PSNR {p:.2} dB");
+        }
+    }
 }
 
 #[test]

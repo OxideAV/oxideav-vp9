@@ -4,6 +4,14 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- `Default` on `Vp9DecodedFrame`; `with_<field>` setters on `Vp9EncoderOptions` and `Vp9DecodedFrame`.
+
+### Changed
+
+- API hygiene: `Error`, `Vp9EncoderOptions` and `Vp9DecodedFrame` are now `#[non_exhaustive]`. The §6/§7 syntax and loop-filter internals were already `#[doc(hidden)]`.
+
 ## [0.0.15](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.14...v0.0.15) - 2026-11-06
 
 ### Other

@@ -518,6 +518,7 @@ impl Decoder for Vp9Decoder {
 
 /// Typed options for [`Vp9Encoder`] (`CodecParameters::options`).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Vp9EncoderOptions {
     /// §7.2.9 `base_q_idx` for every frame of the GOP (`1..=255`,
     /// smaller = higher quality). Ignored when `lossless` is set.
@@ -525,6 +526,22 @@ pub struct Vp9EncoderOptions {
     /// Lossless encode (§7.2.9 `Lossless == 1`: `base_q_idx == 0` with
     /// zero deltas — the §8.7.2 WHT path). Requires 8-bit 4:2:0 input.
     pub lossless: bool,
+}
+
+impl Vp9EncoderOptions {
+    /// Set `q`.
+    #[must_use]
+    pub fn with_q(mut self, v: u32) -> Self {
+        self.q = v;
+        self
+    }
+
+    /// Set `lossless`.
+    #[must_use]
+    pub fn with_lossless(mut self, v: bool) -> Self {
+        self.lossless = v;
+        self
+    }
 }
 
 impl Default for Vp9EncoderOptions {

@@ -98,7 +98,8 @@ use crate::worker_pool::{Batch, Job, WorkerPool};
 /// `width x height`; each chroma plane spans
 /// `((width + subsampling_x) >> subsampling_x) x
 /// ((height + subsampling_y) >> subsampling_y)` per §8.10.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct Vp9DecodedFrame {
     /// `FrameWidth` per §7.2.5.
     pub width: u32,
@@ -116,6 +117,64 @@ pub struct Vp9DecodedFrame {
     pub u: Vec<u16>,
     /// Decoded V chroma plane (§8.10 subsampled extent).
     pub v: Vec<u16>,
+}
+
+impl Vp9DecodedFrame {
+    /// Set `width`.
+    #[must_use]
+    pub fn with_width(mut self, v: u32) -> Self {
+        self.width = v;
+        self
+    }
+
+    /// Set `height`.
+    #[must_use]
+    pub fn with_height(mut self, v: u32) -> Self {
+        self.height = v;
+        self
+    }
+
+    /// Set `bit_depth`.
+    #[must_use]
+    pub fn with_bit_depth(mut self, v: u8) -> Self {
+        self.bit_depth = v;
+        self
+    }
+
+    /// Set `subsampling_x`.
+    #[must_use]
+    pub fn with_subsampling_x(mut self, v: bool) -> Self {
+        self.subsampling_x = v;
+        self
+    }
+
+    /// Set `subsampling_y`.
+    #[must_use]
+    pub fn with_subsampling_y(mut self, v: bool) -> Self {
+        self.subsampling_y = v;
+        self
+    }
+
+    /// Set `y`.
+    #[must_use]
+    pub fn with_y(mut self, v: Vec<u16>) -> Self {
+        self.y = v;
+        self
+    }
+
+    /// Set `u`.
+    #[must_use]
+    pub fn with_u(mut self, v: Vec<u16>) -> Self {
+        self.u = v;
+        self
+    }
+
+    /// Set `v`.
+    #[must_use]
+    pub fn with_v(mut self, v: Vec<u16>) -> Self {
+        self.v = v;
+        self
+    }
 }
 
 use crate::loop_filter::{DEFAULT_LOOP_FILTER_MODE_DELTAS, DEFAULT_LOOP_FILTER_REF_DELTAS};

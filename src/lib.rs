@@ -648,6 +648,7 @@ pub use wide_filter::{WideFilterOutput, WideFilterSamples, wide_filter};
 /// P-frames) end-to-end. [`encode_vp9`] still returns
 /// [`Error::NotImplemented`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// The decoder or encoder pipeline is not wired up yet.
     NotImplemented,

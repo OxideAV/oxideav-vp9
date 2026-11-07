@@ -4,6 +4,12 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.16](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.15...v0.0.16) - 2026-11-07
+
+### Other
+
+- API hygiene: non_exhaustive Error/encoder options/decoded frame
+
 ### Added
 
 - `Default` on `Vp9DecodedFrame`; `with_<field>` setters on `Vp9EncoderOptions` and `Vp9DecodedFrame`.

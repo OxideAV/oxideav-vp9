@@ -523,8 +523,6 @@ impl BlockDecoder<'_> {
                                 tx_type_for_intra(mode)
                             };
                             let scan = get_scan(plane, tx_sz, tx_type);
-                            let n0 = 1usize << (tx_sz + 2);
-                            let seg_eob = n0 * n0;
 
                             let tbc = TokenBlockCtx {
                                 plane,
@@ -540,17 +538,7 @@ impl BlockDecoder<'_> {
                             // neighbour precedes its position in the scan
                             // (pinned by a tokens.rs unit test), so only
                             // this block's own entries are read.
-                            let eob = tokens_eob(
-                                coder,
-                                &tbc,
-                                tx_sz,
-                                scan,
-                                &self.chdr.coef_probs,
-                                &self.nz[plane],
-                                &mut self.token_cache[..],
-                                &mut self.tok_buf[..seg_eob],
-                                self.counts,
-                            )?;
+                            let (eob, logged) = self.read_tokens(coder, &tbc, tx_sz, scan)?;
                             nonzero = eob > 0;
                             // §6.4.24: EobTotal += nonzero.
                             eob_total += u32::from(nonzero);
@@ -572,6 +560,7 @@ impl BlockDecoder<'_> {
                                     },
                                     scan,
                                     eob,
+                                    logged,
                                 );
                             }
                         }
@@ -1014,8 +1003,6 @@ impl BlockDecoder<'_> {
                                 tx_type_for_intra(mode)
                             };
                             let scan = get_scan(plane, tx_sz, tx_type);
-                            let n0 = 1usize << (tx_sz + 2);
-                            let seg_eob = n0 * n0;
 
                             let tbc = TokenBlockCtx {
                                 plane,
@@ -1031,17 +1018,7 @@ impl BlockDecoder<'_> {
                             // neighbour precedes its position in the scan
                             // (pinned by a tokens.rs unit test), so only
                             // this block's own entries are read.
-                            let eob = tokens_eob(
-                                coder,
-                                &tbc,
-                                tx_sz,
-                                scan,
-                                &self.chdr.coef_probs,
-                                &self.nz[plane],
-                                &mut self.token_cache[..],
-                                &mut self.tok_buf[..seg_eob],
-                                self.counts,
-                            )?;
+                            let (eob, logged) = self.read_tokens(coder, &tbc, tx_sz, scan)?;
                             nonzero = eob > 0;
                             eob_total += u32::from(nonzero);
 
@@ -1063,6 +1040,7 @@ impl BlockDecoder<'_> {
                                     },
                                     scan,
                                     eob,
+                                    logged,
                                 );
                             }
                         }
@@ -1168,23 +1146,64 @@ impl BlockDecoder<'_> {
         }
     }
 
-    /// §8.6.2 `reconstruct( )` of one transform block whose `Tokens[ ]`
-    /// (the first `eob` positions of `scan`) are in `tok_buf` — run now
-    /// or logged with its coefficients; either way `tok_buf` is left
-    /// all-zero.
-    fn px_recon(&mut self, mut op: ReconOp, scan: &[u16], eob: usize) {
-        let n0 = 1usize << (op.tx_sz + 2);
+    /// §6.4.24 `tokens( )` of one transform block. Returns `eob` and,
+    /// when the pixel work is logged, the block's non-zero `( position,
+    /// token )` range in the log's arena (the tokens go straight there);
+    /// otherwise the tokens are in `tok_buf`.
+    fn read_tokens(
+        &mut self,
+        coder: &mut BoolCoder<'_>,
+        tbc: &TokenBlockCtx,
+        tx_sz: u32,
+        scan: &[u16],
+    ) -> Result<(usize, (u32, u32)), Error> {
         match &mut self.sink {
             Sink::Log(log) => {
                 let start = log.coefs.len();
-                for &p in &scan[..eob] {
-                    let v = self.tok_buf[p as usize];
-                    if v != 0 {
-                        log.coefs.push((p, v as i32));
-                        self.tok_buf[p as usize] = 0;
-                    }
-                }
-                op.coefs = (start as u32, (log.coefs.len() - start) as u32);
+                let coefs = &mut log.coefs;
+                let eob = crate::tokens::tokens_eob_with(
+                    coder,
+                    tbc,
+                    tx_sz,
+                    scan,
+                    &self.chdr.coef_probs,
+                    &self.nz[tbc.plane],
+                    &mut self.token_cache[..],
+                    self.counts,
+                    |pos, v| {
+                        if v != 0 {
+                            coefs.push((pos as u16, v));
+                        }
+                    },
+                )?;
+                Ok((eob, (start as u32, (coefs.len() - start) as u32)))
+            }
+            Sink::Now { .. } => {
+                let eob = tokens_eob(
+                    coder,
+                    tbc,
+                    tx_sz,
+                    scan,
+                    &self.chdr.coef_probs,
+                    &self.nz[tbc.plane],
+                    &mut self.token_cache[..],
+                    &mut self.tok_buf[..scan.len()],
+                    self.counts,
+                )?;
+                Ok((eob, (0, 0)))
+            }
+        }
+    }
+
+    /// §8.6.2 `reconstruct( )` of one transform block whose `Tokens[ ]`
+    /// (the first `eob` positions of `scan`) [`Self::read_tokens`] just
+    /// read: run now from `tok_buf` (left all-zero), or logged with its
+    /// `logged` coefficient range.
+    fn px_recon(&mut self, mut op: ReconOp, scan: &[u16], eob: usize, logged: (u32, u32)) {
+        let n0 = 1usize << (op.tx_sz + 2);
+        match &mut self.sink {
+            Sink::Log(log) => {
+                op.coefs = logged;
                 log.ops.push(PixelOp::Recon(op));
             }
             Sink::Now { y, u, v, .. } => {

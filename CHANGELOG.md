@@ -31,6 +31,11 @@ All notable changes to `oxideav-vp9` are recorded here.
 - §8.6.2 reconstruction reads the logged `(position, token)` pairs
   directly (no dense `Tokens[ ]` / `Dequant[ ]` round trip, no
   per-entry division), with the DC-only block as a constant add.
+- §6.4.24 tokens: a block's symbols are read with the `BoolMaxBits`
+  test deferred to the end of the block (a tile that runs out fails
+  with the same error; pinned against the checked reads), the deep
+  token-tree nodes read a precomputed `pareto( )` table, and the
+  decoded tokens go straight into the reconstruction log.
 
 ## [0.0.15](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.14...v0.0.15) - 2026-11-06
 

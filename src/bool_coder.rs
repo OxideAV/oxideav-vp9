@@ -132,6 +132,49 @@ impl<'a> BoolCoder<'a> {
         Ok(bit)
     }
 
+    /// [`Self::read_bool`] with the `BoolMaxBits` test deferred to
+    /// [`Self::deferred_check`]: a read past `BoolMaxBits` consumes the
+    /// window's virtual zero bits and returns a bit instead of failing.
+    /// A caller reads a bounded run of symbols this way and then calls
+    /// `deferred_check( )`, which fails exactly when some read of the
+    /// run would have failed in [`Self::read_bool`] (`consumed` only
+    /// grows) — until then every read returned what `read_bool` returns.
+    #[inline(always)]
+    pub(crate) fn read_bool_deferred(&mut self, p: u32) -> u32 {
+        debug_assert!(p <= 255);
+        let split = 1 + (((self.range - 1) * p) >> 8);
+        let big = u64::from(split) << 56;
+        let bit = self.value >= big;
+        if bit {
+            self.range -= split;
+            self.value -= big;
+        } else {
+            self.range = split;
+        }
+        // §9.2.2: one refill bit per doubling of BoolRange until it is
+        // at least 128 (no doubling: a shift of 0).
+        let shift = self.range.leading_zeros() - 24;
+        if self.count < shift as i32 {
+            self.fill();
+        }
+        self.value <<= shift;
+        self.range <<= shift;
+        self.count -= shift as i32;
+        self.consumed += u64::from(shift);
+        u32::from(bit)
+    }
+
+    /// The `BoolMaxBits` test of the [`Self::read_bool_deferred`] reads
+    /// since the last check.
+    #[inline(always)]
+    pub(crate) fn deferred_check(&self) -> Result<(), Error> {
+        if self.consumed > self.max_bits {
+            Err(Error::InvalidBitstream)
+        } else {
+            Ok(())
+        }
+    }
+
     /// `read_literal( n )` per spec §9.2.4: `n` `read_bool( 128 )`
     /// calls, most significant bit first.
     pub(crate) fn read_literal(&mut self, n: u32) -> Result<u32, Error> {
@@ -172,6 +215,53 @@ impl<'a> BoolCoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The deferred-check reads return exactly the checked reads' bits,
+    /// and `deferred_check( )` fails from exactly the read on which
+    /// `read_bool` first fails.
+    #[test]
+    fn deferred_reads_match_checked_reads_and_fail_together() {
+        let mut seed = 0x6a09_e667_f3bc_c908u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut failures = 0;
+        for trial in 0..300 {
+            let len = 2 + (next() % 40) as usize;
+            let mut data: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            data[0] &= 0x7f; // the marker bit decodes 0
+            let (Ok(mut a), Ok(mut b)) = (
+                BoolCoder::init_bool(&data, len),
+                BoolCoder::init_bool(&data, len),
+            ) else {
+                continue;
+            };
+            let skew = trial % 3;
+            for _ in 0..2000 {
+                let p = match skew {
+                    0 => 1 + (next() % 255) as u32,
+                    1 => 1 + (next() % 8) as u32,
+                    _ => 128,
+                };
+                let got = b.read_bool_deferred(p);
+                match a.read_bool(p) {
+                    Ok(bit) => {
+                        assert_eq!(bit, got);
+                        assert!(b.deferred_check().is_ok());
+                    }
+                    Err(_) => {
+                        assert!(b.deferred_check().is_err());
+                        failures += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(failures > 100, "{failures} streams ran out");
+    }
 
     /// The spec-literal per-bit §9.2 coder — the oracle the windowed
     /// [`BoolCoder`] is pinned against.

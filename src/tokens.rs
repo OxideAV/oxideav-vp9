@@ -336,6 +336,30 @@ pub(crate) fn pareto(node: u32, prob: u8) -> u8 {
     }
 }
 
+/// `pareto( node, prob )` for `node = 2..=9` at every `prob`:
+/// `PARETO_FULL[ prob ][ node - 2 ]` (the odd rows are [`PARETO_TABLE`]
+/// rows, the even ones the interpolations — see [`pareto`]).
+static PARETO_FULL: [[u8; 8]; 256] = {
+    let mut t = [[0u8; 8]; 256];
+    let mut prob = 0usize;
+    while prob < 256 {
+        let p = if prob == 0 { 1 } else { prob };
+        let x = (p - 1) >> 1;
+        let next = if x + 1 > 127 { 127 } else { x + 1 };
+        let mut col = 0;
+        while col < 8 {
+            t[prob][col] = if p & 1 != 0 {
+                PARETO_TABLE[x][col]
+            } else {
+                ((PARETO_TABLE[x][col] as u32 + PARETO_TABLE[next][col] as u32) >> 1) as u8
+            };
+            col += 1;
+        }
+        prob += 1;
+    }
+    t
+};
+
 /// `more_coefs` per spec §6.4.24 / §9.3.2.
 ///
 /// Reads one `B(p)` from the §9.2 Boolean coder. Returns `true` if
@@ -813,9 +837,42 @@ pub(crate) fn tokens_eob(
     tokens: &mut [i64],
     counts: &mut crate::prob_adapt::FrameCounts,
 ) -> Result<usize, Error> {
+    debug_assert_eq!(tokens.len(), 16usize << (tx_sz << 1));
+    tokens_eob_with(
+        coder,
+        block,
+        tx_sz,
+        scan,
+        coef_probs,
+        nz,
+        token_cache,
+        counts,
+        |pos, v| tokens[pos] = i64::from(v),
+    )
+}
+
+/// [`tokens_eob`] handing every decoded token to `emit( position,
+/// token )` in scan order (zero tokens included) instead of storing it.
+///
+/// The symbols are read with the coder's deferred `BoolMaxBits` test,
+/// checked once after the block: a block that runs past its tile fails
+/// with the error the first failing read would have returned (its
+/// `emit` calls and counts are then meaningless — the tile is abandoned).
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(crate) fn tokens_eob_with(
+    coder: &mut BoolCoder<'_>,
+    block: &TokenBlockCtx,
+    tx_sz: u32,
+    scan: &[u16],
+    coef_probs: &crate::coef_probs::CoefProbs,
+    nz: &NonzeroContext,
+    token_cache: &mut [u8],
+    counts: &mut crate::prob_adapt::FrameCounts,
+    mut emit: impl FnMut(usize, i32),
+) -> Result<usize, Error> {
     let seg_eob = 16usize << (tx_sz << 1);
     debug_assert_eq!(scan.len(), seg_eob);
-    debug_assert_eq!(tokens.len(), seg_eob);
     debug_assert!(token_cache.len() >= seg_eob);
 
     let plane_gt0 = usize::from(block.plane > 0);
@@ -831,12 +888,17 @@ pub(crate) fn tokens_eob(
         .map(|(_, nb)| nb);
     let more_counts = &mut counts.more_coefs[tx_sz as usize][plane_gt0][is_inter];
     let token_counts = &mut counts.token[tx_sz as usize][plane_gt0][is_inter];
+    let bands: &[u8] = if tx_sz == 0 {
+        &COEFBAND_4X4
+    } else {
+        &COEFBAND_8X8PLUS
+    };
 
     let mut check_eob = true;
     let mut c = 0usize;
     while c < seg_eob {
         let pos = scan[c] as usize;
-        let band = coef_band(c, tx_sz);
+        let band = bands[c] as usize;
 
         // §9.3.2 ctx derivation.
         let ctx = if c == 0 {
@@ -866,7 +928,7 @@ pub(crate) fn tokens_eob(
         let cell = &tx_slab[band][ctx];
 
         if check_eob {
-            let more = read_more_coefs(coder, cell[0])?;
+            let more = coder.read_bool_deferred(u32::from(cell[0])) == 1;
             // §9.3.4 special case for `more_coefs` (errata #249 part 1):
             // count exactly one `counts_more_coefs` event per decoded
             // `more_coefs`, at this position's band/ctx. Positions with
@@ -877,22 +939,58 @@ pub(crate) fn tokens_eob(
             }
         }
 
-        let token = read_token_cell(coder, cell)?;
+        // The §9.3 token tree walk: node 0 reads `cell[ 1 ]`, node 1
+        // `cell[ 2 ]`, deeper nodes the Pareto extension of `cell[ 2 ]`.
+        let token = {
+            let deep = &PARETO_FULL[cell[2] as usize];
+            let mut n: i32 = 0;
+            loop {
+                let node = (n >> 1) as usize;
+                let prob = match node {
+                    0 => cell[1],
+                    1 => cell[2],
+                    _ => deep[node - 2],
+                };
+                let bit = coder.read_bool_deferred(u32::from(prob));
+                n = TOKEN_TREE[n as usize + bit as usize];
+                if n <= 0 {
+                    break (-n) as u32;
+                }
+            }
+        };
         // §9.3.4: counts_token[…][Min(2, syntax)] += 1.
         token_counts[band][ctx][(token as usize).min(2)] += 1;
         token_cache[pos] = ENERGY_CLASS[token as usize];
         if token == ZERO_TOKEN {
-            tokens[pos] = 0;
+            emit(pos, 0);
             check_eob = false;
         } else {
-            let mag = read_coef(coder, token, block.bit_depth)?;
-            // sign_bit: L(1), one read_bool( 128 ).
-            let sign = coder.read_bool(128)?;
-            tokens[pos] = if sign == 1 { -(mag as i64) } else { mag as i64 };
+            // §6.4.26 read_coef( token ), then sign_bit: L(1).
+            let row = &EXTRA_BITS[token as usize];
+            let num_extra = row[1];
+            let mut mag = row[2];
+            if token == DCT_VAL_CATEGORY6 && block.bit_depth > 8 {
+                for e in 0..(block.bit_depth - 8) {
+                    mag += coder.read_bool_deferred(255) << (5 + block.bit_depth - e);
+                }
+            }
+            let cat_row = &CAT_PROBS[row[0] as usize];
+            for e in 0..num_extra {
+                let bit = coder.read_bool_deferred(u32::from(cat_row[e as usize]));
+                mag += bit << (num_extra - 1 - e);
+            }
+            let sign = coder.read_bool_deferred(128);
+            emit(pos, if sign == 1 { -(mag as i32) } else { mag as i32 });
             check_eob = true;
         }
         c += 1;
+        // A tile that ran out is noticed within one coefficient's reads
+        // of where the checked reads fail; nothing after it is used.
+        if c & 63 == 0 {
+            coder.deferred_check()?;
+        }
     }
+    coder.deferred_check()?;
 
     Ok(c)
 }

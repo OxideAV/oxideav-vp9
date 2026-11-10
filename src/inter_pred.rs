@@ -207,7 +207,7 @@ pub(crate) struct PredScratch {
     /// `preds[ refList ]`, row-major `w x h`.
     preds: [[i32; 64 * 64]; 2],
     /// The horizontal-pass intermediate (`h + 7` rows).
-    inter: [i32; 64 * 71],
+    inter: [u16; 64 * 71],
 }
 
 impl PredScratch {

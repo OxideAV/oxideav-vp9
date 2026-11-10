@@ -12,6 +12,15 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 - API hygiene: `Error`, `Vp9EncoderOptions` and `Vp9DecodedFrame` are now `#[non_exhaustive]`. The §6/§7 syntax and loop-filter internals were already `#[doc(hidden)]`.
 
+### Performance
+
+- §8.5.2.4 inter prediction: each row of the horizontal / vertical pass
+  is eight multiply-accumulate sweeps (tap loop outermost) instead of a
+  per-sample eight-tap sum, the intermediate rows are `u16`, and 8-bit
+  streams accumulate on wrapping 16-bit lanes (a bias lifts every
+  reachable sum into `0..=65535`, pinned per kernel). Output unchanged.
+  1080p 8-bit single thread, motion-heavy clip: 52 → 83 fps.
+
 ## [0.0.15](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.14...v0.0.15) - 2026-11-06
 
 ### Other

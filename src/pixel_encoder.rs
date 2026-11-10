@@ -8708,6 +8708,73 @@ pub(crate) fn encode_sequence_lossy_rc_two_pass_420(
     vbv_bytes: usize,
     model: ChainModel,
 ) -> Result<(Vec<Vec<u8>>, Vec<TwoPassFrame>), Error> {
+    encode_sequence_lossy_rc_two_pass_420_first_pass(
+        frames,
+        width,
+        height,
+        target_bytes_per_frame,
+        vbv_bytes,
+        model,
+        false,
+    )
+}
+
+/// Smallest luma extent (either axis) the half-size first pass is run
+/// at; a smaller sequence takes the full-size first pass.
+pub(crate) const HALF_FIRST_PASS_MIN_DIM: u32 = 32;
+
+/// A planar 8-bit 4:2:0 frame at half size on both axes — each output
+/// sample the rounded mean of its 2x2 source cell (cells clamp at the
+/// right / bottom edge of odd extents), luma and chroma alike. Returns
+/// the frame with its `( width, height )`.
+fn half_size_420(frame: &[u8], width: u32, height: u32) -> (Vec<u8>, u32, u32) {
+    fn plane(src: &[u8], w: usize, h: usize, out: &mut Vec<u8>) {
+        let (ow, oh) = (w.div_ceil(2), h.div_ceil(2));
+        for y in 0..oh {
+            let (r0, r1) = (2 * y, (2 * y + 1).min(h - 1));
+            for x in 0..ow {
+                let (c0, c1) = (2 * x, (2 * x + 1).min(w - 1));
+                let sum = u32::from(src[r0 * w + c0])
+                    + u32::from(src[r0 * w + c1])
+                    + u32::from(src[r1 * w + c0])
+                    + u32::from(src[r1 * w + c1]);
+                out.push(((sum + 2) >> 2) as u8);
+            }
+        }
+    }
+    let (w, h) = (width as usize, height as usize);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let (hw, hh) = (width.div_ceil(2), height.div_ceil(2));
+    let mut out = Vec::with_capacity(LossyFormat::YUV420_8.planar_len(hw, hh));
+    plane(&frame[..w * h], w, h, &mut out);
+    plane(&frame[w * h..w * h + cw * ch], cw, ch, &mut out);
+    plane(
+        &frame[w * h + cw * ch..w * h + 2 * cw * ch],
+        cw,
+        ch,
+        &mut out,
+    );
+    (out, hw, hh)
+}
+
+/// [`encode_sequence_lossy_rc_two_pass_420`] with a choice of first
+/// pass: `half_size_first_pass` codes the probe chain over the frames
+/// at half size on both axes ([`half_size_420`]) — a quarter of the
+/// samples to plan, search and code — when both luma extents are at
+/// least [`HALF_FIRST_PASS_MIN_DIM`]. The statistics keep their
+/// meaning: `bytes` is the probe's coded size (at the probe's size —
+/// the allocation only uses the frames' sizes relative to each other),
+/// `motion_activity` is doubled back to full-size eighth-pels. The
+/// second pass is the same either way.
+pub(crate) fn encode_sequence_lossy_rc_two_pass_420_first_pass(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    target_bytes_per_frame: usize,
+    vbv_bytes: usize,
+    model: ChainModel,
+    half_size_first_pass: bool,
+) -> Result<(Vec<Vec<u8>>, Vec<TwoPassFrame>), Error> {
     if frames.is_empty() || target_bytes_per_frame == 0 || !model.chained() {
         return Err(Error::Unsupported);
     }
@@ -8721,14 +8788,25 @@ pub(crate) fn encode_sequence_lossy_rc_two_pass_420(
     }
 
     // First pass.
-    let mut probe = LossyGopEncoder::new(width, height, TWO_PASS_PROBE_Q, fmt, model)?;
+    let half = half_size_first_pass && width.min(height) >= HALF_FIRST_PASS_MIN_DIM;
+    let (pw, ph) = if half {
+        (width.div_ceil(2), height.div_ceil(2))
+    } else {
+        (width, height)
+    };
+    let mut probe = LossyGopEncoder::new(pw, ph, TWO_PASS_PROBE_Q, fmt, model)?;
     let mut first_pass: Vec<FirstPassStat> = Vec::with_capacity(frames.len());
     for &f in frames {
-        let targets = padded_targets_from_u8(f, width, height, fmt);
+        let targets = if half {
+            let (small, ..) = half_size_420(f, width, height);
+            padded_targets_from_u8(&small, pw, ph, fmt)
+        } else {
+            padded_targets_from_u8(f, width, height, fmt)
+        };
         let bytes = probe.push(&targets)?;
         first_pass.push(FirstPassStat {
             bytes: bytes.len(),
-            motion_activity: probe.last_motion_activity,
+            motion_activity: probe.last_motion_activity << u32::from(half),
         });
     }
 

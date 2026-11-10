@@ -37,6 +37,14 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Added
 
+- `encode_vp9_lossy_sequence_rc_two_pass_half_size_first_pass`: the
+  two-pass chain with its first pass run over the frames at half size
+  on both axes (rounded 2x2 means) — a quarter of the samples to plan,
+  search and code; the second pass (allocation, VBV model, per-frame
+  bisection at full size) is unchanged. First pass 1.59 s → 0.49 s on
+  a 352x288 eight-frame GOP; 99.9 % of the pool, within 0.13–0.25 dB
+  of the full-size plan on the test GOPs. Sequences under 32 luma
+  samples on an axis take the full-size first pass.
 - `benches/decode_sweep.sh`: regenerates the 1080p / 2160p decode
   benchmark streams with a black-box encoder, checks the output of
   every thread budget against a black-box decode, and prints the fps

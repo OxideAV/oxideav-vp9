@@ -1345,6 +1345,52 @@ pub fn encode_vp9_lossy_sequence_rc_two_pass(
     Ok((packets, report))
 }
 
+/// [`encode_vp9_lossy_sequence_rc_two_pass`] with a **half-size first
+/// pass**: the probe chain that measures each frame's complexity codes
+/// the sequence at half size on both axes (each sample the rounded mean
+/// of a 2x2 cell), a quarter of the samples of the full-size first
+/// pass; the second pass — allocation, VBV model, per-frame bisection —
+/// is unchanged and codes the frames at full size. The report keeps its
+/// meaning: `first_pass_bytes` is the probe's coded size (at the probe's
+/// size; the allocation uses the frames' sizes relative to each other)
+/// and `motion_activity` is scaled back to full-size eighth-pels.
+///
+/// A sequence narrower or shorter than 32 luma samples takes the
+/// full-size first pass (the result then equals
+/// [`encode_vp9_lossy_sequence_rc_two_pass`]). Errors as that entry.
+pub fn encode_vp9_lossy_sequence_rc_two_pass_half_size_first_pass(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    target_bytes_per_frame: usize,
+    vbv_bytes: usize,
+) -> Result<(Vec<Vec<u8>>, Vec<Vp9TwoPassFrame>), Error> {
+    let (packets, report) = pixel_encoder::encode_sequence_lossy_rc_two_pass_420_first_pass(
+        frames,
+        width,
+        height,
+        target_bytes_per_frame,
+        vbv_bytes,
+        pixel_encoder::ChainModel::Adaptive,
+        true,
+    )?;
+    let report = report
+        .into_iter()
+        .enumerate()
+        .map(|(i, f)| Vp9TwoPassFrame {
+            first_pass_bytes: f.first_pass.bytes,
+            motion_activity: f.first_pass.motion_activity,
+            budget: f.budget,
+            coded_bytes: f.coded_bytes,
+            base_q_idx: f.base_q_idx,
+            show_existing: false,
+            keyframe: i == 0,
+            frame: i,
+        })
+        .collect();
+    Ok((packets, report))
+}
+
 /// **Two-pass rate control over a structured GOP** (round 458):
 /// [`encode_vp9_lossy_sequence_rc_two_pass`] generalised over a
 /// [`Vp9GopConfig`] — the alt-ref pyramid, §6.2.11 segmentation, tile

@@ -6,6 +6,7 @@
 use oxideav_vp9::{
     Error, Vp9DecodedFrame, Vp9GopConfig, Vp9Segmentation, Vp9TwoPassFrame, decode_vp9_sequence,
     encode_vp9_lossy_sequence_rc, encode_vp9_lossy_sequence_rc_two_pass,
+    encode_vp9_lossy_sequence_rc_two_pass_half_size_first_pass,
     encode_vp9_lossy_sequence_rc_two_pass_with, encode_vp9_lossy_sequence_rc_two_pass_with_422,
     encode_vp9_lossy_sequence_rc_two_pass_with_440, encode_vp9_lossy_sequence_rc_two_pass_with_444,
     encode_vp9_lossy_sequence_rc_two_pass_with_hbd,
@@ -173,6 +174,89 @@ fn two_pass_rate_accuracy_across_gop_shapes() {
             report.iter().map(|f| f.motion_activity).collect::<Vec<_>>(),
         );
     }
+}
+
+/// The half-size first pass plans the same second pass in outline: the
+/// stream stays inside the sequence pool and every frame inside its
+/// budget, the costliest first-pass frames are the full-size first
+/// pass's, quality stays close to the full-size plan's, the probe codes
+/// far fewer bytes, and a sequence too small to halve equals the
+/// full-size entry byte for byte.
+#[test]
+fn half_size_first_pass_plans_like_the_full_size_one() {
+    let (w, h) = (96usize, 64usize);
+    let moving = scene_gop(w, h, 6, 7);
+    let cut: Vec<Vec<u8>> = (0..6)
+        .map(|k| scene(w, h, k, if k < 3 { 3 } else { 40 }))
+        .collect();
+    for (name, frames, target) in [("moving", moving, 500usize), ("scene-cut", cut, 800)] {
+        let n = frames.len();
+        let (full, full_report) =
+            encode_vp9_lossy_sequence_rc_two_pass(&refs(&frames), w as u32, h as u32, target, 0)
+                .expect("full-size first pass");
+        let (half, report) = encode_vp9_lossy_sequence_rc_two_pass_half_size_first_pass(
+            &refs(&frames),
+            w as u32,
+            h as u32,
+            target,
+            0,
+        )
+        .expect("half-size first pass");
+        assert_eq!((half.len(), report.len()), (n, n));
+        let total: usize = half.iter().map(Vec::len).sum();
+        let floor = report
+            .iter()
+            .any(|f| f.base_q_idx == 255 && f.coded_bytes > f.budget);
+        if !floor {
+            assert!(total <= target * n, "{name}: {total} > {}", target * n);
+        }
+        for (i, f) in report.iter().enumerate() {
+            assert_eq!(f.coded_bytes, half[i].len());
+            assert!(
+                f.coded_bytes <= f.budget || f.base_q_idx == 255,
+                "{name} frame {i}"
+            );
+        }
+        // The same frame leads the inter-coded frames in both plans.
+        let lead = |r: &[oxideav_vp9::Vp9TwoPassFrame]| {
+            (1..r.len())
+                .max_by_key(|&i| r[i].first_pass_bytes)
+                .expect("P-frames")
+        };
+        if name == "scene-cut" {
+            assert_eq!(lead(&report), 3, "{name}: the cut frame leads");
+            assert_eq!(lead(&report), lead(&full_report));
+        }
+        let probe = |r: &[oxideav_vp9::Vp9TwoPassFrame]| -> usize {
+            r.iter().map(|f| f.first_pass_bytes).sum()
+        };
+        assert!(
+            2 * probe(&report) < probe(&full_report),
+            "{name}: half-size probe {} B vs full-size {} B",
+            probe(&report),
+            probe(&full_report)
+        );
+        let full_total: usize = full.iter().map(Vec::len).sum();
+        let (pf, ph) = (psnr(&full, &frames), psnr(&half, &frames));
+        eprintln!(
+            "{name}: full-size first pass {full_total} B @ {pf:.2} dB (probe {} B); half-size {total} B @ {ph:.2} dB (probe {} B)",
+            probe(&full_report),
+            probe(&report)
+        );
+        assert!(
+            total * 100 >= target * n * 97,
+            "{name}: {total} of {}",
+            target * n
+        );
+        assert!(ph > pf - 0.5, "{name}: {ph:.2} dB vs {pf:.2} dB");
+    }
+    // Below the minimum extent the full-size first pass runs.
+    let small = scene_gop(24, 40, 3, 5);
+    assert_eq!(
+        encode_vp9_lossy_sequence_rc_two_pass_half_size_first_pass(&refs(&small), 24, 40, 300, 0)
+            .unwrap(),
+        encode_vp9_lossy_sequence_rc_two_pass(&refs(&small), 24, 40, 300, 0).unwrap()
+    );
 }
 
 /// The scene cut draws a visibly larger budget than its neighbours

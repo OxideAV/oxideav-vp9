@@ -945,9 +945,16 @@ the pre-455 default-bank framing) reproduce the earlier bytes.
     [`Vp9GopConfig::adaptive_group_length`] halves alt-ref groups on
     fast motion (+0.06…+1.04 dB across the shapes / formats; static
     and intra-only GOPs byte-identical);
-  * the two-pass first pass is still one extra full encode at a fixed
-    probe quantizer (no downscaled / partial first pass), and the
-    allocation stays first-pass-size proportional (no explicit
+  * ~~the two-pass first pass is one extra full encode~~ — **round
+    486 adds [`encode_vp9_lossy_sequence_rc_two_pass_half_size_first_pass`]**
+    on the plain 4:2:0 chain: the probe chain codes the frames at half
+    size on both axes (2x2 means), the second pass is unchanged. On a
+    352x288 eight-frame GOP the first pass drops from 1.59 s to 0.49 s
+    (two-pass overhead over one-pass 26 % → 8 %); the stream stays at
+    99.9 % of the pool and within 0.13–0.25 dB of the full-size plan
+    on the test GOPs. The structured-GOP two-pass entries still run
+    the full-size first pass, the probe quantizer is still fixed, and
+    the allocation stays first-pass-size proportional (no explicit
     per-frame quality targeting);
   * ~~structured-GOP / resized entries public at 8-bit 4:2:0 only~~ —
     **round 455 lands the format-matrix wrappers**:

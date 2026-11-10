@@ -28,8 +28,22 @@ All notable changes to `oxideav-vp9` are recorded here.
   pinned by a truncated-frame + keyframe-group test at 2 / 3 / 4 / 8
   threads.
 
+### Added
+
+- `benches/decode_sweep.sh`: regenerates the 1080p / 2160p decode
+  benchmark streams with a black-box encoder, checks the output of
+  every thread budget against a black-box decode, and prints the fps
+  table (the README's "Decode speed" table).
+
 ### Performance
 
+- Decode speed, 120-frame streams, same machine before → after
+  (fps): 1080p 8-bit single-tile 85 → 149 on one thread and 263 → 765
+  on eight; 1080p 10-bit 4-tile 76 → 127 / 415 → 711; 2160p 8-bit
+  single-tile 25 → 43 / 80 → 231; 2160p 8-bit 8-tile 21 → 36 /
+  136 → 206. A strict SSE2-only x86-64 build under binary translation:
+  44 → 86 fps single-threaded on the first stream. Output
+  byte-identical at every thread budget.
 - §8.5.2.4 inter prediction: each row of the horizontal / vertical pass
   is eight multiply-accumulate sweeps (tap loop outermost) instead of a
   per-sample eight-tap sum, the intermediate rows are `u16`, and 8-bit

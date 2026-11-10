@@ -3415,11 +3415,19 @@ impl Vp9SequenceDecoder {
     ) -> Result<(), Error> {
         self.last_counts = None;
         // The bank this frame loads from may still owe the previous
-        // frame's backward adaptation.
-        self.resolve_adaptation()?;
+        // frame's backward adaptation. If an earlier frame turns out to
+        // have failed there, the state is the one that frame left and
+        // this frame is still decoded on it — as a serial decode, which
+        // reported the failure a call earlier, would — before the
+        // failure is returned.
+        let earlier = self.resolve_adaptation();
         let payload: Arc<[u8]> = Arc::from(frame);
-        let pending = self.start_frame(payload, tag)?;
-        self.inflight.push_back(pending);
+        match self.start_frame(payload, tag) {
+            Ok(pending) => self.inflight.push_back(pending),
+            // Both failed: the earlier frame's error is the one reported.
+            Err(e) => return Err(earlier.err().unwrap_or(e)),
+        }
+        earlier?;
         while self.inflight.len() > max_in_flight {
             self.complete_front()?;
         }

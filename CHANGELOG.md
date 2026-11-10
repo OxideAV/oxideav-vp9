@@ -12,6 +12,22 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 - API hygiene: `Error`, `Vp9EncoderOptions` and `Vp9DecodedFrame` are now `#[non_exhaustive]`. The §6/§7 syntax and loop-filter internals were already `#[doc(hidden)]`.
 
+### Fixed
+
+- Framework `Vp9Decoder` under a multi-thread budget, a frame failing
+  while later frames are in flight: the packet being submitted when the
+  failure surfaced was dropped instead of decoded (a keyframe right
+  behind a damaged frame was lost, and every frame of its group with
+  it), and frames completed on the way stayed queued inside the
+  decoder when no later packet succeeded. The submitted frame is now
+  decoded on the state the failing frame left — exactly what a serial
+  decode does — and completed frames are collected before the error is
+  returned. Found by the new `decode_frame_threads_diff` fuzz target
+  (serial vs 2..=9-thread `Vp9Decoder` over packet lists: identical
+  shown frames, `pts`, stream-params placement, and error presence);
+  pinned by a truncated-frame + keyframe-group test at 2 / 3 / 4 / 8
+  threads.
+
 ### Performance
 
 - §8.5.2.4 inter prediction: each row of the horizontal / vertical pass
@@ -35,7 +51,12 @@ All notable changes to `oxideav-vp9` are recorded here.
   test deferred to the end of the block (a tile that runs out fails
   with the same error; pinned against the checked reads), the deep
   token-tree nodes read a precomputed `pareto( )` table, and the
-  decoded tokens go straight into the reconstruction log.
+  decoded tokens go straight into the reconstruction log; the
+  `ZERO_TOKEN` / `ONE_TOKEN` leaves are read in line.
+- §8.5.1 intra prediction keeps its edge and prediction arrays on the
+  stack (three heap allocations per transform block before).
+- Output frames are packed with fixed-length row loops (10/12-bit
+  streams: no per-sample growth check).
 - Threading, single-tile-column frames: the reconstruction job filters
   each superblock row right after publishing it instead of handing it
   to separate loop-filter jobs (which parked pool threads behind one

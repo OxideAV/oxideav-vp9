@@ -941,17 +941,17 @@ pub(crate) fn tokens_eob_with(
 
         // The §9.3 token tree walk: node 0 reads `cell[ 1 ]`, node 1
         // `cell[ 2 ]`, deeper nodes the Pareto extension of `cell[ 2 ]`.
-        let token = {
+        // The first two nodes (ZERO_TOKEN / ONE_TOKEN leaves) are read
+        // in line; the rest of the tree is walked from node 2.
+        let token = if coder.read_bool_deferred(u32::from(cell[1])) == 0 {
+            ZERO_TOKEN
+        } else if coder.read_bool_deferred(u32::from(cell[2])) == 0 {
+            ONE_TOKEN
+        } else {
             let deep = &PARETO_FULL[cell[2] as usize];
-            let mut n: i32 = 0;
+            let mut n: i32 = 4;
             loop {
-                let node = (n >> 1) as usize;
-                let prob = match node {
-                    0 => cell[1],
-                    1 => cell[2],
-                    _ => deep[node - 2],
-                };
-                let bit = coder.read_bool_deferred(u32::from(prob));
+                let bit = coder.read_bool_deferred(u32::from(deep[(n >> 1) as usize - 2]));
                 n = TOKEN_TREE[n as usize + bit as usize];
                 if n <= 0 {
                     break (-n) as u32;

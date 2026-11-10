@@ -743,3 +743,129 @@ fn registry_decoder_execution_context_is_output_invariant() {
         }
     }
 }
+
+/// A failing frame in the middle of a stream costs exactly that frame at
+/// every thread budget: the frames ahead of it (possibly still in
+/// flight when the failure surfaces) come out, the packets behind it
+/// are decoded on the state the failure left — a keyframe right behind
+/// it included — and an error is reported.
+#[test]
+fn registry_decoder_recovers_identically_from_a_failing_frame_at_every_budget() {
+    use oxideav_core::ExecutionContext;
+    use oxideav_vp9::Vp9Decoder;
+    let (w, h) = (192usize, 128usize);
+    let frames: Vec<Vec<u8>> = (0..6)
+        .map(|t| {
+            let mut f = vec![0u8; w * h * 3 / 2];
+            for y in 0..h {
+                for x in 0..w {
+                    f[y * w + x] =
+                        (((x + 3 * t) * 2 + y) / 2 + ((x / 16 + y / 16 + t) % 3) * 20) as u8;
+                }
+            }
+            for (i, c) in f[w * h..].iter_mut().enumerate() {
+                *c = (96 + ((i + 7 * t) % 64)) as u8;
+            }
+            f
+        })
+        .collect();
+    let refs: Vec<&[u8]> = frames.iter().map(|f| &f[..]).collect();
+    // Backward-adapting frames (the default of the structured entry):
+    // each frame's probabilities wait on the previous frame's counts, so
+    // a failure surfaces while the next packet is being submitted.
+    let cfg = oxideav_vp9::Vp9GopConfig::new(200);
+    let first = oxideav_vp9::encode_vp9_lossy_sequence_with(&refs[..5], w as u32, h as u32, &cfg)
+        .expect("encode the first group");
+    let second = oxideav_vp9::encode_vp9_lossy_sequence_with(&refs[3..], w as u32, h as u32, &cfg)
+        .expect("encode the second group");
+    // Packet 3 loses its tail (its entropy decode runs out) and a fresh
+    // keyframe group follows it directly.
+    let mut stream: Vec<Vec<u8>> = first[..4].to_vec();
+    let cut = stream[3].len() / 2;
+    stream[3].truncate(cut);
+    // The same failure at the end of a stream, followed only by a
+    // packet that is no frame at all.
+    let mut tail_failure = stream.clone();
+    tail_failure.push(vec![0xff]);
+    stream.extend(second.iter().cloned());
+
+    // (frames in output order as (pts, plane bytes), any error seen).
+    type Decoded = (Vec<(Option<i64>, Vec<u8>)>, bool);
+    let run = |exec: &ExecutionContext, stream: &[Vec<u8>]| -> Decoded {
+        let mut dec = Vp9Decoder::new();
+        dec.set_execution_context(exec);
+        let mut out = Vec::new();
+        let mut failed = false;
+        let mut drain = |dec: &mut Vp9Decoder, failed: &mut bool| {
+            for _ in 0..64 {
+                match dec.receive_frame() {
+                    Ok(Frame::Video(vf)) => {
+                        let bytes = vf
+                            .planes
+                            .iter()
+                            .flat_map(|p| p.data.iter().copied())
+                            .collect();
+                        out.push((vf.pts, bytes));
+                    }
+                    Ok(_) => {}
+                    Err(e) if e.is_need_more() || e.is_eof() => break,
+                    Err(_) => *failed = true,
+                }
+            }
+        };
+        for (i, payload) in stream.iter().enumerate() {
+            let pkt = Packet::new(0, TimeBase::new(1, 30), payload.clone()).with_pts(i as i64);
+            failed |= dec.send_packet(&pkt).is_err();
+            drain(&mut dec, &mut failed);
+        }
+        dec.flush().expect("flush");
+        drain(&mut dec, &mut failed);
+        (out, failed)
+    };
+
+    let (serial, serial_failed) = run(&ExecutionContext::serial(), &stream);
+    assert!(serial_failed, "the truncated packet must fail");
+    let pts: Vec<_> = serial.iter().map(|(p, _)| p.expect("pts")).collect();
+    assert_eq!(
+        pts,
+        [0, 1, 2, 4, 5, 6],
+        "the frames ahead of the failure and the keyframe group behind it"
+    );
+    // The keyframe group behind the failure decodes as it does alone.
+    let (alone, alone_failed) = run(&ExecutionContext::serial(), &second);
+    assert!(!alone_failed);
+    for (k, (_, bytes)) in alone.iter().enumerate() {
+        assert!(
+            &serial[3 + k].1 == bytes,
+            "keyframe-group frame {k} after the failure"
+        );
+    }
+    let (serial_tail, _) = run(&ExecutionContext::serial(), &tail_failure);
+    assert_eq!(
+        serial_tail.len(),
+        3,
+        "the three frames ahead of the failure"
+    );
+
+    for threads in [2usize, 3, 4, 8] {
+        let exec = ExecutionContext::with_threads(threads);
+        for (name, input, want) in [
+            ("keyframe behind the failure", &stream, &serial),
+            ("failure at the end", &tail_failure, &serial_tail),
+        ] {
+            let (got, failed) = run(&exec, input);
+            assert!(failed, "{threads} threads, {name}: the failure is reported");
+            assert_eq!(
+                got.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+                want.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+                "{threads} threads, {name}: output order"
+            );
+            for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+                assert!(
+                    a.1 == b.1,
+                    "{threads} threads, {name}: frame {i} differs from the serial decode"
+                );
+            }
+        }
+    }
+}

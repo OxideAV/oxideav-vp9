@@ -261,17 +261,26 @@ fn buf_to_frame(f: &FrameBuf, pts: Option<i64>) -> CoreResult<(OutputShape, Fram
     );
     let (w, h) = (f.frame_width as usize, f.frame_height as usize);
     let pack = |p: usize, pw: usize, ph: usize| -> VideoPlane {
+        // Fixed-length row loops over a pre-sized buffer (no per-sample
+        // capacity check), so the narrowing / byte-pair store vectorises.
         if f.bit_depth == 8 {
-            let mut data = Vec::with_capacity(pw * ph);
-            for y in 0..ph {
-                data.extend(f.row(p, y)[..pw].iter().map(|&s| s as u8));
+            let mut data = vec![0u8; pw * ph];
+            if pw > 0 {
+                for (y, out) in data.chunks_exact_mut(pw).enumerate() {
+                    for (d, &s) in out.iter_mut().zip(&f.row(p, y)[..pw]) {
+                        *d = s as u8;
+                    }
+                }
             }
             VideoPlane { stride: pw, data }
         } else {
-            let mut data = Vec::with_capacity(pw * ph * 2);
-            for y in 0..ph {
-                for &s in &f.row(p, y)[..pw] {
-                    data.extend_from_slice(&s.to_le_bytes());
+            let mut data = vec![0u8; pw * ph * 2];
+            if pw > 0 {
+                for (y, out) in data.chunks_exact_mut(pw * 2).enumerate() {
+                    let (pairs, _) = out.as_chunks_mut::<2>();
+                    for (d, &s) in pairs.iter_mut().zip(&f.row(p, y)[..pw]) {
+                        *d = s.to_le_bytes();
+                    }
                 }
             }
             VideoPlane {
@@ -441,8 +450,12 @@ impl Decoder for Vp9Decoder {
             if self.current.is_none() && self.announced.is_none() {
                 self.announced = OutputShape::of_keyframe(payload);
             }
-            self.seq.submit(payload, tag, in_flight).map_err(map_err)?;
+            // Frames a failing submit completed on the way (the ones
+            // ahead of the failing frame, and the ones replayed behind
+            // it) are output all the same.
+            let submitted = self.seq.submit(payload, tag, in_flight);
             self.collect_ready()?;
+            submitted.map_err(map_err)?;
         }
         Ok(())
     }
@@ -482,8 +495,9 @@ impl Decoder for Vp9Decoder {
             }
             match self.seq.finish_one() {
                 Some(r) => {
-                    r.map_err(map_err)?;
+                    // As in `send_packet`: collect before reporting.
                     self.collect_ready()?;
+                    r.map_err(map_err)?;
                 }
                 None => return Err(CoreError::Eof),
             }

@@ -231,8 +231,50 @@ pub fn predict_intra(
     max_y: usize,
     bit_depth: u32,
 ) {
+    macro_rules! run {
+        ($sq:literal) => {
+            predict_intra_sized::<$sq>(
+                plane_buf,
+                x,
+                y,
+                have_left,
+                have_above,
+                not_on_right,
+                tx_sz,
+                mode,
+                max_x,
+                max_y,
+                bit_depth,
+            )
+        };
+    }
+    match tx_sz {
+        0 => run!(16),
+        1 => run!(64),
+        2 => run!(256),
+        _ => run!(1024),
+    }
+}
+
+/// [`predict_intra`] with its working arrays on the stack (`SQ` = `size
+/// * size`).
+#[allow(clippy::too_many_arguments)]
+fn predict_intra_sized<const SQ: usize>(
+    plane_buf: &mut Plane,
+    x: usize,
+    y: usize,
+    have_left: bool,
+    have_above: bool,
+    not_on_right: bool,
+    tx_sz: u32,
+    mode: PredMode,
+    max_x: usize,
+    max_y: usize,
+    bit_depth: u32,
+) {
     let log2_size = tx_sz + 2;
     let size = 1usize << log2_size;
+    debug_assert_eq!(SQ, size * size);
 
     // §8.5.1 base value for "no neighbour" fills.
     let base = 1i32 << (bit_depth - 1);
@@ -241,7 +283,8 @@ pub fn predict_intra(
     // one so logical index -1 maps to slot 0.
     //
     //   above_buf[ k + 1 ] == aboveRow[ k ]   for k in -1 .. 2*size-1
-    let mut above_buf = vec![0i32; 2 * size + 1];
+    let mut above_store = [0i32; 65];
+    let above_buf = &mut above_store[..2 * size + 1];
     // aboveRow[ i ] for i = 0 .. size-1
     for i in 0..size {
         let v = if !have_above {
@@ -275,7 +318,8 @@ pub fn predict_intra(
     };
 
     // leftCol[ i ] for i = 0 .. size-1
-    let mut left = vec![0i32; size];
+    let mut left_store = [0i32; 32];
+    let left = &mut left_store[..size];
     for (i, slot) in left.iter_mut().enumerate() {
         *slot = if have_left {
             let row = (y + i).min(max_y);
@@ -291,7 +335,7 @@ pub fn predict_intra(
     let lc = |i: usize| left[i];
 
     // pred[ i ][ j ], row-major in a flat Vec of length size*size.
-    let mut pred = vec![0i32; size * size];
+    let mut pred = [0i32; SQ];
     let idx = |i: usize, j: usize| i * size + j;
 
     match mode {

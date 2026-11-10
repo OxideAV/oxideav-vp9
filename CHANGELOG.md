@@ -18,8 +18,19 @@ All notable changes to `oxideav-vp9` are recorded here.
   is eight multiply-accumulate sweeps (tap loop outermost) instead of a
   per-sample eight-tap sum, the intermediate rows are `u16`, and 8-bit
   streams accumulate on wrapping 16-bit lanes (a bias lifts every
-  reachable sum into `0..=65535`, pinned per kernel). Output unchanged.
-  1080p 8-bit single thread, motion-heavy clip: 52 → 83 fps.
+  reachable sum into `0..=65535`, pinned per kernel) in fixed-width
+  column groups whose accumulators stay in registers; deeper streams
+  use widening 16 x 16 -> 32 multiplies. Output unchanged.
+- §8.7 inverse transform: non-lossless blocks run both passes on
+  32-bit lanes (every row, then every column, of the block at once per
+  butterfly). The lanes are exact while every stored value fits 16
+  bits; a range flag folded over every stored value proves it per
+  block, and a block that trips it is evaluated by the 64-bit form
+  from its untouched input — so the result is the 64-bit one for any
+  input. Rows below the last non-zero row are left out of the row pass.
+- §8.6.2 reconstruction reads the logged `(position, token)` pairs
+  directly (no dense `Tokens[ ]` / `Dequant[ ]` round trip, no
+  per-entry division), with the DC-only block as a constant add.
 
 ## [0.0.15](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.14...v0.0.15) - 2026-11-06
 

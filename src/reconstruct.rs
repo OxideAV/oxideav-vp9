@@ -146,6 +146,128 @@ pub(crate) fn reconstruct_block(
     }
 }
 
+/// [`reconstruct_block`] from the block's non-zero tokens only:
+/// `coefs` lists `( position, token )` (raster positions, each at most
+/// once, tokens non-zero) and every other `Tokens[ ]` entry is zero.
+/// `dense` is an all-zero `Tokens[ ]` scratch of at least `n0 * n0`
+/// entries, returned all-zero. Same samples as the dense form.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reconstruct_block_sparse(
+    plane_buf: &mut Plane,
+    x: usize,
+    y: usize,
+    tx_sz: u32,
+    coefs: &[(u16, i32)],
+    dense: &mut [i64],
+    dc_quant: i32,
+    ac_quant: i32,
+    tx_type: u8,
+    lossless: bool,
+    bit_depth: u32,
+) {
+    let done = !lossless
+        && match tx_sz {
+            0 => sparse_n::<2, 4, 4>(
+                plane_buf, x, y, coefs, dc_quant, ac_quant, tx_type, bit_depth,
+            ),
+            1 => sparse_n::<3, 8, 4>(
+                plane_buf, x, y, coefs, dc_quant, ac_quant, tx_type, bit_depth,
+            ),
+            2 => sparse_n::<4, 16, 4>(
+                plane_buf, x, y, coefs, dc_quant, ac_quant, tx_type, bit_depth,
+            ),
+            _ => sparse_n::<5, 32, 8>(
+                plane_buf, x, y, coefs, dc_quant, ac_quant, tx_type, bit_depth,
+            ),
+        };
+    if done {
+        return;
+    }
+    let n0 = 4usize << tx_sz;
+    for &(p, v) in coefs {
+        dense[p as usize] = i64::from(v);
+    }
+    reconstruct_block(
+        plane_buf,
+        x,
+        y,
+        tx_sz,
+        &dense[..n0 * n0],
+        dc_quant,
+        ac_quant,
+        tx_type,
+        lossless,
+        bit_depth,
+    );
+    for &(p, _) in coefs {
+        dense[p as usize] = 0;
+    }
+}
+
+/// The lane-transform body of [`reconstruct_block_sparse`] for a
+/// `L x L` (`L = 1 << N`) non-lossless block. Returns `false` — the
+/// plane untouched — when the block is outside the lanes' exact range.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn sparse_n<const N: u32, const L: usize, const Q: usize>(
+    plane_buf: &mut Plane,
+    x: usize,
+    y: usize,
+    coefs: &[(u16, i32)],
+    dc_quant: i32,
+    ac_quant: i32,
+    tx_type: u8,
+    bit_depth: u32,
+) -> bool {
+    // §8.6.2 steps 1-2 on the listed tokens (the division truncates
+    // toward zero, as the dense form's does).
+    let dequant = |p: u16, tok: i32| -> i64 {
+        let q = if p == 0 { dc_quant } else { ac_quant };
+        let v = i64::from(tok) * i64::from(q);
+        if N == 5 { v / 2 } else { v }
+    };
+    let (pw, ph) = (plane_buf.width(), plane_buf.height());
+    let max = (1i32 << bit_depth) - 1;
+
+    if tx_type == DCT_DCT && coefs.len() == 1 && coefs[0].0 == 0 {
+        let r = crate::idct::dc_only_residual(dequant(0, coefs[0].1), N);
+        if x >= pw || y >= ph {
+            return true;
+        }
+        let (cols, rows) = (L.min(pw - x), L.min(ph - y));
+        let r = r.clamp(-i64::from(max), i64::from(max)) as i32;
+        let data = plane_buf.samples_mut();
+        for i in 0..rows {
+            for o in &mut data[(y + i) * pw + x..][..cols] {
+                *o = (i32::from(*o) + r).clamp(0, max) as u16;
+            }
+        }
+        return true;
+    }
+
+    let rows_used = coefs
+        .iter()
+        .fold(0usize, |m, &(p, _)| m.max((p as usize >> N) + 1));
+    let mut res = [[0i32; L]; 32];
+    let list = coefs.iter().map(|&(p, v)| (p as usize, dequant(p, v)));
+    if !crate::idct::inverse_transform_2d_sparse::<N, L, Q>(list, rows_used, tx_type, &mut res) {
+        return false;
+    }
+    // §8.6.2 step 4, limited to the plane extent.
+    if x >= pw || y >= ph {
+        return true;
+    }
+    let (cols, rows) = (L.min(pw - x), L.min(ph - y));
+    let data = plane_buf.samples_mut();
+    for (i, r) in res.iter().take(rows).enumerate() {
+        let out = &mut data[(y + i) * pw + x..][..cols];
+        for (o, &r) in out.iter_mut().zip(r) {
+            *o = (i32::from(*o) + r).clamp(0, max) as u16;
+        }
+    }
+    true
+}
+
 /// [`reconstruct_block`] with the `Dequant` block on the stack (`SQ` =
 /// `n0 * n0` samples).
 #[allow(clippy::too_many_arguments)]
@@ -297,6 +419,85 @@ mod tests {
         for i in 0..4 {
             for j in 0..4 {
                 assert_eq!(p.get(1 + j, 1 + i), 50 + (i * 4 + j) as i32, "i={i} j={j}");
+            }
+        }
+    }
+
+    /// The sparse form writes the dense form's samples: every size,
+    /// transform type and bit depth, DC-only / few-row / full blocks,
+    /// small and range-overflowing tokens, lossless, and blocks clipped
+    /// by the plane edge.
+    #[test]
+    fn sparse_form_matches_dense_form() {
+        use crate::idct::{ADST_ADST, ADST_DCT, DCT_ADST};
+        let mut seed = 0x243f_6a88_85a3_08d3u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut dense_scratch = vec![0i64; 1024];
+        for tx_sz in 0..4u32 {
+            let n0 = 4usize << tx_sz;
+            for tx_type in [DCT_DCT, ADST_DCT, DCT_ADST, ADST_ADST] {
+                for trial in 0..400u32 {
+                    let bit_depth = [8u32, 10, 12][(trial % 3) as usize];
+                    let lossless = tx_sz == 0 && trial % 23 == 0;
+                    let tx_type = if tx_sz == 3 { DCT_DCT } else { tx_type };
+                    let max = (1i32 << bit_depth) - 1;
+                    let mut plane = Plane::new(40, 40);
+                    for v in plane.samples_mut() {
+                        *v = (next() as i32 & max) as u16;
+                    }
+                    let live = match trial % 5 {
+                        0 => 1,
+                        1 => n0 * (n0 / 4).max(1),
+                        2 => 3,
+                        _ => n0 * n0,
+                    };
+                    let mag_bits = 1 + (trial / 5) % 14;
+                    let mut tokens = vec![0i64; n0 * n0];
+                    let mut coefs = Vec::new();
+                    for (p, t) in tokens.iter_mut().enumerate().take(live) {
+                        if live > 3 && next() % 3 == 0 {
+                            continue;
+                        }
+                        let mag = (next() % (1 << mag_bits)) as i64 + 1;
+                        *t = if next() & 1 == 0 { mag } else { -mag };
+                        coefs.push((p as u16, *t as i32));
+                    }
+                    let (dc_q, ac_q) = (8 + (next() % 1300) as i32, 8 + (next() % 1800) as i32);
+                    // Inside, clipped at the right / bottom edge, outside.
+                    let (x, y) = match trial % 7 {
+                        0 => (40 - n0 / 2, 4),
+                        1 => (4, 40 - n0 / 2),
+                        2 => (40, 0),
+                        _ => (4, 4),
+                    };
+                    let mut dense = plane.clone();
+                    reconstruct_block(
+                        &mut dense, x, y, tx_sz, &tokens, dc_q, ac_q, tx_type, lossless, bit_depth,
+                    );
+                    reconstruct_block_sparse(
+                        &mut plane,
+                        x,
+                        y,
+                        tx_sz,
+                        &coefs,
+                        &mut dense_scratch,
+                        dc_q,
+                        ac_q,
+                        tx_type,
+                        lossless,
+                        bit_depth,
+                    );
+                    assert!(
+                        plane.samples() == dense.samples(),
+                        "tx_sz={tx_sz} tx_type={tx_type} trial={trial}"
+                    );
+                    assert!(dense_scratch.iter().all(|&v| v == 0));
+                }
             }
         }
     }

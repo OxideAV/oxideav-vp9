@@ -653,37 +653,69 @@ const FIR_BIAS: u16 = 16384;
 #[inline(always)]
 fn fir8<P: Px, O: Px>(src: &[&[P]; 8], taps: &[i32; 8], max: i32, dst: &mut [O]) {
     let w = dst.len();
-    debug_assert!(w <= 64);
+    let src: [&[P]; 8] = std::array::from_fn(|k| &src[k][..w]);
+    // Fixed-width column groups (block widths are powers of two), each
+    // with its accumulators in registers across the eight taps.
+    let mut c = 0;
+    while c + 16 <= w {
+        fir8_group::<P, O, 16>(&src, c, taps, max, &mut dst[c..c + 16]);
+        c += 16;
+    }
+    if c + 8 <= w {
+        fir8_group::<P, O, 8>(&src, c, taps, max, &mut dst[c..c + 8]);
+        c += 8;
+    }
+    if c + 4 <= w {
+        fir8_group::<P, O, 4>(&src, c, taps, max, &mut dst[c..c + 4]);
+        c += 4;
+    }
+    while c < w {
+        fir8_group::<P, O, 1>(&src, c, taps, max, &mut dst[c..c + 1]);
+        c += 1;
+    }
+}
+
+/// `C` adjacent columns of [`fir8`], starting at column `c`.
+#[inline(always)]
+fn fir8_group<P: Px, O: Px, const C: usize>(
+    src: &[&[P]; 8],
+    c: usize,
+    taps: &[i32; 8],
+    max: i32,
+    dst: &mut [O],
+) {
+    let rows: [&[P; C]; 8] = std::array::from_fn(|k| {
+        src[k][c..c + C]
+            .try_into()
+            .expect("a group lies inside the row")
+    });
+    let dst: &mut [O; C] = dst.try_into().expect("a group's destination");
     if max == 255 {
-        let mut acc = [FIR_BIAS + 64; 64];
-        let acc = &mut acc[..w];
+        let mut acc = [FIR_BIAS + 64; C];
         for k in 0..8 {
-            if taps[k] == 0 {
-                continue;
-            }
             let t = taps[k] as u16;
-            for (a, &s) in acc.iter_mut().zip(&src[k][..w]) {
-                debug_assert!((0..=255).contains(&s.get()));
-                *a = a.wrapping_add((s.get() as u16).wrapping_mul(t));
+            for i in 0..C {
+                debug_assert!((0..=255).contains(&rows[k][i].get()));
+                acc[i] = acc[i].wrapping_add((rows[k][i].get() as u16).wrapping_mul(t));
             }
         }
         const OFF: u16 = FIR_BIAS >> 7;
-        for (o, &a) in dst.iter_mut().zip(acc.iter()) {
-            *o = O::put(i32::from((a >> 7).saturating_sub(OFF).min(255)));
+        for i in 0..C {
+            dst[i] = O::put(i32::from((acc[i] >> 7).saturating_sub(OFF).min(255)));
         }
     } else {
-        let mut acc = [64i32; 64];
-        let acc = &mut acc[..w];
+        // Samples (at most 12 bits) and taps both fit `i16`: a widening
+        // 16 x 16 -> 32 multiply per lane.
+        let mut acc = [64i32; C];
         for k in 0..8 {
-            if taps[k] == 0 {
-                continue;
-            }
-            for (a, &s) in acc.iter_mut().zip(&src[k][..w]) {
-                *a += taps[k] * s.get();
+            let t = i32::from(taps[k] as i16);
+            for i in 0..C {
+                debug_assert!((0..=4095).contains(&rows[k][i].get()));
+                acc[i] += t * i32::from(rows[k][i].get() as i16);
             }
         }
-        for (o, &a) in dst.iter_mut().zip(acc.iter()) {
-            *o = O::put((a >> 7).clamp(0, max));
+        for i in 0..C {
+            dst[i] = O::put((acc[i] >> 7).clamp(0, max));
         }
     }
 }

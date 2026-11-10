@@ -499,10 +499,10 @@ fn apply_1d(t: &mut [i64], n: u32, use_dct: bool) {
 /// On return `dequant` holds the spatial-domain residual.
 pub(crate) fn inverse_transform_2d(dequant: &mut [i64], n: u32, tx_type: u8, lossless: bool) {
     match n {
-        2 => inverse_transform_2d_n::<2>(dequant, tx_type, lossless),
-        3 => inverse_transform_2d_n::<3>(dequant, tx_type, lossless),
-        4 => inverse_transform_2d_n::<4>(dequant, tx_type, lossless),
-        _ => inverse_transform_2d_n::<5>(dequant, tx_type, lossless),
+        2 => inverse_transform_2d_n::<2, 4, 4>(dequant, tx_type, lossless),
+        3 => inverse_transform_2d_n::<3, 8, 4>(dequant, tx_type, lossless),
+        4 => inverse_transform_2d_n::<4, 16, 4>(dequant, tx_type, lossless),
+        _ => inverse_transform_2d_n::<5, 32, 8>(dequant, tx_type, lossless),
     }
 }
 
@@ -716,21 +716,48 @@ fn apply_1d_fast<const N: u32>(t: &mut [i64; 32], use_dct: bool) {
 
 /// [`inverse_transform_2d`] at a constant size `N` (see the section
 /// note for the zero-row and DC-only shortcuts).
-fn inverse_transform_2d_n<const N: u32>(dequant: &mut [i64], tx_type: u8, lossless: bool) {
+fn inverse_transform_2d_n<const N: u32, const L: usize, const Q: usize>(
+    dequant: &mut [i64],
+    tx_type: u8,
+    lossless: bool,
+) {
     let n0 = 1usize << N;
     let block = &mut dequant[..n0 * n0];
     let shift = core::cmp::min(6, N + 2);
 
     if !lossless && tx_type == DCT_DCT && block[1..].iter().all(|&v| v == 0) {
-        let c = COS64_LOOKUP[16];
-        let row = round2(block[0] * c, 14);
-        let col = round2(row * c, 14);
-        block.fill(round2(col, shift));
+        block.fill(dc_only_residual(block[0], N));
         return;
     }
 
     let row_dct = tx_type == DCT_DCT || tx_type == ADST_DCT;
     let col_dct = tx_type == DCT_DCT || tx_type == DCT_ADST;
+    if !lossless {
+        // Rows below the last non-zero one stay zero through the row
+        // pass: a block whose non-zero rows fit `Q` lanes runs it on `Q`.
+        let few_rows = Q < L && block[Q * L..].iter().all(|&v| v == 0);
+        let done = if few_rows {
+            lanes_2d::<N, L, Q>(block, row_dct, col_dct, shift)
+        } else {
+            lanes_2d::<N, L, L>(block, row_dct, col_dct, shift)
+        };
+        if done {
+            return;
+        }
+    }
+    inverse_transform_2d_scalar::<N>(block, row_dct, col_dct, lossless, shift);
+}
+
+/// The one-vector-at-a-time 64-bit form of [`inverse_transform_2d_n`]
+/// (lossless blocks, and blocks the lane form declines).
+fn inverse_transform_2d_scalar<const N: u32>(
+    block: &mut [i64],
+    row_dct: bool,
+    col_dct: bool,
+    lossless: bool,
+    shift: u32,
+) {
+    let n0 = 1usize << N;
     let mut t = [0i64; 32];
     for row in block.chunks_exact_mut(n0) {
         if row.iter().all(|&v| v == 0) {
@@ -763,9 +790,604 @@ fn inverse_transform_2d_n<const N: u32>(dequant: &mut [i64], tx_type: u8, lossle
     }
 }
 
+// ───────────── lane form: every row / column of a block at once ─────────────
+//
+// The same §8.7.1 stage sequences as above with each array entry `T[ i ]`
+// widened to `L = 1 << n` lanes — one lane per row of the block in the
+// row pass, one per column in the column pass — so every butterfly /
+// Hadamard is a short loop over lanes of `i32`.
+//
+// 32-bit lanes are exact while every value stored in `T` fits a signed
+// 16-bit integer: a butterfly then forms `a * c + b * s` with `|a|, |b| <
+// 1 << 15` and `c * c + s * s <= 1 << 28` (to rounding), so the sum stays
+// under `1 << 30`; the ADST's high-precision `S` entries are bounded by
+// `1 << 29.5` and an `SH` adds two of them plus the rounding constant,
+// under `1 << 31`; the ADST4 sums carry weights of at most 43801 on
+// 16-bit inputs. Each stage's outputs are therefore the exact values as
+// long as its inputs passed the check, and the check is applied to the
+// inputs and to every value a stage stores (`note`): by induction a
+// clean flag proves the whole 32-bit evaluation equals the 64-bit one.
+// A block that trips the flag is evaluated by the 64-bit form from its
+// untouched input instead.
+
+type Lanes<const L: usize> = [i32; L];
+
+/// Fold `v` into the range flag: the flag's bits 16.. stay clear exactly
+/// while every noted value lies in `-32768..=32767`.
+#[inline(always)]
+fn note<const L: usize>(flag: &mut Lanes<L>, v: &Lanes<L>) {
+    for l in 0..L {
+        flag[l] |= v[l].wrapping_add(0x8000);
+    }
+}
+
+#[inline(always)]
+fn round14(x: i32) -> i32 {
+    x.wrapping_add(1 << 13) >> 14
+}
+
+/// §8.7.1.1 `B( a, b, angle, flip )` on lanes.
+#[inline(always)]
+fn lb<const L: usize>(
+    t: &mut [Lanes<L>; 32],
+    flag: &mut Lanes<L>,
+    a: usize,
+    b: usize,
+    angle: i32,
+    flip: bool,
+) {
+    let (ta, tb) = (t[a], t[b]);
+    let (mut x, mut y) = ([0i32; L], [0i32; L]);
+    let c = cos64(angle) as i32;
+    if (angle & 31) == 16 {
+        let neg = (angle & 32) != 0;
+        for l in 0..L {
+            let (v, w) = if neg {
+                (ta[l].wrapping_add(tb[l]), tb[l].wrapping_sub(ta[l]))
+            } else {
+                (ta[l].wrapping_sub(tb[l]), ta[l].wrapping_add(tb[l]))
+            };
+            x[l] = round14(v.wrapping_mul(c));
+            y[l] = round14(w.wrapping_mul(c));
+        }
+    } else {
+        let s = sin64(angle) as i32;
+        for l in 0..L {
+            x[l] = round14(ta[l].wrapping_mul(c).wrapping_sub(tb[l].wrapping_mul(s)));
+            y[l] = round14(ta[l].wrapping_mul(s).wrapping_add(tb[l].wrapping_mul(c)));
+        }
+    }
+    note(flag, &x);
+    note(flag, &y);
+    if flip {
+        t[b] = x;
+        t[a] = y;
+    } else {
+        t[a] = x;
+        t[b] = y;
+    }
+}
+
+/// §8.7.1.1 `H( a, b, flip )` on lanes.
+#[inline(always)]
+fn lh<const L: usize>(t: &mut [Lanes<L>; 32], flag: &mut Lanes<L>, a: usize, b: usize, flip: bool) {
+    let (a, b) = if flip { (b, a) } else { (a, b) };
+    let (ta, tb) = (t[a], t[b]);
+    let (mut x, mut y) = ([0i32; L], [0i32; L]);
+    for l in 0..L {
+        x[l] = ta[l].wrapping_add(tb[l]);
+        y[l] = ta[l].wrapping_sub(tb[l]);
+    }
+    note(flag, &x);
+    note(flag, &y);
+    t[a] = x;
+    t[b] = y;
+}
+
+/// §8.7.1.1 `SB( a, b, angle, flip )` on lanes.
+#[inline(always)]
+fn lsb<const L: usize>(
+    t: &[Lanes<L>; 32],
+    s: &mut [Lanes<L>; 16],
+    a: usize,
+    b: usize,
+    angle: i32,
+    flip: bool,
+) {
+    let (ta, tb) = (t[a], t[b]);
+    let (c, sn) = (cos64(angle) as i32, sin64(angle) as i32);
+    let (mut x, mut y) = ([0i32; L], [0i32; L]);
+    for l in 0..L {
+        x[l] = ta[l].wrapping_mul(c).wrapping_sub(tb[l].wrapping_mul(sn));
+        y[l] = ta[l].wrapping_mul(sn).wrapping_add(tb[l].wrapping_mul(c));
+    }
+    if flip {
+        s[b] = x;
+        s[a] = y;
+    } else {
+        s[a] = x;
+        s[b] = y;
+    }
+}
+
+/// §8.7.1.1 `SH( a, b )` on lanes.
+#[inline(always)]
+fn lsh<const L: usize>(
+    t: &mut [Lanes<L>; 32],
+    flag: &mut Lanes<L>,
+    s: &[Lanes<L>; 16],
+    a: usize,
+    b: usize,
+) {
+    let (sa, sb) = (s[a], s[b]);
+    let (mut x, mut y) = ([0i32; L], [0i32; L]);
+    for l in 0..L {
+        x[l] = round14(sa[l].wrapping_add(sb[l]));
+        y[l] = round14(sa[l].wrapping_sub(sb[l]));
+    }
+    note(flag, &x);
+    note(flag, &y);
+    t[a] = x;
+    t[b] = y;
+}
+
+/// The §8.7.1.3 level-`n` tail on lanes (the stage list of
+/// [`dct_level`]).
+#[inline(always)]
+fn dct_level_lanes<const L: usize>(t: &mut [Lanes<L>; 32], flag: &mut Lanes<L>, n: u32) {
+    let n0 = 1usize << n;
+    let n1 = 1usize << (n - 1);
+    let n2 = 1usize << (n - 2);
+    let n3 = if n >= 3 { 1usize << (n - 3) } else { 0 };
+    let ni = n as i32;
+    for i in 0..n2 {
+        let angle = 32 - BREV[5][n1 + i] as i32;
+        lb(t, flag, n1 + i, n0 - 1 - i, angle, false);
+    }
+    if n >= 3 {
+        for i in 0..n3 {
+            for j in 0..2 {
+                lh(t, flag, n1 + 4 * i + 2 * j, n1 + 1 + 4 * i + 2 * j, j != 0);
+            }
+        }
+    }
+    if n == 5 {
+        for i in 0..2usize {
+            for j in 0..2usize {
+                let a = n0 as i32 - ni + 3 - n2 as i32 * j as i32 - 4 * i as i32;
+                let b = n1 as i32 + ni - 4 + n2 as i32 * j as i32 + 4 * i as i32;
+                lb(
+                    t,
+                    flag,
+                    a as usize,
+                    b as usize,
+                    28 - 16 * i as i32 + 56 * j as i32,
+                    true,
+                );
+            }
+        }
+        for i in 0..2usize {
+            for j in 0..4usize {
+                lh(
+                    t,
+                    flag,
+                    n1 + n3 * j + i,
+                    n1 + n2 - 5 + n3 * j - i,
+                    (j & 1) != 0,
+                );
+            }
+        }
+    }
+    if n >= 4 {
+        let i_max = if n == 5 { 1usize } else { 0usize };
+        for i in 0..=i_max {
+            for j in 0..2usize {
+                let a = n0 as i32 - ni + 2 - i as i32 - n2 as i32 * j as i32;
+                let b = n1 as i32 + ni - 3 + i as i32 + n2 as i32 * j as i32;
+                lb(t, flag, a as usize, b as usize, 24 + 48 * j as i32, true);
+            }
+        }
+        for i in 0..=(2 * ni - 7) as usize {
+            for j in 0..2usize {
+                lh(
+                    t,
+                    flag,
+                    n1 + n2 * j + i,
+                    n1 + n2 - 1 + n2 * j - i,
+                    (j & 1) != 0,
+                );
+            }
+        }
+    }
+    if n >= 3 {
+        for i in 0..n3 {
+            lb(t, flag, n0 - n3 - 1 - i, n1 + n3 + i, 16, true);
+        }
+    }
+    for i in 0..n1 {
+        lh(t, flag, i, n0 - 1 - i, false);
+    }
+}
+
+/// §8.7.1.2 permutation + §8.7.1.3 inverse DCT on lanes.
+#[inline(always)]
+fn idct_lanes<const N: u32, const L: usize>(t: &mut [Lanes<L>; 32], flag: &mut Lanes<L>) {
+    let c = *t;
+    for i in 0..1usize << N {
+        t[i] = c[BREV[N as usize][i] as usize];
+    }
+    lb(t, flag, 0, 1, 16, true);
+    for m in 2..=N {
+        dct_level_lanes(t, flag, m);
+    }
+}
+
+/// §8.7.1.6 inverse ADST4 on lanes.
+#[inline(always)]
+fn adst4_lanes<const L: usize>(t: &mut [Lanes<L>; 32], flag: &mut Lanes<L>) {
+    const S1: i32 = SINPI_1_9 as i32;
+    const S2: i32 = SINPI_2_9 as i32;
+    const S3: i32 = SINPI_3_9 as i32;
+    const S4: i32 = SINPI_4_9 as i32;
+    let (t0, t1, t2, t3) = (t[0], t[1], t[2], t[3]);
+    let mut o = [[0i32; L]; 4];
+    for l in 0..L {
+        let s0 = S1.wrapping_mul(t0[l]);
+        let s1 = S2.wrapping_mul(t0[l]);
+        let s2 = S3.wrapping_mul(t1[l]);
+        let s3 = S4.wrapping_mul(t2[l]);
+        let s4 = S1.wrapping_mul(t2[l]);
+        let s5 = S2.wrapping_mul(t3[l]);
+        let s6 = S4.wrapping_mul(t3[l]);
+        let v = t0[l].wrapping_sub(t2[l]).wrapping_add(t3[l]);
+        let s7 = S3.wrapping_mul(v);
+        let x0 = s0.wrapping_add(s3).wrapping_add(s5);
+        let x1 = s1.wrapping_sub(s4).wrapping_sub(s6);
+        let x2 = s7;
+        let x3 = s2;
+        o[0][l] = round14(x0.wrapping_add(x3));
+        o[1][l] = round14(x1.wrapping_add(x3));
+        o[2][l] = round14(x2);
+        o[3][l] = round14(x0.wrapping_add(x1).wrapping_sub(x3));
+    }
+    for (i, row) in o.iter().enumerate() {
+        note(flag, row);
+        t[i] = *row;
+    }
+}
+
+/// `T[ i ] = -T[ i ]` on lanes (the negated value is a stored value).
+#[inline(always)]
+fn negate_lanes<const L: usize>(t: &mut [Lanes<L>; 32], flag: &mut Lanes<L>, i: usize) {
+    let mut v = t[i];
+    for x in v.iter_mut() {
+        *x = x.wrapping_neg();
+    }
+    note(flag, &v);
+    t[i] = v;
+}
+
+/// §8.7.1.4 input permutation on lanes.
+#[inline(always)]
+fn adst_input_permute_lanes<const L: usize>(t: &mut [Lanes<L>; 32], n: u32) {
+    let n0 = 1usize << n;
+    let c = *t;
+    for i in 0..n0 / 2 {
+        t[2 * i] = c[n0 - 1 - 2 * i];
+        t[2 * i + 1] = c[2 * i];
+    }
+}
+
+/// §8.7.1.5 output permutation on lanes.
+#[inline(always)]
+fn adst_output_permute_lanes<const L: usize>(t: &mut [Lanes<L>; 32], n: u32) {
+    let c = *t;
+    if n == 4 {
+        for (dst, slot) in t.iter_mut().enumerate().take(16) {
+            let (a, b, cc, d) = (dst >> 3, (dst >> 2) & 1, (dst >> 1) & 1, dst & 1);
+            *slot = c[8 * (d ^ cc) + 4 * (cc ^ b) + 2 * (b ^ a) + a];
+        }
+    } else {
+        for (dst, slot) in t.iter_mut().enumerate().take(8) {
+            let (a, b, cc) = (dst >> 2, (dst >> 1) & 1, dst & 1);
+            *slot = c[4 * (cc ^ b) + 2 * (b ^ a) + a];
+        }
+    }
+}
+
+/// §8.7.1.7 inverse ADST8 on lanes (the stage list of
+/// [`inverse_adst8`]).
+#[inline(always)]
+fn adst8_lanes<const L: usize>(t: &mut [Lanes<L>; 32], flag: &mut Lanes<L>) {
+    let mut s = [[0i32; L]; 16];
+    adst_input_permute_lanes(t, 3);
+    for i in 0..4 {
+        lsb(t, &mut s, 2 * i, 1 + 2 * i, 30 - 8 * i as i32, true);
+    }
+    for i in 0..4 {
+        lsh(t, flag, &s, i, 4 + i);
+    }
+    for i in 0..2 {
+        lsb(t, &mut s, 4 + 3 * i, 5 + i, 24 - 16 * i as i32, true);
+    }
+    for i in 0..2 {
+        lsh(t, flag, &s, 4 + i, 6 + i);
+    }
+    for i in 0..2 {
+        lh(t, flag, i, 2 + i, false);
+    }
+    for i in 0..2 {
+        lb(t, flag, 2 + 4 * i, 3 + 4 * i, 16, true);
+    }
+    adst_output_permute_lanes(t, 3);
+    for i in 0..4 {
+        negate_lanes(t, flag, 1 + 2 * i);
+    }
+}
+
+/// §8.7.1.8 inverse ADST16 on lanes (the stage list of
+/// [`inverse_adst16`]).
+#[inline(always)]
+fn adst16_lanes<const L: usize>(t: &mut [Lanes<L>; 32], flag: &mut Lanes<L>) {
+    let mut s = [[0i32; L]; 16];
+    adst_input_permute_lanes(t, 4);
+    for i in 0..8 {
+        lsb(t, &mut s, 2 * i, 1 + 2 * i, 31 - 4 * i as i32, true);
+    }
+    for i in 0..8 {
+        lsh(t, flag, &s, i, 8 + i);
+    }
+    for i in 0..4 {
+        lsb(t, &mut s, 8 + 2 * i, 9 + 2 * i, 28 - 16 * i as i32, true);
+    }
+    for i in 0..4 {
+        lsh(t, flag, &s, 8 + i, 12 + i);
+    }
+    for i in 0..4 {
+        lh(t, flag, i, 4 + i, false);
+    }
+    for i in 0..2 {
+        for j in 0..2 {
+            lsb(
+                t,
+                &mut s,
+                4 + 8 * i + 3 * j,
+                5 + 8 * i + j,
+                24 - 16 * j as i32,
+                true,
+            );
+        }
+    }
+    for j in 0..2 {
+        for i in 0..2 {
+            lsh(t, flag, &s, 4 + 8 * j + i, 6 + 8 * j + i);
+        }
+    }
+    for j in 0..2 {
+        for i in 0..2 {
+            lh(t, flag, 8 * j + i, 2 + 8 * j + i, false);
+        }
+    }
+    for i in 0..2 {
+        for j in 0..2 {
+            lb(
+                t,
+                flag,
+                2 + 4 * j + 8 * i,
+                3 + 4 * j + 8 * i,
+                48 + 64 * (i ^ j) as i32,
+                false,
+            );
+        }
+    }
+    adst_output_permute_lanes(t, 4);
+    for j in 0..2 {
+        for i in 0..2 {
+            negate_lanes(t, flag, 1 + 12 * j + 2 * i);
+        }
+    }
+}
+
+#[inline(always)]
+fn apply_1d_lanes<const N: u32, const L: usize>(
+    t: &mut [Lanes<L>; 32],
+    flag: &mut Lanes<L>,
+    use_dct: bool,
+) {
+    if use_dct {
+        idct_lanes::<N, L>(t, flag);
+    } else {
+        match N {
+            2 => adst4_lanes(t, flag),
+            3 => adst8_lanes(t, flag),
+            _ => adst16_lanes(t, flag),
+        }
+    }
+}
+
+/// The §8.7.2 row and column passes of a non-lossless block on 32-bit
+/// lanes. Returns `false` — leaving `block` untouched — when a value
+/// left the 16-bit range the lanes are exact for (see the section note).
+#[inline(always)]
+fn lanes_2d<const N: u32, const L: usize, const R: usize>(
+    block: &mut [i64],
+    row_dct: bool,
+    col_dct: bool,
+    shift: u32,
+) -> bool {
+    debug_assert_eq!(block.len(), L * L);
+    debug_assert!(R <= L && block[R * L..].iter().all(|&v| v == 0));
+    let mut res = [[0i32; L]; 32];
+    let coefs = block[..R * L].iter().copied().enumerate();
+    if !lanes_2d_from::<N, L, R>(coefs, row_dct, col_dct, shift, &mut res) {
+        return false;
+    }
+    for (row, src) in block.as_chunks_mut::<L>().0.iter_mut().zip(&res) {
+        for (d, &v) in row.iter_mut().zip(src) {
+            *d = i64::from(v);
+        }
+    }
+    true
+}
+
+/// [`lanes_2d`] from `( position, Dequant value )` pairs — every entry
+/// not listed is zero, every listed position lies in the first `R` rows
+/// — into `res` (`res[ i ][ j ]`: the residual of row `i`, column `j`).
+/// On `false`, `res` holds no result.
+#[inline(always)]
+fn lanes_2d_from<const N: u32, const L: usize, const R: usize>(
+    coefs: impl Iterator<Item = (usize, i64)>,
+    row_dct: bool,
+    col_dct: bool,
+    shift: u32,
+    res: &mut [Lanes<L>; 32],
+) -> bool {
+    debug_assert_eq!(L, 1usize << N);
+    // Row pass over the first R rows (the rest are zero and stay zero):
+    // entry j of row i lives in lane i of t[ j ].
+    let mut t = [[0i32; R]; 32];
+    let mut wide = 0u64;
+    for (p, v) in coefs {
+        wide |= v.wrapping_add(0x8000) as u64;
+        t[p & (L - 1)][p >> N] = v as i32;
+    }
+    if wide >> 16 != 0 {
+        return false;
+    }
+    let mut row_flag = [0i32; R];
+    apply_1d_lanes::<N, R>(&mut t, &mut row_flag, row_dct);
+    // Column pass: entry i of column j lives in lane j of res[ i ].
+    for (i, row) in res.iter_mut().enumerate().take(L) {
+        if i < R {
+            for j in 0..L {
+                row[j] = t[j][i];
+            }
+        } else {
+            *row = [0; L];
+        }
+    }
+    let mut flag = [0i32; L];
+    apply_1d_lanes::<N, L>(res, &mut flag, col_dct);
+    let seen = flag.iter().chain(&row_flag).fold(0, |a, &f| a | f);
+    if seen as u32 >> 16 != 0 {
+        return false;
+    }
+    let half = 1i32 << (shift - 1);
+    for row in res.iter_mut().take(L) {
+        for v in row.iter_mut() {
+            *v = (*v + half) >> shift;
+        }
+    }
+    true
+}
+
+/// The §8.7.2 inverse transform of a non-lossless block given as its
+/// non-zero `( position, Dequant value )` pairs, on lanes: `res[ i ][ j ]`
+/// receives the residual. `rows` bounds the rows holding a listed
+/// position (`position >> N < rows`). Returns `false` (no result) for a
+/// block outside the lanes' exact range — the caller then runs
+/// [`inverse_transform_2d`] on the dense block.
+#[inline(always)]
+pub(crate) fn inverse_transform_2d_sparse<const N: u32, const L: usize, const Q: usize>(
+    coefs: impl Iterator<Item = (usize, i64)>,
+    rows: usize,
+    tx_type: u8,
+    res: &mut [[i32; L]; 32],
+) -> bool {
+    let shift = core::cmp::min(6, N + 2);
+    let row_dct = tx_type == DCT_DCT || tx_type == ADST_DCT;
+    let col_dct = tx_type == DCT_DCT || tx_type == DCT_ADST;
+    if rows <= Q {
+        lanes_2d_from::<N, L, Q>(coefs, row_dct, col_dct, shift, res)
+    } else {
+        lanes_2d_from::<N, L, L>(coefs, row_dct, col_dct, shift, res)
+    }
+}
+
+/// The residual of a `DCT_DCT` block whose only non-zero entry is
+/// `Dequant[ 0 ][ 0 ] = dc` (every sample equals it — see the fast-path
+/// section note).
+#[inline]
+pub(crate) fn dc_only_residual(dc: i64, n: u32) -> i64 {
+    let c = COS64_LOOKUP[16];
+    let row = round2(dc * c, 14);
+    let col = round2(row * c, 14);
+    round2(col, core::cmp::min(6, n + 2))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lane form takes every conforming-range block (values of the
+    /// size a `BitDepth = 8` residual produces) and declines — never
+    /// mis-evaluates — blocks that leave the 16-bit range; either way the
+    /// driver's output is the spec-literal one (covered together with
+    /// `fast_transform_matches_spec_literal`, whose magnitudes straddle
+    /// the boundary).
+    #[test]
+    fn lane_form_accepts_small_blocks_and_declines_wide_ones() {
+        let mut seed = 0x0bad_5eed_1234_5678u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let (mut taken, mut declined) = (0u32, 0u32);
+        for n in 2..=5u32 {
+            let n0 = 1usize << n;
+            for tx_type in [DCT_DCT, ADST_DCT, DCT_ADST, ADST_ADST] {
+                if n == 5 && tx_type != DCT_DCT {
+                    continue;
+                }
+                let row_dct = tx_type == DCT_DCT || tx_type == ADST_DCT;
+                let col_dct = tx_type == DCT_DCT || tx_type == DCT_ADST;
+                let shift = core::cmp::min(6, n + 2);
+                for trial in 0..600 {
+                    let bits = 4 + trial % 14;
+                    let mut block = vec![0i64; n0 * n0];
+                    // Every other trial keeps only the rows the reduced
+                    // row pass covers.
+                    let few = trial % 2 == 1;
+                    let live = if few {
+                        n0 * (n0 / 4).max(4).min(n0)
+                    } else {
+                        n0 * n0
+                    };
+                    for v in block[..live].iter_mut() {
+                        if next() % 3 != 0 {
+                            let mag = (next() % (1 << bits)) as i64;
+                            *v = if next() & 1 == 0 { mag } else { -mag };
+                        }
+                    }
+                    let mut want = block.clone();
+                    inverse_transform_2d_reference(&mut want, n, tx_type, false);
+                    let mut got = block.clone();
+                    let ok = match (n, few) {
+                        (2, _) => lanes_2d::<2, 4, 4>(&mut got, row_dct, col_dct, shift),
+                        (3, false) => lanes_2d::<3, 8, 8>(&mut got, row_dct, col_dct, shift),
+                        (3, true) => lanes_2d::<3, 8, 4>(&mut got, row_dct, col_dct, shift),
+                        (4, false) => lanes_2d::<4, 16, 16>(&mut got, row_dct, col_dct, shift),
+                        (4, true) => lanes_2d::<4, 16, 4>(&mut got, row_dct, col_dct, shift),
+                        (_, false) => lanes_2d::<5, 32, 32>(&mut got, row_dct, col_dct, shift),
+                        (_, true) => lanes_2d::<5, 32, 8>(&mut got, row_dct, col_dct, shift),
+                    };
+                    if ok {
+                        taken += 1;
+                        assert_eq!(got, want, "n={n} tx_type={tx_type} bits={bits}");
+                    } else {
+                        declined += 1;
+                        assert_eq!(got, block, "a declined block is left untouched");
+                    }
+                    if bits <= 6 {
+                        assert!(ok, "small block declined: n={n} tx_type={tx_type}");
+                    }
+                }
+            }
+        }
+        assert!(taken > 1000 && declined > 1000, "{taken} / {declined}");
+    }
 
     /// The fast driver is the spec-literal one, bit for bit, at every
     /// size / type (including the lossless WHT path) on sparse and dense

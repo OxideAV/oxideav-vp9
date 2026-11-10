@@ -1422,27 +1422,20 @@ fn replay(
                     1 => &mut *u,
                     _ => &mut *v,
                 };
-                let n0 = 1usize << (op.tx_sz + 2);
                 let (start, len) = (op.coefs.0 as usize, op.coefs.1 as usize);
-                let coefs = &log.coefs[start..start + len];
-                for &(p, val) in coefs {
-                    tok_buf[p as usize] = i64::from(val);
-                }
-                reconstruct_block(
+                crate::reconstruct::reconstruct_block_sparse(
                     dst,
                     usize::from(op.x),
                     usize::from(op.y),
                     u32::from(op.tx_sz),
-                    &tok_buf[..n0 * n0],
+                    &log.coefs[start..start + len],
+                    tok_buf,
                     op.dc_quant,
                     op.ac_quant,
                     op.tx_type,
                     ctx.lossless,
                     ctx.bit_depth,
                 );
-                for &(p, _) in coefs {
-                    tok_buf[p as usize] = 0;
-                }
             }
         }
     }

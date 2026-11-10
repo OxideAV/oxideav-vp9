@@ -36,6 +36,13 @@ All notable changes to `oxideav-vp9` are recorded here.
   with the same error; pinned against the checked reads), the deep
   token-tree nodes read a precomputed `pareto( )` table, and the
   decoded tokens go straight into the reconstruction log.
+- Threading, single-tile-column frames: the reconstruction job filters
+  each superblock row right after publishing it instead of handing it
+  to separate loop-filter jobs (which parked pool threads behind one
+  reconstruction job); the framework decoder keeps `1.5 x threads`
+  frames in flight (4..=8, was a fixed 4), so a stream without tile
+  columns keeps a larger budget busy through frame-level parallelism.
+  Output is byte-identical at every budget.
 
 ## [0.0.15](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.14...v0.0.15) - 2026-11-06
 

@@ -2236,6 +2236,14 @@ fn tile_recon_job(job: &FrameJob, pipe: &FramePipe, scratch_pool: &ScratchPool, 
         } = &mut scratch;
         replay(&log, &ctx, [&mut *y, &mut *u, &mut *v], pred, tok_buf);
         publish_tile_pixels(job, pipe, r, c0, c1, [y, u, v]);
+        // A lone tile column filters each superblock row as soon as it
+        // has published it (no separate loop-filter jobs — see
+        // `launch_frame`): the row and the row above are complete.
+        if job.tile_cols == 1
+            && let Some(lfp) = job.lf.as_ref()
+        {
+            loop_filter_row_job(lfp, pipe, (r / 8) as usize);
+        }
         log.clear();
         lock(scratch_pool).logs.push(log);
     }
@@ -2755,7 +2763,10 @@ fn launch_frame(
         );
         jobs.push(Box::new(move || tile_recon_job(&job, &pipe, &scratch, col)));
     }
-    if lf_on {
+    if lf_on && job.tile_cols > 1 {
+        // (A lone tile column filters its own rows as it publishes them:
+        // a waiting loop-filter job would hold a thread the next frames'
+        // jobs could use, for work that trails one reconstruction job.)
         // A few loop-filter jobs that claim superblock rows in order: a
         // waiting job holds its thread, so one job per row would park
         // most of the pool on rows not decoded yet (and keep the next

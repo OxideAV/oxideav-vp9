@@ -342,8 +342,20 @@ pub struct Vp9Decoder {
 }
 
 /// Frames the framework decoder keeps decoding concurrently under a
-/// multi-thread budget.
-const IN_FLIGHT: usize = 4;
+/// budget of `threads`: none serially (every frame completes within its
+/// packet), else one and a half per thread, at least 4 and at most 8.
+/// A frame's entropy decode and reconstruction are two jobs per tile
+/// column, each waiting on the frames before it only for the rows it
+/// reads, so a stream of single-tile frames keeps a thread busy only
+/// with that many frames open; the cap bounds the decoded frames held
+/// (and the output delay) at any budget.
+fn frames_in_flight(threads: usize) -> usize {
+    if threads > 1 {
+        (threads + threads / 2).clamp(4, 8)
+    } else {
+        0
+    }
+}
 
 /// The tag of a packet without a presentation timestamp.
 const NO_PTS: i64 = i64::MIN;
@@ -416,11 +428,11 @@ impl Decoder for Vp9Decoder {
         // §B.2 / §B.4: split the packet into its coded frames (a chunk
         // with no valid superframe index is a single coded frame — the
         // split is total, per the §B.4 fallback). Under a multi-thread
-        // budget up to `IN_FLIGHT` frames decode concurrently (each
+        // budget several frames ([`frames_in_flight`]) decode concurrently (each
         // frame's rows wait on the rows of the frames it reads), so a
         // shown frame may surface a couple of packets later; serially
         // every frame completes within its own packet.
-        let in_flight = if self.exec.threads > 1 { IN_FLIGHT } else { 0 };
+        let in_flight = frames_in_flight(self.exec.threads);
         let tag = packet.pts.unwrap_or(NO_PTS);
         let frames = split_superframe(&packet.data);
         for payload in frames {

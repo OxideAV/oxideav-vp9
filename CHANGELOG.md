@@ -4,6 +4,21 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ## [Unreleased]
 
+## [0.0.16](https://github.com/OxideAV/oxideav-vp9/compare/v0.0.15...v0.0.16) - 2026-11-10
+
+### Other
+
+- thread-budget invariance on self-encoded streams (no staged corpus needed)
+- two-pass rate control: optional half-size first pass
+- inter prediction: a reference deeper than the frame takes the spec-literal form
+- decode speed table, threading model as landed; benches/decode_sweep.sh
+- threaded decoder: a failing in-flight frame no longer drops the next packet or strands finished frames
+- single-tile frames filter rows in the reconstruction job; frames in flight follow the budget
+- deferred BoolMaxBits test per block, full pareto table, direct logging
+- inverse transform on exact 32-bit lanes, sparse reconstruction, grouped FIR sweeps
+- inter prediction: tap-outer row sweeps, u16 intermediate, 16-bit lanes at 8 bits
+- API hygiene: non_exhaustive Error/encoder options/decoded frame
+
 ### Added
 
 - `Default` on `Vp9DecodedFrame`; `with_<field>` setters on `Vp9EncoderOptions` and `Vp9DecodedFrame`.

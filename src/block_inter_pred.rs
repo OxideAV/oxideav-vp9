@@ -273,7 +273,6 @@ fn clip1(x: i32, bit_depth: u32) -> i32 {
 // The generic reference form: the §8.5.2 driver runs the plane form
 // below (round 458); this one stays as the oracle the equivalence
 // test and the cross-check tests read from.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn block_inter_predict<F>(
     ref_sample: F,
     x: i32,
@@ -442,6 +441,12 @@ pub(crate) fn block_inter_predict_plane<R: SampleRows>(
 /// bytes are those of the §8.5.2.3 process. Everything else (scaled
 /// references, footprints crossing the plane edge) takes the general
 /// path.
+///
+/// `ref_fits` states that every reference sample lies in `0..1 <<
+/// bit_depth` (a reference decoded at this depth or a lower one) — what
+/// the shortcuts here rely on (a phase-0 pass copies the sample, where
+/// §8.5.2.4 writes `Clip1` of it). A deeper reference takes the
+/// spec-literal [`block_inter_predict`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn block_inter_predict_into<R: SampleRows, O: Px>(
     rows_of: &R,
@@ -455,10 +460,32 @@ pub(crate) fn block_inter_predict_into<R: SampleRows, O: Px>(
     last_x: i32,
     last_y: i32,
     bit_depth: u32,
+    ref_fits: bool,
     out: &mut [O],
     out_stride: usize,
     scratch: &mut [u16; 64 * 71],
 ) {
+    if !ref_fits {
+        let pred = block_inter_predict(
+            |r, c| rows_of.row(r as usize)[c as usize].get(),
+            x,
+            y,
+            x_step,
+            y_step,
+            w,
+            h,
+            interp_filter,
+            last_x,
+            last_y,
+            bit_depth,
+        );
+        for (r, src) in pred.chunks_exact(w).enumerate() {
+            for (o, &v) in out[r * out_stride..r * out_stride + w].iter_mut().zip(src) {
+                *o = O::put(v);
+            }
+        }
+        return;
+    }
     let (ix, iy) = (x >> 4, y >> 4);
     let unscaled = x_step == 16 && y_step == 16 && w <= 64 && h <= 64;
     let inside = ix - 3 >= 0
@@ -592,6 +619,9 @@ fn unscaled_kernel<R: SampleRows, O: Px>(
     }
 
     let max = (1i32 << bit_depth) - 1;
+    // 16-bit accumulators at 8 bits: the reference samples are in range
+    // (the caller's `ref_fits`), as is the clipped intermediate.
+    let narrow = bit_depth == 8;
     if fy == 0 {
         // Horizontal only: the rows the vertical pass would copy.
         let taps = &filter[fx];
@@ -599,7 +629,7 @@ fn unscaled_kernel<R: SampleRows, O: Px>(
             let d = dst_row(out, r);
             let row = &rows_of.row(iy + r)[ix - 3..ix + w + 4];
             let src: [&[R::Px]; 8] = std::array::from_fn(|k| &row[k..k + w]);
-            fir8(&src, taps, max, &mut out[d]);
+            fir8(&src, taps, max, narrow, &mut out[d]);
         }
         return;
     }
@@ -612,7 +642,7 @@ fn unscaled_kernel<R: SampleRows, O: Px>(
             let src: [&[R::Px]; 8] =
                 std::array::from_fn(|k| &rows_of.row(iy + r + k - 3)[ix..ix + w]);
             let d = dst_row(out, r);
-            fir8(&src, taps, max, &mut out[d]);
+            fir8(&src, taps, max, narrow, &mut out[d]);
         }
         return;
     }
@@ -625,12 +655,12 @@ fn unscaled_kernel<R: SampleRows, O: Px>(
     for (r, dst) in inter.chunks_exact_mut(w).enumerate() {
         let row = &rows_of.row(iy + r - 3)[ix - 3..ix + w + 4];
         let src: [&[R::Px]; 8] = std::array::from_fn(|k| &row[k..k + w]);
-        fir8(&src, htaps, max, dst);
+        fir8(&src, htaps, max, narrow, dst);
     }
     for r in 0..h {
         let src: [&[u16]; 8] = std::array::from_fn(|k| &inter[(r + k) * w..(r + k + 1) * w]);
         let d = dst_row(out, r);
-        fir8(&src, taps, max, &mut out[d]);
+        fir8(&src, taps, max, narrow, &mut out[d]);
     }
 }
 
@@ -649,28 +679,30 @@ const FIR_BIAS: u16 = 16384;
 /// `N >= -54` and `P <= 182` (pinned by `fir8_bias_covers_every_kernel`),
 /// so `sum + 64 + FIR_BIAS` lies in `0..=65535` and arithmetic modulo
 /// `1 << 16` returns it exactly; `FIR_BIAS >> 7` is then subtracted
-/// after the shift. Deeper samples accumulate in `i32`.
+/// after the shift — the `narrow` form, which the caller selects only
+/// for sources known to hold 8-bit samples. Everything else
+/// accumulates in `i32`.
 #[inline(always)]
-fn fir8<P: Px, O: Px>(src: &[&[P]; 8], taps: &[i32; 8], max: i32, dst: &mut [O]) {
+fn fir8<P: Px, O: Px>(src: &[&[P]; 8], taps: &[i32; 8], max: i32, narrow: bool, dst: &mut [O]) {
     let w = dst.len();
     let src: [&[P]; 8] = std::array::from_fn(|k| &src[k][..w]);
     // Fixed-width column groups (block widths are powers of two), each
     // with its accumulators in registers across the eight taps.
     let mut c = 0;
     while c + 16 <= w {
-        fir8_group::<P, O, 16>(&src, c, taps, max, &mut dst[c..c + 16]);
+        fir8_group::<P, O, 16>(&src, c, taps, max, narrow, &mut dst[c..c + 16]);
         c += 16;
     }
     if c + 8 <= w {
-        fir8_group::<P, O, 8>(&src, c, taps, max, &mut dst[c..c + 8]);
+        fir8_group::<P, O, 8>(&src, c, taps, max, narrow, &mut dst[c..c + 8]);
         c += 8;
     }
     if c + 4 <= w {
-        fir8_group::<P, O, 4>(&src, c, taps, max, &mut dst[c..c + 4]);
+        fir8_group::<P, O, 4>(&src, c, taps, max, narrow, &mut dst[c..c + 4]);
         c += 4;
     }
     while c < w {
-        fir8_group::<P, O, 1>(&src, c, taps, max, &mut dst[c..c + 1]);
+        fir8_group::<P, O, 1>(&src, c, taps, max, narrow, &mut dst[c..c + 1]);
         c += 1;
     }
 }
@@ -682,6 +714,7 @@ fn fir8_group<P: Px, O: Px, const C: usize>(
     c: usize,
     taps: &[i32; 8],
     max: i32,
+    narrow: bool,
     dst: &mut [O],
 ) {
     let rows: [&[P; C]; 8] = std::array::from_fn(|k| {
@@ -690,7 +723,8 @@ fn fir8_group<P: Px, O: Px, const C: usize>(
             .expect("a group lies inside the row")
     });
     let dst: &mut [O; C] = dst.try_into().expect("a group's destination");
-    if max == 255 {
+    if narrow {
+        debug_assert_eq!(max, 255);
         let mut acc = [FIR_BIAS + 64; C];
         for k in 0..8 {
             let t = taps[k] as u16;
@@ -775,6 +809,7 @@ mod tests {
                                 last_x,
                                 last_y,
                                 8,
+                                true,
                                 &mut c,
                                 w,
                                 &mut scratch,
@@ -902,6 +937,7 @@ mod tests {
                                 last_x,
                                 last_y,
                                 bit_depth,
+                                bit_depth == 8,
                                 &mut out,
                                 w,
                                 &mut scratch,
@@ -914,6 +950,60 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// An 8-bit block predicted from a reference holding deeper samples
+    /// (`ref_fits == false`) is the spec-literal form: the `Clip1` of
+    /// each pass applies, and no 16-bit accumulator wraps.
+    #[test]
+    fn eight_bit_block_over_a_deeper_reference_matches_generic_form() {
+        let (pw, ph) = (64usize, 64usize);
+        let samples: Vec<i32> = (0..pw * ph)
+            .map(|i| if (i / 3 + i / pw) % 2 == 0 { 1023 } else { 0 })
+            .collect();
+        let rows = FlatRows {
+            samples: &samples,
+            stride: pw,
+        };
+        let (last_x, last_y) = (pw as i32 - 1, ph as i32 - 1);
+        for filt in 0..4usize {
+            for (x, y) in [(165, 170), (160, 173), (171, 160), (160, 160), (3, 500)] {
+                let (w, h) = (16usize, 16usize);
+                let a = block_inter_predict(
+                    |r, c| samples[r as usize * pw + c as usize],
+                    x,
+                    y,
+                    16,
+                    16,
+                    w,
+                    h,
+                    filt,
+                    last_x,
+                    last_y,
+                    8,
+                );
+                let mut out = vec![0i32; w * h];
+                let mut scratch = Box::new([0u16; 64 * 71]);
+                block_inter_predict_into(
+                    &rows,
+                    x,
+                    y,
+                    16,
+                    16,
+                    w,
+                    h,
+                    filt,
+                    last_x,
+                    last_y,
+                    8,
+                    false,
+                    &mut out,
+                    w,
+                    &mut scratch,
+                );
+                assert_eq!(a, out, "filter {filt} at ({x},{y})");
             }
         }
     }

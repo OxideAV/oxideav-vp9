@@ -303,6 +303,13 @@ pub(crate) fn predict_inter_with(
         let last_x = ((ref_plane.ref_frame_width + sub_x as i32) >> sub_x) - 1;
         let last_y = ((ref_plane.ref_frame_height + sub_y as i32) >> sub_y) - 1;
 
+        // Whether the reference's samples lie in this frame's sample
+        // range (a decoded frame states its depth; a caller-held plane
+        // is at the block's own).
+        let ref_fits = match ref_plane.bands {
+            Some((f, _)) => u32::from(f.bit_depth) <= args.bit_depth,
+            None => true,
+        };
         // §8.5.2 step 5 — §8.5.2.4 block inter prediction.
         macro_rules! run {
             ($rows:expr, $out:expr, $stride:expr) => {
@@ -318,6 +325,7 @@ pub(crate) fn predict_inter_with(
                     last_x,
                     last_y,
                     args.bit_depth,
+                    ref_fits,
                     $out,
                     $stride,
                     inter,

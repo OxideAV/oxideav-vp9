@@ -1,6 +1,6 @@
 #!/bin/bash
 # Decode-speed sweep: generates 120-frame 1080p / 2160p streams with a
-# black-box encoder (ffmpeg's VP9 encoder — single-tile and
+# black-box libvpx-vp9 encode through ffmpeg (single-tile and
 # multi-tile-column, 8- and 10-bit), checks the crate's output against
 # the black-box decode of the same stream, and prints frames per second
 # per thread budget (median of RUNS).

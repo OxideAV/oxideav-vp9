@@ -28,6 +28,13 @@ All notable changes to `oxideav-vp9` are recorded here.
   pinned by a truncated-frame + keyframe-group test at 2 / 3 / 4 / 8
   threads.
 
+- §8.5.2.4 inter prediction from a reference slot holding deeper
+  samples than the current frame (an 8-bit intra-only frame followed
+  by an inter frame that still references a 10/12-bit slot): the block
+  now runs the spec-literal two-pass form, so `Clip1` applies in both
+  passes — the whole-sample shortcut used to copy the deeper samples
+  through unclipped.
+
 ### Added
 
 - `benches/decode_sweep.sh`: regenerates the 1080p / 2160p decode

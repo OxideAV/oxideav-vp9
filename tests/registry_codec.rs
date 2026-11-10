@@ -869,3 +869,102 @@ fn registry_decoder_recovers_identically_from_a_failing_frame_at_every_budget() 
         }
     }
 }
+
+/// Self-encoded streams decode to the same frames at every thread
+/// budget (no staged corpus needed): a single-tile-column stream of
+/// four superblock rows — the reconstruction job filters its own rows,
+/// more frames than are ever in flight at once — and a two-tile-column
+/// stream (separate loop-filter jobs), both with the encoder's elected
+/// §8.8 filter levels and backward adaptation between frames. Every
+/// budget also equals the batch [`oxideav_vp9::decode_vp9_sequence`].
+#[test]
+fn registry_decoder_is_budget_invariant_on_self_encoded_streams() {
+    use oxideav_core::ExecutionContext;
+    use oxideav_vp9::{Vp9Decoder, Vp9GopConfig, encode_vp9_lossy_sequence_with};
+    let content = |w: usize, h: usize, n: usize| -> Vec<Vec<u8>> {
+        (0..n)
+            .map(|t| {
+                let mut f = vec![0u8; w * h * 3 / 2];
+                for y in 0..h {
+                    for x in 0..w {
+                        f[y * w + x] = (((x + 5 * t) * 2 + y + 3 * t) / 2
+                            + ((x / 16 + y / 16 + t) % 3) * 24
+                            + (x * 7 + y * 13 + t * 5) % 9)
+                            as u8;
+                    }
+                }
+                for (i, c) in f[w * h..].iter_mut().enumerate() {
+                    *c = (96 + ((i + 11 * t) % 64)) as u8;
+                }
+                f
+            })
+            .collect()
+    };
+    let mut tiled = Vp9GopConfig::new(150);
+    tiled.tile_cols_log2 = 1;
+    for (name, w, h, n, cfg) in [
+        (
+            "single tile column",
+            64usize,
+            256usize,
+            9usize,
+            Vp9GopConfig::new(140),
+        ),
+        ("two tile columns", 512, 64, 4, tiled),
+    ] {
+        let frames = content(w, h, n);
+        let refs: Vec<&[u8]> = frames.iter().map(|f| &f[..]).collect();
+        let stream =
+            encode_vp9_lossy_sequence_with(&refs, w as u32, h as u32, &cfg).expect("encode");
+        let slices: Vec<&[u8]> = stream.iter().map(|p| &p[..]).collect();
+        let batch: Vec<Vec<u8>> = oxideav_vp9::decode_vp9_sequence(&slices)
+            .expect("batch decode")
+            .iter()
+            .map(|f| f.to_planar_bytes())
+            .collect();
+        assert_eq!(batch.len(), n, "{name}: shown frames");
+        let packets: Vec<Packet> = stream
+            .iter()
+            .enumerate()
+            .map(|(i, p)| Packet::new(0, TimeBase::new(1, 30), p.clone()).with_pts(i as i64))
+            .collect();
+        let budgets = [
+            ExecutionContext::serial(),
+            ExecutionContext::with_threads(2),
+            ExecutionContext::with_threads(3),
+            ExecutionContext::with_threads(4),
+            ExecutionContext::with_threads(8),
+            ExecutionContext::with_threads(16),
+            ExecutionContext::auto(),
+        ];
+        for exec in &budgets {
+            let mut dec = Vp9Decoder::new();
+            dec.set_execution_context(exec);
+            let got = decode_all(&mut dec, &packets);
+            assert_eq!(
+                got.len(),
+                n,
+                "{name}, {} threads: frame count",
+                exec.threads
+            );
+            for (i, (vf, want)) in got.iter().zip(&batch).enumerate() {
+                assert_eq!(
+                    vf.pts,
+                    Some(i as i64),
+                    "{name}, {} threads: order",
+                    exec.threads
+                );
+                let bytes: Vec<u8> = vf
+                    .planes
+                    .iter()
+                    .flat_map(|p| p.data.iter().copied())
+                    .collect();
+                assert!(
+                    &bytes == want,
+                    "{name}, {} threads: frame {i} differs from the batch decode",
+                    exec.threads
+                );
+            }
+        }
+    }
+}

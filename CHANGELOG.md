@@ -52,6 +52,28 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Performance
 
+- §8.8 loop filter (the decoder's row jobs), output unchanged:
+  - the §8.8.2 steps 1-14 / §8.8.3 / §8.8.4 decisions are resolved
+    once per superblock row into a byte per `(edge, mode-info unit)`
+    — the luma plane with one visit per mode-info cell (a cell owns
+    exactly its boundary edge and its middle edge), both chroma planes
+    from one shared plan — instead of once per edge position and
+    plane; an edge with nothing to filter is skipped on one 64-bit
+    compare, and runs of equal decisions are filtered as one span of
+    any length;
+  - the lane kernel is instantiated per lane count (16, and 8 for
+    short tails and 4:2:0 chroma units), orientation and `filterSize`:
+    the 4-wide instance evaluates no flatness test, and a 16-wide edge
+    loads `p7..p4` / `q4..q7` only when some position passes the
+    8-wide flatness test; only the taps of the widest filter that
+    actually ran are stored;
+  - vertical edges (taps along a row) transpose through a stride-4
+    de-interleave / interleave of four taps per row with one bounds
+    check per row, instead of one scalar load and store per sample.
+  Instructions retired, single thread, whole decode (120 frames):
+  1080p 8-bit 5 Mb/s 19.42 G → 16.86 G (-13 %), 2160p 8-bit 16 Mb/s
+  65.1 G → 55.6 G; the loop filter's part of the 1080p decode goes
+  from about 5.3 G to about 2.7 G.
 - Decode speed, 120-frame streams, same machine before → after
   (fps): 1080p 8-bit single-tile 85 → 149 on one thread and 263 → 765
   on eight; 1080p 10-bit 4-tile 76 → 127 / 415 → 711; 2160p 8-bit

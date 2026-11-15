@@ -563,7 +563,7 @@ pub(crate) fn superblock_loop_filter_window_at<T: Px>(
 /// One mode-info cell's §8.8.2 / §8.8.4 inputs, resolved once per
 /// superblock row for the decoder's loop filter.
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct LfCell {
+struct LfCell {
     /// `8 * num_8x8_blocks_{wide,high}( sbSize ) - 1` for the §8.8.2
     /// `isBlockEdge` test, per pass, for `sub == 0` / `sub == 1`.
     block_mask: [[u8; 2]; 2],
@@ -580,24 +580,203 @@ pub(crate) struct LfCell {
 
 const INVALID_LVL: u8 = u8::MAX;
 
-/// A superblock row's mode info prepared for
-/// [`superblock_loop_filter_cells`]: per-cell [`LfCell`]s (`8 * MiCols`
-/// entries from MI row `mi_row_base`) and the §8.8.4 strength of every
-/// level.
+/// Edge slots per superblock in an edge plan: sixteen edges of eight
+/// mode-info units each.
+const PLAN_SB: usize = 16 * 8;
+
+/// A superblock row's §8.8.2 decisions prepared for
+/// [`superblock_loop_filter_cells`], resolved once per row instead of
+/// once per edge position.
+///
+/// `plans[ class ][ pass ]` (class 0 = luma, 1 = both chroma planes,
+/// which share every decision) holds, per superblock, one byte for each
+/// `(edge, unit)` pair — `edge` the §8.8.2 edge index inside the
+/// superblock, `unit` the mode-info index along the edge (eight luma
+/// samples; every §8.8.2 input is constant across one unit). The byte
+/// is `0` when the unit is not filtered (not a block / transform edge,
+/// off screen, on the frame border, or `lvl == 0`), else
+/// `lvl << 2 | filterSize + 1`.
 pub(crate) struct LfRowCells {
-    cells: Vec<LfCell>,
+    plans: [[Vec<u8>; 2]; 2],
     mi_row_base: u32,
     mi_cols: u32,
-    mi_rows: u32,
     subsampling_x: u8,
     subsampling_y: u8,
     bit_depth: u8,
     strengths: [FilterStrength; 64],
 }
 
+/// The §8.8.2 steps 1-14 and §8.8.3 for every `(edge, unit)` of one
+/// superblock, one plane class and one pass, written to `out`
+/// (`PLAN_SB` bytes, zero on entry).
+///
+/// In a pass the edges lie along one axis (the "fixed" coordinate is
+/// the one an edge shares along its length); `sf` / `sa` are the
+/// subsampling factors across / along the edge. A mode-info cell
+/// (after the §8.8.2 steps 2-3 rounding to the chroma-sampled cell)
+/// owns two consecutive edges, so each cell is looked up once.
+#[allow(clippy::too_many_arguments)]
+fn plan_superblock(
+    out: &mut [u8],
+    cells: &[LfCell],
+    (mi_row_base, mi_rows, mi_cols): (u32, u32, u32),
+    chroma: bool,
+    (sub_x, sub_y): (u32, u32),
+    pass: u8,
+    col: u32,
+) {
+    let vertical = pass == PASS_VERTICAL;
+    let (sf, sa) = if vertical {
+        (sub_x, sub_y)
+    } else {
+        (sub_y, sub_x)
+    };
+    let (base_f, base_a, n_fixed, n_along) = if vertical {
+        (col, mi_row_base, mi_cols, mi_rows)
+    } else {
+        (mi_row_base, col, mi_rows, mi_cols)
+    };
+    let pass_idx = usize::from(!vertical);
+    let cols = mi_cols as usize;
+    // The H-pass chroma special case of §8.8.2 step 10 (odd MiCols,
+    // odd edge, right frame edge).
+    let odd_cols = !vertical && sub_x == 1 && (mi_cols & 1) == 1;
+    for u in 0..8u32 {
+        let a_mi = base_a + u;
+        if a_mi >= n_along {
+            break;
+        }
+        let a_cell = (a_mi >> sa) << sa;
+        let last_col = a_mi + 1 >= mi_cols;
+        for k in 0..(8u32 >> sf) {
+            let f_cell = base_f + (k << sf);
+            if f_cell >= n_fixed {
+                break;
+            }
+            let (r, c) = if vertical {
+                (a_cell, f_cell)
+            } else {
+                (f_cell, a_cell)
+            };
+            let cell = cells[(r - mi_row_base) as usize * cols + c as usize];
+            let tx_sz = if chroma { cell.uv_tx } else { cell.tx };
+            let tx_mask = (1u32 << tx_sz) - 1;
+            let block_mask = u32::from(cell.block_mask[pass_idx][sf as usize]);
+            for edge in [2 * k, 2 * k + 1] {
+                let fixed = base_f * 8 + edge * (4 << sf);
+                // An edge past the frame, or on its left / top border,
+                // has no on-screen position (§8.8.2 step 13).
+                if fixed >= 8 * n_fixed {
+                    break;
+                }
+                if fixed == 0 {
+                    continue;
+                }
+                let is_block_edge = fixed & block_mask == 0;
+                let is_tx_edge = edge & tx_mask == 0 && !(odd_cols && edge & 1 == 1 && last_col);
+                if !(is_block_edge || (is_tx_edge && !cell.skip_inter)) {
+                    continue;
+                }
+                assert!(
+                    cell.lvl != INVALID_LVL,
+                    "§8.8.4: segment_id must be < 8 and ref_frame in 0..=3"
+                );
+                if cell.lvl == 0 {
+                    continue;
+                }
+                let (x, y) = if vertical {
+                    (fixed, a_mi * 8)
+                } else {
+                    (a_mi * 8, fixed)
+                };
+                let f_size = filter_size(
+                    tx_sz,
+                    edge & 7 == 0,
+                    pass,
+                    x,
+                    y,
+                    sub_x as u8,
+                    sub_y as u8,
+                    mi_cols,
+                    mi_rows,
+                );
+                out[(edge * 8 + u) as usize] = ((cell.lvl & 63) << 2) | (f_size + 1);
+            }
+        }
+    }
+}
+
+/// [`plan_superblock`] for the luma plane of a whole superblock row
+/// (`plan` holds `PLAN_SB` zeroed bytes per superblock), one visit per
+/// mode-info cell.
+///
+/// Without subsampling every cell owns exactly its own two edges, and
+/// the §8.8.2 / §8.8.3 conditions reduce to the cell's position:
+///
+/// * the edge on the cell's boundary (`fixed = 8 * mi`) is a block edge
+///   when `fixed & blockMask == 0` and a transform edge when the cell
+///   index inside the superblock is a multiple of the transform width
+///   in cells; its `filterSize` is `Min( TX_16X16, txSz )`, or `TX_8X8`
+///   for a `TX_4X4` cell on a 32-sample boundary;
+/// * the edge through the middle of the cell (`fixed = 8 * mi + 4`) is
+///   never a block edge (every block mask has bit 2 set) and is a
+///   transform edge only for `TX_4X4`, with `filterSize = TX_4X4`.
+fn plan_luma_row(
+    plan: &mut [u8],
+    cells: &[LfCell],
+    (mi_row_base, mi_rows, mi_cols): (u32, u32, u32),
+    pass: u8,
+) {
+    use crate::filter_size::{TX_4X4, TX_8X8, TX_16X16};
+    let vertical = pass == PASS_VERTICAL;
+    let pass_idx = usize::from(!vertical);
+    let cols = mi_cols as usize;
+    let rows = mi_rows.saturating_sub(mi_row_base).min(8) as usize;
+    for (r, row_cells) in cells.chunks_exact(cols).enumerate().take(rows) {
+        for (c, cell) in row_cells.iter().enumerate() {
+            // `k`: the cell's index across the edges inside its
+            // superblock; `u`: its index along them; `mi`: its frame
+            // position across the edges.
+            let (k, u, mi) = if vertical {
+                (c & 7, r, c as u32)
+            } else {
+                (r, c & 7, mi_row_base + r as u32)
+            };
+            let tx = cell.tx;
+            let on_boundary = mi != 0
+                && ((8 * mi) & u32::from(cell.block_mask[pass_idx][0]) == 0
+                    || (!cell.skip_inter && (2 * k) & ((1usize << tx) - 1) == 0));
+            let in_middle = !cell.skip_inter && tx == TX_4X4;
+            if !(on_boundary || in_middle) {
+                continue;
+            }
+            assert!(
+                cell.lvl != INVALID_LVL,
+                "§8.8.4: segment_id must be < 8 and ref_frame in 0..=3"
+            );
+            if cell.lvl == 0 {
+                continue;
+            }
+            let lvl = (cell.lvl & 63) << 2;
+            let out = &mut plan[(c >> 3) * PLAN_SB..][..PLAN_SB];
+            if on_boundary {
+                let f_size = if tx == TX_4X4 && k & 3 == 0 {
+                    TX_8X8
+                } else {
+                    tx.min(TX_16X16)
+                };
+                out[2 * k * 8 + u] = lvl | (f_size + 1);
+            }
+            if in_middle {
+                out[(2 * k + 1) * 8 + u] = lvl | (TX_4X4 + 1);
+            }
+        }
+    }
+}
+
 impl LfRowCells {
-    /// Resolve the cells of MI rows `mi_row_base ..+ 8` of `frame` (whose
-    /// arrays start at that row).
+    /// Resolve the decisions of MI rows `mi_row_base ..+ 8` of `frame`
+    /// (whose arrays start at that row).
     pub(crate) fn new(frame: &SuperblockFilterFrame, mi_row_base: u32) -> Self {
         let cols = frame.mi_cols as usize;
         let rows = (frame.mi_rows.saturating_sub(mi_row_base)).min(8) as usize;
@@ -635,11 +814,29 @@ impl LfRowCells {
                 lvl,
             };
         }
+        let sb_cols = cols.div_ceil(8);
+        let subs = (
+            u32::from(frame.subsampling_x),
+            u32::from(frame.subsampling_y),
+        );
+        let dims = (mi_row_base, frame.mi_rows, frame.mi_cols);
+        let plans = std::array::from_fn(|class| {
+            std::array::from_fn(|pass| {
+                let mut plan = vec![0u8; sb_cols * PLAN_SB];
+                if class == 0 {
+                    plan_luma_row(&mut plan, &cells, dims, pass as u8);
+                } else {
+                    for (sb, out) in plan.as_chunks_mut::<PLAN_SB>().0.iter_mut().enumerate() {
+                        plan_superblock(out, &cells, dims, true, subs, pass as u8, (sb * 8) as u32);
+                    }
+                }
+                plan
+            })
+        });
         Self {
-            cells,
+            plans,
             mi_row_base,
             mi_cols: frame.mi_cols,
-            mi_rows: frame.mi_rows,
             subsampling_x: frame.subsampling_x,
             subsampling_y: frame.subsampling_y,
             bit_depth: frame.bit_depth,
@@ -654,9 +851,9 @@ impl LfRowCells {
 }
 
 /// [`superblock_loop_filter_window`] over a superblock row's prepared
-/// [`LfRowCells`]: the same §8.8.2 steps per mode-info run (the
-/// predicates of [`superblock_filter_edge`], [`filter_size`] and the
-/// §8.8.4 strength), read from the resolved cells.
+/// [`LfRowCells`]: each edge's units with one decision
+/// (`filterSize`, `lvl`) are filtered as one span. `row` must be the
+/// row the plan was built for.
 pub(crate) fn superblock_loop_filter_cells<T: Px>(
     plane_buf: &mut PlaneWindow<'_, T>,
     lf: &LfRowCells,
@@ -665,6 +862,8 @@ pub(crate) fn superblock_loop_filter_cells<T: Px>(
     row: u32,
     col: u32,
 ) {
+    debug_assert_eq!(row, lf.mi_row_base);
+    debug_assert!(col < lf.mi_cols && col & 7 == 0);
     let (sub_x, sub_y) = if plane == 0 {
         (0u32, 0u32)
     } else {
@@ -672,101 +871,31 @@ pub(crate) fn superblock_loop_filter_cells<T: Px>(
     };
     let geom = superblock_filter_geometry(pass, sub_x, sub_y);
     let vertical = pass == PASS_VERTICAL;
-    let (mi_cols, mi_rows) = (lf.mi_cols, lf.mi_rows);
     let along_sub = if vertical { sub_y } else { sub_x };
     let run_len = 8u32 >> along_sub;
-    let sub = geom.sub as usize;
-    let pass_idx = usize::from(!vertical);
-    let cols = mi_cols as usize;
-    for edge in 0..(16u32 >> geom.sub) {
-        // The edge's own coordinate is fixed: an edge past the frame
-        // (and every later one) or on the left / top frame border has
-        // no on-screen position (§8.8.2 step 13).
-        let fixed = if vertical {
-            col * 8 + edge * (4 << sub_x)
-        } else {
-            row * 8 + edge * (4 << sub_y)
-        };
-        if fixed >= 8 * if vertical { mi_cols } else { mi_rows } {
-            break;
-        }
-        if fixed == 0 {
+    let sb = (col / 8) as usize;
+    let plan = &lf.plans[usize::from(plane > 0)][usize::from(pass)][sb * PLAN_SB..][..PLAN_SB];
+    for (edge, &codes) in plan
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .enumerate()
+        .take(16usize >> geom.sub)
+    {
+        if u64::from_ne_bytes(codes) == 0 {
             continue;
         }
-        let is_32_edge = edge & 7 == 0;
-        // The H-pass chroma special case of §8.8.2 step 10 (odd MiCols,
-        // odd edge, right frame edge).
-        let odd_tail = !vertical && sub_x == 1 && (mi_cols & 1) == 1 && (edge & 1) == 1;
-        let mut pending: Option<(u32, u32, u8, FilterStrength)> = None;
-        let mut i = 0u32;
-        while i < geom.edge_len {
-            let (x, y) = if vertical {
-                (fixed, row * 8 + (i << sub_y))
-            } else {
-                (col * 8 + (i << sub_x), fixed)
-            };
-            if if vertical {
-                y >= 8 * mi_rows
-            } else {
-                x >= 8 * mi_cols
-            } {
-                break;
+        let mut u = 0usize;
+        while u < 8 {
+            let code = codes[u];
+            let start = u;
+            u += 1;
+            if code == 0 {
+                continue;
             }
-            let i0 = i;
-            i += run_len;
-            let loop_col = ((x >> 3) >> sub_x) << sub_x;
-            let loop_row = ((y >> 3) >> sub_y) << sub_y;
-            let c = lf.cells[(loop_row - lf.mi_row_base) as usize * cols + loop_col as usize];
-            let tx_sz = if plane > 0 { c.uv_tx } else { c.tx };
-            let is_block_edge = fixed & u32::from(c.block_mask[pass_idx][sub]) == 0;
-            let is_tx_edge =
-                !(odd_tail && (x + 8) >= mi_cols * 8) && edge & ((1u32 << tx_sz) - 1) == 0;
-            let decision = if is_block_edge || (is_tx_edge && !c.skip_inter) {
-                assert!(
-                    c.lvl != INVALID_LVL,
-                    "§8.8.4: segment_id must be < 8 and ref_frame in 0..=3"
-                );
-                (c.lvl > 0).then(|| {
-                    let f_size = filter_size(
-                        tx_sz,
-                        is_32_edge,
-                        pass,
-                        x,
-                        y,
-                        sub_x as u8,
-                        sub_y as u8,
-                        mi_cols,
-                        mi_rows,
-                    );
-                    (f_size, lf.strengths[c.lvl as usize & 63])
-                })
-            } else {
-                None
-            };
-            match (pending, decision) {
-                (Some((s0, n, fs, st)), Some((fs2, st2)))
-                    if fs == fs2 && st == st2 && s0 + n == i0 && n + run_len <= LANES as u32 =>
-                {
-                    pending = Some((s0, n + run_len, fs, st));
-                }
-                (p, d) => {
-                    if let Some(run) = p {
-                        filter_run(
-                            plane_buf,
-                            lf.bit_depth,
-                            &geom,
-                            (pass, sub_x, sub_y),
-                            row,
-                            col,
-                            edge,
-                            run,
-                        );
-                    }
-                    pending = d.map(|(fs, st)| (i0, run_len, fs, st));
-                }
+            while u < 8 && codes[u] == code {
+                u += 1;
             }
-        }
-        if let Some(run) = pending {
             filter_run(
                 plane_buf,
                 lf.bit_depth,
@@ -774,14 +903,19 @@ pub(crate) fn superblock_loop_filter_cells<T: Px>(
                 (pass, sub_x, sub_y),
                 row,
                 col,
-                edge,
-                run,
+                edge as u32,
+                (
+                    start as u32 * run_len,
+                    (u - start) as u32 * run_len,
+                    (code & 3) - 1,
+                    lf.strengths[usize::from(code >> 2)],
+                ),
             );
         }
     }
 }
 
-/// Positions the lane-parallel §8.8.5 kernel filters at once.
+/// Positions the lane-parallel §8.8.5 kernel filters at once (at most).
 const LANES: usize = 16;
 
 /// Filter the `n` consecutive edge positions starting at `i = i0` of
@@ -853,75 +987,143 @@ fn filter_run<T: Px>(
 /// below `16 * 1023 + 8`, and the §8.8.5.4 narrow filter's
 /// `filter + 3 * (qs0 - ps0)` below `512 + 3 * 1023` — and `i32` lanes
 /// the 12-bit case. Both are the same arithmetic.
+///
+/// The kernel is instantiated per lane count `L` (8 or 16 positions),
+/// per orientation (`HORIZONTAL`: the positions are consecutive samples
+/// of a row and the taps `step` apart; otherwise the positions are
+/// `along` apart and the taps consecutive) and per §8.8.3 `filterSize`
+/// (`SIZE`), so each instance only evaluates the §8.8.5.2 flatness
+/// tests its dispatch can use. The outer taps `p7..p4` / `q4..q7` are
+/// loaded only when some position passes the 8-wide flatness test of a
+/// 16-wide edge, and only the taps the filters that actually ran can
+/// change are stored.
 macro_rules! lane_kernel {
-    ($name:ident, $t:ty) => {
+    ($name:ident, $split:ident, $join:ident, $t:ty) => {
         // The lane loops index several parallel tap arrays by lane on
         // purpose.
         #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
-        fn $name<T: Px, const HORIZONTAL: bool>(
+        fn $name<T: Px, const L: usize, const HORIZONTAL: bool, const SIZE: u8>(
             data: &mut [T],
             q0: usize,
             step: usize,
             along: usize,
             n: usize,
             strength: FilterStrength,
-            filter_size: u8,
             bit_depth: u8,
         ) {
-            use crate::filter_size::{TX_4X4, TX_8X8, TX_16X16};
-            debug_assert!((1..=LANES).contains(&n));
-            let wide16 = filter_size >= TX_16X16;
-            // t[ k ][ l ]: the sample at offset k - 8 across the edge, lane l.
-            let mut t = [[0 as $t; LANES]; 16];
-            // Fixed tap ranges per case, so every copy loop has constant
-            // bounds.
+            use crate::filter_size::{TX_8X8, TX_16X16};
+            debug_assert!((1..=L).contains(&n));
+            // Load taps LO..HI (as offsets + 8) of every position.
             #[inline(always)]
-            fn gather_h<T: Px>(
-                t: &mut [[$t; LANES]; 16],
+            fn gather<T: Px, const L: usize, const LO: usize, const HI: usize>(
+                t: &mut [[$t; L]; 16],
                 data: &[T],
-                q0: usize,
-                step: usize,
-                n: usize,
-                (lo, hi): (usize, usize),
+                horizontal: bool,
+                (q0, step, along, n): (usize, usize, usize, usize),
             ) {
-                if n == LANES {
-                    for (k, tap) in t.iter_mut().enumerate().take(hi).skip(lo) {
-                        let at = (q0 + k * step) - 8 * step;
-                        for (d, &v) in tap.iter_mut().zip(&data[at..at + LANES]) {
-                            *d = v.get() as $t;
+                if horizontal {
+                    let base = q0 - 8 * step;
+                    if n == L {
+                        for k in LO..HI {
+                            let at = base + k * step;
+                            for (d, &v) in t[k].iter_mut().zip(&data[at..at + L]) {
+                                *d = v.get() as $t;
+                            }
+                        }
+                    } else {
+                        for k in LO..HI {
+                            let at = base + k * step;
+                            for (d, &v) in t[k].iter_mut().zip(&data[at..at + n]) {
+                                *d = v.get() as $t;
+                            }
                         }
                     }
                 } else {
-                    for (k, tap) in t.iter_mut().enumerate().take(hi).skip(lo) {
-                        let at = (q0 + k * step) - 8 * step;
-                        for (d, &v) in tap.iter_mut().zip(&data[at..at + n]) {
+                    // Each position's taps are consecutive samples of
+                    // one row: four at a time, the rows' pieces are laid
+                    // end to end and de-interleaved into the tap arrays.
+                    debug_assert!((HI - LO) % 4 == 0 && HI - LO <= 8);
+                    let mut flat = [[[0 as $t; 4]; L]; 2];
+                    let [flat_a, flat_b] = &mut flat;
+                    let rows = data[q0 - 8..].chunks(along);
+                    for ((row, qa), qb) in
+                        rows.zip(flat_a.iter_mut()).zip(flat_b.iter_mut()).take(n)
+                    {
+                        let row: &[T; 16] = row.first_chunk().expect("sixteen taps in the row");
+                        for (d, &v) in qa.iter_mut().zip(&row[LO..LO + 4]) {
                             *d = v.get() as $t;
+                        }
+                        if HI - LO == 8 {
+                            for (d, &v) in qb.iter_mut().zip(&row[LO + 4..LO + 8]) {
+                                *d = v.get() as $t;
+                            }
+                        }
+                    }
+                    for (g, quads) in flat.iter().enumerate().take((HI - LO) / 4) {
+                        let k0 = LO + 4 * g;
+                        let [a, b, c, d] = &mut t[k0..k0 + 4] else {
+                            unreachable!("four tap arrays");
+                        };
+                        $split(quads.as_flattened(), a, b, c, d);
+                    }
+                }
+            }
+            // Store taps LO..HI of every position.
+            #[inline(always)]
+            fn scatter<T: Px, const L: usize, const LO: usize, const HI: usize>(
+                o: &[[$t; L]; 16],
+                data: &mut [T],
+                horizontal: bool,
+                (q0, step, along, n): (usize, usize, usize, usize),
+            ) {
+                if horizontal {
+                    let base = q0 - 8 * step;
+                    if n == L {
+                        for k in LO..HI {
+                            let at = base + k * step;
+                            for (d, &v) in data[at..at + L].iter_mut().zip(&o[k]) {
+                                *d = T::put(i32::from(v));
+                            }
+                        }
+                    } else {
+                        for k in LO..HI {
+                            let at = base + k * step;
+                            for (d, &v) in data[at..at + n].iter_mut().zip(&o[k]) {
+                                *d = T::put(i32::from(v));
+                            }
+                        }
+                    }
+                } else {
+                    debug_assert!((HI - LO) % 4 == 0);
+                    let mut flat = [[[0 as $t; 4]; L]; 4];
+                    let groups = (HI - LO) / 4;
+                    for (g, quads) in flat.iter_mut().enumerate().take(groups) {
+                        let k0 = LO + 4 * g;
+                        let [a, b, c, d] = &o[k0..k0 + 4] else {
+                            unreachable!("four tap arrays");
+                        };
+                        $join(quads.as_flattened_mut(), a, b, c, d);
+                    }
+                    for (l, row) in data[q0 - 8..].chunks_mut(along).enumerate().take(n) {
+                        let row: &mut [T; 16] =
+                            row.first_chunk_mut().expect("sixteen taps in the row");
+                        for (quads, taps) in flat
+                            .iter()
+                            .zip(row[LO..HI].chunks_exact_mut(4))
+                            .take(groups)
+                        {
+                            for (d, &v) in taps.iter_mut().zip(&quads[l]) {
+                                *d = T::put(i32::from(v));
+                            }
                         }
                     }
                 }
             }
-            #[inline(always)]
-            fn gather_v<T: Px, const LO: usize, const HI: usize>(
-                t: &mut [[$t; LANES]; 16],
-                data: &[T],
-                q0: usize,
-                along: usize,
-                n: usize,
-            ) {
-                for l in 0..n {
-                    let at = q0 + l * along - 8;
-                    let line = &data[at + LO..at + HI];
-                    for k in LO..HI {
-                        t[k][l] = line[k - LO].get() as $t;
-                    }
-                }
-            }
-            match (HORIZONTAL, wide16) {
-                (true, true) => gather_h(&mut t, data, q0, step, n, (0, 16)),
-                (true, false) => gather_h(&mut t, data, q0, step, n, (4, 12)),
-                (false, true) => gather_v::<T, 0, 16>(&mut t, data, q0, along, n),
-                (false, false) => gather_v::<T, 4, 12>(&mut t, data, q0, along, n),
-            }
+            let place = (q0, step, along, n);
+            // t[ k ][ l ]: the sample at offset k - 8 across the edge, lane l.
+            // Every decision but the 16-wide flatness reads p3..q3 only.
+            let mut t = [[0 as $t; L]; 16];
+            gather::<T, L, 4, 12>(&mut t, data, HORIZONTAL, place);
 
             let shift = u32::from(bit_depth - 8);
             let limit = (strength.limit as $t) << shift;
@@ -936,13 +1138,12 @@ macro_rules! lane_kernel {
             // §8.8.5 dispatch arm; a lane with none of them set is echoed.
             let ad = |a: $t, b: $t| (a - b).abs();
             let bit = |c: bool| -(c as $t);
-            let mut m_narrow = [0 as $t; LANES];
-            let mut m_wide8 = [0 as $t; LANES];
-            let mut m_wide16 = [0 as $t; LANES];
-            let mut m_hev = [0 as $t; LANES];
-            let filter8 = (filter_size >= TX_8X8) as $t;
-            let not4 = bit(filter_size != TX_4X4);
-            for l in 0..LANES {
+            let any = |m: &[$t; L]| m.iter().fold(0, |a, &v| a | v) != 0;
+            let mut m_narrow = [0 as $t; L];
+            let mut m_wide8 = [0 as $t; L];
+            let mut m_wide16 = [0 as $t; L];
+            let mut m_hev = [0 as $t; L];
+            for l in 0..L {
                 let (p3, p2, p1, p0) = (t[4][l], t[5][l], t[6][l], t[7][l]);
                 let (q0, q1, q2, q3) = (t[8][l], t[9][l], t[10][l], t[11][l]);
                 let mask = bit(l < n)
@@ -954,29 +1155,44 @@ macro_rules! lane_kernel {
                     & bit(ad(q3, q2) <= limit)
                     & bit(ad(p0, q0) * 2 + ad(p1, q1) / 2 <= blimit);
                 m_hev[l] = bit(ad(p1, p0) > thresh) | bit(ad(q1, q0) > thresh);
-                let flat = -filter8
-                    & bit(ad(p1, p0) <= one)
-                    & bit(ad(q1, q0) <= one)
-                    & bit(ad(p2, p0) <= one)
-                    & bit(ad(q2, q0) <= one)
-                    & bit(ad(p3, p0) <= one)
-                    & bit(ad(q3, q0) <= one);
-                let flat2 = bit(wide16)
-                    & bit(ad(t[0][l], p0) <= one)
-                    & bit(ad(t[15][l], q0) <= one)
-                    & bit(ad(t[1][l], p0) <= one)
-                    & bit(ad(t[14][l], q0) <= one)
-                    & bit(ad(t[2][l], p0) <= one)
-                    & bit(ad(t[13][l], q0) <= one)
-                    & bit(ad(t[3][l], p0) <= one)
-                    & bit(ad(t[12][l], q0) <= one);
-                let wide = mask & not4 & flat;
+                let wide = if SIZE >= TX_8X8 {
+                    mask & bit(ad(p1, p0) <= one)
+                        & bit(ad(q1, q0) <= one)
+                        & bit(ad(p2, p0) <= one)
+                        & bit(ad(q2, q0) <= one)
+                        & bit(ad(p3, p0) <= one)
+                        & bit(ad(q3, q0) <= one)
+                } else {
+                    0
+                };
                 m_narrow[l] = mask & !wide;
-                m_wide16[l] = wide & flat2;
-                m_wide8[l] = wide & !flat2;
+                m_wide8[l] = wide;
             }
-            let any = |m: &[$t; LANES]| m.iter().fold(0, |a, &v| a | v) != 0;
-            let (any_n, any_w8, any_w16) = (any(&m_narrow), any(&m_wide8), any(&m_wide16));
+            let any_n = any(&m_narrow);
+            let mut any_w8 = SIZE >= TX_8X8 && any(&m_wide8);
+            let mut any_w16 = false;
+            if SIZE >= TX_16X16 && any_w8 {
+                // Some position passes the 8-wide flatness test: only now
+                // are p7..p4 / q4..q7 needed, for the §8.8.5.2 `flat2`.
+                gather::<T, L, 0, 4>(&mut t, data, HORIZONTAL, place);
+                gather::<T, L, 12, 16>(&mut t, data, HORIZONTAL, place);
+                for l in 0..L {
+                    let (p0, q0) = (t[7][l], t[8][l]);
+                    let flat2 = bit(ad(t[0][l], p0) <= one)
+                        & bit(ad(t[15][l], q0) <= one)
+                        & bit(ad(t[1][l], p0) <= one)
+                        & bit(ad(t[14][l], q0) <= one)
+                        & bit(ad(t[2][l], p0) <= one)
+                        & bit(ad(t[13][l], q0) <= one)
+                        & bit(ad(t[3][l], p0) <= one)
+                        & bit(ad(t[12][l], q0) <= one);
+                    let wide = m_wide8[l];
+                    m_wide16[l] = wide & flat2;
+                    m_wide8[l] = wide & !flat2;
+                }
+                any_w8 = any(&m_wide8);
+                any_w16 = any(&m_wide16);
+            }
             if !(any_n || any_w8 || any_w16) {
                 return;
             }
@@ -986,7 +1202,7 @@ macro_rules! lane_kernel {
             if any_n {
                 // §8.8.5.4 narrow filter.
                 let c = |v: $t| v.clamp(-half, half - 1);
-                for l in 0..LANES {
+                for l in 0..L {
                     let (m, hev) = (m_narrow[l], m_hev[l]);
                     let (ps1, ps0) = (t[6][l] - offset, t[7][l] - offset);
                     let (qs0, qs1) = (t[8][l] - offset, t[9][l] - offset);
@@ -1005,7 +1221,7 @@ macro_rules! lane_kernel {
             if any_w8 {
                 // §8.8.5.3 wide filter, log2Size = 3 (n = 3: taps clamp to
                 // offsets -4..=3).
-                for l in 0..LANES {
+                for l in 0..L {
                     let m = m_wide8[l];
                     let get = |k: i32| t[(k.clamp(-4, 3) + 8) as usize][l];
                     let mut window: $t = (-3..=3).map(|j| get(-3 + j)).sum();
@@ -1019,7 +1235,7 @@ macro_rules! lane_kernel {
             if any_w16 {
                 // §8.8.5.3 wide filter, log2Size = 4 (n = 7: taps clamp to
                 // offsets -8..=7).
-                for l in 0..LANES {
+                for l in 0..L {
                     let m = m_wide16[l];
                     let get = |k: i32| t[(k.clamp(-8, 7) + 8) as usize][l];
                     let mut window: $t = (-7..=7).map(|j| get(-7 + j)).sum();
@@ -1031,77 +1247,100 @@ macro_rules! lane_kernel {
                 }
             }
 
-            // Write back the taps a filter can modify (p6..q6 / p2..q2 / p1..q1).
-            #[inline(always)]
-            fn scatter_h<T: Px>(
-                o: &[[$t; LANES]; 16],
-                data: &mut [T],
-                q0: usize,
-                step: usize,
-                n: usize,
-                (lo, hi): (usize, usize),
-            ) {
-                if n == LANES {
-                    for (k, tap) in o.iter().enumerate().take(hi).skip(lo) {
-                        let at = (q0 + k * step) - 8 * step;
-                        for (d, &v) in data[at..at + LANES].iter_mut().zip(tap) {
-                            *d = T::put(i32::from(v));
-                        }
-                    }
-                } else {
-                    for (k, tap) in o.iter().enumerate().take(hi).skip(lo) {
-                        let at = (q0 + k * step) - 8 * step;
-                        for (d, &v) in data[at..at + n].iter_mut().zip(tap) {
-                            *d = T::put(i32::from(v));
-                        }
-                    }
-                }
-            }
-            #[inline(always)]
-            fn scatter_v<T: Px, const LO: usize, const HI: usize>(
-                o: &[[$t; LANES]; 16],
-                data: &mut [T],
-                q0: usize,
-                along: usize,
-                n: usize,
-            ) {
-                for l in 0..n {
-                    let at = q0 + l * along - 8;
-                    let line = &mut data[at + LO..at + HI];
-                    for k in LO..HI {
-                        line[k - LO] = T::put(i32::from(o[k][l]));
-                    }
-                }
-            }
-            let width = if wide16 {
-                2
-            } else if filter_size >= TX_8X8 {
-                1
-            } else {
-                0
-            };
-            match (HORIZONTAL, width) {
-                (true, 2) => scatter_h(&o, data, q0, step, n, (1, 15)),
-                (true, 1) => scatter_h(&o, data, q0, step, n, (5, 11)),
-                (true, _) => scatter_h(&o, data, q0, step, n, (6, 10)),
-                (false, 2) => scatter_v::<T, 1, 15>(&o, data, q0, along, n),
-                (false, 1) => scatter_v::<T, 5, 11>(&o, data, q0, along, n),
-                (false, _) => scatter_v::<T, 6, 10>(&o, data, q0, along, n),
+            // Write back the taps the filters that ran can modify
+            // (p6..q6 / p2..q2 / p1..q1).
+            // Across consecutive samples of a row the taps go four at a
+            // time, so the stored range widens to whole groups there:
+            // the extra taps (p3 / q3, or p7 / q7) are stored with the
+            // values just loaded from the same samples.
+            match (any_w16, any_w8, HORIZONTAL) {
+                (true, _, true) => scatter::<T, L, 1, 15>(&o, data, true, place),
+                (true, _, false) => scatter::<T, L, 0, 16>(&o, data, false, place),
+                (false, true, true) => scatter::<T, L, 5, 11>(&o, data, true, place),
+                (false, true, false) => scatter::<T, L, 4, 12>(&o, data, false, place),
+                (false, false, _) => scatter::<T, L, 6, 10>(&o, data, HORIZONTAL, place),
             }
         }
     };
 }
 
-lane_kernel!(filter_lanes_i16, i16);
-lane_kernel!(filter_lanes_i32, i32);
+/// Generates the transposition steps of the lane kernel for positions
+/// that are rows of the plane: `$split` de-interleaves `flat` (four
+/// consecutive taps of each position, position after position) into one
+/// array per tap, `$join` is the inverse. They are kept out of line with
+/// run-time lengths so each compiles as a plain stride-4 loop of its
+/// own.
+macro_rules! quad_transpose {
+    ($split:ident, $join:ident, $t:ty) => {
+        #[inline(never)]
+        fn $split(flat: &[$t], a: &mut [$t], b: &mut [$t], c: &mut [$t], d: &mut [$t]) {
+            let n = a.len();
+            let (flat, b, c, d) = (&flat[..4 * n], &mut b[..n], &mut c[..n], &mut d[..n]);
+            for l in 0..n {
+                a[l] = flat[4 * l];
+                b[l] = flat[4 * l + 1];
+                c[l] = flat[4 * l + 2];
+                d[l] = flat[4 * l + 3];
+            }
+        }
+        #[inline(never)]
+        fn $join(flat: &mut [$t], a: &[$t], b: &[$t], c: &[$t], d: &[$t]) {
+            let n = a.len();
+            let (flat, b, c, d) = (&mut flat[..4 * n], &b[..n], &c[..n], &d[..n]);
+            for l in 0..n {
+                flat[4 * l] = a[l];
+                flat[4 * l + 1] = b[l];
+                flat[4 * l + 2] = c[l];
+                flat[4 * l + 3] = d[l];
+            }
+        }
+    };
+}
 
-/// The §8.8.5 sample filter over up to [`LANES`] interior positions at
-/// once: position `l` has `q0` at `data[ q0 + l * along ]`, `p_k` at
-/// `q0 - (k + 1) * step` and `q_k` at `q0 + k * step`. Each lane makes
-/// its own §8.8.5.2 mask / flat decisions and gets exactly the outputs
-/// of the gather → [`sample_filtering`] → scatter round trip (the
-/// echoed outputs are the samples already in the plane, so only the
-/// taps a filter can modify are written back).
+quad_transpose!(quad_split_i16, quad_join_i16, i16);
+quad_transpose!(quad_split_i32, quad_join_i32, i32);
+lane_kernel!(filter_lanes_i16, quad_split_i16, quad_join_i16, i16);
+lane_kernel!(filter_lanes_i32, quad_split_i32, quad_join_i32, i32);
+
+/// One kernel call of at most `L` positions, dispatched on the lane
+/// type (by bit depth) and the §8.8.3 `filterSize`.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn filter_chunk<T: Px, const L: usize, const HORIZONTAL: bool>(
+    data: &mut [T],
+    q0: usize,
+    step: usize,
+    along: usize,
+    n: usize,
+    strength: FilterStrength,
+    filter_size: u8,
+    bit_depth: u8,
+) {
+    use crate::filter_size::{TX_4X4, TX_8X8, TX_16X16};
+    macro_rules! call {
+        ($f:ident, $size:expr) => {
+            $f::<T, L, HORIZONTAL, { $size }>(data, q0, step, along, n, strength, bit_depth)
+        };
+    }
+    match (bit_depth <= 10, filter_size) {
+        (true, TX_4X4) => call!(filter_lanes_i16, TX_4X4),
+        (true, TX_8X8) => call!(filter_lanes_i16, TX_8X8),
+        (true, _) => call!(filter_lanes_i16, TX_16X16),
+        (false, TX_4X4) => call!(filter_lanes_i32, TX_4X4),
+        (false, TX_8X8) => call!(filter_lanes_i32, TX_8X8),
+        (false, _) => call!(filter_lanes_i32, TX_16X16),
+    }
+}
+
+/// The §8.8.5 sample filter over `n` interior positions: position `l`
+/// has `q0` at `data[ q0 + l * along ]`, `p_k` at `q0 - (k + 1) * step`
+/// and `q_k` at `q0 + k * step`. Each position makes its own §8.8.5.2
+/// mask / flat decisions and gets exactly the outputs of the gather →
+/// [`sample_filtering`] → scatter round trip (the echoed outputs are
+/// the samples already in the plane, so only the taps a filter can
+/// modify are written back). The positions of one edge never overlap,
+/// so they are filtered [`LANES`] at a time, a tail of eight or fewer
+/// through the half-width kernel.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn filter_lanes<T: Px>(
@@ -1114,36 +1353,54 @@ fn filter_lanes<T: Px>(
     filter_size: u8,
     bit_depth: u8,
 ) {
-    if bit_depth <= 10 {
-        if along == 1 {
-            filter_lanes_i16::<T, true>(data, q0, step, along, n, strength, filter_size, bit_depth);
-        } else {
-            filter_lanes_i16::<T, false>(
+    let mut done = 0usize;
+    while done < n {
+        let rest = n - done;
+        let at = q0 + done * along;
+        let take = rest.min(LANES);
+        match (along == 1, rest > LANES / 2) {
+            (true, true) => filter_chunk::<T, LANES, true>(
                 data,
-                q0,
+                at,
                 step,
                 along,
-                n,
+                take,
                 strength,
                 filter_size,
                 bit_depth,
-            );
-        }
-    } else {
-        if along == 1 {
-            filter_lanes_i32::<T, true>(data, q0, step, along, n, strength, filter_size, bit_depth);
-        } else {
-            filter_lanes_i32::<T, false>(
+            ),
+            (true, false) => filter_chunk::<T, { LANES / 2 }, true>(
                 data,
-                q0,
+                at,
                 step,
                 along,
-                n,
+                take,
                 strength,
                 filter_size,
                 bit_depth,
-            );
+            ),
+            (false, true) => filter_chunk::<T, LANES, false>(
+                data,
+                at,
+                step,
+                along,
+                take,
+                strength,
+                filter_size,
+                bit_depth,
+            ),
+            (false, false) => filter_chunk::<T, { LANES / 2 }, false>(
+                data,
+                at,
+                step,
+                along,
+                take,
+                strength,
+                filter_size,
+                bit_depth,
+            ),
         }
+        done += take;
     }
 }
 
@@ -1295,6 +1552,281 @@ mod tests {
 
         fn get(&self, x: usize, y: usize) -> i32 {
             self.data[y * self.w + x]
+        }
+    }
+
+    /// A grid of unrelated cells (every block size, transform size,
+    /// skip flag, reference and segment drawn independently) — the
+    /// §8.8.2 predicates are per cell, so the prepared plans must hold
+    /// for any cell contents, not only for well-formed partitions.
+    fn scrambled(mi_cols: u32, mi_rows: u32, sub_x: u8, sub_y: u8, seed: u32) -> Fixture {
+        let mut fix = Fixture::uniform(mi_cols, mi_rows, BLOCK_8X8, TX_4X4, false, 0, 24);
+        let mut params = lf(24);
+        params.delta_enabled = true;
+        params.ref_deltas = [Some(6), Some(-24), Some(-3), Some(9)];
+        params.mode_deltas = [Some(-2), Some(4)];
+        fix.lookup = loop_filter_frame_init(&params, &seg_disabled(), [6, -24, -3, 9], [-2, 4]);
+        fix.sub_x = sub_x;
+        fix.sub_y = sub_y;
+        let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(12_345);
+        let mut next = |n: u32| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 16) % n
+        };
+        for i in 0..(mi_cols * mi_rows) as usize {
+            fix.mi_sizes[i] = next(13) as u8;
+            fix.tx_sizes[i] = next(4) as u8;
+            fix.skips[i] = next(3) == 0;
+            fix.refs[i] = next(4) as i32;
+            fix.y_modes[i] = next(14) as u8;
+        }
+        fix
+    }
+
+    /// The prepared per-row plans carry, for every `(edge, unit)`, the
+    /// decision the §8.8.2 predicate bundle, §8.8.3 and §8.8.4 give for
+    /// each position of that unit.
+    #[test]
+    fn row_plans_match_the_per_position_predicates() {
+        for (seed, &(mi_cols, mi_rows)) in [(19u32, 21u32), (8, 8), (17, 9), (33, 16), (1, 1)]
+            .iter()
+            .enumerate()
+        {
+            for &(sx, sy) in &[(1u8, 1u8), (1, 0), (0, 1), (0, 0)] {
+                let fix = scrambled(
+                    mi_cols,
+                    mi_rows,
+                    sx,
+                    sy,
+                    seed as u32 * 4 + u32::from(sx * 2 + sy),
+                );
+                let frame = fix.frame();
+                let cols = mi_cols as usize;
+                for row in (0..mi_rows).step_by(8) {
+                    let at = row as usize * cols;
+                    let band = SuperblockFilterFrame {
+                        mi_sizes: &fix.mi_sizes[at..],
+                        tx_sizes: &fix.tx_sizes[at..],
+                        skips: &fix.skips[at..],
+                        ref_frames_0: &fix.refs[at..],
+                        y_modes: &fix.y_modes[at..],
+                        segment_ids: &fix.seg_ids[at..],
+                        ..fix.frame()
+                    };
+                    let lf = LfRowCells::new(&band, row);
+                    for class in 0..2usize {
+                        let (sub_x, sub_y) = if class == 0 {
+                            (0u32, 0u32)
+                        } else {
+                            (u32::from(sx), u32::from(sy))
+                        };
+                        for pass in 0..2u8 {
+                            let geom = superblock_filter_geometry(pass, sub_x, sub_y);
+                            let run_len = 8 >> if pass == PASS_VERTICAL { sub_y } else { sub_x };
+                            for col in (0..mi_cols).step_by(8) {
+                                let plan = &lf.plans[class][usize::from(pass)]
+                                    [(col / 8) as usize * PLAN_SB..][..PLAN_SB];
+                                for edge in 0..16u32 {
+                                    for i in 0..geom.edge_len {
+                                        let got = plan[(edge * 8 + i / run_len) as usize];
+                                        let want = if edge >= 16 >> geom.sub {
+                                            0
+                                        } else {
+                                            position_code(
+                                                &frame,
+                                                class as u8,
+                                                pass,
+                                                row,
+                                                col,
+                                                edge,
+                                                i,
+                                            )
+                                        };
+                                        assert_eq!(
+                                            got, want,
+                                            "{mi_cols}x{mi_rows} sub=({sx},{sy}) class={class} \
+                                             pass={pass} sb=({row},{col}) edge={edge} i={i}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The plan byte the spec-literal §8.8.2 steps 1-16 give for one
+    /// position (`0` = not filtered).
+    fn position_code(
+        frame: &SuperblockFilterFrame,
+        plane: u8,
+        pass: u8,
+        row: u32,
+        col: u32,
+        edge: u32,
+        i: u32,
+    ) -> u8 {
+        let (sub_x, sub_y) = if plane == 0 {
+            (0u32, 0u32)
+        } else {
+            (
+                u32::from(frame.subsampling_x),
+                u32::from(frame.subsampling_y),
+            )
+        };
+        let (x, y) = if pass == PASS_VERTICAL {
+            (col * 8 + edge * (4 << sub_x), row * 8 + (i << sub_y))
+        } else {
+            (col * 8 + (i << sub_x), row * 8 + edge * (4 << sub_y))
+        };
+        if x >= 8 * frame.mi_cols || y >= 8 * frame.mi_rows {
+            return 0;
+        }
+        let loop_col = ((x >> 3) >> sub_x) << sub_x;
+        let loop_row = ((y >> 3) >> sub_y) << sub_y;
+        let idx = loop_row as usize * frame.mi_cols as usize + loop_col as usize;
+        let (mi_size, tx_size) = (frame.mi_sizes[idx], frame.tx_sizes[idx]);
+        let tx_sz = if plane > 0 {
+            get_uv_tx_size(
+                u32::from(tx_size),
+                mi_size,
+                frame.subsampling_x == 1,
+                frame.subsampling_y == 1,
+            ) as u8
+        } else {
+            tx_size
+        };
+        let mi = SuperblockFilterMi {
+            mi_size,
+            tx_sz,
+            skip: frame.skips[idx],
+            ref_frame_0: frame.ref_frames_0[idx],
+        };
+        let e = superblock_filter_edge(
+            pass,
+            row,
+            col,
+            edge,
+            i,
+            sub_x,
+            sub_y,
+            frame.mi_cols,
+            frame.mi_rows,
+            &mi,
+        );
+        if !e.apply_filter {
+            return 0;
+        }
+        let f_size = filter_size(
+            tx_sz,
+            e.is_32_edge,
+            pass,
+            e.x,
+            e.y,
+            sub_x as u8,
+            sub_y as u8,
+            frame.mi_cols,
+            frame.mi_rows,
+        );
+        let strength = adaptive_filter_strength(
+            frame.lvl_lookup,
+            frame.segment_ids[idx] as usize,
+            frame.ref_frames_0[idx],
+            frame.y_modes[idx],
+            frame.loop_filter_sharpness,
+        )
+        .expect("valid segment / reference");
+        if strength.lvl == 0 {
+            0
+        } else {
+            (strength.lvl << 2) | (f_size + 1)
+        }
+    }
+
+    /// The prepared-plan path against the per-position reference walk on
+    /// scrambled cells, at every bit depth and subsampling, over sample
+    /// content that exercises each §8.8.5 arm (near-flat areas with
+    /// small and large steps).
+    #[test]
+    fn prepared_rows_match_reference_walk_at_every_depth() {
+        for (seed, &(mi_cols, mi_rows)) in [(19u32, 21u32), (9, 17), (16, 8)].iter().enumerate() {
+            for &(sx, sy) in &[(1u8, 1u8), (1, 0), (0, 1), (0, 0)] {
+                for bit_depth in [8u8, 10, 12] {
+                    let mut fix = scrambled(mi_cols, mi_rows, sx, sy, 77 + seed as u32);
+                    fix.bit_depth = bit_depth;
+                    let frame = fix.frame();
+                    let cols = mi_cols as usize;
+                    let scale = 1u32 << (bit_depth - 8);
+                    for plane in 0..3u8 {
+                        let (px, py) = if plane == 0 { (0, 0) } else { (sx, sy) };
+                        let w = (8 * mi_cols as usize) >> px;
+                        let h = (8 * mi_rows as usize) >> py;
+                        let mut state = 0x9E37_79B9u32 ^ (u32::from(plane) << 8) ^ seed as u32;
+                        let base: Vec<u16> = (0..w * h)
+                            .map(|at| {
+                                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                                let (x, y) = (at % w, at / w);
+                                // Flat 16x16 areas with steps between
+                                // them, a little noise on some.
+                                let level = 60 + ((x / 16) * 7 + (y / 16) * 5) % 11 * 3;
+                                let noisy = (x / 32 + y / 32) % 3 == 0;
+                                let noise = if noisy {
+                                    (state >> 20) % 12
+                                } else {
+                                    (state >> 20) % 2
+                                };
+                                ((level as u32 + noise) * scale + ((state >> 9) % scale)) as u16
+                            })
+                            .collect();
+                        let mut want = base.clone();
+                        let mut got = base.clone();
+                        for row in (0..mi_rows).step_by(8) {
+                            let at = row as usize * cols;
+                            let band = SuperblockFilterFrame {
+                                mi_sizes: &fix.mi_sizes[at..],
+                                tx_sizes: &fix.tx_sizes[at..],
+                                skips: &fix.skips[at..],
+                                ref_frames_0: &fix.refs[at..],
+                                y_modes: &fix.y_modes[at..],
+                                segment_ids: &fix.seg_ids[at..],
+                                ..fix.frame()
+                            };
+                            let lf = LfRowCells::new(&band, row);
+                            for col in (0..mi_cols).step_by(8) {
+                                for pass in 0..2u8 {
+                                    let mut win = PlaneWindow {
+                                        data: &mut want[..],
+                                        stride: w,
+                                        width: w,
+                                        height: h,
+                                        y_origin: 0,
+                                    };
+                                    superblock_loop_filter_window_at(
+                                        &mut win, &frame, 0, plane, pass, row, col,
+                                    );
+                                    let mut win = PlaneWindow {
+                                        data: &mut got[..],
+                                        stride: w,
+                                        width: w,
+                                        height: h,
+                                        y_origin: 0,
+                                    };
+                                    superblock_loop_filter_cells(
+                                        &mut win, &lf, plane, pass, row, col,
+                                    );
+                                }
+                            }
+                        }
+                        assert!(want != base, "the fixture filters something");
+                        assert!(
+                            got == want,
+                            "{mi_cols}x{mi_rows} sub=({sx},{sy}) depth={bit_depth} plane={plane}"
+                        );
+                    }
+                }
+            }
         }
     }
 

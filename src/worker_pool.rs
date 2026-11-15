@@ -45,7 +45,8 @@ impl Batch {
 }
 
 struct Queue {
-    jobs: VecDeque<(Job, Arc<BatchState>)>,
+    /// `(job, its batch, its index inside the batch)`.
+    jobs: VecDeque<(Job, Arc<BatchState>, usize)>,
     shutdown: bool,
 }
 
@@ -125,8 +126,11 @@ impl WorkerPool {
         });
         {
             let mut q = lock(&self.shared.queue);
-            q.jobs
-                .extend(jobs.into_iter().map(|j| (j, Arc::clone(&state))));
+            q.jobs.extend(
+                jobs.into_iter()
+                    .enumerate()
+                    .map(|(i, j)| (j, Arc::clone(&state), i)),
+            );
         }
         self.shared.work.notify_all();
         Batch { state }
@@ -142,7 +146,7 @@ impl WorkerPool {
             }
             let job = lock(&self.shared.queue).jobs.pop_front();
             match job {
-                Some((job, state)) => execute(job, &state),
+                Some((job, state, _)) => execute(job, &state),
                 None => {
                     // Everything left is running on helpers.
                     let mut p = lock(&batch.state.pending);
@@ -159,6 +163,35 @@ impl WorkerPool {
         }
     }
 
+    /// Run, on the calling thread, the first still-queued job of `batch`
+    /// whose index inside the batch is below `below`; `false` when there
+    /// is none (each is running or finished).
+    ///
+    /// This takes a job out of FIFO order, so it is only for jobs that
+    /// block on nothing but jobs queued earlier *which the helpers will
+    /// reach on their own*: the helpers' FIFO argument is untouched (the
+    /// job is simply gone from their queue, and nothing queued before it
+    /// waits on it), and the caller's wait ends because the helpers keep
+    /// making progress. With no helper there is no out-of-order hazard
+    /// either: the caller only gets here between its own FIFO runs.
+    pub(crate) fn run_queued(&self, batch: &Batch, below: usize) -> bool {
+        let job = {
+            let mut q = lock(&self.shared.queue);
+            let at = q
+                .jobs
+                .iter()
+                .position(|(_, state, index)| Arc::ptr_eq(state, &batch.state) && *index < below);
+            at.and_then(|at| q.jobs.remove(at))
+        };
+        match job {
+            Some((job, state, _)) => {
+                execute(job, &state);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// [`Self::submit`] + [`Self::wait`].
     #[cfg(test)]
     pub(crate) fn run(&self, jobs: Vec<Job>) {
@@ -172,8 +205,8 @@ fn helper_loop(shared: &Shared) {
         let (job, state) = {
             let mut q = lock(&shared.queue);
             loop {
-                if let Some(item) = q.jobs.pop_front() {
-                    break item;
+                if let Some((job, state, _)) = q.jobs.pop_front() {
+                    break (job, state);
                 }
                 if q.shutdown {
                     return;
@@ -250,6 +283,47 @@ mod tests {
             assert!(first.is_done() && second.is_done());
             assert_eq!(*state.0.lock().unwrap(), 12);
         }
+    }
+
+    /// The caller can run the leading jobs of a batch itself while the
+    /// helpers are held by an earlier batch; the batch's later jobs stay
+    /// queued for the FIFO order.
+    #[test]
+    fn caller_runs_the_leading_jobs_of_a_batch_out_of_order() {
+        let pool = WorkerPool::new(1);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let blocker = {
+            let gate = Arc::clone(&gate);
+            pool.submit(vec![Box::new(move || {
+                let (m, cv) = &*gate;
+                let mut open = m.lock().unwrap();
+                while !*open {
+                    open = cv.wait(open).unwrap();
+                }
+            }) as Job])
+        };
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let jobs: Vec<Job> = (0..4)
+            .map(|i| {
+                let ran = Arc::clone(&ran);
+                Box::new(move || ran.lock().unwrap().push(i)) as Job
+            })
+            .collect();
+        let batch = pool.submit(jobs);
+        // The only helper is (or will be) inside the blocker: jobs 0 and
+        // 1 run here, in order; 2 and 3 are not eligible.
+        assert!(pool.run_queued(&batch, 2));
+        assert!(pool.run_queued(&batch, 2));
+        assert!(!pool.run_queued(&batch, 2));
+        assert_eq!(*ran.lock().unwrap(), vec![0, 1]);
+        assert!(!pool.run_queued(&blocker, 0));
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        pool.wait(&batch);
+        pool.wait(&blocker);
+        assert_eq!(*ran.lock().unwrap(), vec![0, 1, 2, 3]);
+        // Nothing left to take.
+        assert!(!pool.run_queued(&batch, 4));
     }
 
     #[test]

@@ -3472,6 +3472,19 @@ impl Vp9SequenceDecoder {
         if adapt.is_none() {
             return Ok(());
         }
+        // The next frame cannot start before these counts exist, and the
+        // counts need this frame's entropy-decode jobs, which may still
+        // sit in the queue behind the reconstruction of earlier frames.
+        // Rather than wait for a helper to reach them, run them here:
+        // an entropy-decode job blocks only on the mode-info rows of
+        // earlier frames (published by their entropy-decode jobs, queued
+        // earlier, which the helpers reach on their own), so taking it
+        // out of FIFO order is safe (see `WorkerPool::run_queued`) — and
+        // the bytes do not depend on which thread runs a job.
+        if let (Some(pool), Some(batch)) = (self.pool.as_ref(), inflight.batch.as_ref()) {
+            let entropy_jobs = inflight.pipe.row_queues.len();
+            while pool.run_queued(batch, entropy_jobs) {}
+        }
         match inflight.counts() {
             Ok(counts) => {
                 let a = adapt.take().expect("checked");

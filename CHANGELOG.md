@@ -45,6 +45,10 @@ All notable changes to `oxideav-vp9` are recorded here.
   a 352x288 eight-frame GOP; 99.9 % of the pool, within 0.13–0.25 dB
   of the full-size plan on the test GOPs. Sequences under 32 luma
   samples on an axis take the full-size first pass.
+- `benches/decode_sweep.sh` also generates `_adapt` streams
+  (`frame_parallel_decoding_mode = 0`) next to the non-adapting ones,
+  and states the flag explicitly for both, since it decides how far
+  consecutive frames' entropy decodes can overlap.
 - `benches/decode_sweep.sh`: regenerates the 1080p / 2160p decode
   benchmark streams with a black-box encoder, checks the output of
   every thread budget against a black-box decode, and prints the fps
@@ -52,6 +56,20 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Performance
 
+- Threading, streams with backward adaptation
+  (`error_resilient_mode = 0`, `frame_parallel_decoding_mode = 0`,
+  `refresh_frame_context = 1`): the next frame cannot start before the
+  §8.4 adaptation has the current frame's symbol counts, and the
+  entropy-decode jobs that produce them used to wait in the pool's
+  queue behind the reconstruction of earlier frames. The submitting
+  thread now runs the frame's still-queued entropy-decode jobs itself
+  (`WorkerPool::run_queued`; such a job blocks only on mode-info rows
+  published by earlier frames' entropy-decode jobs, which the helpers
+  reach on their own, so the FIFO deadlock argument is untouched).
+  1080p 8-bit single-tile adapting stream at a 2-thread budget:
+  110 → 210 fps (interleaved medians of five, loaded machine); other
+  budgets and non-adapting streams unchanged. Output byte-identical
+  at every budget.
 - §8.5.2.4 inter prediction, blocks whose taps reach past the plane
   edge: the edge-replicated footprint is gathered into the caller's
   reusable working storage (as `u16`) instead of a freshly zeroed

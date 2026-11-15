@@ -52,6 +52,16 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Performance
 
+- §8.5.2.4 inter prediction: blocks 4 / 8 / 16 / 32 / 64 samples wide
+  (every width the partition produces) run through a kernel compiled
+  for that width — each row is a fixed-size array, so the column
+  loops have constant bounds and a row costs one bounds check per
+  slice instead of one per tap and column group; the vertical-only
+  case looks each reference row up once instead of eight times.
+  Other widths keep the general form. Output unchanged (pinned
+  against the per-sample form at every width, phase, filter and bit
+  depth). Instructions retired, single thread, 120 frames: 1080p
+  8-bit 16.86 G → 13.93 G, 1080p 10-bit 21.27 G → 18.88 G.
 - §8.8 loop filter (the decoder's row jobs), output unchanged:
   - the §8.8.2 steps 1-14 / §8.8.3 / §8.8.4 decisions are resolved
     once per superblock row into a byte per `(edge, mode-info unit)`

@@ -622,6 +622,18 @@ fn unscaled_kernel<R: SampleRows, O: Px>(
     // 16-bit accumulators at 8 bits: the reference samples are in range
     // (the caller's `ref_fits`), as is the clipped intermediate.
     let narrow = bit_depth == 8;
+    // The block widths the partition produces run through a kernel
+    // compiled for that width; anything else takes the general form
+    // below.
+    let fixed = (ix, iy, fx, fy, h, filter, max, narrow);
+    match w {
+        4 => return fixed_width_kernel::<R, O, 4>(rows_of, fixed, out, out_stride, scratch),
+        8 => return fixed_width_kernel::<R, O, 8>(rows_of, fixed, out, out_stride, scratch),
+        16 => return fixed_width_kernel::<R, O, 16>(rows_of, fixed, out, out_stride, scratch),
+        32 => return fixed_width_kernel::<R, O, 32>(rows_of, fixed, out, out_stride, scratch),
+        64 => return fixed_width_kernel::<R, O, 64>(rows_of, fixed, out, out_stride, scratch),
+        _ => {}
+    }
     if fy == 0 {
         // Horizontal only: the rows the vertical pass would copy.
         let taps = &filter[fx];
@@ -661,6 +673,118 @@ fn unscaled_kernel<R: SampleRows, O: Px>(
         let src: [&[u16]; 8] = std::array::from_fn(|k| &inter[(r + k) * w..(r + k + 1) * w]);
         let d = dst_row(out, r);
         fir8(&src, taps, max, narrow, &mut out[d]);
+    }
+}
+
+/// The sub-sample cases of [`unscaled_kernel`] for a block exactly `W`
+/// samples wide (`fx != 0 || fy != 0`, `h <= 64`): the same passes over
+/// the same rows, with every row handled as a `[_; W]` array so the
+/// column loops have constant bounds and each row costs one bounds
+/// check per slice it takes rather than one per tap and column group.
+#[allow(clippy::type_complexity)]
+fn fixed_width_kernel<R: SampleRows, O: Px, const W: usize>(
+    rows_of: &R,
+    (ix, iy, fx, fy, h, filter, max, narrow): (
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        &[[i32; 8]; 16],
+        i32,
+        bool,
+    ),
+    out: &mut [O],
+    out_stride: usize,
+    scratch: &mut [u16; 64 * 71],
+) {
+    // The eight tap positions of a horizontal pass: `row` holds the
+    // samples `ix - 3 .. ix + W + 4`.
+    #[inline(always)]
+    fn spread<P, const W: usize>(row: &[P]) -> [&[P; W]; 8] {
+        let row = &row[..W + 7];
+        let at = |k: usize| -> &[P; W] { row[k..k + W].try_into().expect("W samples") };
+        [at(0), at(1), at(2), at(3), at(4), at(5), at(6), at(7)]
+    }
+    #[inline(always)]
+    fn dst_row<O, const W: usize>(out: &mut [O], at: usize) -> &mut [O; W] {
+        (&mut out[at..at + W]).try_into().expect("W samples")
+    }
+
+    if fy == 0 {
+        let taps = &filter[fx];
+        for r in 0..h {
+            let src = spread::<R::Px, W>(&rows_of.row(iy + r)[ix - 3..]);
+            fir8_row(
+                &src,
+                taps,
+                max,
+                narrow,
+                dst_row::<O, W>(out, r * out_stride),
+            );
+        }
+        return;
+    }
+    let taps = &filter[fy];
+    let rows = h + 7;
+    if fx == 0 {
+        // Vertical only: each reference row is looked up once.
+        let first: &[R::Px; W] = rows_of.row(iy - 3)[ix..ix + W]
+            .try_into()
+            .expect("W samples");
+        let mut lines = [first; 71];
+        for (r, line) in lines.iter_mut().enumerate().take(rows).skip(1) {
+            *line = rows_of.row(iy + r - 3)[ix..ix + W]
+                .try_into()
+                .expect("W samples");
+        }
+        for r in 0..h {
+            let src: &[&[R::Px; W]; 8] = lines[r..r + 8].try_into().expect("eight rows");
+            fir8_row(src, taps, max, narrow, dst_row::<O, W>(out, r * out_stride));
+        }
+        return;
+    }
+    // Intermediate rows iy - 3 .. iy + h + 4; every value is a clipped
+    // sample, so `u16` holds it at every bit depth.
+    let (inter, _) = scratch[..rows * W].as_chunks_mut::<W>();
+    let htaps = &filter[fx];
+    for (r, dst) in inter.iter_mut().enumerate() {
+        let src = spread::<R::Px, W>(&rows_of.row(iy + r - 3)[ix - 3..]);
+        fir8_row(&src, htaps, max, narrow, dst);
+    }
+    for r in 0..h {
+        let v: &[[u16; W]; 8] = inter[r..r + 8].try_into().expect("eight rows");
+        let src = [&v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]];
+        fir8_row(
+            &src,
+            taps,
+            max,
+            narrow,
+            dst_row::<O, W>(out, r * out_stride),
+        );
+    }
+}
+
+/// One `W`-sample row of a §8.5.2.4 pass (see [`fir8`]), in column
+/// groups of sixteen whose accumulators stay in registers across the
+/// eight taps.
+#[inline(always)]
+fn fir8_row<P: Px, O: Px, const W: usize>(
+    src: &[&[P; W]; 8],
+    taps: &[i32; 8],
+    max: i32,
+    narrow: bool,
+    dst: &mut [O; W],
+) {
+    if W <= 16 {
+        fir8_lanes(src, taps, max, narrow, dst);
+        return;
+    }
+    let (groups, _) = dst.as_chunks_mut::<16>();
+    for (j, group) in groups.iter_mut().enumerate() {
+        let at = |k: usize| -> &[P; 16] { &src[k].as_chunks::<16>().0[j] };
+        let rows = [at(0), at(1), at(2), at(3), at(4), at(5), at(6), at(7)];
+        fir8_lanes(&rows, taps, max, narrow, group);
     }
 }
 
@@ -723,6 +847,19 @@ fn fir8_group<P: Px, O: Px, const C: usize>(
             .expect("a group lies inside the row")
     });
     let dst: &mut [O; C] = dst.try_into().expect("a group's destination");
+    fir8_lanes(&rows, taps, max, narrow, dst);
+}
+
+/// `C` adjacent columns of one §8.5.2.4 pass row: the multiply-
+/// accumulate sweeps of [`fir8`] over fixed-size arrays.
+#[inline(always)]
+fn fir8_lanes<P: Px, O: Px, const C: usize>(
+    rows: &[&[P; C]; 8],
+    taps: &[i32; 8],
+    max: i32,
+    narrow: bool,
+    dst: &mut [O; C],
+) {
     if narrow {
         debug_assert_eq!(max, 255);
         let mut acc = [FIR_BIAS + 64; C];
@@ -906,7 +1043,22 @@ mod tests {
                 };
                 let (last_x, last_y) = (pw as i32 - 1, ph as i32 - 1);
                 for filt in 0..4usize {
-                    for (w, h) in [(4usize, 4usize), (8, 16), (16, 8), (32, 32), (64, 64)] {
+                    // Every fixed-width kernel at short and tall heights,
+                    // and widths only the general form takes.
+                    for (w, h) in [
+                        (4usize, 4usize),
+                        (4, 8),
+                        (8, 4),
+                        (8, 16),
+                        (16, 8),
+                        (16, 64),
+                        (32, 32),
+                        (32, 16),
+                        (64, 64),
+                        (64, 32),
+                        (2, 2),
+                        (12, 8),
+                    ] {
                         for _ in 0..24 {
                             let x = (next() % ((pw - w) as u64 * 16 + 64)) as i32 - 32;
                             let y = (next() % ((ph - h) as u64 * 16 + 64)) as i32 - 32;

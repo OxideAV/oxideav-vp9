@@ -323,8 +323,8 @@ mod tests {
         let out = slot.to_decoded_frame();
         assert_eq!(out.y.len(), (lw * lh) as usize);
         // Row 0 of the cropped plane is cols 0..9 of the working plane.
-        for col in 0..lw as usize {
-            assert_eq!(out.y[col], col as u16);
+        for (col, &sample) in out.y.iter().enumerate().take(lw as usize) {
+            assert_eq!(sample, col as u16);
         }
         // Row 1, col 0 is working (1,0) = 100, not the stride-tail of row 0.
         assert_eq!(out.y[lw as usize], 100);

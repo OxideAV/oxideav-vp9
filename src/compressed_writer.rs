@@ -640,10 +640,11 @@ mod tests {
             }
         };
         let mut c = base.clone();
-        for size in 1..4 {
-            for ctx in 0..2 {
-                for j in 0..size {
-                    moved(&mut c.tx_probs[size][ctx][j]);
+        // tx_probs[ size ] carries `size` probabilities per context.
+        for (size, per_ctx) in c.tx_probs.iter_mut().enumerate().skip(1) {
+            for probs in per_ctx.iter_mut() {
+                for p in probs.iter_mut().take(size) {
+                    moved(p);
                 }
             }
         }
@@ -716,10 +717,8 @@ mod tests {
             for p in mv.bits_prob[i].iter_mut() {
                 mv_moved(p);
             }
-            for j in 0..2 {
-                for p in mv.class0_fr_probs[i][j].iter_mut() {
-                    mv_moved(p);
-                }
+            for p in mv.class0_fr_probs[i].iter_mut().flatten() {
+                mv_moved(p);
             }
             for p in mv.fr_probs[i].iter_mut() {
                 mv_moved(p);

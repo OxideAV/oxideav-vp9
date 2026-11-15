@@ -146,9 +146,9 @@ fn check_extents(curr: &CurrFrame, frame: &SuperblockFilterFrame) {
     // ((FrameHeight + subsampling_y) >> subsampling_y).
     let uv_w = (y.width + frame.subsampling_x as usize) >> frame.subsampling_x;
     let uv_h = (y.height + frame.subsampling_y as usize) >> frame.subsampling_y;
-    for plane in 1..3 {
+    for chroma in &curr.planes[1..3] {
         assert!(
-            curr.planes[plane].width == uv_w && curr.planes[plane].height == uv_h,
+            chroma.width == uv_w && chroma.height == uv_h,
             "§8.8: chroma plane extent inconsistent with subsampling (§8.10)"
         );
     }

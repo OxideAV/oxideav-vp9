@@ -1515,10 +1515,8 @@ pub(crate) fn mv_probs(
     // Phase 3: per-component fractional — 2 × (CLASS0_SIZE × (MV_FR_SIZE
     // - 1) + (MV_FR_SIZE - 1)) = 2 × 9 = 18 cells.
     for i in 0..2 {
-        for j in 0..CLASS0_SIZE {
-            for slot in probs.class0_fr_probs[i][j].iter_mut() {
-                *slot = update_mv_prob(coder, *slot)?;
-            }
+        for slot in probs.class0_fr_probs[i].iter_mut().flatten() {
+            *slot = update_mv_prob(coder, *slot)?;
         }
         for slot in probs.fr_probs[i].iter_mut() {
             *slot = update_mv_prob(coder, *slot)?;
@@ -4159,10 +4157,8 @@ mod tests {
                     }
                 }
                 for i in 0..2 {
-                    for j in 0..CLASS0_SIZE {
-                        for slot in ref_p.class0_fr_probs[i][j].iter_mut() {
-                            *slot = update_mv_prob(&mut ref_dec, *slot).unwrap();
-                        }
+                    for slot in ref_p.class0_fr_probs[i].iter_mut().flatten() {
+                        *slot = update_mv_prob(&mut ref_dec, *slot).unwrap();
                     }
                     for slot in ref_p.fr_probs[i].iter_mut() {
                         *slot = update_mv_prob(&mut ref_dec, *slot).unwrap();

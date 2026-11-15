@@ -272,10 +272,8 @@ pub fn loop_filter_frame_init(
 
         // §8.8.1 step 3: if ( loop_filter_delta_update == 0 ) broadcast.
         if !lf.delta_update {
-            for r in 0..MAX_REF_FRAMES_USIZE {
-                for m in 0..MAX_MODE_LF_DELTAS {
-                    out.levels[segment_id][r][m] = lvl_seg as u8;
-                }
+            for level in out.levels[segment_id].iter_mut().flatten() {
+                *level = lvl_seg as u8;
             }
         }
 
@@ -353,10 +351,10 @@ mod tests {
         let lf = lf_disabled();
         let seg = seg_disabled();
         let lookup = loop_filter_frame_init(&lf, &seg, [0; 4], [0; 2]);
-        for s in 0..MAX_SEGMENTS {
-            for r in 0..MAX_REF_FRAMES_USIZE {
-                for m in 0..MAX_MODE_LF_DELTAS {
-                    assert_eq!(lookup.levels[s][r][m], 0, "s={s} r={r} m={m}");
+        for (s, per_ref) in lookup.levels.iter().enumerate() {
+            for (r, per_mode) in per_ref.iter().enumerate() {
+                for (m, &level) in per_mode.iter().enumerate() {
+                    assert_eq!(level, 0, "s={s} r={r} m={m}");
                 }
             }
         }
@@ -371,12 +369,8 @@ mod tests {
         // delta_enabled = false, delta_update = false: only step 3 fires.
         let seg = seg_disabled();
         let lookup = loop_filter_frame_init(&lf, &seg, [0; 4], [0; 2]);
-        for s in 0..MAX_SEGMENTS {
-            for r in 0..MAX_REF_FRAMES_USIZE {
-                for m in 0..MAX_MODE_LF_DELTAS {
-                    assert_eq!(lookup.levels[s][r][m], 42);
-                }
-            }
+        for &level in lookup.levels.iter().flatten().flatten() {
+            assert_eq!(level, 42);
         }
     }
 

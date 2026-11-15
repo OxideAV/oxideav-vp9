@@ -769,8 +769,8 @@ impl MvRefGeometry {
         let mode_context = COUNTER_TO_CONTEXT[context_counter];
 
         // §6.5.3 clamp_mv_ref( i ) for both candidates.
-        for i in 0..MAX_MV_REF_CANDIDATES {
-            state.ref_list_mv[i] = self.clamp_mv_ref(state.ref_list_mv[i]);
+        for mv in state.ref_list_mv.iter_mut() {
+            *mv = self.clamp_mv_ref(*mv);
         }
 
         MvRefs {

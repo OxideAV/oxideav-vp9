@@ -970,11 +970,11 @@ mod tests {
 
         // Strip layout: luma block at x4 = (8>>2) = 2 covers
         // x4 ∈ {2, 3, 4, 5}; left[y4 ∈ {2,3,4,5}] = 1.
-        for x4 in 2..6 {
-            assert_eq!(nz[0].above[x4], 1, "above[{x4}]");
+        for (x4, &flag) in nz[0].above.iter().enumerate().take(6).skip(2) {
+            assert_eq!(flag, 1, "above[{x4}]");
         }
-        for y4 in 2..6 {
-            assert_eq!(nz[0].left[y4], 1, "left[{y4}]");
+        for (y4, &flag) in nz[0].left.iter().enumerate().take(6).skip(2) {
+            assert_eq!(flag, 1, "left[{y4}]");
         }
         // Untouched cells remain 0.
         assert_eq!(nz[0].above[0], 0);

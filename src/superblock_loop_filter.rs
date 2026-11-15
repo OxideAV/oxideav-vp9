@@ -1614,7 +1614,7 @@ mod tests {
                         ..fix.frame()
                     };
                     let lf = LfRowCells::new(&band, row);
-                    for class in 0..2usize {
+                    for (class, class_plans) in lf.plans.iter().enumerate() {
                         let (sub_x, sub_y) = if class == 0 {
                             (0u32, 0u32)
                         } else {
@@ -1624,7 +1624,7 @@ mod tests {
                             let geom = superblock_filter_geometry(pass, sub_x, sub_y);
                             let run_len = 8 >> if pass == PASS_VERTICAL { sub_y } else { sub_x };
                             for col in (0..mi_cols).step_by(8) {
-                                let plan = &lf.plans[class][usize::from(pass)]
+                                let plan = &class_plans[usize::from(pass)]
                                     [(col / 8) as usize * PLAN_SB..][..PLAN_SB];
                                 for edge in 0..16u32 {
                                     for i in 0..geom.edge_len {

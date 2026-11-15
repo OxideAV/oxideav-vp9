@@ -7503,9 +7503,9 @@ impl StructuredGopEncoder {
         } else {
             final_hdr.refresh_frame_flags
         };
-        for slot in 0..3 {
-            if mask & (1 << slot) != 0 {
-                self.slots[slot] = Some(crop.clone());
+        for (index, slot) in self.slots.iter_mut().enumerate() {
+            if mask & (1 << index) != 0 {
+                *slot = Some(crop.clone());
             }
         }
         self.prev_field = next_field;

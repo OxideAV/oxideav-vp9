@@ -235,6 +235,29 @@ frames after it, exactly as a serial decode would (pinned at 2 / 3 /
 4 / 8 threads, and by the `decode_frame_threads_diff` differential
 fuzz target).
 
+Which parallelism a stream gets follows from its headers; nothing is
+selected by the caller beyond the thread budget:
+
+| mode | needs | what overlaps |
+|---|---|---|
+| tile columns | §6.2.13 `tile_cols_log2 > 0` | each column's entropy decode and reconstruction run as their own jobs, in any frame type |
+| loop-filter rows | two or more tile columns | three §8.8 jobs filter superblock rows in a wavefront behind reconstruction; a frame with one tile column filters each row inside its reconstruction job instead (no extra parallelism inside such a frame) |
+| frame overlap, reconstruction | any inter stream | frame N+1 reconstructs and filters while frame N is still decoding, waiting only for the reference rows, §6.5 previous-frame motion vectors and §6.4.14 previous segment ids it reads |
+| frame overlap, entropy decode | frame N owes no §8.4 backward adaptation: `error_resilient_mode = 1`, or `frame_parallel_decoding_mode = 1`, or `refresh_frame_context = 0` | frame N+1's entropy decode starts while frame N's is still running |
+
+A frame that does owe backward adaptation (`error_resilient_mode = 0`,
+`frame_parallel_decoding_mode = 0`, `refresh_frame_context = 1`)
+makes the next frame's probabilities depend on all of its symbol
+counts (§6.1.2 `refresh_probs( )`), so the entropy decodes of such a
+stream form a serial chain: the next frame's headers are processed
+only once the counts exist (the submitting thread runs the frame's
+queued entropy-decode jobs itself rather than idle behind earlier
+frames' reconstruction). Tile columns still split each link of the
+chain, and reconstruction and loop filtering still overlap across
+frames. The wait is applied whenever the newest frame owes
+adaptation, including the cases where the next frame resets or loads
+a different context slot and could in principle start earlier.
+
 Everything is dependency-free (`std::thread`, `Mutex` / `Condvar` /
 atomics; no `unsafe`, no CPU-specific code paths — the kernels are
 plain loops the compiler vectorises for the build target), and the
@@ -244,27 +267,39 @@ default), `with_threads( n )`, or `auto( )`.
 **Decode speed** — frames per second on 120-frame streams from a
 black-box encoder (`benches/decode_sweep.sh` regenerates them and
 checks every output against a black-box decode), Apple M5 Max
-(18 cores), other builds running on the machine, median of three,
-through the framework decoder (`examples/decode_ivf.rs`); in
-parentheses the same build before round 486:
+(18 cores), through the framework decoder (`examples/decode_ivf.rs`).
+Each cell is *before → after* round 489, the two builds run
+alternately in one session, median of five; other builds were running
+on the machine, so compare cells within a row rather than against
+earlier tables. "Adapting" streams code
+`frame_parallel_decoding_mode = 0` (the serial entropy chain
+described above); the others code `1`.
 
-| stream | 1 thread | 2 | 4 | 8 | 16 |
-|---|---|---|---|---|---|
-| 1080p 8-bit, 1 tile column, 5 Mb/s | 149 (85) | 281 (139) | 524 (150) | 765 (263) | 841 (358) |
-| 1080p 8-bit, 4 tile columns, 5 Mb/s | 142 (81) | 260 (153) | 505 (301) | 795 (435) | 1148 (665) |
-| 1080p 10-bit, 4 tile columns, 5 Mb/s | 127 (76) | 234 (145) | 460 (281) | 711 (415) | 1038 (632) |
-| 1080p 8-bit, 1 tile column, 20 Mb/s | 70 (43) | 127 (77) | 205 (93) | 287 (128) | 281 (150) |
-| 2160p 8-bit, 1 tile column, 16 Mb/s | 43 (25) | 84 (42) | 153 (44) | 231 (80) | 260 (117) |
-| 2160p 8-bit, 8 tile columns, 16 Mb/s | 36 (21) | 69 (41) | 129 (80) | 206 (136) | 329 (224) |
-| 2160p 10-bit, 8 tile columns, 16 Mb/s | 33 (20) | 62 (39) | 118 (74) | 194 (128) | 316 (192) |
+| stream | 1 thread | 2 | 4 | 8 |
+|---|---|---|---|---|
+| 1080p 8-bit, 4 tile columns, 5 Mb/s | 115 → 140 | 223 → 273 | 386 → 462 | 672 → 792 |
+| 1080p 8-bit, 1 tile column, 5 Mb/s | 138 → 164 | 265 → 324 | 454 → 541 | 657 → 829 |
+| 1080p 8-bit, 4 tile columns, adapting | 122 → 146 | 123 → 284 | 346 → 475 | 629 → 764 |
+| 1080p 8-bit, 1 tile column, adapting | 135 → 165 | 137 → 311 | 367 → 434 | 430 → 439 |
+| 1080p 10-bit, 4 tile columns, 5 Mb/s | 117 → 133 | 219 → 247 | 427 → 480 | 595 → 618 |
+| 1080p 8-bit, 1 tile column, 20 Mb/s | 59 → 64 | 113 → 123 | 179 → 192 | 258 → 267 |
+| 2160p 8-bit, 1 tile column, 16 Mb/s | 37 → 46 | 73 → 89 | 132 → 158 | 201 → 241 |
+| 2160p 8-bit, 8 tile columns, 16 Mb/s | 32 → 37 | 57 → 66 | 104 → 121 | 180 → 216 |
+| 2160p 8-bit, 1 tile column, adapting | 41 → 49 | 41 → 92 | 110 → 135 | 134 → 137 |
 
-On that machine 1080p30 and 1080p60 are real-time on one thread
-(the 20 Mb/s stream included), 2160p30 on one thread and 2160p60 on
-two. A strict `x86-64` baseline build (`-C target-cpu=x86-64`, SSE2
-only) of the same code, run under binary translation on the same
-machine, measures 86 (44) / 37 (29) / 64 (41) fps single-threaded on
-the first, fourth and third 1080p rows and 28 (14) on the 2160p
-single-tile row — no native x86-64 hardware was measured.
+On that machine 1080p60 is real-time on one thread (the 20 Mb/s
+stream included), 2160p30 on one thread and 2160p60 on two. An
+adapting stream with a single tile column stops scaling near four
+threads (about 440 fps at 1080p, 137 fps at 2160p): its entropy
+decode is one serial chain, and that is the rate of the chain. The
+§8.8 loop filter costs 24 % of single-thread time on the first
+1080p single-tile stream (29 % before; 5.84 G → 3.28 G instructions).
+A strict `x86-64` baseline build (`-C target-cpu=x86-64`, SSE2 only)
+was last measured in round 486, before these changes, under binary
+translation on the same machine: 86 / 37 / 64 fps single-threaded on
+the 1080p single-tile 5 Mb/s, 20 Mb/s and 10-bit streams and 28 on
+the 2160p single-tile stream — no native x86-64 hardware was
+measured.
 
 The decode path composes:
 

@@ -104,8 +104,13 @@ All notable changes to `oxideav-vp9` are recorded here.
     check per row, instead of one scalar load and store per sample.
   Instructions retired, single thread, whole decode (120 frames):
   1080p 8-bit 5 Mb/s 19.42 G → 16.86 G (-13 %), 2160p 8-bit 16 Mb/s
-  65.1 G → 55.6 G; the loop filter's part of the 1080p decode goes
-  from about 5.3 G to about 2.7 G.
+  65.1 G → 55.6 G. The loop filter's own cost (a decode with the
+  filter against the same decode with the filter work skipped) on
+  the 1080p stream: 5.84 G → 3.28 G instructions (-44 %), 1.06 G →
+  0.71 G cycles (-33 %); 2160p: 21.7 G → 12.2 G instructions, 3.67 G
+  → 2.49 G cycles. As a part of single-thread decode time (cycles)
+  that is 29 % → 24 % at 1080p — the rest of the decode got faster
+  in the same round, so the share did not halve.
 - Decode speed, 120-frame streams, same machine before → after
   (fps): 1080p 8-bit single-tile 85 → 149 on one thread and 263 → 765
   on eight; 1080p 10-bit 4-tile 76 → 127 / 415 → 711; 2160p 8-bit

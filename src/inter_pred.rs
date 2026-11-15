@@ -206,16 +206,16 @@ pub(crate) fn predict_inter(
 pub(crate) struct PredScratch {
     /// `preds[ refList ]`, row-major `w x h`.
     preds: [[i32; 64 * 64]; 2],
-    /// The horizontal-pass intermediate (`h + 7` rows).
-    inter: [u16; 64 * 71],
+    /// The §8.5.2.4 filter's working storage.
+    inter: [u16; crate::block_inter_pred::SCRATCH_LEN],
 }
 
 impl PredScratch {
-    /// Fresh (boxed: ~40 KiB) storage.
+    /// Fresh (boxed: ~50 KiB) storage.
     pub(crate) fn new_boxed() -> Box<Self> {
         Box::new(PredScratch {
             preds: [[0; 64 * 64]; 2],
-            inter: [0; 64 * 71],
+            inter: [0; crate::block_inter_pred::SCRATCH_LEN],
         })
     }
 }
@@ -226,7 +226,7 @@ thread_local! {
     static PRED_SCRATCH: std::cell::RefCell<Box<PredScratch>> =
         std::cell::RefCell::new(Box::new(PredScratch {
             preds: [[0; 64 * 64]; 2],
-            inter: [0; 64 * 71],
+            inter: [0; crate::block_inter_pred::SCRATCH_LEN],
         }));
 }
 

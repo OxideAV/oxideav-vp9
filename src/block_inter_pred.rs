@@ -463,7 +463,7 @@ pub(crate) fn block_inter_predict_into<R: SampleRows, O: Px>(
     ref_fits: bool,
     out: &mut [O],
     out_stride: usize,
-    scratch: &mut [u16; 64 * 71],
+    scratch: &mut [u16; SCRATCH_LEN],
 ) {
     if !ref_fits {
         let pred = block_inter_predict(
@@ -498,16 +498,18 @@ pub(crate) fn block_inter_predict_into<R: SampleRows, O: Px>(
         // (edge replication — exactly the samples the per-tap clamped
         // reads return), then filter it like an interior block.
         let (fw, fh) = (w + 7, h + 7);
-        let mut emu = [0i32; 71 * 71];
-        for r in 0..fh {
+        let (scratch, emu) = scratch.split_at_mut(INTER_LEN);
+        let emu = &mut emu[..fw * fh];
+        for (r, dst) in emu.chunks_exact_mut(fw).enumerate() {
             let ry = (iy + r as i32 - 3).clamp(0, last_y) as usize;
             let row = rows_of.row(ry);
-            for (c, d) in emu[r * fw..(r + 1) * fw].iter_mut().enumerate() {
-                *d = row[(ix + c as i32 - 3).clamp(0, last_x) as usize].get();
+            for (c, d) in dst.iter_mut().enumerate() {
+                // In range: the caller's `ref_fits`.
+                *d = row[(ix + c as i32 - 3).clamp(0, last_x) as usize].get() as u16;
             }
         }
         let win = Window {
-            data: &emu[..fw * fh],
+            data: &*emu,
             stride: fw,
             y0: 0,
         };
@@ -566,6 +568,15 @@ pub(crate) fn block_inter_predict_into<R: SampleRows, O: Px>(
     }
 }
 
+/// Samples of the horizontal-pass intermediate of a 64-wide block
+/// (`64 + 7` rows).
+const INTER_LEN: usize = 64 * 71;
+
+/// The working storage [`block_inter_predict_into`] needs: the
+/// horizontal-pass intermediate, then the edge-replicated footprint
+/// (`71 x 71` samples) of a block whose taps reach past the plane.
+pub(crate) const SCRATCH_LEN: usize = INTER_LEN + 71 * 71;
+
 /// Rows `y0..` of a plane stored contiguously (`stride` apart).
 struct Window<'a, P> {
     data: &'a [P],
@@ -600,7 +611,7 @@ fn unscaled_kernel<R: SampleRows, O: Px>(
     ),
     out: &mut [O],
     out_stride: usize,
-    scratch: &mut [u16; 64 * 71],
+    scratch: &mut [u16],
 ) {
     let filter = &SUBPEL_FILTERS[interp_filter];
     let dst_row = |out: &mut [O], r: usize| -> std::ops::Range<usize> {
@@ -696,7 +707,7 @@ fn fixed_width_kernel<R: SampleRows, O: Px, const W: usize>(
     ),
     out: &mut [O],
     out_stride: usize,
-    scratch: &mut [u16; 64 * 71],
+    scratch: &mut [u16],
 ) {
     // The eight tap positions of a horizontal pass: `row` holds the
     // samples `ix - 3 .. ix + W + 4`.
@@ -933,7 +944,7 @@ mod tests {
                             );
                             assert_eq!(a, b, "filter {filt} step ({xs},{ys}) {w}x{h} at ({x},{y})");
                             let mut c = vec![0i32; w * h];
-                            let mut scratch = Box::new([0u16; 64 * 71]);
+                            let mut scratch = Box::new([0u16; SCRATCH_LEN]);
                             block_inter_predict_into(
                                 &rows,
                                 x,
@@ -1076,7 +1087,7 @@ mod tests {
                                 bit_depth,
                             );
                             let mut out = vec![0u16; w * h];
-                            let mut scratch = Box::new([0u16; 64 * 71]);
+                            let mut scratch = Box::new([0u16; SCRATCH_LEN]);
                             block_inter_predict_into(
                                 &rows,
                                 x,
@@ -1137,7 +1148,7 @@ mod tests {
                     8,
                 );
                 let mut out = vec![0i32; w * h];
-                let mut scratch = Box::new([0u16; 64 * 71]);
+                let mut scratch = Box::new([0u16; SCRATCH_LEN]);
                 block_inter_predict_into(
                     &rows,
                     x,

@@ -52,6 +52,10 @@ All notable changes to `oxideav-vp9` are recorded here.
 
 ### Performance
 
+- §8.5.2.4 inter prediction, blocks whose taps reach past the plane
+  edge: the edge-replicated footprint is gathered into the caller's
+  reusable working storage (as `u16`) instead of a freshly zeroed
+  20 KiB stack array per block. Output unchanged.
 - §8.5.2.4 inter prediction: blocks 4 / 8 / 16 / 32 / 64 samples wide
   (every width the partition produces) run through a kernel compiled
   for that width — each row is a fixed-size array, so the column
